@@ -1,0 +1,17 @@
+appId: dev.dotz.app
+productName: dotz
+directories:
+  output: release
+# asar:false ships plain files so pi's jiti .ts-extension loading and native deps work unchanged.
+asar: false
+extraMetadata:
+  main: dist/main.js
+files:
+  - dist/**/*
+  - web/**/*
+  - .pi/**/*
+  - package.json
+  - node_modules/**/*
+win:
+  target: portable
+# icon: assets/dotz.ico

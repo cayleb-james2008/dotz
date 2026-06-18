@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>dotz · pi.dev coding agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600;700&family=JetBrains+Mono:wght@400;500;700&family=Pixelify+Sans:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- TOP BAR -->
+      <header class="topbar">
+        <div class="brand">
+          <span class="wordmark">dotz</span>
+          <span class="subtitle">pi.dev coding agent</span>
+        </div>
+        <div class="topbar-center">
+          <span class="ascii-dim">▓▒░</span>
+          <span id="session-name" class="session-name">new session</span>
+          <span class="ascii-dim">░▒▓</span>
+        </div>
+        <div class="topbar-right">
+          <div id="profile-picker" class="profile-picker" title="dotz operating profile"></div>
+          <span id="model-badge" class="model-badge">—</span>
+          <span id="conn-chip" class="chip chip-off"><span class="blk">█</span> CONNECTING</span>
+        </div>
+      </header>
+
+      <!-- LEFT RAIL: Projects + Sessions -->
+      <aside class="rail rail-left">
+        <div class="rail-head">
+          <span>▓▓ PROJECTS</span>
+          <button id="new-project" class="btn-mini" title="New project">+ NEW</button>
+        </div>
+        <div id="project-list" class="project-list"></div>
+        <div id="project-form" class="project-form hidden">
+          <input id="pf-name" class="pf-input" placeholder="project name" />
+          <input id="pf-cwd" class="pf-input" placeholder="cwd (absolute path)" />
+          <select id="pf-profile" class="pf-select"></select>
+          <input id="pf-model" class="pf-input" placeholder="model id (openrouter)" />
+          <div class="pf-actions">
+            <button id="pf-create" class="btn-mini btn-go">CREATE</button>
+            <button id="pf-cancel" class="btn-mini">CANCEL</button>
+          </div>
+        </div>
+
+        <div class="rail-head rail-head-split">
+          <span>▓▓ SESSIONS</span>
+          <button id="new-session" class="btn-mini" title="New session">+ NEW</button>
+        </div>
+        <div id="session-list" class="session-list"></div>
+        <div class="rail-foot">
+          <span class="blk blink">█</span>
+          <span id="ws-status" class="mono dim">ws … 127.0.0.1:4317</span>
+        </div>
+      </aside>
+
+      <!-- CENTER: tabs (CHAT | SANDBOX) + transcript/sandbox + composer -->
+      <main class="center">
+        <div class="center-tabs">
+          <button id="tab-chat" class="tab active" data-tab="chat">▓ CHAT</button>
+          <button id="tab-sandbox" class="tab" data-tab="sandbox">▒ SANDBOX</button>
+          <div class="tab-spacer"></div>
+          <span id="sandbox-tab-count" class="tab-count hidden">0 runs</span>
+        </div>
+
+        <!-- CHAT view -->
+        <div id="view-chat" class="view-chat">
+          <div id="transcript" class="transcript"></div>
+        </div>
+
+        <!-- SANDBOX view -->
+        <div id="view-sandbox" class="view-sandbox hidden">
+          <div class="sandbox-toolbar">
+            <select id="sb-lang" class="sb-select" title="language"></select>
+            <select id="sb-mode" class="sb-select" title="mode">
+              <option value="terminal">terminal</option>
+              <option value="web">web</option>
+            </select>
+            <button id="sb-run" class="btn-mini btn-go">▶ RUN</button>
+            <button id="sb-kill" class="btn-mini btn-stop hidden">■ KILL</button>
+            <span id="sb-status" class="sb-status dim mono">idle</span>
+          </div>
+          <div class="sandbox-body">
+            <div class="sandbox-editor">
+              <div class="sb-pane-head">CODE</div>
+              <textarea id="sb-code" class="sb-code" spellcheck="false" placeholder="// print('hello dotz sandbox')"></textarea>
+            </div>
+            <div id="sb-output-wrap" class="sandbox-output-wrap">
+              <div class="sb-pane-head">OUTPUT <span id="sb-runid" class="dim mono"></span></div>
+              <div id="sb-output" class="sb-output"></div>
+            </div>
+            <div id="sb-web-wrap" class="sandbox-web-wrap hidden">
+              <div class="sb-pane-head">WEB PREVIEW <span id="sb-port-label" class="dim mono"></span></div>
+              <div class="sb-iframe-host">
+                <iframe id="sb-iframe" class="sb-iframe" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" referrerpolicy="no-referrer"></iframe>
+                <div id="sb-cursor" class="agent-cursor hidden">
+                  <div class="agent-cursor-sprite"></div>
+                  <div id="sb-cursor-label" class="agent-cursor-label">move</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div id="sb-runs" class="sb-runs"></div>
+        </div>
+
+        <!-- COMPOSER (shared, below both views) -->
+        <div class="composer">
+          <div id="quick-chips" class="quick-chips"></div>
+          <div class="composer-row">
+            <textarea
+              id="composer-input"
+              class="composer-input"
+              rows="1"
+              placeholder="message dotz…   / skills · @ files"
+            ></textarea>
+            <button id="send-btn" class="btn-send">SEND ▸</button>
+            <button id="stop-btn" class="btn-stop hidden">STOP ■</button>
+          </div>
+        </div>
+      </main>
+
+      <!-- RIGHT RAIL: controls + memory -->
+      <aside class="rail rail-right">
+        <section class="ctl">
+          <div class="ctl-head">▓▓ MODEL ▓▓</div>
+          <label class="ctl-label" for="provider-select">PROVIDER</label>
+          <select id="provider-select" class="provider-select"></select>
+          <label class="ctl-label" for="model-input">MODEL</label>
+          <input id="model-input" class="model-input" list="model-suggestions" spellcheck="false" />
+          <datalist id="model-suggestions"></datalist>
+          <select id="model-select" class="model-select hidden"></select>
+          <div class="ctl-tags">
+            <span id="model-ctx" class="tag">ctx —</span>
+            <span id="model-reasoning" class="tag">reasoning —</span>
+          </div>
+          <div class="ctl-caption">OpenRouter/local = free-form model id · catalog providers use dropdown · default <code>nex-agi/nex-n2-pro:free</code></div>
+        </section>
+
+        <section class="ctl">
+          <div class="ctl-head">▓▓ REASONING ▓▓</div>
+          <div id="reasoning-seg" class="seg"></div>
+        </section>
+
+        <section class="ctl">
+          <div class="ctl-head">▓▓ TOOLS ▓▓</div>
+          <div id="tools-grid" class="tools-grid"></div>
+        </section>
+
+        <section class="ctl">
+          <div class="ctl-head">▓▓ SKILLS ▓▓</div>
+          <div id="skills-list" class="cmd-list"><span class="dim mono">none loaded</span></div>
+        </section>
+
+        <section class="ctl">
+          <div class="ctl-head">▓▓ SUBAGENTS ▓▓</div>
+          <div id="subagents-list" class="cmd-list"><span class="dim mono">none loaded</span></div>
+        </section>
+
+        <section class="ctl ctl-memory">
+          <div class="ctl-head">▓▓ MEMORY ▓▓</div>
+          <div id="memory-list" class="memory-list"><span class="dim mono">no entries</span></div>
+          <button id="mem-add" class="btn-mini btn-go mem-add-btn">+ ADD</button>
+          <div id="mem-form" class="mem-form hidden">
+            <input id="mem-key" class="pf-input" placeholder="key" />
+            <input id="mem-value" class="pf-input" placeholder="value" />
+            <select id="mem-scope" class="pf-select">
+              <option value="project">project</option>
+              <option value="global">global</option>
+            </select>
+            <div class="pf-actions">
+              <button id="mem-create" class="btn-mini btn-go">SAVE</button>
+              <button id="mem-cancel" class="btn-mini">CANCEL</button>
+            </div>
+          </div>
+        </section>
+      </aside>
+
+      <!-- STATUS BAR -->
+      <footer class="statusbar">
+        <span class="mono">tokens <span id="st-tok-in" class="cyan">↑0</span> <span id="st-tok-out" class="green">↓0</span></span>
+        <span class="sep">│</span>
+        <span class="mono">cost <span id="st-cost" class="yellow">$0.00</span></span>
+        <span class="sep">│</span>
+        <span class="mono ctx-wrap">ctx <span id="st-ctx-pct" class="lav">0%</span>
+          <span class="ctx-meter"><span id="st-ctx-bar" class="ctx-bar"></span></span>
+          <span id="st-ctx-win" class="dim">of —</span>
+        </span>
+        <span class="sep">│</span>
+        <span class="mono">sandbox <span id="st-sandbox" class="peach">0 runs</span></span>
+        <span class="spacer"></span>
+        <span id="st-state" class="mono dim">idle</span>
+      </footer>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>
