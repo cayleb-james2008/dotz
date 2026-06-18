@@ -19,6 +19,7 @@ export interface ProviderMeta {
 
 export const PROVIDERS: ProviderMeta[] = [
   { id: "openrouter", label: "OpenRouter", freeForm: true },
+  { id: "ollama", label: "Ollama Cloud", freeForm: true },
   { id: "anthropic", label: "Anthropic" },
   { id: "openai", label: "OpenAI" },
   { id: "google", label: "Google" },
@@ -27,8 +28,24 @@ export const PROVIDERS: ProviderMeta[] = [
   { id: "xai", label: "xAI" },
   { id: "deepseek", label: "DeepSeek" },
   { id: "cohere", label: "Cohere" },
-  { id: "local", label: "Local (Ollama/LM Studio)" },
+  { id: "local", label: "Local (Ollama/LM Studio)", freeForm: true },
 ];
+
+/** Low-cost sub-models per provider — used by automatic task distribution.
+ *  The main model selects from this list when dispersing subtasks to subagents,
+ *  keeping cost down while the main agent retains the high-quality orchestrator role.
+ *  Format: `{provider}/{modelId}` (the same shape pi's --model flag expects). */
+export const LOW_COST_MODELS: ModelRef[] = [
+  { provider: "ollama", modelId: "minimax-m3" },
+  { provider: "openrouter", modelId: "nvidia/nemotron-3-ultra-550b-a55b:free" },
+  { provider: "openrouter", modelId: "nex-agi/nex-n2-pro:free" },
+];
+
+/** Render the low-cost model list for system-prompt injection. */
+export function renderLowCostModels(): string {
+  const lines = LOW_COST_MODELS.map((m) => `- ${m.provider}/${m.modelId}`);
+  return `\n# dotz low-cost sub-model list (for automatic task distribution)\nWhen dispersing subtasks to subagents via the \`subagent\` tool, select a model from this list\n(using the \`model\` parameter) to keep cost down. The main agent (you) retains the\nhigh-quality orchestrator role; subagents run on these low-cost models.\n${lines.join("\n")}\n`;
+}
 
 /** Project definition — persistent workspace with its own cwd, profile, model, and memory. */
 export interface Project {

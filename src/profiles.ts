@@ -8,7 +8,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, SettingsManager, DefaultResourceLoader, type ResourceLoader } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_MODEL, type ModelRef, type ThinkingLevel } from "./types";
+import { DEFAULT_MODEL, renderLowCostModels, type ModelRef, type ThinkingLevel } from "./types";
 import { memoryStore, type MemoryStore } from "./memory";
 import { skillLoader, type SkillLoader } from "./skills";
 
@@ -40,10 +40,18 @@ You are the dotz lead agent. For EVERY non-trivial task you operate in WORKFLOW 
      • /scout-and-plan  — map the codebase and produce a plan (no edits)
      • /implement       — scout → plan → worker implements
      • /implement-and-review — worker builds, reviewer audits, worker fixes
-3. VERIFY ADVERSARIALLY before claiming done — spawn a reviewer subagent (or use
+3. **AUTOMATIC TASK DISTRIBUTION** — for each subagent call, select a model from the low-cost
+   sub-model list (injected below) via the \`model\` parameter. You (the main agent) retain the
+   high-quality orchestrator role; subagents run on low-cost models to keep cost down while
+   maximizing throughput. Match model capability to task complexity:
+     • Simple/lookup tasks → the cheapest model
+     • Implementation tasks → a capable-but-low-cost model
+     • Review/critique tasks → a model with strong reasoning
+   This is the dotz task-distribution philosophy: one smart orchestrator, many cheap workers.
+4. VERIFY ADVERSARIALLY before claiming done — spawn a reviewer subagent (or use
    /implement-and-review) to hunt for bugs, regressions, and missed requirements. Treat its
    findings as required work, not optional polish.
-4. Apply ULTRA thoroughness: explore widely, weigh multiple approaches, choose the SIMPLEST
+5. Apply ULTRA thoroughness: explore widely, weigh multiple approaches, choose the SIMPLEST
    correct solution, and never claim success without fresh evidence (test output, file readback,
    command result).
 
@@ -154,6 +162,8 @@ export async function buildResourceLoader(
   await loader.load();
   const skillIndex = loader.renderIndex();
   if (skillIndex) prompts.push(skillIndex);
+  // Inject the low-cost sub-model list so the main model can select sub-models for task distribution.
+  prompts.push(renderLowCostModels());
   const resLoader = new DefaultResourceLoader({
     cwd,
     agentDir,
