@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { getAgentDir, SettingsManager, DefaultResourceLoader, type ResourceLoader } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MODEL, type ModelRef, type ThinkingLevel } from "./types";
 import { memoryStore, type MemoryStore } from "./memory";
+import { skillLoader, type SkillLoader } from "./skills";
 
 /** Bundled .pi (skills / extensions / prompts) — resolved relative to this module so it works
  *  both in dev (src/) and in the packaged app (dist/, with .pi shipped alongside). */
@@ -136,26 +137,35 @@ export function profileSummary(p: Profile) {
 export async function buildResourceLoader(
   cwd: string,
   profile: Profile,
-  opts: { projectId?: string | null; memory?: MemoryStore } = {}
+  opts: { projectId?: string | null; memory?: MemoryStore; skills?: SkillLoader } = {}
 ): Promise<ResourceLoader> {
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir);
   const prompts = [profile.appendSystemPrompt];
   if (opts.projectId) {
     const store = opts.memory ?? memoryStore;
-    const entries = await store.forProject(opts.projectId);
+    const entries = await store.forProject(opts.projectId, cwd);
     const memBlock = store.renderForPrompt(entries);
     if (memBlock) prompts.push(memBlock);
   }
-  const loader = new DefaultResourceLoader({
+  // Inject the unified skill index (names + one-line descriptions) so the agent knows what
+  // skills are available without loading every full body. The `skill` tool loads bodies on demand.
+  const loader = opts.skills ?? skillLoader;
+  await loader.load();
+  const skillIndex = loader.renderIndex();
+  if (skillIndex) prompts.push(skillIndex);
+  const resLoader = new DefaultResourceLoader({
     cwd,
     agentDir,
     settingsManager,
     appendSystemPrompt: prompts,
-    additionalExtensionPaths: [path.join(DOTZ_PI, "extensions", "subagent")],
+    additionalExtensionPaths: [
+      path.join(DOTZ_PI, "extensions", "subagent"),
+      path.join(DOTZ_PI, "extensions", "dotz-tools"),
+    ],
     additionalSkillPaths: [path.join(DOTZ_PI, "skills")],
     additionalPromptTemplatePaths: [path.join(DOTZ_PI, "prompts")],
   });
-  await loader.reload();
-  return loader;
+  await resLoader.reload();
+  return resLoader;
 }
