@@ -85,6 +85,31 @@ ok(!!memRes.id, `global memory entry created in .ai-agents namespace`);
 const memList = await (await fetch(base + "/api/memory")).json();
 ok(memList.entries.some((e) => e.key === "test:ultra"), `global memory entry retrievable`);
 
+// [10] Phase 2 tools — rsi_baseline, rsi_compare, human_gate, design_system, design_components, design_audit
+ok(tools.all.includes("rsi_baseline"), `rsi_baseline tool registered`);
+ok(tools.all.includes("rsi_compare"), `rsi_compare tool registered`);
+ok(tools.all.includes("human_gate"), `human_gate tool registered`);
+ok(tools.all.includes("design_system"), `design_system tool registered`);
+ok(tools.all.includes("design_components"), `design_components tool registered`);
+ok(tools.all.includes("design_audit"), `design_audit tool registered`);
+
+// [11] commands — new workflow presets (ultra-code-review, e2e-test, self-improve)
+const cmds = await (await fetch(base + `/api/sessions/${sess.sessionId}/commands`)).json();
+const cmdNames = cmds.commands.map((c) => c.name);
+ok(cmdNames.includes("ultra-code-review"), `/ultra-code-review preset registered`);
+ok(cmdNames.includes("e2e-test"), `/e2e-test preset registered`);
+ok(cmdNames.includes("self-improve"), `/self-improve preset registered`);
+
+// [12] browser endpoints (stub in dev mode, but routes must exist)
+const browserState = await (await fetch(base + "/api/browser/state")).json();
+ok(typeof browserState.available === "boolean", `/api/browser/state responds (available=${browserState.available})`);
+
+// [13] Ollama provider present + free-form
+const provRes = await (await fetch(base + "/api/providers")).json();
+const ollama = provRes.providers.find((p) => p.id === "ollama");
+ok(!!ollama, `ollama provider registered`);
+ok(!!ollama.freeForm, `ollama provider is free-form`);
+
 // cleanup
 const memEntry = memList.entries.find((e) => e.key === "test:ultra");
 if (memEntry) await fetch(base + "/api/memory/" + memEntry.id, { method: "DELETE" });

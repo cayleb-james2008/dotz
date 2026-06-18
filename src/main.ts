@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, shell } from "electron";
 import { buildServer } from "./server";
 import { sandbox } from "./sandbox";
+import * as browser from "./browser";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.DOTZ_PORT || 4317);
@@ -44,6 +45,9 @@ function createWindow() {
     if (/^https?:/.test(url)) shell.openExternal(url);
     return { action: "deny" };
   });
+  // Attach the in-app browser view (hidden until the UI opens the browser panel).
+  browser.attach(win).catch(() => {});
+  win.on("closed", () => browser.detach());
 }
 
 app.whenReady().then(async () => {
@@ -60,6 +64,7 @@ app.whenReady().then(async () => {
 
 app.on("window-all-closed", () => {
   sandbox.disposeAll();
+  browser.detach();
   if (runtime) runtime.pi.disposeAll();
   app.quit();
 });
