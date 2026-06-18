@@ -92,41 +92,115 @@ preview iframe at the published port, and the agent drives an **agent cursor** o
 overlay; the server emits `sandbox_cursor` events back so both the agent and the user see the same
 pointer state. Run lifecycle: `pending → running → done|error|killed`.
 
+## Multi-provider + Ollama cloud + task distribution
+
+The model surface is **multi-provider**: OpenRouter, **Ollama Cloud** (minimax-m3), Anthropic, OpenAI,
+Google, Groq, Mistral, xAI, DeepSeek, Cohere, and Local. OpenRouter, Ollama, and Local are
+**free-form model-id inputs** (not dropdowns). `resolveModel` clones any same-provider template for
+unknown ids; Ollama falls back to cloning an OpenRouter template if no Ollama model is registered.
+
+**Automatic task distribution**: `LOW_COST_MODELS` in `types.ts` lists the low-cost sub-models per
+provider (Ollama: `minimax-m3`; OpenRouter: `nvidia/nemotron-3-ultra-550b-a55b:free`,
+`nex-agi/nex-n2-pro:free`). This list is injected into the system prompt via `renderLowCostModels()`,
+and the `subagent` tool accepts a `model` override parameter (format: `provider/model-id`). The main
+agent (the high-quality orchestrator) selects a sub-model per task from this list, keeping cost down
+while maximizing throughput. The WORKFLOW_DOCTRINE instructs the agent to match model capability to
+task complexity.
+
+## Subagent → workflow bridge
+
+`src/workflow-bridge.ts` (`WorkflowBridge`) synthesizes `WorkflowRun` objects from the subagent
+extension's `tool_execution_*` events so the UI graph auto-populates when the agent runs `/implement`,
+`/implement-and-review`, or any subagent dispersal. It detects `toolName === "subagent"` in the event
+stream, creates a run with one step per subagent result, and updates step states as the tool
+progresses. This is the glue between the subagent extension (execution backend) and `WorkflowStore`
+(observability layer). It is best-effort and never blocks the agent loop.
+
+## RSI agent brain (recursive self-improvement)
+
+`src/metrics.ts` is the **measurement layer** for the RSI loop: `captureBaseline(cwd)` runs typecheck
++ build + tests and stores the result; `compare(baseline)` re-measures and reports whether metrics
+improved/regressed. Anti-gaming checks: tests must not be deleted, must still pass.
+
+The RSI loop is driven by three pi tools registered by the dotz-tools extension:
+- `rsi_baseline` — capture a verification baseline
+- `rsi_compare` — re-measure and compare against a baseline
+- `human_gate` — pause for user approval (RSI Phase 2 gate); the UI renders an approval card via a
+  `{kind:"gate", gateId, plan}` WS event and replies with `{kind:"gate.approve"|"gate.reject"}`
+
+The `/self-improve` workflow preset (`/self-improve`) runs the full 7-phase loop:
+measure → research → pick → plan (HUMAN GATE) → implement (TDD) → review (5-reviewer fan-out) →
+simplify → verify. The brain panel's SELF-IMPROVE button sends this prompt.
+
+## Open-Design (baked-in frontend tooling)
+
+`src/design.ts` is the **baked-in design system**: bundled palettes (Catppuccin Mocha, fintech SaaS,
+landing modern), typography pairings with Google Fonts imports, layout patterns, platform guidelines,
+Lucide icon guidance, chart recommendations, and a UX/accessibility audit rubric (WCAG 2.2 AA, touch
+targets, focus states, no AI-slop). Three pi tools expose it:
+- `design_system(query)` — returns CSS tokens + palette + typography + layout
+- `design_components(query)` — returns Lucide icons + chart types + framework rules
+- `design_audit(target)` — returns UX/accessibility findings with specific fixes
+
+The FRONTEND profile doctrine instructs the agent to use these tools for any frontend task.
+
+## In-app browser
+
+`src/browser.ts` embeds a Chromium instance inside the Electron window via `WebContentsView` (the
+modern replacement for `BrowserView`). It uses a dedicated `--user-data-dir`
+(`~/.dotz/ai-agents/browser-profile`) so it never conflicts with the user's personal Chrome profile.
+In browser-dev mode (`npm run dev:server`, no Electron), it's a no-op stub — the UI shows the
+placeholder. REST endpoints: `/api/browser/state|navigate|back|forward|reload|screenshot|eval`.
+
+## Workflow presets
+
+`.pi/prompts/` contains 6 slash-command presets:
+- `/scout-and-plan` — scout → planner (no edits)
+- `/implement` — scout → planner → worker
+- `/implement-and-review` — worker → reviewer → worker (applies feedback)
+- `/ultra-code-review` — 5-reviewer fan-out → isolated scorers → confidence ≥80 filter → report
+- `/e2e-test` — discover surface → baseline → write e2e tests (parallel) → run → compare
+- `/self-improve` — full RSI 7-phase loop with human gate
+
 ## Key files
 
-- `src/pi.ts` — `PiSessions`: create/get/list/subscribe/dispose, model resolution (OpenRouter
-  custom-id support), command aggregation. **Import only from the top-level
-  `@earendil-works/pi-coding-agent`** — `pi-ai`/`pi-agent-core` are nested and not resolvable from
-  the project root.
-- `src/profiles.ts` — 5 profiles (WORKFLOW/SOLO/PLAN/FRONTEND/BACKEND) + `buildResourceLoader`
-  (loads bundled `.pi` + injects doctrine + injects skill index + injects project memory).
-- `src/skills.ts` — unified skills loader (300+ skills across opencode/claude/codex/ecc/superpowers/hermes/.pi pools).
+- `src/pi.ts` — `PiSessions`: create/get/list/subscribe/dispose, model resolution (OpenRouter +
+  Ollama + local free-form), command aggregation. **Import only from the top-level
+  `@earendil-works/pi-coding-agent`**.
+- `src/profiles.ts` — 5 profiles + `buildResourceLoader` (loads bundled `.pi` + injects doctrine +
+  skill index + low-cost model list + project memory).
+- `src/skills.ts` — unified skills loader (320 skills across opencode/claude/codex/ecc/superpowers/hermes/.pi pools).
 - `src/workflows.ts` — workflow store (first-class `WorkflowRun` DAG, status propagation, event emitter, JSON-persisted).
+- `src/workflow-bridge.ts` — synthesizes WorkflowRuns from subagent tool_execution events (auto-populates the graph).
+- `src/metrics.ts` — RSI measurement layer (baseline + compare + anti-gaming).
+- `src/design.ts` — Open-Design baked-in frontend tooling (palettes, typography, UX audit).
+- `src/browser.ts` — in-app Electron browser (WebContentsView + dedicated profile).
 - `src/projects.ts` — persistent projects layer (name + cwd + profile/model/thinking defaults).
 - `src/memory.ts` — memory store (`project` / `global` scope) under `.ai-agents` namespace + AGENTS.md read/write helpers. Injected into the system prompt via `buildResourceLoader`.
 - `src/sandbox.ts` — sandbox runner (`terminal` + `web` modes, agent cursor, lifecycle events).
 - `src/types.ts` — shared types (`ModelRef`, `ProviderMeta`, `Project`, `MemoryEntry`, `SandboxRun`,
-  `Skill`, `WorkflowRun`, `WorkflowStep`, `ThinkingLevel`, `DEFAULT_MODEL`). Kept separate from
-  `pi.ts` to avoid a circular import — do not merge.
-- `src/server.ts` — Fastify REST + WS + static. The `need()` helper resolves `:id` → session entry.
-  Routes: sessions, projects, memory, skills, workflows, sandbox.
+  `Skill`, `WorkflowRun`, `WorkflowStep`, `ThinkingLevel`, `DEFAULT_MODEL`, `LOW_COST_MODELS`,
+  `renderLowCostModels`). Kept separate from `pi.ts` to avoid a circular import — do not merge.
+- `src/server.ts` — Fastify REST + WS + static. Routes: sessions, projects, memory, skills, workflows,
+  sandbox, browser, human-gate.
 - `src/main.ts` / `src/preload.ts` — Electron main + contextIsolation preload.
 - `web/` — vanilla JS bento dashboard (project launcher, progressive panel disclosure, drag-and-drop,
   on-the-fly SVG workflow graph, skills/memory/sandbox/brain panels).
-- `.pi/` — bundled agent resources (subagent extension, dotz-tools extension, agents, workflow prompts).
+- `.pi/` — bundled agent resources (subagent extension, dotz-tools extension, agents, 6 workflow prompts).
   Shipped in the exe via `electron-builder.yml` `files:`.
-- `.pi/extensions/dotz-tools/index.ts` — registers `skill`, `memory_list`, `memory_add`,
-  `memory_delete`, `agents_md` pi tools.
+- `.pi/extensions/dotz-tools/index.ts` — registers 13 pi tools: `skill`, `memory_list`, `memory_add`,
+  `memory_delete`, `agents_md`, `rsi_baseline`, `rsi_compare`, `human_gate`, `design_system`,
+  `design_components`, `design_audit` + the `resolveHumanGate`/`onGateRequest` server hooks.
 - `docs/api-contract.md` — the authoritative UI↔backend contract.
 
 ## Verification commands
 
 ```bash
 npm run typecheck                      # tsc --noEmit — must be clean
-npx tsx scripts/verify-profiles.mjs   # e2e: profiles + .pi bundle + subagent + dotz-tools tools
+npx tsx scripts/verify-profiles.mjs   # e2e: profiles + .pi bundle + subagent + 13 dotz-tools tools
 npx tsx scripts/verify-ui.mjs          # e2e: UI markup + profiles API
-npx tsx scripts/verify-features.mjs    # e2e: projects + memory + sandbox + multi-provider
-npx tsx scripts/verify-ultra.mjs       # e2e: skills pool + workflows + .ai-agents memory + tools
+npx tsx scripts/verify-features.mjs    # e2e: projects + memory + sandbox + multi-provider (11 providers)
+npx tsx scripts/verify-ultra.mjs       # e2e: 320 skills + workflows + .ai-agents memory + RSI/design/browser tools + 6 presets + Ollama
 npm run dev:server                      # http://127.0.0.1:4317 (browser dev loop)
 npm run build                           # esbuild → dist/main.js + dist/preload.cjs
 npm run dist                            # → release/dotz <version>.exe (Windows portable)
@@ -135,9 +209,12 @@ npm run dist                            # → release/dotz <version>.exe (Window
 ## Provider config
 
 dotz uses pi's normal auth resolution (`~/.pi/agent/auth.json` → env vars). Provide a working
-provider key, e.g. `OPENROUTER_API_KEY`. OpenRouter is a **free-form model-id input** (not a
-dropdown), defaulting to `nex-agi/nex-n2-pro:free`; use `:free` models when the balance is low
-(provider errors surface in-chat as `stopReason:"error"` + `errorMessage`).
+provider key, e.g. `OPENROUTER_API_KEY` or `OLLAMA_API_KEY`. OpenRouter + Ollama + Local are
+**free-form model-id inputs** (not dropdowns), defaulting to `nex-agi/nex-n2-pro:free`. Use `:free`
+models when the balance is low (provider errors surface in-chat as `stopReason:"error"` +
+`errorMessage`). The low-cost sub-model list (Ollama `minimax-m3`, OpenRouter
+`nvidia/nemotron-3-ultra-550b-a55b:free`, `nex-agi/nex-n2-pro:free`) is injected into the system
+prompt for automatic task distribution.
 
 ## Known caveats
 
@@ -165,5 +242,14 @@ dropdown), defaulting to `nex-agi/nex-n2-pro:free`; use `:free` models when the 
 - `sandbox.ts` owns process lifecycle for both `terminal` and `web` runs; never spawn sandbox
   processes directly from `server.ts`. The agent cursor is a UI overlay driven by `sandbox_cursor`
   WS events — both sides (agent send + UI render) must consume the same event shape.
+- `browser.ts` owns the in-app Electron browser (`WebContentsView`). It must never reuse the user's
+  personal Chrome profile — always use the dedicated `~/.dotz/ai-agents/browser-profile`. In
+  browser-dev mode it's a no-op stub.
+- `workflow-bridge.ts` is best-effort — it never blocks the agent loop. If it fails to synthesize a
+  run, the subagent extension still works; the UI graph just doesn't populate for that call.
+- `metrics.ts` is a pure measurement layer — no agent runtime. The RSI brain (the `/self-improve`
+  preset + the `rsi_*`/`human_gate` tools) drives the loop; `metrics.ts` provides the evidence.
+- `design.ts` is bundled offline design knowledge. If the `ui-ux-pro` MCP is available in the dev
+  environment, the agent may also use it directly — but `design_*` tools must work standalone.
 - esbuild leaves `node_modules` external so pi's jiti `.ts` extension loading works at runtime;
   `electron-builder.yml` sets `asar: false` for the same reason.

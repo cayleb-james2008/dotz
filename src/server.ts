@@ -27,6 +27,9 @@ import { memoryStore } from "./memory";
 import { sandbox, SANDBOX_LANGUAGES, type SandboxEvent } from "./sandbox";
 import { skillLoader } from "./skills";
 import { workflowStore, type WorkflowEvent } from "./workflows";
+import { workflowBridge } from "./workflow-bridge";
+import { resolveHumanGate, onGateRequest } from "../.pi/extensions/dotz-tools/index";
+import * as browser from "./browser";
 import { PROVIDERS, type Project, type MemoryEntry, type SandboxRun, type WorkflowRun } from "./types";
 
 const HOST = "127.0.0.1";
@@ -54,6 +57,15 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   const pi = new PiSessions();
 
   await app.register(fastifyWebsocket);
+
+  // Human-gate: when the agent calls the `human_gate` tool, forward the gate request to all
+  // open WS sockets so the UI can render an approval card. The UI replies via gate.approve/reject.
+  const wsSockets = new Set<{ readyState: number; send: (data: string) => void; OPEN: number }>();
+  onGateRequest((gateId, plan) => {
+    for (const s of wsSockets) {
+      if (s.readyState === s.OPEN) s.send(JSON.stringify({ kind: "gate", gateId, plan }));
+    }
+  });
 
   // ---- health + providers ----
   app.get("/api/health", async () => ({ ok: true, sessions: pi.list().length, sandboxRuns: sandbox.list().length }));
@@ -187,6 +199,23 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   app.post("/api/workflows/:id/abort", async (req) => {
     await workflowStore.abort((req.params as { id: string }).id);
     return { ok: true };
+  });
+
+  // ---- in-app browser (Electron only; stubs in browser dev mode) ----
+  app.get("/api/browser/state", async () => browser.state());
+  app.post("/api/browser/navigate", async (req, reply) => {
+    const body = (req.body ?? {}) as { url?: string };
+    if (!body.url) { reply.code(400).send({ error: "url required" }); return; }
+    return browser.navigate(body.url);
+  });
+  app.post("/api/browser/back", async () => browser.back());
+  app.post("/api/browser/forward", async () => browser.forward());
+  app.post("/api/browser/reload", async () => browser.reload());
+  app.get("/api/browser/screenshot", async () => ({ dataUrl: await browser.screenshot() }));
+  app.post("/api/browser/eval", async (req, reply) => {
+    const body = (req.body ?? {}) as { js?: string };
+    if (!body.js) { reply.code(400).send({ error: "js required" }); return; }
+    return { result: await browser.evalJs(body.js) };
   });
 
   // ---- sandbox ----
@@ -332,6 +361,8 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
 
     // Fan agent events to the socket.
     const offAgent = pi.subscribe(sessionId, (event) => {
+      // Bridge: synthesize workflow runs from subagent tool calls so the graph auto-populates.
+      try { workflowBridge.handleEvent(sessionId, entry.projectId, event); } catch { /* best-effort */ }
       if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ kind: "event", sessionId, event }));
     });
     // Fan sandbox events to the same socket so the UI can render live sandbox output inline.
@@ -346,9 +377,10 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ kind: "workflow", sessionId, runId, event }));
     });
     socket.send(JSON.stringify({ kind: "ready", sessionId }));
+    wsSockets.add(socket);
 
     socket.on("message", async (raw: Buffer) => {
-      let msg: { kind?: string; text?: string; projectId?: string | null; language?: string; code?: string; mode?: "terminal" | "web"; timeoutMs?: number; runId?: string; x?: number; y?: number; action?: "move" | "click" | "type"; cursorText?: string };
+      let msg: { kind?: string; text?: string; projectId?: string | null; language?: string; code?: string; mode?: "terminal" | "web"; timeoutMs?: number; runId?: string; x?: number; y?: number; action?: "move" | "click" | "type"; cursorText?: string; gateId?: string; feedback?: string };
       try {
         msg = JSON.parse(raw.toString());
       } catch {
@@ -369,16 +401,21 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
           if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ kind: "sandbox", sessionId, event: { type: "sandbox_start", runId: run.id, run } }));
         } else if (msg.kind === "sandbox.kill") {
           await sandbox.kill(msg.runId || "");
-        } else if (msg.kind === "sandbox.cursor") {
+        }         else if (msg.kind === "sandbox.cursor") {
           // Cursor event — the UI renders the agent's cursor over the live web preview iframe.
           sandbox.cursor(msg.runId || "", msg.x || 0, msg.y || 0, msg.action || "move", msg.cursorText);
+        } else if (msg.kind === "gate.approve") {
+          // Human-gate approval — resolves the human_gate tool's awaiting Promise.
+          resolveHumanGate(msg.gateId || "", true, msg.feedback);
+        } else if (msg.kind === "gate.reject") {
+          resolveHumanGate(msg.gateId || "", false, msg.feedback);
         }
       } catch (e) {
         socket.send(JSON.stringify({ kind: "error", error: (e as Error).message }));
       }
     });
 
-    socket.on("close", () => { offAgent(); offWorkflow(); });
+    socket.on("close", () => { offAgent(); offWorkflow(); wsSockets.delete(socket); });
   });
 
   // Static chat UI last, so explicit /api and /ws routes win.
