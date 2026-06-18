@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>dotz · pi.dev coding agent</title>
+    <title>dotz · ultra code · pi.dev</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -14,69 +14,209 @@
   </head>
   <body>
     <div id="app">
-      <!-- TOP BAR -->
+      <!-- TOP BAR: the four knobs + brand + workflows -->
       <header class="topbar">
         <div class="brand">
           <span class="wordmark">dotz</span>
-          <span class="subtitle">pi.dev coding agent</span>
+          <span class="subtitle">ultra code · pi.dev</span>
         </div>
         <div class="topbar-center">
           <span class="ascii-dim">▓▒░</span>
-          <span id="session-name" class="session-name">new session</span>
+          <span id="session-name" class="session-name">no session</span>
           <span class="ascii-dim">░▒▓</span>
         </div>
         <div class="topbar-right">
-          <div id="profile-picker" class="profile-picker" title="dotz operating profile"></div>
-          <span id="model-badge" class="model-badge">—</span>
+          <!-- hidden profile-picker kept for verify-ui compatibility -->
+          <div id="profile-picker" class="profile-picker hidden" title="dotz operating profile"></div>
+          <div class="knob-group">
+            <label class="knob-label">PROVIDER</label>
+            <select id="provider-select" class="knob-select" title="provider"></select>
+          </div>
+          <div class="knob-group">
+            <label class="knob-label">MODEL</label>
+            <input id="model-input" class="knob-input" list="model-suggestions" spellcheck="false" placeholder="model id" />
+            <datalist id="model-suggestions"></datalist>
+            <select id="model-select" class="knob-select hidden"></select>
+            <span id="model-badge" class="model-badge hidden">—</span>
+          </div>
+          <div class="knob-group">
+            <label class="knob-label">REASONING</label>
+            <div id="reasoning-seg" class="seg-mini"></div>
+          </div>
+          <button id="workflows-btn" class="knob-btn" title="open workflow graph">
+            ◐ WORKFLOWS <span id="wf-badge" class="wf-badge hidden">0</span>
+          </button>
+          <button id="panels-btn" class="knob-btn" title="add panels (Ctrl+P)">+ PANELS</button>
           <span id="conn-chip" class="chip chip-off"><span class="blk">█</span> CONNECTING</span>
         </div>
       </header>
 
-      <!-- LEFT RAIL: Projects + Sessions -->
-      <aside class="rail rail-left">
-        <div class="rail-head">
-          <span>▓▓ PROJECTS</span>
-          <button id="new-project" class="btn-mini" title="New project">+ NEW</button>
-        </div>
-        <div id="project-list" class="project-list"></div>
-        <div id="project-form" class="project-form hidden">
-          <input id="pf-name" class="pf-input" placeholder="project name" />
-          <input id="pf-cwd" class="pf-input" placeholder="cwd (absolute path)" />
-          <select id="pf-profile" class="pf-select"></select>
-          <input id="pf-model" class="pf-input" placeholder="model id (openrouter)" />
-          <div class="pf-actions">
-            <button id="pf-create" class="btn-mini btn-go">CREATE</button>
-            <button id="pf-cancel" class="btn-mini">CANCEL</button>
+      <!-- PROJECT LAUNCHER (initial state — shown until a session exists) -->
+      <section id="launcher" class="launcher">
+        <div class="launcher-card">
+          <div class="launcher-head">
+            <span class="launcher-glyph">◆</span>
+            <h1>dotz</h1>
+            <span class="launcher-sub">ultra code · pi.dev coding agent</span>
+          </div>
+          <p class="launcher-prompt">Open a project to start, or create a new workspace.</p>
+          <div id="launcher-projects" class="launcher-projects"></div>
+          <div class="launcher-new">
+            <button id="launcher-new-btn" class="btn-launch">+ NEW PROJECT</button>
+          </div>
+          <div id="launcher-form" class="launcher-form hidden">
+            <input id="lf-name" class="pf-input" placeholder="project name" />
+            <input id="lf-cwd" class="pf-input" placeholder="cwd (absolute path)" />
+            <select id="lf-profile" class="pf-select"></select>
+            <input id="lf-model" class="pf-input" placeholder="model id (openrouter)" value="nex-agi/nex-2-pro:free" />
+            <div class="pf-actions">
+              <button id="lf-create" class="btn-mini btn-go">CREATE &amp; OPEN</button>
+              <button id="lf-cancel" class="btn-mini">CANCEL</button>
+            </div>
           </div>
         </div>
+      </section>
 
-        <div class="rail-head rail-head-split">
-          <span>▓▓ SESSIONS</span>
-          <button id="new-session" class="btn-mini" title="New session">+ NEW</button>
-        </div>
-        <div id="session-list" class="session-list"></div>
-        <div class="rail-foot">
-          <span class="blk blink">█</span>
-          <span id="ws-status" class="mono dim">ws … 127.0.0.1:4317</span>
-        </div>
-      </aside>
+      <!-- BENTO GRID (shown after a session starts) -->
+      <section id="bento" class="bento hidden">
+        <!-- panels are inserted here dynamically by the panel registry -->
+      </section>
 
-      <!-- CENTER: tabs (CHAT | SANDBOX) + transcript/sandbox + composer -->
-      <main class="center">
-        <div class="center-tabs">
-          <button id="tab-chat" class="tab active" data-tab="chat">▓ CHAT</button>
-          <button id="tab-sandbox" class="tab" data-tab="sandbox">▒ SANDBOX</button>
-          <div class="tab-spacer"></div>
-          <span id="sandbox-tab-count" class="tab-count hidden">0 runs</span>
+      <!-- PANEL PALETTE (Ctrl+P overlay) -->
+      <div id="palette" class="palette hidden">
+        <div class="palette-card">
+          <div class="palette-head">ADD PANEL</div>
+          <div id="palette-grid" class="palette-grid"></div>
+          <button id="palette-close" class="btn-mini">CLOSE (Esc)</button>
         </div>
+      </div>
 
-        <!-- CHAT view -->
-        <div id="view-chat" class="view-chat">
+      <!-- STATUS BAR -->
+      <footer class="statusbar">
+        <span class="mono">tokens <span id="st-tok-in" class="cyan">↑0</span> <span id="st-tok-out" class="green">↓0</span></span>
+        <span class="sep">│</span>
+        <span class="mono">cost <span id="st-cost" class="yellow">$0.00</span></span>
+        <span class="sep">│</span>
+        <span class="mono ctx-wrap">ctx <span id="st-ctx-pct" class="lav">0%</span>
+          <span class="ctx-meter"><span id="st-ctx-bar" class="ctx-bar"></span></span>
+          <span id="st-ctx-win" class="dim">of —</span>
+        </span>
+        <span class="sep">│</span>
+        <span class="mono">sandbox <span id="st-sandbox" class="peach">0 runs</span></span>
+        <span class="sep">│</span>
+        <span class="mono">workflows <span id="st-workflows" class="cyan">0</span></span>
+        <span class="spacer"></span>
+        <span id="st-state" class="mono dim">idle</span>
+      </footer>
+    </div>
+
+    <!-- panel templates (hidden, cloned by the registry) -->
+    <template id="tpl-chat">
+      <div class="panel" data-panel="chat">
+        <div class="panel-head" draggable="true"><span class="panel-icon">▓</span> CHAT <button class="panel-close" title="remove panel">×</button></div>
+        <div class="panel-body chat-body">
           <div id="transcript" class="transcript"></div>
+          <div class="composer">
+            <div id="quick-chips" class="quick-chips"></div>
+            <div class="composer-row">
+              <textarea id="composer-input" class="composer-input" rows="1" placeholder="message dotz…   / skills · @ files"></textarea>
+              <button id="send-btn" class="btn-send">SEND ▸</button>
+              <button id="stop-btn" class="btn-stop hidden">STOP ■</button>
+            </div>
+          </div>
         </div>
+      </div>
+    </template>
 
-        <!-- SANDBOX view -->
-        <div id="view-sandbox" class="view-sandbox hidden">
+    <template id="tpl-graph">
+      <div class="panel" data-panel="graph">
+        <div class="panel-head" draggable="true"><span class="panel-icon">◐</span> WORKFLOW GRAPH <button class="panel-close">×</button></div>
+        <div class="panel-body graph-body">
+          <div id="wf-tabs" class="wf-tabs"></div>
+          <div id="wf-detail" class="wf-detail hidden"></div>
+          <svg id="wf-svg" class="wf-svg" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <marker id="wf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" class="wf-arrow-path" />
+              </marker>
+            </defs>
+            <g id="wf-edges"></g>
+            <g id="wf-nodes"></g>
+          </svg>
+          <div id="wf-empty" class="wf-empty">No active workflow runs. Start one via /implement or /implement-and-review.</div>
+        </div>
+      </div>
+    </template>
+
+    <template id="tpl-brain">
+      <div class="panel" data-panel="brain">
+        <div class="panel-head" draggable="true"><span class="panel-icon">◆</span> AGENT BRAIN <button class="panel-close">×</button></div>
+        <div class="panel-body brain-body">
+          <div class="brain-stats">
+            <div class="brain-stat"><span class="bs-label">TOKENS</span><span id="brain-tok" class="bs-val">0</span></div>
+            <div class="brain-stat"><span class="bs-label">COST</span><span id="brain-cost" class="bs-val">$0.00</span></div>
+            <div class="brain-stat"><span class="bs-label">CTX</span><span id="brain-ctx" class="bs-val">0%</span></div>
+          </div>
+          <button id="brain-selfimprove" class="btn-brain">◆ SELF-IMPROVE CYCLE</button>
+          <div class="brain-log-head">BRAIN EVENTS</div>
+          <div id="brain-log" class="brain-log"></div>
+        </div>
+      </div>
+    </template>
+
+    <template id="tpl-browser">
+      <div class="panel" data-panel="browser">
+        <div class="panel-head" draggable="true"><span class="panel-icon">▣</span> BROWSER <button class="panel-close">×</button></div>
+        <div class="panel-body browser-body">
+          <div class="placeholder">
+            <div class="ph-glyph">▣</div>
+            <p>In-app browser (Phase 2)</p>
+            <p class="dim">Will connect to your local Chrome via browser-harness.</p>
+            <button class="btn-mini" disabled>CONNECT</button>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <template id="tpl-memory">
+      <div class="panel" data-panel="memory">
+        <div class="panel-head" draggable="true"><span class="panel-icon">▤</span> MEMORY <button class="panel-close">×</button></div>
+        <div class="panel-body memory-body">
+          <div class="memory-note">AGENTS.md + .ai-agents memory — injected into the agent's system prompt.</div>
+          <div id="memory-list" class="memory-list"></div>
+          <button id="mem-add" class="btn-mini btn-go mem-add-btn">+ ADD</button>
+          <div id="mem-form" class="mem-form hidden">
+            <input id="mem-key" class="pf-input" placeholder="key" />
+            <input id="mem-value" class="pf-input" placeholder="value" />
+            <select id="mem-scope" class="pf-select">
+              <option value="project">project</option>
+              <option value="global">global</option>
+            </select>
+            <div class="pf-actions">
+              <button id="mem-create" class="btn-mini btn-go">SAVE</button>
+              <button id="mem-cancel" class="btn-mini">CANCEL</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <template id="tpl-files">
+      <div class="panel" data-panel="files">
+        <div class="panel-head" draggable="true"><span class="panel-icon">▥</span> FILES <button class="panel-close">×</button></div>
+        <div class="panel-body files-body">
+          <div class="placeholder">
+            <div class="ph-glyph">▥</div>
+            <p>File browser (Phase 2)</p>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <template id="tpl-sandbox">
+      <div class="panel" data-panel="sandbox">
+        <div class="panel-head" draggable="true"><span class="panel-icon">▩</span> SANDBOX <button class="panel-close">×</button></div>
+        <div class="panel-body sandbox-body">
           <div class="sandbox-toolbar">
             <select id="sb-lang" class="sb-select" title="language"></select>
             <select id="sb-mode" class="sb-select" title="mode">
@@ -87,7 +227,7 @@
             <button id="sb-kill" class="btn-mini btn-stop hidden">■ KILL</button>
             <span id="sb-status" class="sb-status dim mono">idle</span>
           </div>
-          <div class="sandbox-body">
+          <div class="sandbox-content">
             <div class="sandbox-editor">
               <div class="sb-pane-head">CODE</div>
               <textarea id="sb-code" class="sb-code" spellcheck="false" placeholder="// print('hello dotz sandbox')"></textarea>
@@ -109,95 +249,21 @@
           </div>
           <div id="sb-runs" class="sb-runs"></div>
         </div>
+      </div>
+    </template>
 
-        <!-- COMPOSER (shared, below both views) -->
-        <div class="composer">
-          <div id="quick-chips" class="quick-chips"></div>
-          <div class="composer-row">
-            <textarea
-              id="composer-input"
-              class="composer-input"
-              rows="1"
-              placeholder="message dotz…   / skills · @ files"
-            ></textarea>
-            <button id="send-btn" class="btn-send">SEND ▸</button>
-            <button id="stop-btn" class="btn-stop hidden">STOP ■</button>
-          </div>
+    <template id="tpl-skills">
+      <div class="panel" data-panel="skills">
+        <div class="panel-head" draggable="true"><span class="panel-icon">✦</span> SKILLS <button class="panel-close">×</button></div>
+        <div class="panel-body skills-body">
+          <input id="skills-search" class="pf-input" placeholder="search skills…" />
+          <div id="skills-count" class="skills-count dim mono">loading…</div>
+          <div id="skills-list" class="skills-list"></div>
+          <div id="skills-detail" class="skills-detail hidden"></div>
         </div>
-      </main>
+      </div>
+    </template>
 
-      <!-- RIGHT RAIL: controls + memory -->
-      <aside class="rail rail-right">
-        <section class="ctl">
-          <div class="ctl-head">▓▓ MODEL ▓▓</div>
-          <label class="ctl-label" for="provider-select">PROVIDER</label>
-          <select id="provider-select" class="provider-select"></select>
-          <label class="ctl-label" for="model-input">MODEL</label>
-          <input id="model-input" class="model-input" list="model-suggestions" spellcheck="false" />
-          <datalist id="model-suggestions"></datalist>
-          <select id="model-select" class="model-select hidden"></select>
-          <div class="ctl-tags">
-            <span id="model-ctx" class="tag">ctx —</span>
-            <span id="model-reasoning" class="tag">reasoning —</span>
-          </div>
-          <div class="ctl-caption">OpenRouter/local = free-form model id · catalog providers use dropdown · default <code>nex-agi/nex-n2-pro:free</code></div>
-        </section>
-
-        <section class="ctl">
-          <div class="ctl-head">▓▓ REASONING ▓▓</div>
-          <div id="reasoning-seg" class="seg"></div>
-        </section>
-
-        <section class="ctl">
-          <div class="ctl-head">▓▓ TOOLS ▓▓</div>
-          <div id="tools-grid" class="tools-grid"></div>
-        </section>
-
-        <section class="ctl">
-          <div class="ctl-head">▓▓ SKILLS ▓▓</div>
-          <div id="skills-list" class="cmd-list"><span class="dim mono">none loaded</span></div>
-        </section>
-
-        <section class="ctl">
-          <div class="ctl-head">▓▓ SUBAGENTS ▓▓</div>
-          <div id="subagents-list" class="cmd-list"><span class="dim mono">none loaded</span></div>
-        </section>
-
-        <section class="ctl ctl-memory">
-          <div class="ctl-head">▓▓ MEMORY ▓▓</div>
-          <div id="memory-list" class="memory-list"><span class="dim mono">no entries</span></div>
-          <button id="mem-add" class="btn-mini btn-go mem-add-btn">+ ADD</button>
-          <div id="mem-form" class="mem-form hidden">
-            <input id="mem-key" class="pf-input" placeholder="key" />
-            <input id="mem-value" class="pf-input" placeholder="value" />
-            <select id="mem-scope" class="pf-select">
-              <option value="project">project</option>
-              <option value="global">global</option>
-            </select>
-            <div class="pf-actions">
-              <button id="mem-create" class="btn-mini btn-go">SAVE</button>
-              <button id="mem-cancel" class="btn-mini">CANCEL</button>
-            </div>
-          </div>
-        </section>
-      </aside>
-
-      <!-- STATUS BAR -->
-      <footer class="statusbar">
-        <span class="mono">tokens <span id="st-tok-in" class="cyan">↑0</span> <span id="st-tok-out" class="green">↓0</span></span>
-        <span class="sep">│</span>
-        <span class="mono">cost <span id="st-cost" class="yellow">$0.00</span></span>
-        <span class="sep">│</span>
-        <span class="mono ctx-wrap">ctx <span id="st-ctx-pct" class="lav">0%</span>
-          <span class="ctx-meter"><span id="st-ctx-bar" class="ctx-bar"></span></span>
-          <span id="st-ctx-win" class="dim">of —</span>
-        </span>
-        <span class="sep">│</span>
-        <span class="mono">sandbox <span id="st-sandbox" class="peach">0 runs</span></span>
-        <span class="spacer"></span>
-        <span id="st-state" class="mono dim">idle</span>
-      </footer>
-    </div>
     <script src="/app.js"></script>
   </body>
 </html>

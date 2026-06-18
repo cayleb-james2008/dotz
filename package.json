@@ -2,7 +2,7 @@
   "name": "dotz",
   "version": "0.1.0",
   "private": true,
-  "description": "A pi.dev-based Claude-Desktop-style coding agent dashboard",
+  "description": "dotz — ultra code mode. A pi.dev-based Claude-Code-style multi-agent coding dashboard with on-the-fly workflow graphs, unified skills, and bento UI.",
   "type": "module",
   "main": "dist/main.js",
   "scripts": {

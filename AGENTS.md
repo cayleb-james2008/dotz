@@ -1,24 +1,30 @@
 # dotz — project agent guide
 
-dotz is a **pi.dev-based, Claude-Desktop-style coding-agent dashboard** — a clean chat interface
-for the pi coding agent, with live controls for **profile, model, reasoning effort, tools, skills,
-and subagent orchestration**, packaged as a single Electron `.exe`.
+dotz is a **pi.dev-based, Claude-Code-style ultra-code coding-agent dashboard** — a bento-style
+multi-agent coding interface with **on-the-fly workflow graphs, unified skills across the
+opencode/claude/codex/ecc/superpowers pools, `.ai-agents` global memory, and recursive
+self-improvement wiring**, packaged as a single Electron `.exe`.
 
 ## Architecture in one paragraph
 
 dotz embeds pi's SDK **directly** (`@earendil-works/pi-coding-agent`), so the dashboard server *is*
 the agent — no subprocess, nothing to version separately. `src/profiles.ts` loads the bundled
-`.pi/` resources (subagent extension + 4 agents + 3 workflow prompts) and injects the active
-profile's doctrine as an `appendSystemPrompt`. `src/projects.ts` persists named workspaces (cwd +
-profile + model + thinking defaults) that sessions bind to; `src/memory.ts` stores per-project (and
-global) memory entries that `buildResourceLoader` injects into the system prompt so the agent has
-durable context across turns. `src/sandbox.ts` runs code in a sandbox with a `terminal` mode and a
-`web` mode (long-lived process on a local port) plus an agent cursor the UI overlays on the live web
-preview. `src/pi.ts` owns `AgentSession` lifecycle and fans events to WebSocket subscribers. `src/server.ts`
-is a lean Fastify surface (REST controls + WS event stream + static UI). `src/main.ts` boots the
-server in the Electron main process and opens a native window. The UI in `web/` is plain
-HTML/CSS/JS talking over fetch + WebSocket, so it runs identically in a browser (`npm run dev:server`)
-and inside the packaged app.
+`.pi/` resources (subagent extension + dotz-tools extension + 4 agents + 3 workflow prompts) and
+injects the active profile's doctrine + the unified skill index + project memory as
+`appendSystemPrompt`. `src/skills.ts` discovers 300+ `SKILL.md` files across the opencode, claude,
+codex/ecc, superpowers, hermes, and bundled `.pi/skills` pools, dedupes by name, and exposes a
+`skill(name)` pi tool for on-demand full-body loading. `src/workflows.ts` is the first-class
+`WorkflowRun` domain — DAGs of steps (agent + task + parents + status) that make the implicit
+subagent orchestration observable by the UI's interactive SVG graph. `src/projects.ts` persists
+named workspaces (cwd + profile + model + thinking defaults); `src/memory.ts` stores per-project
+and global memory under the `.ai-agents` namespace (`~/.dotz/ai-agents/memory.json` global +
+`<cwd>/.ai-agents/memory.json` project) and exposes `agents_md` read/write tools. `src/sandbox.ts`
+runs code in `terminal` + `web` modes with an agent cursor overlay. `src/pi.ts` owns
+`AgentSession` lifecycle and fans events to WebSocket subscribers. `src/server.ts` is a lean
+Fastify surface (REST controls + WS event stream + static UI). `src/main.ts` boots the server in
+the Electron main process. The UI in `web/` is a vanilla HTML/CSS/JS **bento dashboard** with a
+project launcher, progressive panel disclosure, drag-and-drop repositioning, and an on-the-fly SVG
+workflow graph — runs identically in a browser and inside the packaged app.
 
 ## Multi-provider models
 
@@ -33,8 +39,49 @@ resolves the `{provider, modelId}` pair per provider; `src/types.ts` carries the
 default `profileId` / `model` / `thinkingLevel`. Sessions created with a `projectId` inherit those
 defaults. `src/memory.ts` is the **memory store**: `MemoryEntry`s are scoped `project` or `global`
 and are injected into the agent's system prompt at session-build time via the project's
-`buildResourceLoader`, so the agent sees durable notes without re-prompting. Both persist across
+`buildResourceLoader`, so the agent sees durable notes without re-prompting. Storage lives under the
+`.ai-agents` namespace: `~/.dotz/ai-agents/memory.json` (global) + `<cwd>/.ai-agents/memory.json`
+(project). AGENTS.md files (project root + global `~/.config/opencode/AGENTS.md`) are the **doctrine**
+layer — read by `buildResourceLoader`, written by the agent via the `agents_md` tool. Memory entries
+are the **knowledge** layer — structured, agent-curated. Don't blur them. Both persist across
 server restarts.
+
+## Unified skills pool
+
+`src/skills.ts` (`SkillLoader`) is the **single skill-discovery path**. It walks five scan roots
+(`~/.config/opencode/skills`, `~/.claude/skills`, `~/.codex/skills`,
+`~/.codex/marketplaces/ecc-local/plugins/ecc/skills`, `~/.codex/plugins/cache/openai-curated/superpowers`,
+plus bundled `.pi/skills`), parses YAML frontmatter once (handling Claude/OpenCode/Hermes/ECC
+dialects), dedupes by name with a priority order (dotz > opencode > claude > codex > ecc >
+superpowers > hermes), filters by platform, and injects a compact name+description index into the
+system prompt. The `skill(name)` pi tool (registered by the dotz-tools extension) loads the full
+body on demand — same pattern as Claude Code's `Skill` tool and OpenCode's `skill` tool. This gives
+the agent access to 300+ skills across all four ecosystems without bloating the system prompt.
+
+## Workflow domain
+
+`src/workflows.ts` (`WorkflowStore`) is the **observability + control layer** for multi-agent
+orchestration. The execution backend stays the existing `subagent` extension (it spawns isolated
+pi processes); this module records step DAGs (with parents/children, status propagation, readiness),
+their statuses, outputs, and usage, and emits `workflow_*` events the UI renders as an interactive
+SVG node/edge graph. Storage: JSON at `~/.dotz/ai-agents/workflows.json`. `WorkflowRun` = DAG of
+`WorkflowStep`s; steps transition `pending → ready → running → done|error|skipped`; children auto-
+promote to `ready` when all parents are `done`. REST: `/api/workflows` (CRUD + step + abort). WS:
+`{kind:"workflow", runId, event}` events (`workflow_start`, `workflow_end`, `step_state`,
+`step_added`).
+
+## Bento UI
+
+`web/` is a **vanilla JS bento dashboard** (no framework, no build step). Initial state: a project
+launcher (pick or create a project → opens agent directly). Once a session is active, a CSS-grid
+bento layout with progressive panel disclosure: only `chat` is visible initially; a `+ PANELS`
+button (or `Ctrl+P`) opens a palette to add panels (`graph`, `brain`, `browser`, `memory`, `files`,
+`sandbox`, `skills`). Panels auto-open on relevant events (workflow start → `graph`; sandbox start →
+`sandbox`; memory tool call → `memory`). Drag-and-drop repositioning via HTML5 DnD on panel headers
+(swaps grid spans). Layout persists to `localStorage.dotz.layout.v1`. The **workflow graph panel**
+renders live SVG DAGs with layered topological layout, node state colors (pending/ready/running/
+done/error/skipped), animated transitions, click-to-inspect step detail, and pan/zoom. The four
+control knobs (model, provider, reasoning, workflows) live in the top bar.
 
 ## Sandbox
 
@@ -52,28 +99,34 @@ pointer state. Run lifecycle: `pending → running → done|error|killed`.
   `@earendil-works/pi-coding-agent`** — `pi-ai`/`pi-agent-core` are nested and not resolvable from
   the project root.
 - `src/profiles.ts` — 5 profiles (WORKFLOW/SOLO/PLAN/FRONTEND/BACKEND) + `buildResourceLoader`
-  (loads bundled `.pi` + injects doctrine + injects project memory).
+  (loads bundled `.pi` + injects doctrine + injects skill index + injects project memory).
+- `src/skills.ts` — unified skills loader (300+ skills across opencode/claude/codex/ecc/superpowers/hermes/.pi pools).
+- `src/workflows.ts` — workflow store (first-class `WorkflowRun` DAG, status propagation, event emitter, JSON-persisted).
 - `src/projects.ts` — persistent projects layer (name + cwd + profile/model/thinking defaults).
-- `src/memory.ts` — memory store (`project` / `global` scope), injected into the system prompt via
-  `buildResourceLoader`.
+- `src/memory.ts` — memory store (`project` / `global` scope) under `.ai-agents` namespace + AGENTS.md read/write helpers. Injected into the system prompt via `buildResourceLoader`.
 - `src/sandbox.ts` — sandbox runner (`terminal` + `web` modes, agent cursor, lifecycle events).
-- `src/types.ts` — shared types (`ModelRef`, `ProviderMeta`, `Project`, `MemoryEntry`,
-  `SandboxRun`, `ThinkingLevel`, `DEFAULT_MODEL`). Kept separate from `pi.ts` to avoid a circular
-  import — do not merge.
+- `src/types.ts` — shared types (`ModelRef`, `ProviderMeta`, `Project`, `MemoryEntry`, `SandboxRun`,
+  `Skill`, `WorkflowRun`, `WorkflowStep`, `ThinkingLevel`, `DEFAULT_MODEL`). Kept separate from
+  `pi.ts` to avoid a circular import — do not merge.
 - `src/server.ts` — Fastify REST + WS + static. The `need()` helper resolves `:id` → session entry.
+  Routes: sessions, projects, memory, skills, workflows, sandbox.
 - `src/main.ts` / `src/preload.ts` — Electron main + contextIsolation preload.
-- `web/` — cyberbrutalist/Catppuccin-Mocha chat UI (vanilla, no framework).
-- `.pi/` — bundled agent resources (subagent extension, agents, workflow prompts). Shipped in the
-  exe via `electron-builder.yml` `files:`.
+- `web/` — vanilla JS bento dashboard (project launcher, progressive panel disclosure, drag-and-drop,
+  on-the-fly SVG workflow graph, skills/memory/sandbox/brain panels).
+- `.pi/` — bundled agent resources (subagent extension, dotz-tools extension, agents, workflow prompts).
+  Shipped in the exe via `electron-builder.yml` `files:`.
+- `.pi/extensions/dotz-tools/index.ts` — registers `skill`, `memory_list`, `memory_add`,
+  `memory_delete`, `agents_md` pi tools.
 - `docs/api-contract.md` — the authoritative UI↔backend contract.
 
 ## Verification commands
 
 ```bash
 npm run typecheck                      # tsc --noEmit — must be clean
-npx tsx scripts/verify-profiles.mjs   # e2e: profiles + .pi bundle + subagent tool
+npx tsx scripts/verify-profiles.mjs   # e2e: profiles + .pi bundle + subagent + dotz-tools tools
 npx tsx scripts/verify-ui.mjs          # e2e: UI markup + profiles API
 npx tsx scripts/verify-features.mjs    # e2e: projects + memory + sandbox + multi-provider
+npx tsx scripts/verify-ultra.mjs       # e2e: skills pool + workflows + .ai-agents memory + tools
 npm run dev:server                      # http://127.0.0.1:4317 (browser dev loop)
 npm run build                           # esbuild → dist/main.js + dist/preload.cjs
 npm run dist                            # → release/dotz <version>.exe (Windows portable)
@@ -104,6 +157,11 @@ dropdown), defaulting to `nex-agi/nex-n2-pro:free`; use `:free` models when the 
 - `projects.ts` and `memory.ts` are pure persistence layers (no agent runtime). Memory is injected
   into the system prompt via `buildResourceLoader` in `profiles.ts` — keep that the single injection
   point; don't add a second path.
+- `skills.ts` is the single skill-discovery path. Don't add a second skill loader. The skill index
+  is injected via `buildResourceLoader` (same as memory); the `skill(name)` tool loads bodies on demand.
+- `workflows.ts` is the observability + control layer for multi-agent orchestration. It does NOT
+  spawn agents — the `subagent` extension is still the execution backend. `WorkflowStore` only
+  records and surfaces step DAGs. Keep it a pure persistence + event layer.
 - `sandbox.ts` owns process lifecycle for both `terminal` and `web` runs; never spawn sandbox
   processes directly from `server.ts`. The agent cursor is a UI overlay driven by `sandbox_cursor`
   WS events — both sides (agent send + UI render) must consume the same event shape.
