@@ -1,0 +1,32 @@
+{
+  "name": "dotz",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A pi.dev-based Claude-Desktop-style coding agent dashboard",
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "dev:server": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "wsclient": "tsx scripts/wsclient.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "node esbuild.config.mjs",
+    "electron": "npm run build && electron .",
+    "dist": "npm run build && electron-builder --win portable"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.6",
+    "@fastify/static": "^9.1.3",
+    "@fastify/websocket": "^11.2.0",
+    "fastify": "^5.8.5",
+    "gray-matter": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "electron": "^42.4.1",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}

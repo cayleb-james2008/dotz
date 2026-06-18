@@ -1,0 +1,161 @@
+/**
+ * dotz agent profiles. The DEFAULT profile ("workflow") puts the agent in Claude-style
+ * "ultra + workflow" mode: every non-trivial task is decomposed and dispersed to subagents,
+ * then adversarially verified. A profile is applied by injecting its doctrine as an
+ * appendSystemPrompt via a DefaultResourceLoader (which still discovers bundled .pi skills,
+ * subagent extension, and workflow presets).
+ */
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { getAgentDir, SettingsManager, DefaultResourceLoader, type ResourceLoader } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MODEL, type ModelRef, type ThinkingLevel } from "./types";
+import { memoryStore, type MemoryStore } from "./memory";
+
+/** Bundled .pi (skills / extensions / prompts) — resolved relative to this module so it works
+ *  both in dev (src/) and in the packaged app (dist/, with .pi shipped alongside). */
+const DOTZ_PI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".pi");
+
+export interface Profile {
+  id: string;
+  name: string;
+  tagline: string;
+  model: ModelRef;
+  thinkingLevel: ThinkingLevel;
+  /** Tool allowlist; undefined keeps pi defaults (read,bash,edit,write) + extension tools (subagent). */
+  tools?: string[];
+  /** Whether this profile defaults to multi-agent workflow dispersal. */
+  workflow: boolean;
+  appendSystemPrompt: string;
+}
+
+const WORKFLOW_DOCTRINE = `# dotz operating mode: ULTRA + WORKFLOW (multi-agent dispersal — DEFAULT)
+
+You are the dotz lead agent. For EVERY non-trivial task you operate in WORKFLOW MODE by default:
+
+1. DECOMPOSE the task into independent and dependent subtasks before acting.
+2. DISPERSE the work to subagents via the \`subagent\` tool — run independent subtasks in PARALLEL
+   (\`tasks: [...]\`, up to the extension's limit) and dependent ones as a CHAIN where each step
+   consumes the previous result. Prefer the bundled workflow presets:
+     • /scout-and-plan  — map the codebase and produce a plan (no edits)
+     • /implement       — scout → plan → worker implements
+     • /implement-and-review — worker builds, reviewer audits, worker fixes
+3. VERIFY ADVERSARIALLY before claiming done — spawn a reviewer subagent (or use
+   /implement-and-review) to hunt for bugs, regressions, and missed requirements. Treat its
+   findings as required work, not optional polish.
+4. Apply ULTRA thoroughness: explore widely, weigh multiple approaches, choose the SIMPLEST
+   correct solution, and never claim success without fresh evidence (test output, file readback,
+   command result).
+
+Only handle a task SOLO (no dispersal) when it is genuinely trivial — a one-line edit, a single
+lookup, or a direct question. When in doubt, decompose and disperse. This is the dotz default;
+the user chose the Workflow profile precisely so that multi-agent dispersal happens automatically.`;
+
+const SOLO_DOCTRINE = `# dotz operating mode: SOLO
+
+Operate as a single agent. Execute directly, concisely, and verify your own work. Do NOT spawn
+subagents or use workflow presets unless the user explicitly asks for multi-agent orchestration.`;
+
+const PLAN_DOCTRINE = `# dotz operating mode: PLAN (read-only)
+
+Planning mode. Investigate read-only and produce a concrete, step-by-step plan. Use scout
+subagents (\`subagent\` / /scout-and-plan) to map the codebase in PARALLEL, then synthesize a
+plan with named files and a verification section. Do NOT edit files in this mode.`;
+
+export const PROFILES: Profile[] = [
+  {
+    id: "workflow",
+    name: "WORKFLOW",
+    tagline: "Multi-agent dispersal by default · ultra",
+    model: DEFAULT_MODEL,
+    thinkingLevel: "high",
+    tools: undefined,
+    workflow: true,
+    appendSystemPrompt: WORKFLOW_DOCTRINE,
+  },
+  {
+    id: "solo",
+    name: "SOLO",
+    tagline: "Single agent · direct execution",
+    model: DEFAULT_MODEL,
+    thinkingLevel: "medium",
+    tools: undefined,
+    workflow: false,
+    appendSystemPrompt: SOLO_DOCTRINE,
+  },
+  {
+    id: "plan",
+    name: "PLAN",
+    tagline: "Read-only research & planning",
+    model: DEFAULT_MODEL,
+    thinkingLevel: "high",
+    tools: ["read", "grep", "find", "ls", "subagent"],
+    workflow: true,
+    appendSystemPrompt: PLAN_DOCTRINE,
+  },
+  {
+    id: "frontend",
+    name: "FRONTEND",
+    tagline: "UI / design workflow",
+    model: DEFAULT_MODEL,
+    thinkingLevel: "high",
+    tools: undefined,
+    workflow: true,
+    appendSystemPrompt:
+      WORKFLOW_DOCTRINE +
+      `\n\n## Domain: front-end & design\nHonor existing design tokens and components. Avoid AI-slop (no purple gradients, fake glassmorphism, side-stripe borders, generic SaaS cards). Meet WCAG contrast, real focus states, and 44px touch targets. Use the impeccable design skills to polish and audit UI.`,
+  },
+  {
+    id: "backend",
+    name: "BACKEND",
+    tagline: "APIs / data / infra workflow",
+    model: DEFAULT_MODEL,
+    thinkingLevel: "high",
+    tools: undefined,
+    workflow: true,
+    appendSystemPrompt:
+      WORKFLOW_DOCTRINE +
+      `\n\n## Domain: back-end, data & infra\nPrefer boring, well-tested technology. Write tests first (TDD) for core logic. Validate inputs at boundaries, surface errors honestly, and never log secrets.`,
+  },
+];
+
+export const DEFAULT_PROFILE_ID = "workflow";
+
+export function getProfile(id?: string): Profile {
+  return PROFILES.find((p) => p.id === id) || PROFILES[0];
+}
+
+/** Public profile summary for the UI. */
+export function profileSummary(p: Profile) {
+  return { id: p.id, name: p.name, tagline: p.tagline, workflow: p.workflow, thinkingLevel: p.thinkingLevel, model: p.model };
+}
+
+/** Build a resource loader that injects the profile's doctrine and loads the bundled .pi
+ *  skills/extensions/prompts regardless of the session cwd (so it works in the packaged exe).
+ *  If a projectId is supplied, the project's persistent memory entries are appended to the
+ *  system prompt so the agent carries durable, user-curated context across sessions. */
+export async function buildResourceLoader(
+  cwd: string,
+  profile: Profile,
+  opts: { projectId?: string | null; memory?: MemoryStore } = {}
+): Promise<ResourceLoader> {
+  const agentDir = getAgentDir();
+  const settingsManager = SettingsManager.create(cwd, agentDir);
+  const prompts = [profile.appendSystemPrompt];
+  if (opts.projectId) {
+    const store = opts.memory ?? memoryStore;
+    const entries = await store.forProject(opts.projectId);
+    const memBlock = store.renderForPrompt(entries);
+    if (memBlock) prompts.push(memBlock);
+  }
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    settingsManager,
+    appendSystemPrompt: prompts,
+    additionalExtensionPaths: [path.join(DOTZ_PI, "extensions", "subagent")],
+    additionalSkillPaths: [path.join(DOTZ_PI, "skills")],
+    additionalPromptTemplatePaths: [path.join(DOTZ_PI, "prompts")],
+  });
+  await loader.reload();
+  return loader;
+}

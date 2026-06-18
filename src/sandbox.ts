@@ -1,0 +1,294 @@
+/**
+ * dotz sandbox — isolated code execution with live output streaming + visual web preview.
+ *
+ * The sandbox is the agent's "little box": it spins up a program in its own temp dir and
+ * streams stdout/stderr in real time. For web apps, it also exposes the HTTP port so the
+ * dotz UI can render the app live in an iframe and overlay the agent's cursor as it
+ * controls/tests the frontend.
+ *
+ * Modes:
+ *  - "terminal" — CLI program, output streamed line-by-line.
+ *  - "web"      — HTTP server program; the UI loads http://127.0.0.1:<port> in an iframe
+ *                 and overlays an animated agent cursor driven by sandbox_cursor events.
+ *
+ * Cursor interaction model:
+ *  The agent (or user) sends cursor events {x, y, action:"move"|"click"|"type", text?} over
+ *  the WS. The UI renders a visual cursor at (x,y) over the iframe and, for click/type,
+ *  dispatches synthetic DOM events into the iframe so the agent truly controls the frontend.
+ *  This is the lean visual bridge — no heavy browser-automation dependency, just coordinate
+ *  events + postMessage into the iframe.
+ */
+import { spawn, type ChildProcess } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import { randomUUID } from "node:crypto";
+import net from "node:net";
+import type { SandboxRun } from "./types";
+
+export type SandboxEvent =
+  | { type: "sandbox_start"; runId: string; run: SandboxRun }
+  | { type: "sandbox_output"; runId: string; stream: "stdout" | "stderr"; line: string }
+  | { type: "sandbox_port"; runId: string; port: number }
+  | { type: "sandbox_cursor"; runId: string; x: number; y: number; action: "move" | "click" | "type"; text?: string }
+  | { type: "sandbox_end"; runId: string; run: SandboxRun };
+
+interface ActiveRun {
+  run: SandboxRun;
+  proc: ChildProcess | null;
+  tempDir: string;
+  timeout: NodeJS.Timeout | null;
+  listeners: Set<(e: SandboxEvent) => void>;
+  port: number | null;
+  portDetector: PortDetector | null;
+}
+
+/** Language → { filename, command, defaultMode } mapping. */
+const LANGUAGES: Record<string, { file: string; cmd: string[]; env?: Record<string, string>; mode?: "terminal" | "web" }> = {
+  javascript: { file: "run.mjs", cmd: ["node", "run.mjs"] },
+  typescript: { file: "run.ts", cmd: ["npx", "tsx", "run.ts"] },
+  python: { file: "run.py", cmd: ["python", "run.py"] },
+  bash: { file: "run.sh", cmd: ["bash", "run.sh"] },
+  powershell: { file: "run.ps1", cmd: ["powershell", "-NoProfile", "-File", "run.ps1"] },
+  shell: { file: "run.sh", cmd: ["sh", "run.sh"] },
+};
+
+export const SANDBOX_LANGUAGES = Object.keys(LANGUAGES);
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * Detects the first TCP port a process listens on by scanning stdout/stderr for port
+ * patterns and probing candidate ports. Emits `sandbox_port` via onFound when detected.
+ */
+class PortDetector {
+  private candidates = new Set<number>();
+  private found: number | null = null;
+  private probeTimer: NodeJS.Timeout | null = null;
+  private onFound: (port: number) => void;
+
+  constructor(onFound: (port: number) => void) {
+    this.onFound = onFound;
+  }
+
+  scan(text: string): void {
+    if (this.found) return;
+    // Common patterns: "port 3000", ":3000", "localhost:5173", "http://localhost:8080",
+    // "listening on port 3000", "listening on 3000", "Server running at http://localhost:4321"
+    // Capture group is always the port number regardless of which alternative matched.
+    const portRe = /(?:(?:port|on|at)\s+(\d{2,5})|:(\d{2,5})\b|localhost:(\d{2,5})|127\.0\.0\.1:(\d{2,5}))/gi;
+    const matches = text.matchAll(portRe);
+    for (const m of matches) {
+      const port = Number(m[1] || m[2] || m[3] || m[4]);
+      if (port && port > 1024 && port < 65536) this.candidates.add(port);
+    }
+    this.maybeProbe();
+  }
+
+  private maybeProbe() {
+    if (this.found || this.candidates.size === 0) return;
+    if (this.probeTimer) return;
+    // Probe on a short cadence so we catch the port shortly after the server starts listening.
+    this.probeTimer = setTimeout(async () => {
+      this.probeTimer = null;
+      for (const port of this.candidates) {
+        const open = await isPortOpen(port);
+        if (open) { this.found = port; this.onFound(port); return; }
+      }
+      if (!this.found) this.maybeProbe(); // keep trying remaining/new candidates
+    }, 250);
+  }
+
+  get port() { return this.found; }
+
+  dispose() { if (this.probeTimer) clearTimeout(this.probeTimer); }
+}
+
+function isPortOpen(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = new net.Socket();
+    sock.setTimeout(400);
+    sock.once("connect", () => { sock.destroy(); resolve(true); });
+    sock.once("timeout", () => { sock.destroy(); resolve(false); });
+    sock.once("error", () => { sock.destroy(); resolve(false); });
+    sock.connect(port, "127.0.0.1");
+  });
+}
+
+export class Sandbox {
+  private active = new Map<string, ActiveRun>();
+
+  private async spawnRun(
+    run: SandboxRun,
+    code: string,
+    language: string,
+    timeoutMs: number,
+    listeners: Set<(e: SandboxEvent) => void>,
+    mode: "terminal" | "web"
+  ): Promise<ActiveRun> {
+    const lang = LANGUAGES[language];
+    if (!lang) throw new Error(`unsupported sandbox language: ${language}. Available: ${SANDBOX_LANGUAGES.join(", ")}`);
+
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "dotz-sandbox-"));
+    await fs.writeFile(path.join(tempDir, lang.file), code, "utf-8");
+
+    const proc = spawn(lang.cmd[0], lang.cmd.slice(1), {
+      cwd: tempDir,
+      env: { ...process.env, ...lang.env },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    const portDetector = mode === "web" ? new PortDetector((port) => {
+      if (ar.port !== null) return;
+      ar.port = port;
+      run.output += `[dotz] detected web server on port ${port}\n`;
+      emit({ type: "sandbox_port", runId: run.id, port });
+    }) : null;
+    const ar: ActiveRun = { run, proc, tempDir, timeout: null, listeners, port: null, portDetector };
+
+    const emit = (e: SandboxEvent) => {
+      for (const l of [...ar.listeners]) {
+        try { l(e); } catch { /* listener errors must not break the sandbox loop */ }
+      }
+    };
+
+    const finish = (status: "done" | "error" | "killed", exitCode: number | null) => {
+      if (ar.timeout) { clearTimeout(ar.timeout); ar.timeout = null; }
+      if (portDetector) portDetector.dispose();
+      run.status = status;
+      run.exitCode = exitCode;
+      run.endedAt = Date.now();
+      emit({ type: "sandbox_end", runId: run.id, run });
+      // NOTE: we intentionally keep the run in `active` after completion so REST
+      // (GET /api/sandbox/runs/:id) can still query the final output/exitCode. The
+      // process handle is dead; only the run record stays for inspection. Cleanup
+      // happens via disposeAll() on shutdown or kill() reclaiming the entry.
+      if (ar.proc) { try { ar.proc.removeAllListeners(); } catch { /* */ } ar.proc = null; }
+      fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    };
+
+    const processOutput = (chunk: Buffer, stream: "stdout" | "stderr") => {
+      let buf = chunk.toString();
+      const lines = buf.split("\n");
+      buf = lines.pop() || "";
+      for (const line of lines) {
+        run.output += line + "\n";
+        emit({ type: "sandbox_output", runId: run.id, stream, line });
+      }
+      // Web mode: scan output for a listening port. The PortDetector calls its onFound
+      // callback (which emits sandbox_port) asynchronously after probing the candidate.
+      if (portDetector) {
+        portDetector.scan(chunk.toString());
+      }
+      // Stash any partial line back onto the buffer by re-appending — handled by caller closure.
+      (ar as { _buf?: Record<string, string> })._buf = (ar as { _buf?: Record<string, string> })._buf || {};
+      (ar as { _buf?: Record<string, string> })._buf![stream] = buf;
+    };
+
+    if (proc.stdout) {
+      proc.stdout.on("data", (chunk: Buffer) => processOutput(chunk, "stdout"));
+    }
+    if (proc.stderr) {
+      proc.stderr.on("data", (chunk: Buffer) => processOutput(chunk, "stderr"));
+    }
+
+    proc.on("error", (err) => {
+      run.output += `\n[spawn error] ${err.message}\n`;
+      finish("error", null);
+    });
+    proc.on("exit", (code, signal) => {
+      if (signal === "SIGTERM" || signal === "SIGKILL") finish("killed", null);
+      else finish(code === 0 ? "done" : "error", code);
+    });
+
+    if (timeoutMs > 0) {
+      ar.timeout = setTimeout(() => {
+        if (ar.proc && !ar.proc.killed) {
+          try { ar.proc.kill("SIGKILL"); } catch { /* already dead */ }
+        }
+        run.output += `\n[timeout] killed after ${timeoutMs}ms\n`;
+      }, timeoutMs);
+    }
+
+    return ar;
+  }
+
+  /** Start a sandbox run. Returns the initial SandboxRun; output streams to listeners. */
+  async start(
+    projectId: string | null,
+    language: string,
+    code: string,
+    opts: { timeoutMs?: number; mode?: "terminal" | "web"; onEvent?: (e: SandboxEvent) => void } = {}
+  ): Promise<SandboxRun> {
+    const mode = opts.mode || "terminal";
+    const run: SandboxRun = {
+      id: randomUUID(),
+      projectId,
+      language,
+      code,
+      status: "running",
+      output: "",
+      exitCode: null,
+      startedAt: Date.now(),
+      endedAt: null,
+    };
+    const listeners = new Set<(e: SandboxEvent) => void>();
+    if (opts.onEvent) listeners.add(opts.onEvent);
+    const ar = await this.spawnRun(run, code, language, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, listeners, mode);
+    this.active.set(run.id, ar);
+    for (const l of [...ar.listeners]) l({ type: "sandbox_start", runId: run.id, run });
+    return run;
+  }
+
+  /** Subscribe to a run's live events (output, port detection, cursor, end). */
+  subscribe(runId: string, listener: (e: SandboxEvent) => void): () => void {
+    const ar = this.active.get(runId);
+    if (!ar) return () => {};
+    ar.listeners.add(listener);
+    return () => ar.listeners.delete(listener);
+  }
+
+  /** Emit a cursor event for a run — the UI renders the agent's cursor at (x,y) over the iframe. */
+  cursor(runId: string, x: number, y: number, action: "move" | "click" | "type", text?: string): void {
+    const ar = this.active.get(runId);
+    if (!ar) return;
+    for (const l of [...ar.listeners]) {
+      try { l({ type: "sandbox_cursor", runId, x, y, action, text }); } catch { /* */ }
+    }
+  }
+
+  get(runId: string): ActiveRun["run"] | undefined {
+    return this.active.get(runId)?.run;
+  }
+
+  /** Get the detected web port for a run (null for terminal runs or before detection). */
+  port(runId: string): number | null {
+    return this.active.get(runId)?.port ?? null;
+  }
+
+  list(): SandboxRun[] {
+    return [...this.active.values()].map((ar) => ar.run);
+  }
+
+  async kill(runId: string): Promise<boolean> {
+    const ar = this.active.get(runId);
+    if (!ar || !ar.proc || ar.proc.killed) return false;
+    try { ar.proc.kill("SIGKILL"); return true; } catch { return false; }
+  }
+
+  /** Kill all active runs — called on server shutdown so dotz never leaks child processes. */
+  disposeAll(): void {
+    for (const ar of [...this.active.values()]) {
+      if (ar.timeout) clearTimeout(ar.timeout);
+      if (ar.portDetector) ar.portDetector.dispose();
+      if (ar.proc && !ar.proc.killed) {
+        try { ar.proc.kill("SIGKILL"); } catch { /* already dead */ }
+      }
+      fs.rm(ar.tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+    this.active.clear();
+  }
+}
+
+export const sandbox = new Sandbox();
