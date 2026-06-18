@@ -25,7 +25,9 @@ import {
 import { projectStore } from "./projects";
 import { memoryStore } from "./memory";
 import { sandbox, SANDBOX_LANGUAGES, type SandboxEvent } from "./sandbox";
-import { PROVIDERS, type Project, type MemoryEntry, type SandboxRun } from "./types";
+import { skillLoader } from "./skills";
+import { workflowStore, type WorkflowEvent } from "./workflows";
+import { PROVIDERS, type Project, type MemoryEntry, type SandboxRun, type WorkflowRun } from "./types";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.DOTZ_PORT || 4317);
@@ -85,7 +87,12 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   // ---- memory ----
   app.get("/api/memory", async (req) => {
     const projectId = (req.query as { projectId?: string }).projectId;
-    return { entries: await memoryStore.list(projectId) };
+    let cwd: string | null = null;
+    if (projectId) {
+      const p = await projectStore.get(projectId);
+      if (p) cwd = p.cwd;
+    }
+    return { entries: await memoryStore.list(projectId, cwd) };
   });
   app.post("/api/memory", async (req, reply) => {
     const body = (req.body ?? {}) as { projectId?: string; key?: string; value?: string; scope?: "project" | "global" };
@@ -93,14 +100,94 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       reply.code(400).send({ error: "key and value are required" });
       return;
     }
-    return memoryStore.create({ projectId: body.projectId || "", key: body.key, value: body.value, scope: body.scope });
+    let cwd: string | null = null;
+    if (body.projectId) {
+      const p = await projectStore.get(body.projectId);
+      if (p) cwd = p.cwd;
+    }
+    return memoryStore.create({ projectId: body.projectId || "", key: body.key, value: body.value, scope: body.scope, projectCwd: cwd });
   });
   app.patch("/api/memory/:id", async (req, reply) => {
-    const e = await memoryStore.update((req.params as { id: string }).id, (req.body ?? {}) as Partial<Pick<MemoryEntry, "key" | "value" | "scope">>);
+    const body = (req.body ?? {}) as Partial<Pick<MemoryEntry, "key" | "value" | "scope">> & { projectId?: string };
+    const id = (req.params as { id: string }).id;
+    // Resolve cwd: explicit projectId in body, else search the entry's location across projects.
+    let cwd: string | null = null;
+    if (body.projectId) {
+      const p = await projectStore.get(body.projectId);
+      if (p) cwd = p.cwd;
+    }
+    if (!cwd) {
+      // search all projects for the entry
+      const projects = await projectStore.list();
+      for (const p of projects) {
+        const entries = await memoryStore.list(p.id, p.cwd);
+        if (entries.some((e) => e.id === id)) { cwd = p.cwd; break; }
+      }
+    }
+    const e = await memoryStore.update(id, body, cwd);
     if (!e) { reply.code(404).send({ error: "no such memory entry" }); return; }
     return e;
   });
-  app.delete("/api/memory/:id", async (req) => ({ ok: await memoryStore.remove((req.params as { id: string }).id) }));
+  app.delete("/api/memory/:id", async (req) => {
+    const id = (req.params as { id: string }).id;
+    // search all projects for the entry to resolve its cwd
+    const projects = await projectStore.list();
+    let cwd: string | null = null;
+    for (const p of projects) {
+      const entries = await memoryStore.list(p.id, p.cwd);
+      if (entries.some((e) => e.id === id)) { cwd = p.cwd; break; }
+    }
+    return { ok: await memoryStore.remove(id, cwd) };
+  });
+
+  // ---- skills (unified pool) ----
+  app.get("/api/skills", async () => {
+    await skillLoader.load();
+    return { skills: skillLoader.list().map((s) => ({ name: s.name, description: s.description, source: s.source, tags: s.tags, isUmbrella: s.isUmbrella })) };
+  });
+  app.get("/api/skills/:name", async (req, reply) => {
+    await skillLoader.load();
+    const name = (req.params as { name: string }).name;
+    const body = await skillLoader.loadBody(name);
+    if (!body) { reply.code(404).send({ error: "no such skill" }); return; }
+    return { name, body };
+  });
+
+  // ---- workflows ----
+  app.get("/api/workflows", async (req) => {
+    const projectId = (req.query as { projectId?: string }).projectId;
+    return { runs: await workflowStore.listHistory(projectId) };
+  });
+  app.get("/api/workflows/active", async () => ({ runs: workflowStore.list() }));
+  app.get("/api/workflows/:id", async (req, reply) => {
+    const run = workflowStore.get((req.params as { id: string }).id)
+      ?? (await workflowStore.listHistory()).find((r) => r.id === (req.params as { id: string }).id);
+    if (!run) { reply.code(404).send({ error: "no such workflow run" }); return; }
+    return run;
+  });
+  app.post("/api/workflows", async (req) => {
+    const body = (req.body ?? {}) as { projectId?: string | null; sessionId?: string | null; label?: string; origin?: string; steps: Array<{ agent: string; task: string; parents?: string[]; batch?: string }> };
+    const run = await workflowStore.create({
+      projectId: body.projectId ?? null,
+      sessionId: body.sessionId ?? null,
+      label: body.label || "untitled workflow",
+      origin: body.origin,
+      steps: body.steps,
+    });
+    workflowStore.start(run.id);
+    return run;
+  });
+  app.post("/api/workflows/:id/step", async (req, reply) => {
+    const run = workflowStore.get((req.params as { id: string }).id);
+    if (!run) { reply.code(404).send({ error: "no such workflow run" }); return; }
+    const body = (req.body ?? {}) as { stepId: string; status: WorkflowRun["steps"][number]["status"]; output?: string; error?: string; usage?: WorkflowRun["steps"][number]["usage"] };
+    await workflowStore.stepState(run.id, body.stepId, { status: body.status, output: body.output, error: body.error, usage: body.usage });
+    return workflowStore.get(run.id);
+  });
+  app.post("/api/workflows/:id/abort", async (req) => {
+    await workflowStore.abort((req.params as { id: string }).id);
+    return { ok: true };
+  });
 
   // ---- sandbox ----
   app.get("/api/sandbox/languages", async () => ({ languages: SANDBOX_LANGUAGES }));
@@ -252,6 +339,12 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const sandboxSub = (e: SandboxEvent) => {
       if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ kind: "sandbox", sessionId, event: e }));
     };
+    // Fan workflow events (step state transitions, run lifecycle) to the same socket so the UI
+    // can render the live workflow graph. All active workflow runs broadcast here; the UI filters
+    // by sessionId/projectId as needed.
+    const offWorkflow = workflowStore.onEvent((runId, event) => {
+      if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ kind: "workflow", sessionId, runId, event }));
+    });
     socket.send(JSON.stringify({ kind: "ready", sessionId }));
 
     socket.on("message", async (raw: Buffer) => {
@@ -285,7 +378,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       }
     });
 
-    socket.on("close", () => offAgent());
+    socket.on("close", () => { offAgent(); offWorkflow(); });
   });
 
   // Static chat UI last, so explicit /api and /ws routes win.
