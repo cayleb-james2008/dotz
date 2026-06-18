@@ -152,18 +152,21 @@ export function modelInfo(m: unknown): ModelInfo {
 
 /**
  * Resolve a model by provider+id. For providers that support free-form model-id input
- * (OpenRouter, local), if the id isn't in the built-in catalog, clone an existing model
- * from that provider as a template so any valid model id works. For catalog-only providers
+ * (OpenRouter, Ollama Cloud, local), if the id isn't in the built-in catalog, clone an existing
+ * model from that provider as a template so any valid model id works. For catalog-only providers
  * (anthropic, openai, etc.), only registered models resolve.
  */
 export function resolveModel(session: AgentSession, ref: ModelRef): PiModel | undefined {
   const reg = session.modelRegistry;
   const found = reg.find(ref.provider, ref.modelId);
   if (found) return found as PiModel;
-  const freeForm = ref.provider === "openrouter" || ref.provider === "local";
+  const freeForm = ref.provider === "openrouter" || ref.provider === "ollama" || ref.provider === "local";
   if (freeForm) {
     const tmpl = (reg.getAll() as Array<{ provider: string }>).find((m) => m.provider === ref.provider);
     if (tmpl) return { ...(tmpl as object), id: ref.modelId, name: ref.modelId } as PiModel;
+    // if no template from that provider, clone any free-form template (OpenRouter) and swap provider/id
+    const anyTmpl = (reg.getAll() as Array<{ provider: string }>).find((m) => m.provider === "openrouter");
+    if (anyTmpl) return { ...(anyTmpl as object), provider: ref.provider, id: ref.modelId, name: ref.modelId } as PiModel;
   }
   return undefined;
 }
