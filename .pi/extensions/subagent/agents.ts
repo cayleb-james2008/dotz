@@ -4,6 +4,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 export type AgentScope = "user" | "project" | "both";
@@ -94,23 +95,38 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 	}
 }
 
+// dotz ships its core workflow agents (scout/planner/reviewer/worker) next to this extension so the
+// built-in workflows (/ultra-code-review, /implement, ...) work against ANY project cwd — not only
+// when the session happens to run inside the dotz repo. Resolve them relative to this file:
+//   <dotz>/.pi/extensions/subagent/agents.ts  ->  <dotz>/.pi/agents
+function getBundledAgentsDir(): string | null {
+	try {
+		const here = path.dirname(fileURLToPath(import.meta.url));
+		const dir = path.join(here, "..", "..", "agents");
+		return isDirectory(dir) ? dir : null;
+	} catch {
+		return null;
+	}
+}
+
 export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
 	const userDir = path.join(getAgentDir(), "agents");
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
+	const bundledDir = getBundledAgentsDir();
 
+	// Bundled dotz agents are ALWAYS available (treated as global/user scope) regardless of cwd or the
+	// requested scope, so the flagship workflows never fail with "Available agents: none" on an
+	// external project. Without this, discovery only finds agents in ~/.pi/agent/agents or an ancestor
+	// .pi/agents of the cwd — neither of which contains dotz's bundled agents for a non-dotz project.
+	const bundledAgents = bundledDir ? loadAgentsFromDir(bundledDir, "user") : [];
 	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
 	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
 
 	const agentMap = new Map<string, AgentConfig>();
-
-	if (scope === "both") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
-	} else if (scope === "user") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
-	} else {
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
-	}
+	// Precedence (low -> high): bundled defaults, then user agents, then project-local overrides.
+	for (const agent of bundledAgents) agentMap.set(agent.name, agent);
+	if (scope !== "project") for (const agent of userAgents) agentMap.set(agent.name, agent);
+	if (scope !== "user") for (const agent of projectAgents) agentMap.set(agent.name, agent);
 
 	return { agents: Array.from(agentMap.values()), projectAgentsDir };
 }

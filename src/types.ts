@@ -43,18 +43,23 @@ export const PROVIDERS: ProviderMeta[] = [
   { id: "local", label: "Local (Ollama/LM Studio)", freeForm: true },
 ];
 
-/** Suggested low-cost worker model ids (surfaced as model-id suggestions in the UI). */
+/** Suggested low-cost worker model ids — ONLY configured/available models (Ollama Cloud is the
+ *  working provider; OpenRouter is omitted here because its credits/key are unreliable, and an
+ *  unconfigured id makes the agent fabricate dead ids like `openai/gpt-4.1-mini`). */
 export const LOW_COST_MODELS: ModelRef[] = [
   { provider: "ollama", modelId: "minimax-m3" },
-  { provider: "openrouter", modelId: "nex-agi/nex-n2-pro:free" },
+  { provider: "ollama", modelId: "kimi-k2.7-code" },
 ];
 
 /** Render the subagent-model directive for system-prompt injection. Every dispersed subagent
  *  runs on the configured sub-model (DOTZ_SUBAGENT_MODEL, default ollama/minimax-m3) by default;
- *  the lead keeps the high-quality executive model. */
+ *  the lead keeps the high-quality executive model. The directive is concrete and forbids inventing
+ *  model ids, because the lead otherwise picks plausible-but-unconfigured ids (e.g. openai/gpt-4.1-mini
+ *  on OpenRouter) that fail with credit/auth errors and silently break the fan-out. */
 export function renderLowCostModels(): string {
   const sub = process.env.DOTZ_SUBAGENT_MODEL || `${DEFAULT_PROVIDER}/${PROVIDER_DEFAULTS[DEFAULT_PROVIDER].subagent}`;
-  return `\n# dotz subagent model\nEvery subagent you disperse via the \`subagent\` tool runs on \`${sub}\` by default (the configured low-cost worker). You (the lead) keep the high-quality executive model. Override a single call with the \`model\` parameter only when a task genuinely needs a different model.\n`;
+  const list = LOW_COST_MODELS.map((m) => `${m.provider}/${m.modelId}`).join(", ");
+  return `\n# dotz subagent model\nEvery subagent you disperse via the \`subagent\` tool runs on \`${sub}\` by default (the configured, known-working low-cost worker). You (the lead) keep the high-quality executive model.\n\nDo NOT pass a \`model\` override unless a task genuinely needs a different model — omitting \`model\` uses \`${sub}\`, which always works. If you must override, choose ONLY from this exact list of configured low-cost models: ${list}. NEVER invent a model id (e.g. \`openai/*\`, \`anthropic/*\`, \`google/*\`, or any OpenRouter id) — unconfigured ids fail with auth/credit errors and silently break the fan-out.\n`;
 }
 
 /** Project definition — persistent workspace with its own cwd, profile, model, and memory. */

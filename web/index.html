@@ -20,6 +20,7 @@
           <span class="wordmark">dotz</span>
           <span class="subtitle">ultra code · pi.dev</span>
         </div>
+        <h1 class="sr-only">dotz — ultra code dashboard</h1>
 
         <div class="topbar-center">
           <div class="project-selector-wrap">
@@ -36,7 +37,7 @@
                 <input id="pf-name" class="pf-input" placeholder="project name" />
                 <input id="pf-cwd" class="pf-input" placeholder="cwd (absolute path)" />
                 <select id="pf-profile" class="pf-select"></select>
-                <input id="pf-model" class="pf-input" placeholder="model id" value="nex-agi/nex-n2-pro:free" />
+                <input id="pf-model" class="pf-input" placeholder="model id" />
                 <div class="pf-actions">
                   <button id="pf-create" class="btn-mini btn-go">CREATE &amp; OPEN</button>
                   <button id="pf-cancel" class="btn-mini">CANCEL</button>
@@ -71,7 +72,7 @@
             <div id="reasoning-seg" class="seg-mini"></div>
           </div>
           <button id="panels-btn" class="knob-btn" title="add panels (Ctrl+P)">+ PANELS</button>
-          <button id="settings-btn" class="knob-btn" title="settings">⚙</button>
+          <button id="settings-btn" class="knob-btn" title="settings" aria-label="Settings"><span aria-hidden="true">⚙</span></button>
           <span id="conn-chip" class="chip chip-off"><span class="blk">█</span> OFFLINE</span>
         </div>
       </header>
@@ -84,16 +85,19 @@
             <div class="cc-meta">
               <span id="cc-project" class="cc-project">no project selected</span>
               <span id="cc-profile" class="cc-profile">workflow</span>
-              <span id="cc-model" class="cc-model">—</span>
+              <span id="cc-model" class="cc-model dim">no model</span>
             </div>
-            <h1 class="cc-wordmark">dotz</h1>
+            <div class="cc-wordmark" aria-hidden="true">dotz</div>
             <p class="cc-sub">ultra-code agent dashboard</p>
             <div class="cc-composer-wrap">
               <div id="quick-chips" class="quick-chips"></div>
               <textarea id="composer-input" class="composer-input" rows="1" placeholder="tell dotz what to build…   / slash commands · @ skills · # files"></textarea>
               <div class="cc-actions">
-                <button id="send-btn" class="btn-send">SEND ▹</button>
-                <button id="stop-btn" class="btn-stop hidden">STOP ■</button>
+                <span class="cc-hint mono dim">↵ send · ⇧↵ newline</span>
+                <div class="cc-actions-btns">
+                  <button id="send-btn" class="btn-send">SEND ▹</button>
+                  <button id="stop-btn" class="btn-stop hidden">STOP ■</button>
+                </div>
               </div>
             </div>
           </div>
@@ -122,6 +126,9 @@
       </footer>
     </div>
 
+    <!-- always-present toast host for init-time / pre-chat errors -->
+    <div id="toast" class="toast-host"></div>
+
     <!-- OVERLAYS -->
     <div id="cmd-palette" class="cmd-palette hidden">
       <div class="cmd-palette-card">
@@ -130,9 +137,9 @@
       </div>
     </div>
 
-    <div id="gate-card" class="gate-card hidden">
+    <div id="gate-card" class="gate-card hidden" role="dialog" aria-modal="true" aria-labelledby="gate-head">
       <div class="gate-card-inner">
-        <div class="gate-head">◆ HUMAN GATE</div>
+        <div id="gate-head" class="gate-head">◆ HUMAN GATE</div>
         <div id="gate-plan" class="gate-plan"></div>
         <textarea id="gate-feedback" class="gate-feedback" placeholder="optional feedback (sent back to agent)"></textarea>
         <div class="gate-actions">
@@ -142,9 +149,9 @@
       </div>
     </div>
 
-    <div id="settings-card" class="settings-card hidden">
+    <div id="settings-card" class="settings-card hidden" role="dialog" aria-modal="true" aria-labelledby="settings-head">
       <div class="settings-card-inner">
-        <div class="settings-head">⚙ SETTINGS</div>
+        <div id="settings-head" class="settings-head">⚙ SETTINGS</div>
         <div class="settings-body">
           <div class="settings-row">
             <span class="settings-label">Version</span>
@@ -167,9 +174,9 @@
     </div>
 
     <!-- UPDATE DISCOVERY POPUP -->
-    <div id="update-card" class="update-card hidden">
+    <div id="update-card" class="update-card hidden" role="dialog" aria-modal="true" aria-labelledby="update-head">
       <div class="update-card-inner">
-        <div class="update-head">⬆ UPDATE AVAILABLE</div>
+        <div id="update-head" class="update-head">⬆ UPDATE AVAILABLE</div>
         <div id="update-body" class="update-body">A new version of dotz is available.</div>
         <div id="update-progress" class="update-progress hidden">
           <div class="update-progress-bar" id="update-progress-bar"></div>
@@ -187,7 +194,7 @@
       <div class="node-detail-inner">
         <div class="node-detail-head">
           <span>STEP DETAIL</span>
-          <button id="node-detail-close" class="node-detail-close">×</button>
+          <button id="node-detail-close" class="node-detail-close" aria-label="Close"><span aria-hidden="true">×</span></button>
         </div>
         <div id="node-detail-body" class="node-detail-body"></div>
       </div>
@@ -197,7 +204,7 @@
       <div class="bf-row"><span class="bf-label">TOKENS</span><span id="bf-tok" class="bf-val">0</span></div>
       <div class="bf-row"><span class="bf-label">COST</span><span id="bf-cost" class="bf-val">$0.00</span></div>
       <div class="bf-row"><span class="bf-label">CTX</span><span id="bf-ctx" class="bf-val">0%</span></div>
-      <button id="brain-float-toggle" class="bf-toggle" title="toggle brain float">◆</button>
+      <button id="brain-float-toggle" class="bf-toggle" title="toggle brain float" aria-label="Toggle stats overlay"><span aria-hidden="true">◆</span></button>
     </div>
 
     <!-- PANEL PALETTE (Ctrl+P overlay) -->
@@ -211,7 +218,7 @@
 
     <!-- panel templates (hidden, cloned by the registry) -->
     <template id="tpl-chat">
-      <div class="panel" data-panel="chat">
+      <div class="panel" data-panel="chat" role="region" aria-label="Chat">
         <div class="panel-head" draggable="true"><span class="panel-icon">▓</span> CHAT <button class="panel-close" title="remove panel">×</button></div>
         <div class="panel-body chat-body">
           <div id="transcript" class="transcript"></div>
@@ -228,7 +235,7 @@
     </template>
 
     <template id="tpl-graph">
-      <div class="panel" data-panel="graph">
+      <div class="panel" data-panel="graph" role="region" aria-label="Workflow Graph">
         <div class="panel-head" draggable="true"><span class="panel-icon">◐</span> WORKFLOW GRAPH <button class="panel-close">×</button></div>
         <div class="panel-body graph-body">
           <div id="wf-toolbar" class="wf-toolbar">
@@ -236,7 +243,6 @@
             <button id="wf-reset" class="btn-mini" title="reset view">RESET</button>
             <span id="wf-status" class="wf-status dim mono"></span>
           </div>
-          <div id="wf-detail" class="wf-detail hidden"></div>
           <svg id="wf-svg" class="wf-svg" xmlns="http://www.w3.org/2000/svg">
             <defs>
               <marker id="wf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -253,7 +259,7 @@
     </template>
 
     <template id="tpl-brain">
-      <div class="panel" data-panel="brain">
+      <div class="panel" data-panel="brain" role="region" aria-label="Agent Brain">
         <div class="panel-head" draggable="true"><span class="panel-icon">◆</span> AGENT BRAIN <button class="panel-close">×</button></div>
         <div class="panel-body brain-body">
           <div class="brain-stats">
@@ -269,13 +275,13 @@
     </template>
 
     <template id="tpl-browser">
-      <div class="panel" data-panel="browser">
+      <div class="panel" data-panel="browser" role="region" aria-label="Browser">
         <div class="panel-head" draggable="true"><span class="panel-icon">▣</span> BROWSER <button class="panel-close">×</button></div>
         <div class="panel-body browser-body">
           <div class="browser-toolbar">
-            <button id="br-back" class="btn-mini" title="back">◀</button>
-            <button id="br-forward" class="btn-mini" title="forward">▶</button>
-            <button id="br-reload" class="btn-mini" title="reload">↻</button>
+            <button id="br-back" class="btn-mini" title="back" aria-label="Back"><span aria-hidden="true">◀</span></button>
+            <button id="br-forward" class="btn-mini" title="forward" aria-label="Forward"><span aria-hidden="true">▶</span></button>
+            <button id="br-reload" class="btn-mini" title="reload" aria-label="Reload"><span aria-hidden="true">↻</span></button>
             <input id="br-url" class="br-url" placeholder="https://…" />
             <button id="br-navigate" class="btn-mini btn-go">GO</button>
             <button id="br-shot-btn" class="btn-mini" title="screenshot">📷</button>
@@ -295,7 +301,7 @@
     </template>
 
     <template id="tpl-memory">
-      <div class="panel" data-panel="memory">
+      <div class="panel" data-panel="memory" role="region" aria-label="Memory">
         <div class="panel-head" draggable="true"><span class="panel-icon">▤</span> MEMORY <button class="panel-close">×</button></div>
         <div class="panel-body memory-body">
           <div class="memory-note">Autonomous memory (mem0) — captured, recalled &amp; consolidated automatically. You never have to manage it.</div>
@@ -322,7 +328,7 @@
     </template>
 
     <template id="tpl-files">
-      <div class="panel" data-panel="files">
+      <div class="panel" data-panel="files" role="region" aria-label="Files">
         <div class="panel-head" draggable="true"><span class="panel-icon">▥</span> FILES <button class="panel-close">×</button></div>
         <div class="panel-body files-body">
           <div id="files-tree" class="files-tree">
@@ -333,7 +339,7 @@
     </template>
 
     <template id="tpl-sandbox">
-      <div class="panel" data-panel="sandbox">
+      <div class="panel" data-panel="sandbox" role="region" aria-label="Sandbox">
         <div class="panel-head" draggable="true"><span class="panel-icon">▩</span> SANDBOX <button class="panel-close">×</button></div>
         <div class="panel-body sandbox-body">
           <div class="sandbox-toolbar">
@@ -372,7 +378,7 @@
     </template>
 
     <template id="tpl-skills">
-      <div class="panel" data-panel="skills">
+      <div class="panel" data-panel="skills" role="region" aria-label="Skills">
         <div class="panel-head" draggable="true"><span class="panel-icon">✦</span> SKILLS <button class="panel-close">×</button></div>
         <div class="panel-body skills-body">
           <input id="skills-search" class="pf-input" placeholder="search skills…" />

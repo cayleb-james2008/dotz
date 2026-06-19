@@ -15,14 +15,25 @@
  */
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const MODEL = (id: string, name: string) => ({
+// Per-model metadata. These Ollama Cloud models are ALL reasoning ("thinking") models — declaring
+// reasoning:false (the old generic default) made pi treat them as plain completion models, so the
+// model's answer landed in the separate `reasoning` channel and `content` came back empty: that is
+// the root cause of subagents returning "(no output)" AND of the reasoning control showing nothing.
+// contextWindow/maxTokens are the real per-model values from Ollama's /api/show (not a flat 256k/8k).
+interface ModelOpts {
+  reasoning?: boolean;
+  contextWindow?: number;
+  maxTokens?: number;
+  input?: string[];
+}
+const MODEL = (id: string, name: string, opts: ModelOpts = {}) => ({
   id,
   name,
-  reasoning: false,
-  input: ["text"] as string[],
+  reasoning: opts.reasoning ?? true,
+  input: opts.input ?? (["text"] as string[]),
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  contextWindow: 256000,
-  maxTokens: 8192,
+  contextWindow: opts.contextWindow ?? 256000,
+  maxTokens: opts.maxTokens ?? 32768,
 });
 
 export default function (pi: ExtensionAPI) {
@@ -31,10 +42,10 @@ export default function (pi: ExtensionAPI) {
     apiKey: "$OLLAMA_API_KEY",
     api: "openai-completions",
     models: [
-      MODEL("glm-5.2", "GLM 5.2"),
-      MODEL("minimax-m3", "MiniMax M3"),
-      MODEL("kimi-k2.7-code", "Kimi K2.7 Code"),
-      MODEL("deepseek-v4-pro", "DeepSeek V4 Pro"),
+      MODEL("glm-5.2", "GLM 5.2", { reasoning: true, contextWindow: 1_000_000, maxTokens: 32768 }),
+      MODEL("minimax-m3", "MiniMax M3", { reasoning: true, contextWindow: 524_288, maxTokens: 32768 }),
+      MODEL("kimi-k2.7-code", "Kimi K2.7 Code", { reasoning: true, contextWindow: 262_144, maxTokens: 32768 }),
+      MODEL("deepseek-v4-pro", "DeepSeek V4 Pro", { reasoning: true, contextWindow: 524_288, maxTokens: 32768 }),
     ],
   });
 }

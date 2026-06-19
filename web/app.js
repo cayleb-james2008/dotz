@@ -75,6 +75,11 @@ const truncate = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + "…" : s ||
 init().catch((e) => pushError("init failed: " + e.message));
 
 async function init() {
+  window.addEventListener('unhandledrejection', (e) => {
+    const r = e.reason;
+    pushError('unhandled: ' + ((r && r.message) || r));
+  });
+  window.addEventListener('error', (e) => pushError('error: ' + e.message));
   bindTopbar();
   bindCommandCenter();
   bindProjectSelector();
@@ -92,6 +97,7 @@ async function init() {
   await loadProfiles();
   await loadProviders();
   await loadDotzConfig();
+  primeTopbarFromConfig();
   await loadProjects();
   await loadSandboxLanguages();
   showCommandCenter();
@@ -140,7 +146,10 @@ function updateCommandCenterMeta() {
   $("cc-project").textContent = p ? p.name : "no project selected";
   $("cc-project").classList.toggle("dim", !p);
   $("cc-profile").textContent = (p && p.profileId) || state.activeProfileId || "workflow";
-  $("cc-model").textContent = p && p.model ? `${p.model.provider}/${p.model.modelId}` : "—";
+  const cc = $("cc-model");
+  const hasModel = !!(p && p.model);
+  cc.textContent = hasModel ? `${p.model.provider}/${p.model.modelId}` : "no model";
+  cc.classList.toggle("dim", !hasModel);
 }
 
 function bindCommandCenter() {
@@ -181,10 +190,14 @@ function bindProjectSelector() {
     const name = $("pf-name").value.trim();
     const cwd = $("pf-cwd").value.trim();
     if (!name || !cwd) { pushError("project needs name + cwd"); return; }
+    if (!/^[A-Za-z]:[\\/]/.test(cwd) && !/^\//.test(cwd)) {
+      pushError("cwd must be an absolute path (e.g. C:\\Users\\me\\proj or /home/me/proj)");
+      return;
+    }
     const body = {
       name, cwd,
       profileId: $("pf-profile").value,
-      model: { provider: "openrouter", modelId: $("pf-model").value.trim() || "nex-agi/nex-n2-pro:free" },
+      model: { provider: (state.config && state.config.provider) || "ollama", modelId: $("pf-model").value.trim() || (state.config && state.config.executiveModel) || "glm-5.2" },
     };
     try {
       const p = await post("/api/projects", body);
@@ -199,10 +212,14 @@ function renderProjectDropdown() {
   const list = $("project-list");
   list.innerHTML = "";
   if (!state.projects.length) {
-    list.appendChild(el("div", "dim mono", "no projects yet"));
+    const empty = el("div", "dropdown-empty");
+    empty.appendChild(el("div", "de-glyph", "◆"));
+    empty.appendChild(el("div", "de-title", "No projects yet"));
+    empty.appendChild(el("div", "de-sub dim", "Create one below ↓"));
+    list.appendChild(empty);
   } else {
     state.projects.forEach((p) => {
-      const item = el("div", "project-item");
+      const item = el("button", "project-item");
       item.appendChild(el("span", "pi-glyph", "◆"));
       const info = el("div", "pi-info");
       info.appendChild(el("div", "pi-name", p.name));
@@ -264,7 +281,10 @@ function unmountPanel(name) {
 function bindPanel(node, name) {
   const head = node.querySelector(".panel-head");
   const closeBtn = node.querySelector(".panel-close");
-  if (closeBtn) closeBtn.onclick = (e) => { e.stopPropagation(); if (name !== "chat") unmountPanel(name); };
+  if (closeBtn) {
+    closeBtn.setAttribute("aria-label", "Close panel");
+    closeBtn.onclick = (e) => { e.stopPropagation(); if (name !== "chat") unmountPanel(name); };
+  }
   head.addEventListener("dragstart", (e) => {
     node.classList.add("dragging");
     e.dataTransfer.setData("text/plain", name);
@@ -347,12 +367,47 @@ function togglePalette() {
 function bindKeyboard() {
   document.addEventListener("keydown", (e) => {
     if (e.ctrlKey && e.key.toLowerCase() === "p") { e.preventDefault(); togglePalette(); }
+    // Modal-aware Escape routing + Tab focus trap. A visible dialog takes priority.
+    const modal = visibleModal();
+    if (modal) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        // Gate stays modal until an explicit choice; settings/update get a close path.
+        if (modal.id === "settings-card") $("settings-close").click();
+        else if (modal.id === "update-card") $("update-later").click();
+        return;
+      }
+      if (e.key === "Tab") trapFocus(e, modal);
+      return;
+    }
     if (e.key === "Escape") {
       $("palette").classList.add("hidden");
       $("project-dropdown").classList.add("hidden");
       hideCmdPalette();
     }
   });
+}
+
+// Returns the topmost visible modal dialog element, or null.
+function visibleModal() {
+  for (const id of ["update-card", "settings-card", "gate-card"]) {
+    const card = $(id);
+    if (card && !card.classList.contains("hidden")) return card;
+  }
+  return null;
+}
+
+// Cycle Tab focus within the visible .*-card-inner so it can't escape the dialog.
+function trapFocus(e, modal) {
+  const inner = modal.querySelector(".gate-card-inner, .settings-card-inner, .update-card-inner") || modal;
+  const focusables = inner.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
+  // offsetParent is null inside position:fixed modals, so use the getClientRects visibility idiom instead.
+  const visible = Array.from(focusables).filter((n) => !n.classList.contains("hidden") && (n.offsetWidth || n.offsetHeight || n.getClientRects().length));
+  if (!visible.length) return;
+  const first = visible[0];
+  const last = visible[visible.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
 }
 
 /* ---------- profiles ---------- */
@@ -376,7 +431,7 @@ function renderProfilePicker() {
 
 async function loadProviders() {
   try { const { providers } = await api("/api/providers"); state.providers = providers || []; }
-  catch { state.providers = []; }
+  catch (e) { state.providers = []; pushError("providers: " + e.message); }
 }
 
 async function loadDotzConfig() {
@@ -384,7 +439,7 @@ async function loadDotzConfig() {
     const r = await api("/api/config");
     state.config = r.config || null;
     state.providerDefaults = r.providerDefaults || {};
-  } catch { state.config = null; state.providerDefaults = {}; }
+  } catch (e) { state.config = null; state.providerDefaults = {}; pushError("config: " + e.message); }
 }
 
 async function persistConfig(patch) {
@@ -420,17 +475,27 @@ function setSession(s) {
 }
 
 /* ---------- websocket ---------- */
+let _wsAttempt = 0, _wsIntentional = false;
 function connectWS() {
-  if (state.ws) { try { state.ws.close(); } catch {} }
+  if (state.ws) { _wsIntentional = true; try { state.ws.close(); } catch {} }
+  _wsIntentional = false;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws?sessionId=${state.sessionId}`);
   state.ws = ws;
   setConn("off", "ws connecting…");
-  ws.onopen = () => setConn("on", "ws ✓ " + location.host);
-  ws.onclose = () => setConn("off", "ws closed");
+  ws.onopen = () => { _wsAttempt = 0; setConn("on", "ws ✓ " + location.host); };
+  ws.onclose = () => {
+    setConn("off", "ws closed");
+    if (!_wsIntentional && state.sessionId && ws === state.ws) {
+      const delay = Math.min(15000, 500 * 2 ** _wsAttempt++);
+      setConn("off", "reconnecting…");
+      setTimeout(connectWS, delay);
+    }
+  };
   ws.onerror = () => setConn("err", "ws error");
   ws.onmessage = (ev) => {
-    const m = JSON.parse(ev.data);
+    let m;
+    try { m = JSON.parse(ev.data); } catch { return; }
     if (m.kind === "ready") { /* session confirmed */ }
     else if (m.kind === "event") handleEvent(m.event);
     else if (m.kind === "sandbox") handleSandboxEvent(m.event);
@@ -482,7 +547,7 @@ function wireChatPanel(node) {
   const input = node.querySelector("#composer-input");
   const sendBtn = node.querySelector("#send-btn");
   const stopBtn = node.querySelector("#stop-btn");
-  input.addEventListener("input", autoGrow);
+  attachComposerPalette(input);
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendFrom(input); }
     else if (e.key === "Escape") hideCmdPalette();
@@ -506,7 +571,7 @@ function wireChatPanel(node) {
 }
 
 function autoGrow() {
-  const input = $("composer-input");
+  const input = activeComposerInput();
   if (!input) return;
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 260) + "px";
@@ -538,7 +603,7 @@ function setStreaming(b) {
   }
   const ccSend = $("send-btn");
   const ccStop = $("stop-btn");
-  if (ccSend && !ccSend.closest('.panel[data-panel="chat"]')) {
+  if (ccSend && ccStop && !ccSend.closest('.panel[data-panel="chat"]')) {
     ccSend.classList.toggle("hidden", b);
     ccStop.classList.toggle("hidden", !b);
   }
@@ -560,26 +625,26 @@ function activeComposerInput() {
 }
 
 /* ---------- composer palette ---------- */
-function bindComposer() {
-  const input = $("composer-input");
+// Reusable per-textarea palette trigger: closes over the passed input so it works for both
+// the command-center textarea and each chat-panel clone (which share the #composer-input id).
+function attachComposerPalette(input) {
   if (!input) return;
   input.addEventListener("input", () => {
     autoGrow();
-    const text = input.value;
-    const sel = input.selectionStart;
-    const before = text.slice(0, sel);
+    const before = input.value.slice(0, input.selectionStart);
     const m = before.match(/(^|\s)([/@#])(\w*)$/);
     if (m) {
-      const type = m[2];
-      const prefix = m[3];
-      const items = paletteItemsFor(type, prefix);
-      if (items.length) showCmdPalette(items, type, prefix);
-      else hideCmdPalette();
-    } else {
-      hideCmdPalette();
-    }
+      const items = paletteItemsFor(m[2], m[3]);
+      if (items.length) showCmdPalette(items, m[2], m[3]); else hideCmdPalette();
+    } else hideCmdPalette();
   });
   input.addEventListener("blur", () => { setTimeout(hideCmdPalette, 180); });
+}
+
+function bindComposer() {
+  const input = $("composer-input");
+  if (!input) return;
+  attachComposerPalette(input);
   const pinput = $("cmd-palette-input");
   pinput.addEventListener("input", () => filterPalette(pinput.value));
   pinput.addEventListener("keydown", (e) => {
@@ -637,7 +702,7 @@ function renderPaletteList(items, activeIdx) {
   const list = $("cmd-palette-list");
   list.innerHTML = "";
   items.forEach((it, idx) => {
-    const row = el("div", "cmd-item" + (idx === activeIdx ? " active" : ""));
+    const row = el("button", "cmd-item" + (idx === activeIdx ? " active" : ""));
     row.appendChild(el("span", "cmd-glyph", it.icon));
     row.appendChild(el("span", "cmd-name", it.name));
     row.appendChild(el("span", "cmd-desc", it.desc));
@@ -661,7 +726,6 @@ function navigatePalette(delta) {
     name: r.querySelector(".cmd-name").textContent,
     desc: r.querySelector(".cmd-desc").textContent,
     source: r.querySelector(".cmd-source").textContent,
-    insert: (r.dataset.insert || (_paletteType === "/" ? "/" : _paletteType) + r.querySelector(".cmd-name").textContent + " "),
   })), active);
 }
 
@@ -728,6 +792,60 @@ function ensureAssistantBubble() {
 function hasRenderable(partial) {
   return (partial.content || []).some((b) => (b.type === "text" && b.text) || (b.type === "thinking" && b.thinking && b.thinking.trim()));
 }
+/* Minimal, dependency-free Markdown -> safe HTML for assistant output. Escapes ALL text first,
+   then layers block + inline formatting so LLM replies render as real prose instead of a raw blob. */
+function renderMarkdown(src) {
+  if (src == null) return "";
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const fences = [];
+  const s = String(src).replace(/```(\w*)\r?\n?([\s\S]*?)```/g, (_, _lang, code) => {
+    fences.push(`<pre class="md-pre"><code>${esc(code.replace(/\n+$/, ""))}</code></pre>`);
+    return ` F${fences.length - 1} `;
+  });
+  const inline = (line) => esc(line)
+    .replace(/`([^`]+)`/g, (_, c) => `<code class="md-code">${c}</code>`)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  const out = [];
+  let list = null;
+  let para = [];
+  const flushPara = () => { if (para.length) { out.push(`<p>${para.map(inline).join("<br>")}</p>`); para = []; } };
+  const flushList = () => { if (list) { out.push(`<${list.tag}>${list.items.join("")}</${list.tag}>`); list = null; } };
+  const flush = () => { flushPara(); flushList(); };
+  for (const raw of s.split("\n")) {
+    const line = raw.replace(/\s+$/, "");
+    let m;
+    if ((m = line.match(/^ F(\d+) $/))) { flush(); out.push(fences[+m[1]]); continue; }
+    if (!line.trim()) { flush(); continue; }
+    if ((m = line.match(/^(#{1,4})\s+(.*)$/))) { flush(); out.push(`<h${m[1].length} class="md-h">${inline(m[2])}</h${m[1].length}>`); continue; }
+    if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) { flushPara(); if (!list || list.tag !== "ul") { flushList(); list = { tag: "ul", items: [] }; } list.items.push(`<li>${inline(m[1])}</li>`); continue; }
+    if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) { flushPara(); if (!list || list.tag !== "ol") { flushList(); list = { tag: "ol", items: [] }; } list.items.push(`<li>${inline(m[1])}</li>`); continue; }
+    if ((m = line.match(/^>\s?(.*)$/))) { flush(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); continue; }
+    if (/^(---+|\*\*\*+|___+)$/.test(line.trim())) { flush(); out.push("<hr>"); continue; }
+    flushList(); para.push(line);
+  }
+  flush();
+  return out.join("");
+}
+
+/* One-line summary of a tool call for the collapsed card header, so the transcript reads as a
+   compact list of actions instead of a wall of raw JSON args + output. */
+function toolPreview(name, args) {
+  if (!args || typeof args !== "object") return typeof args === "string" ? args : "";
+  const a = args;
+  switch (name) {
+    case "bash": return a.command || "";
+    case "read": case "write": case "edit": return a.file_path || a.path || "";
+    case "grep": return (a.pattern ? "/" + a.pattern + "/" : "") + (a.path ? " in " + a.path : "");
+    case "find": return (a.pattern || "*") + (a.path ? " in " + a.path : "");
+    case "ls": return a.path || ".";
+    case "subagent": return a.tasks ? `${a.tasks.length} parallel` : a.chain ? `${a.chain.length}-step chain` : (a.agent || "");
+    case "skill": return a.name || a.command || "";
+    default: { try { const s = JSON.stringify(a); return s.length > 90 ? s.slice(0, 90) + "…" : s; } catch { return ""; } }
+  }
+}
+
 function renderAssistantPartial(partial) {
   if (!hasRenderable(partial)) return;
   const cur = ensureAssistantBubble();
@@ -745,8 +863,8 @@ function renderAssistant(cur, streaming) {
       d.appendChild(el("div", "think-body", block.thinking));
       cur.bubble.appendChild(d);
     } else if (block.type === "text") {
-      const t = el("div", "assistant-text");
-      t.textContent = block.text || "";
+      const t = el("div", "assistant-text md");
+      t.innerHTML = renderMarkdown(block.text || "");
       if (streaming) t.appendChild(el("span", "cursor", "█"));
       cur.bubble.appendChild(t);
     }
@@ -764,35 +882,45 @@ function finalizeAssistant(message) {
 function toolCard(id, patch) {
   let tc = state.toolCards[id];
   if (!tc) {
-    const card = el("div", "toolcard");
+    // A <details> so each tool call is a compact, collapsed one-liner (icon · name · preview · status)
+    // that the user can expand for full args/output — instead of a wall of raw JSON in the transcript.
+    const card = el("details", "toolcard");
     card.dataset.tc = id;
-    const head = el("div", "toolcard-head");
-    const nameEl = el("span", "toolcard-name", "⚙ tool");
+    const head = el("summary", "toolcard-head");
+    const glyph = el("span", "toolcard-glyph", "⚙");
+    const nameEl = el("span", "toolcard-name", "tool");
+    const previewEl = el("span", "toolcard-preview");
     const badge = el("span", "toolcard-status status-run", "● RUN");
-    head.appendChild(nameEl); head.appendChild(badge);
+    head.appendChild(glyph); head.appendChild(nameEl); head.appendChild(previewEl); head.appendChild(badge);
     const body = el("div", "toolcard-body");
-    const argsEl = el("div", "toolcard-args");
-    const outEl = el("div", "toolcard-out");
+    const argsEl = el("pre", "toolcard-args");
+    const outEl = el("pre", "toolcard-out");
     outEl.style.display = "none";
     body.appendChild(argsEl); body.appendChild(outEl);
     card.appendChild(head); card.appendChild(body);
     const t = document.querySelector('.panel[data-panel="chat"] #transcript') || $("transcript");
     if (!t) return;
     t.appendChild(card);
-    tc = state.toolCards[id] = { nameEl, badge, argsEl, outEl, data: {} };
+    tc = state.toolCards[id] = { card, nameEl, previewEl, badge, argsEl, outEl, data: {} };
   }
   Object.assign(tc.data, patch);
   const d = tc.data;
-  if (d.name) tc.nameEl.textContent = "⚙ " + d.name;
+  if (d.name) { tc.nameEl.textContent = d.name; tc.previewEl.textContent = toolPreview(d.name, d.args); }
   if (d.args !== undefined) tc.argsEl.textContent = typeof d.args === "string" ? d.args : JSON.stringify(d.args, null, 2);
   if (d.output) { tc.outEl.style.display = ""; tc.outEl.textContent = d.output; }
   const st = d.status || "run";
+  tc.card.classList.toggle("is-running", st === "run");
   tc.badge.className = "toolcard-status " + (st === "done" ? "status-done" : st === "err" ? "status-err" : "status-run");
-  tc.badge.textContent = st === "done" ? "✓ DONE" : st === "err" ? "✕ ERROR" : "● RUN";
+  tc.badge.textContent = st === "done" ? "✓ DONE" : st === "err" ? "✕ ERR" : "● RUN";
+}
+function showToast(msg) {
+  const host = $("toast"); if (!host) { console.error(msg); return; }
+  const n = el("div", "toast-item", msg); host.appendChild(n);
+  setTimeout(() => n.remove(), 6000);
 }
 function pushError(msg) {
   const t = document.querySelector('.panel[data-panel="chat"] #transcript') || $("transcript");
-  if (!t) { console.error(msg); return; }
+  if (!t) { showToast("⚠ " + msg); return; }
   const m = el("div", "msg assistant");
   m.appendChild(el("div", "msg-role", "system"));
   const b = el("div", "bubble");
@@ -803,16 +931,39 @@ function pushError(msg) {
 }
 
 /* ---------- model + provider controls ---------- */
-async function loadModels() {
-  const m = await api(`/api/sessions/${state.sessionId}/models`);
-  state.modelCatalog = m.available || [];
+// Populate #provider-select from a provider-meta list (shared by loadModels + primeTopbarFromConfig).
+function populateProviderSelect(providerMeta) {
   const provSel = $("provider-select");
+  if (!provSel) return;
   provSel.innerHTML = "";
-  (m.providerMeta || state.providers || []).forEach((p) => {
+  (providerMeta || state.providers || []).forEach((p) => {
     const o = el("option", null, p.label || p.id);
     o.value = p.id;
     provSel.appendChild(o);
   });
+}
+
+// First-run priming: before any session exists, populate the four topbar knobs from state.config
+// so a brand-new user sees the real defaults (ollama/glm-5.2) instead of empty controls.
+function primeTopbarFromConfig() {
+  if (!state.config) return;
+  state.activeProvider = state.config.provider || state.activeProvider || "ollama";
+  populateProviderSelect(state.providers);
+  const provSel = $("provider-select");
+  if (provSel) provSel.value = state.activeProvider;
+  renderModelInput();
+  populateModelSuggestions();
+  if (state.config.executiveModel) { const mi = $("model-input"); if (mi) mi.value = state.config.executiveModel; }
+  if (state.config.subagentModel) { const si = $("subagent-input"); if (si) si.value = state.config.subagentModel; }
+  // Prime REASONING with a synthesized stub; renderReasoning early-returns the POST when no session exists.
+  renderReasoning({ thinkingLevel: state.config.thinkingLevel, availableThinkingLevels: THINK_LEVELS, supportsThinking: true });
+}
+
+async function loadModels() {
+  const m = await api(`/api/sessions/${state.sessionId}/models`);
+  state.modelCatalog = m.available || [];
+  populateProviderSelect(m.providerMeta);
+  const provSel = $("provider-select");
   updateModelUI(m.current || state.summary.model);
   state.activeProvider = (m.current && m.current.provider) || (state.config && state.config.provider) || "ollama";
   provSel.value = state.activeProvider;
@@ -866,7 +1017,7 @@ function renderModelInput() {
   } else {
     const input = $("model-input");
     input.onchange = submitModel;
-    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitModel(); } });
+    input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); submitModel(); } };
   }
 }
 function populateModelSuggestions() {
@@ -881,7 +1032,7 @@ function updateModelUI(model) {
   if (free) $("model-input").value = id;
   else $("model-select").value = id;
   const cc = $("cc-model");
-  if (cc) cc.textContent = prov + "/" + id;
+  if (cc) { cc.textContent = prov + "/" + id; cc.classList.remove("dim"); }
 }
 async function submitModel() { const id = $("model-input").value.trim(); if (id) { await setModel({ provider: state.activeProvider, modelId: id }); persistConfig({ provider: state.activeProvider, executiveModel: id }); } }
 async function submitModelSelect() { const id = $("model-select").value; if (id) await setModel({ provider: state.activeProvider, modelId: id }); }
@@ -901,6 +1052,8 @@ function renderReasoning(summary) {
     b.disabled = !summary.supportsThinking || !avail.includes(lvl);
     if (lvl === summary.thinkingLevel) b.classList.add("active");
     b.onclick = async () => {
+      // Pre-session (command center): no sessionId yet — POSTing would hit /api/sessions/null/thinking (404).
+      if (!state.sessionId) return;
       try { const r = await post(`/api/sessions/${state.sessionId}/thinking`, { level: lvl }); state.summary = Object.assign({}, state.summary, r); renderReasoning(state.summary); persistConfig({ thinkingLevel: lvl }); }
       catch (e) { pushError("thinking: " + e.message); }
     };
@@ -1311,12 +1464,30 @@ function renderWorkflowDag(run, panel) {
   const layers = computeLayers(run.steps);
   const positions = {};
   const NODE_W = 160, NODE_H = 58, LAYER_GAP = 190, NODE_GAP = 24;
+  const DOTZ_Y = 24, DOTZ_DROP = 150;
   layers.forEach((layer, i) => {
     const layerWidth = layer.length * (NODE_W + NODE_GAP) - NODE_GAP;
     const startX = (state.wfView.w - layerWidth) / 2;
     layer.forEach((stepId, j) => {
-      positions[stepId] = { x: startX + j * (NODE_W + NODE_GAP), y: 50 + i * LAYER_GAP };
+      positions[stepId] = { x: startX + j * (NODE_W + NODE_GAP), y: DOTZ_Y + DOTZ_DROP + i * LAYER_GAP };
     });
+  });
+  // The main dotz agent (lead orchestrator) sits above the whole graph; every ROOT step (a subagent
+  // it dispersed) hangs off it, so the fan-out reads as "dotz → reviewers" with real connector lines.
+  const dotzPos = { x: state.wfView.w / 2 - NODE_W / 2, y: DOTZ_Y };
+  const rootSteps = run.steps.filter((s) => !s.parents || s.parents.length === 0);
+  const dotzStatus = run.status === "done" ? "done" : (run.status === "error" || run.status === "aborted") ? "error" : "running";
+  // dotz → each root subagent (the dispersal edges)
+  rootSteps.forEach((step) => {
+    const to = positions[step.id];
+    if (!to) return;
+    const e = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    const fx = dotzPos.x + NODE_W / 2, fy = dotzPos.y + NODE_H;
+    const tx = to.x + NODE_W / 2, ty = to.y, midY = (fy + ty) / 2;
+    e.setAttribute("d", `M ${fx} ${fy} C ${fx} ${midY} ${tx} ${midY} ${tx} ${ty}`);
+    e.setAttribute("class", "wf-edge wf-edge-disperse " + (step.status === "running" ? "active" : step.status === "done" ? "done" : ""));
+    e.setAttribute("marker-end", "url(#wf-arrow)");
+    edgesG.appendChild(e);
   });
 
   run.steps.forEach((step) => {
@@ -1379,6 +1550,37 @@ function renderWorkflowDag(run, panel) {
     g.onclick = () => showNodeDetail(run, step);
     nodesG.appendChild(g);
   });
+
+  // The dotz orchestrator node — the lead agent, rendered last so it sits on top, glowing.
+  {
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    g.setAttribute("class", "wf-node wf-node-dotz " + dotzStatus);
+    g.setAttribute("transform", `translate(${dotzPos.x}, ${dotzPos.y})`);
+    const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    rect.setAttribute("width", NODE_W); rect.setAttribute("height", NODE_H); rect.setAttribute("rx", 8);
+    g.appendChild(rect);
+    const ring = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    ring.setAttribute("x", 3); ring.setAttribute("y", 3); ring.setAttribute("width", NODE_W - 6); ring.setAttribute("height", NODE_H - 6); ring.setAttribute("rx", 7);
+    ring.setAttribute("class", "wf-node-ring");
+    g.appendChild(ring);
+    const icon = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    icon.setAttribute("x", 12); icon.setAttribute("y", 23); icon.setAttribute("class", "wf-node-icon"); icon.setAttribute("fill", "currentColor");
+    icon.textContent = "◆";
+    g.appendChild(icon);
+    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    label.setAttribute("x", 42); label.setAttribute("y", 17); label.setAttribute("class", "wf-node-label");
+    label.textContent = "dotz";
+    g.appendChild(label);
+    const sub = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    sub.setAttribute("x", 10); sub.setAttribute("y", 40); sub.setAttribute("class", "wf-node-task");
+    sub.textContent = truncate(run.label || "orchestrator", 26);
+    g.appendChild(sub);
+    const st = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    st.setAttribute("x", NODE_W - 8); st.setAttribute("y", 16); st.setAttribute("text-anchor", "end"); st.setAttribute("class", "wf-node-task");
+    st.textContent = dotzStatus;
+    g.appendChild(st);
+    nodesG.appendChild(g);
+  }
   applyViewBox();
 }
 
@@ -1401,35 +1603,6 @@ function computeLayers(steps) {
     layers.push(layer);
   }
   return layers;
-}
-
-function showStepDetail(run, step) {
-  const panel = document.querySelector('.panel[data-panel="graph"]');
-  const detail = panel ? panel.querySelector("#wf-detail") : $("wf-detail");
-  if (!detail) return;
-  detail.classList.remove("hidden");
-  detail.innerHTML = "";
-  const head = el("div", "wf-detail-head");
-  head.appendChild(el("span", "skill-name", step.agent));
-  head.appendChild(el("span", "skill-source " + step.status, step.status));
-  const close = el("button", "wf-detail-close", "×");
-  close.onclick = () => detail.classList.add("hidden");
-  head.appendChild(close);
-  detail.appendChild(head);
-  detail.appendChild(makeRow("TASK", step.task));
-  detail.appendChild(makeRow("STATUS", step.status));
-  if (step.output) detail.appendChild(el("div", "wf-detail-output", step.output));
-  if (step.error) detail.appendChild(makeRow("ERROR", step.error));
-  if (step.usage) detail.appendChild(makeRow("USAGE", JSON.stringify(step.usage)));
-  if (step.startedAt) detail.appendChild(makeRow("STARTED", new Date(step.startedAt).toLocaleTimeString()));
-  if (step.endedAt) detail.appendChild(makeRow("ENDED", new Date(step.endedAt).toLocaleTimeString()));
-}
-
-function makeRow(label, val) {
-  const row = el("div", "wf-detail-row");
-  row.appendChild(el("span", "label", label + ": "));
-  row.appendChild(el("span", "val", val));
-  return row;
 }
 
 /* ---------- node detail side drawer ---------- */
@@ -1499,6 +1672,7 @@ function showGateCard(gateId, plan) {
   $("gate-plan").textContent = plan || "(no plan provided)";
   $("gate-feedback").value = "";
   card.classList.remove("hidden");
+  $("gate-approve").focus();
 }
 
 function resolveGate(approved) {
@@ -1516,6 +1690,7 @@ function bindSettings() {
     $("settings-version").textContent = (window.dotz && window.dotz.version) || "browser";
     $("settings-feed").textContent = (window.dotz && window.dotz.electron) ? "configured" : "not configured (browser/dev)";
     $("settings-update-status").textContent = state.updateStatus || "—";
+    $("settings-close").focus();
   };
   $("settings-close").onclick = () => $("settings-card").classList.add("hidden");
   $("settings-check-update").onclick = () => {
@@ -1569,6 +1744,7 @@ function wireUpdaterIpc() {
       $("update-apply").classList.toggle("hidden", !!data.dirty);
       $("update-later").textContent = "LATER";
       $("settings-update-status").textContent = `update available: ${n} ${plural} behind`;
+      $("update-later").focus();
     } else if (status === "not-available") {
       $("settings-update-status").textContent = `up to date (${esc(data.localSha || "")})`;
     } else if (status === "applying") {
@@ -1583,6 +1759,7 @@ function wireUpdaterIpc() {
       $("update-apply").classList.add("hidden");
       $("update-later").textContent = "CLOSE";
       $("settings-update-status").textContent = "error: " + esc(data.message);
+      $("update-later").focus();
     }
   });
 }
@@ -1684,9 +1861,9 @@ function renderBrowserObservation(observation) {
     errors.slice(-3).join(" | "), refs,
   ].filter(Boolean).join("\n");
   let cursor = panel.querySelector(".browser-agent-cursor");
-  if (observation.cursor && shot.clientWidth) {
+  const viewport = observation.page?.viewport;
+  if (observation.cursor && shot.clientWidth && viewport?.width && viewport?.height) {
     if (!cursor) { cursor = el("span", "browser-agent-cursor"); panel.querySelector(".browser-shot-host").appendChild(cursor); }
-    const viewport = observation.page.viewport;
     cursor.style.left = `${Math.max(0, Math.min(100, observation.cursor.x / viewport.width * 100))}%`;
     cursor.style.top = `${Math.max(0, Math.min(100, observation.cursor.y / viewport.height * 100))}%`;
   } else if (cursor) cursor.remove();
@@ -1929,7 +2106,9 @@ async function refreshStats() {
     const cost = $("st-cost"); if (cost) cost.textContent = "$" + (st.cost || 0).toFixed(4).replace(/0+$/, "0");
     const cu = st.contextUsage;
     if (cu) {
-      const pct = (cu.percent * 100);
+      // contextUsage.percent is already a percentage (tokens/contextWindow*100), not a 0-1
+      // fraction — multiplying by 100 again printed a nonsensical 800%+ context gauge.
+      const pct = cu.percent || 0;
       const p = $("st-ctx-pct"); if (p) p.textContent = pct.toFixed(1) + "%";
       const bar = $("st-ctx-bar"); if (bar) bar.style.width = Math.min(100, pct) + "%";
       const win = $("st-ctx-win"); if (win) win.textContent = "of " + fmtCtx(cu.contextWindow);
