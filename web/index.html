@@ -298,12 +298,16 @@
       <div class="panel" data-panel="memory">
         <div class="panel-head" draggable="true"><span class="panel-icon">▤</span> MEMORY <button class="panel-close">×</button></div>
         <div class="panel-body memory-body">
-          <div class="memory-note">AGENTS.md + .ai-agents memory — injected into the agent's system prompt.</div>
+          <div class="memory-note">Autonomous memory (mem0) — captured, recalled &amp; consolidated automatically. You never have to manage it.</div>
+          <div id="mem-recalled" class="mem-recalled hidden"></div>
           <div id="memory-list" class="memory-list"></div>
-          <button id="mem-add" class="btn-mini btn-go mem-add-btn">+ ADD</button>
+          <div class="mem-toolbar">
+            <button id="mem-add" class="btn-mini btn-go">+ ADD</button>
+            <button id="mem-consolidate" class="btn-mini">CONSOLIDATE</button>
+          </div>
           <div id="mem-form" class="mem-form hidden">
-            <input id="mem-key" class="pf-input" placeholder="key" />
-            <input id="mem-value" class="pf-input" placeholder="value" />
+            <textarea id="mem-text" class="pf-input" placeholder="a durable fact to remember"></textarea>
+            <input id="mem-category" class="pf-input" placeholder="category (convention, command, gotcha…)" />
             <select id="mem-scope" class="pf-select">
               <option value="project">project</option>
               <option value="global">global</option>

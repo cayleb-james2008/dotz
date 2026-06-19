@@ -9,10 +9,22 @@
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { skillLoader } from "../../../src/skills";
-import { memoryStore, readAgentsMd, writeAgentsMd, appendAgentsMdSection } from "../../../src/memory";
+import { memoryStore, readAgentsMd, writeAgentsMd, appendAgentsMdSection, isMemoryAutonomyEnabled } from "../../../src/memory";
 import { captureBaseline, compare, renderBaseline, type MetricsBaseline } from "../../../src/metrics";
 import { getDesignSystem, getComponents, auditDesign, renderDesignSystem, renderComponents, renderAudit } from "../../../src/design";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "../../../src/browser";
+
+/** Flatten an AgentMessage's content (string or content-part array) to plain text. */
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((p) => (typeof p === "string" ? p : ((p as { text?: string })?.text ?? ""))).join(" ");
+  return "";
+}
+/** Last message text for a given role in a message list (used by post-task auto-capture). */
+function lastText(msgs: Array<{ role?: string; content?: unknown }>, role: string): string {
+  for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].role === role) return textOf(msgs[i].content).trim();
+  return "";
+}
 
 /** In-memory baseline registry (per session) — the RSI brain captures a baseline, then
  *  compares after the improvement. Keyed by a caller-provided label. */
@@ -134,58 +146,91 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ---- memory_list tool ----
+  // ---- memory tools (mem0-backed). Capture + recall + consolidation are AUTOMATIC via the
+  //      before_agent_start / agent_end hooks at the bottom of this file; these tools let the
+  //      agent inspect or self-curate memory on demand. ----
   pi.registerTool({
     name: "memory_list",
     label: "Memory List",
-    description: "List durable memory entries from the .ai-agents namespace. Pass scope='global' for global entries or scope='project' (with projectId) for project entries.",
+    description: "List durable memories. scope='global' for cross-project knowledge, scope='project' for this project/folder. Ids are shown for memory_update/memory_delete.",
     parameters: Type.Object({
       scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("global")])),
-      projectId: Type.Optional(Type.String()),
     }),
     async execute(_id, params) {
-      const p = params as { scope?: "project" | "global"; projectId?: string };
-      const entries = await memoryStore.list(p.projectId, p.scope === "project" ? process.cwd() : null);
-      const text = entries.length === 0 ? "No memory entries found." : entries.map((e) => `[${e.scope}] ${e.key}: ${e.value}`).join("\n");
+      const p = params as { scope?: "project" | "global" };
+      const all = await memoryStore.list(p.scope === "global" ? null : process.cwd());
+      const items = p.scope ? all.filter((e) => e.scope === p.scope) : all;
+      const text = items.length === 0 ? "No memories found." : items.map((e) => `[${e.scope}${e.category ? "/" + e.category : ""}] (${e.id.slice(0, 8)}) ${e.memory}`).join("\n");
       return { content: [{ type: "text", text }], details: undefined };
     },
   });
 
-  // ---- memory_add tool ----
   pi.registerTool({
-    name: "memory_add",
-    label: "Memory Add",
-    description: "Add a durable memory entry to the .ai-agents namespace. Use scope='global' for cross-project knowledge or scope='project' for project-specific knowledge.",
+    name: "memory_search",
+    label: "Memory Search",
+    description: "Semantically recall durable memories relevant to a query (searches this project's folder + global). Use to pull context before acting.",
     parameters: Type.Object({
-      key: Type.String({ description: "Short key (e.g. 'convention:naming')" }),
-      value: Type.String({ description: "The memory content" }),
+      query: Type.String({ description: "What to recall" }),
       scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("global")])),
-      projectId: Type.Optional(Type.String()),
+      topK: Type.Optional(Type.Number()),
     }),
     async execute(_id, params) {
-      const p = params as { key: string; value: string; scope?: "project" | "global"; projectId?: string };
-      const entry = await memoryStore.create({
-        projectId: p.projectId || "",
-        key: p.key,
-        value: p.value,
-        scope: p.scope || "project",
-        projectCwd: p.scope === "project" ? process.cwd() : null,
-      });
-      return { content: [{ type: "text", text: `Memory saved: [${entry.scope}] ${entry.key}` }], details: undefined };
+      const p = params as { query: string; scope?: "project" | "global"; topK?: number };
+      const items = await memoryStore.search(p.query, { projectCwd: process.cwd(), scope: p.scope, topK: p.topK ?? 8 });
+      const text = items.length === 0 ? "No relevant memories." : items.map((e) => `[${e.scope}${e.category ? "/" + e.category : ""}] (${(e.score ?? 0).toFixed(2)}) ${e.memory}`).join("\n");
+      return { content: [{ type: "text", text }], details: undefined };
     },
   });
 
-  // ---- memory_delete tool ----
+  pi.registerTool({
+    name: "memory_add",
+    label: "Memory Add",
+    description: "Save a durable fact now (memory is also captured automatically). scope='global' for cross-project, 'project' for this project. category e.g. convention|architecture|command|gotcha|user|feedback|reference.",
+    parameters: Type.Object({
+      text: Type.String({ description: "The fact to remember (one concise sentence)" }),
+      scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("global")])),
+      category: Type.Optional(Type.String({ description: "Memory category (convention, architecture, command, gotcha, user, feedback, reference, ...)" })),
+      folder: Type.Optional(Type.String({ description: "Folder this fact is about, relative to the project root" })),
+    }),
+    async execute(_id, params) {
+      const p = params as { text: string; scope?: "project" | "global"; category?: string; folder?: string };
+      const scope = p.scope ?? "project";
+      const v = await memoryStore.create({ text: p.text, category: p.category, folder: p.folder, scope, projectCwd: scope === "project" ? process.cwd() : null });
+      return { content: [{ type: "text", text: `Memory saved: [${v.scope}${v.category ? "/" + v.category : ""}] ${v.memory}` }], details: undefined };
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_update",
+    label: "Memory Update",
+    description: "Edit an existing memory's text by id (ids shown by memory_list / memory_search). The agent's self-curation of its own memory.",
+    parameters: Type.Object({ id: Type.String(), text: Type.String({ description: "Replacement fact" }) }),
+    async execute(_id, params) {
+      const p = params as { id: string; text: string };
+      const v = await memoryStore.update(p.id, p.text, process.cwd());
+      return { content: [{ type: "text", text: v ? `Memory updated: ${v.memory}` : "No such memory." }], isError: !v, details: undefined };
+    },
+  });
+
   pi.registerTool({
     name: "memory_delete",
     label: "Memory Delete",
-    description: "Delete a durable memory entry by id.",
-    parameters: Type.Object({
-      id: Type.String(),
-    }),
+    description: "Delete a durable memory by id.",
+    parameters: Type.Object({ id: Type.String() }),
     async execute(_id, params) {
       const ok = await memoryStore.remove((params as { id: string }).id, process.cwd());
-      return { content: [{ type: "text", text: ok ? "Memory entry deleted." : "No such memory entry." }], details: undefined };
+      return { content: [{ type: "text", text: ok ? "Memory deleted." : "No such memory." }], details: undefined };
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_consolidate",
+    label: "Memory Consolidate",
+    description: "Merge near-duplicate memories and prune them now (this also runs automatically on a threshold).",
+    parameters: Type.Object({}),
+    async execute() {
+      const r = await memoryStore.consolidate(process.cwd());
+      return { content: [{ type: "text", text: `Consolidated: removed ${r.removed} duplicate(s), ${r.kept} kept.` }], details: undefined };
     },
   });
 
@@ -360,5 +405,35 @@ export default function (pi: ExtensionAPI) {
       const a = auditDesign(t);
       return { content: [{ type: "text", text: renderAudit(a) }], details: undefined };
     },
+  });
+
+  // ---- AUTONOMOUS memory lifecycle (gated to the main server process via isMemoryAutonomyEnabled,
+  //      so spawned subagents never capture/recall and never churn the shared store) ----
+
+  // Pre-task recall: before each user task, search folder + global memory and inject the most
+  // relevant memories into THIS turn's system prompt (local search — no LLM, sub-second).
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (!isMemoryAutonomyEnabled()) return;
+    try {
+      const { block } = await memoryStore.recall(event.prompt || "", ctx.cwd);
+      if (block) return { systemPrompt: (event.systemPrompt || "") + block };
+    } catch { /* recall is best-effort, never blocks the turn */ }
+  });
+
+  // Post-task capture: after each task completes, extract durable facts from the exchange (mem0's
+  // LLM consolidation). Fire-and-forget so the agent loop is never blocked; then maybe consolidate.
+  pi.on("agent_end", async (event, ctx) => {
+    if (!isMemoryAutonomyEnabled()) return;
+    try {
+      const msgs = (event.messages || []) as Array<{ role?: string; content?: unknown }>;
+      const userText = lastText(msgs, "user");
+      const assistantText = lastText(msgs, "assistant");
+      if (!userText && !assistantText) return;
+      const cwd = ctx.cwd;
+      void memoryStore
+        .captureExchange(userText, assistantText, cwd)
+        .then(() => memoryStore.maybeAutoConsolidate(cwd))
+        .catch(() => { /* best-effort */ });
+    } catch { /* best-effort */ }
   });
 }

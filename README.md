@@ -19,9 +19,11 @@ dotz.exe  (Electron)
  │    src/pi.ts       — PiSessions: owns AgentSession lifecycle, fans events to WS subscribers
  │    src/profiles.ts — 5 operating profiles + bundled .pi loader (injects doctrine + project memory)
  │    src/projects.ts — persistent named workspaces (cwd + profile + model + thinking defaults)
- │    src/memory.ts   — per-project / global memory store, injected into the system prompt
+ │    src/memory.ts   — mem0-backed autonomous memory (on-device; capture/recall/consolidate)
+ │    src/embedder.ts — bundled local transformers.js embedder (all-MiniLM-L6-v2, 384-dim)
+ │    src/memory-graph.ts — on-device entity/relationship graph for recall boost
  │    src/sandbox.ts  — terminal + web sandbox runner with agent-cursor overlay
- │    src/types.ts    — shared types (ModelRef, ProviderMeta, Project, MemoryEntry, SandboxRun)
+ │    src/types.ts    — shared types (ModelRef, ProviderMeta, Project, MemoryView, SandboxRun)
  │    src/server.ts   — Fastify: REST controls + WS event stream + static UI
  │    src/main.ts     — Electron: start server, open BrowserWindow → localhost
  │    .pi/            — bundled agent resources: subagent extension, 4 agents, 3 workflow prompts
@@ -62,10 +64,13 @@ the full UI↔backend contract, and [docs/design-prompt.md](docs/design-prompt.m
   `profile` / `model` / `thinking` settings; sessions created with a `projectId` inherit those
   defaults. Projects survive server restarts, so you can keep one config per codebase and jump back
   into it without re-configuring every session.
-- **Memory** — a per-project (and global) memory store. `MemoryEntry`s are scoped `project` or
-  `global` and are injected into the agent's system prompt at session-build time, so the agent has
-  durable context ("this repo uses pnpm", "never touch `generated/`") without being told again on
-  every turn. Memory persists across restarts alongside projects.
+- **Memory** — an **autonomous, on-device memory** backed by [mem0](https://github.com/mem0ai/mem0).
+  Durable facts (`project` or `global` scope) are **captured automatically** from each task, **recalled
+  automatically** before the next one (semantic search of the folder + global memory, injected into the
+  turn), and **consolidated automatically** — you never manage it. Embeddings run from a bundled local
+  model; the extraction LLM is the same Ollama Cloud chat dotz already uses, so no new key or cloud. A
+  git-committable `MEMORY.md` mirror is the source of truth; the vector index is a derived cache.
+  Memory persists across restarts alongside projects.
 - **Sandbox** — run code in two modes. **`terminal`** mode streams stdout/stderr back into the
   chat. **`web`** mode starts a long-lived process bound to a local HTTP port and the UI renders an
   inline web preview iframe at that port; the agent drives an **agent cursor** over the live
