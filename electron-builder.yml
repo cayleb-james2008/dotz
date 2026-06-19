@@ -14,4 +14,8 @@ files:
   - node_modules/**/*
 win:
   target: portable
+# Update feed for electron-updater. Override at build/publish time or via DOTZ_UPDATE_URL env.
+publish:
+  provider: generic
+  url: https://dotz-releases.example.com
 # icon: assets/dotz.ico

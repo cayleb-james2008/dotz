@@ -10,6 +10,7 @@ import { app, BrowserWindow, shell } from "electron";
 import { buildServer } from "./server";
 import { sandbox } from "./sandbox";
 import * as browser from "./browser";
+import { checkForUpdatesOnLaunch } from "./updater";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.DOTZ_PORT || 4317);
@@ -51,6 +52,9 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  // Check for updates before doing anything else. On portable builds this may quit
+  // and relaunch if an update is ready, keeping the app current on every start.
+  await checkForUpdatesOnLaunch();
   try {
     await startServer();
   } catch (e) {
