@@ -7,15 +7,14 @@
 import { createAgentSession, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { buildResourceLoader, getProfile, PROFILES, profileSummary, type Profile } from "./profiles";
 import { projectStore } from "./projects";
+import { executiveModelRef, getConfig } from "./config";
+import type { ModelRef, ThinkingLevel } from "./types";
 
 export type { AgentSession };
 
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-
-export interface ModelRef {
-  provider: string;
-  modelId: string;
-}
+// ModelRef + ThinkingLevel are defined once in types.ts (the shared leaf). Re-export them here so
+// existing importers of "./pi" (e.g. server.ts) keep resolving them without a second declaration.
+export type { ModelRef, ThinkingLevel };
 
 export interface CreateOpts {
   cwd?: string;
@@ -30,8 +29,8 @@ export interface CreateOpts {
 
 export { PROFILES, profileSummary, type Profile };
 
-/** dotz default: OpenRouter custom model id (Cayleb's preference), a free model. */
-export const DEFAULT_MODEL: ModelRef = { provider: "openrouter", modelId: "nex-agi/nex-n2-pro:free" };
+/** dotz default executive model (single source of truth in types.ts): Ollama Cloud glm-5.2. */
+export { DEFAULT_MODEL } from "./types";
 
 type Listener = (event: unknown) => void;
 
@@ -48,8 +47,9 @@ export class PiSessions {
   private entries = new Map<string, SessionEntry>();
 
   async create(opts: CreateOpts = {}): Promise<SessionEntry> {
-    // If a project is bound, its cwd/profile/model/thinking override the bare opts — the project
-    // is the user's pinned workspace intent, so it wins over ad-hoc defaults.
+    // If a project is bound, it supplies cwd/profile and the DEFAULT model/thinking — the project
+    // is the user's pinned workspace intent, so it wins over ad-hoc defaults. An EXPLICIT opts.model
+    // / opts.thinkingLevel still takes precedence (e.g. reload-context preserving the live selection).
     let cwd = opts.cwd || process.cwd();
     let profileId = opts.profileId;
     let modelRef = opts.model;
@@ -61,8 +61,8 @@ export class PiSessions {
         projectId = project.id;
         cwd = project.cwd;
         profileId = project.profileId;
-        modelRef = project.model;
-        thinkingLevel = project.thinkingLevel;
+        modelRef = opts.model ?? project.model;
+        thinkingLevel = opts.thinkingLevel ?? project.thinkingLevel;
       }
     }
     const profile = getProfile(profileId);
@@ -72,10 +72,12 @@ export class PiSessions {
     const resourceLoader = await buildResourceLoader(cwd, profile, { projectId });
     const { session } = await createAgentSession({ cwd, resourceLoader });
 
-    // A profile pins a default model + thinking level, but an explicit opts override wins
-    // (opts only wins when there is no project binding — project wins by design above).
-    const model = modelRef ?? profile.model;
-    const resolved = session.modelRegistry.find(model.provider, model.modelId);
+    // A project/opts model override wins; otherwise the ad-hoc session starts on the operator's
+    // configured executive model (Ollama Cloud glm-5.2 by default).
+    const model = modelRef ?? executiveModelRef();
+    // resolveModel (not bare registry.find) so a free-form executive id like ollama/glm-5.2
+    // resolves by cloning a provider template — same path the /model endpoint uses.
+    const resolved = resolveModel(session, model);
     if (resolved) {
       try {
         await session.setModel(resolved as Parameters<AgentSession["setModel"]>[0]);
@@ -84,7 +86,7 @@ export class PiSessions {
       }
     }
     if (thinkingLevel && session.supportsThinking()) session.setThinkingLevel(thinkingLevel);
-    else if (session.supportsThinking()) session.setThinkingLevel(profile.thinkingLevel);
+    else if (session.supportsThinking()) session.setThinkingLevel(getConfig().thinkingLevel || profile.thinkingLevel);
     if (opts.tools) session.setActiveToolsByName(opts.tools);
     else if (profile.tools) session.setActiveToolsByName(profile.tools);
 

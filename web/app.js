@@ -35,7 +35,9 @@ const state = {
   projects: [],
   activeProjectId: null,
   providers: [],
-  activeProvider: "openrouter",
+  activeProvider: "ollama",
+  config: null,
+  providerDefaults: {},
   modelCatalog: [],
   memory: [],
   skills: [],
@@ -89,6 +91,7 @@ async function init() {
   loadBrainFloat();
   await loadProfiles();
   await loadProviders();
+  await loadDotzConfig();
   await loadProjects();
   await loadSandboxLanguages();
   showCommandCenter();
@@ -374,6 +377,19 @@ function renderProfilePicker() {
 async function loadProviders() {
   try { const { providers } = await api("/api/providers"); state.providers = providers || []; }
   catch { state.providers = []; }
+}
+
+async function loadDotzConfig() {
+  try {
+    const r = await api("/api/config");
+    state.config = r.config || null;
+    state.providerDefaults = r.providerDefaults || {};
+  } catch { state.config = null; state.providerDefaults = {}; }
+}
+
+async function persistConfig(patch) {
+  try { const r = await post("/api/config", patch); state.config = r.config || state.config; }
+  catch (e) { pushError("config: " + e.message); }
 }
 
 async function loadProjects() {
@@ -794,15 +810,41 @@ async function loadModels() {
   (m.providerMeta || state.providers || []).forEach((p) => {
     const o = el("option", null, p.label || p.id);
     o.value = p.id;
-    if (p.id === state.activeProvider) o.selected = true;
     provSel.appendChild(o);
   });
-  provSel.onchange = () => { state.activeProvider = provSel.value; renderModelInput(); populateModelSuggestions(); };
   updateModelUI(m.current || state.summary.model);
-  state.activeProvider = (m.current && m.current.provider) || "openrouter";
+  state.activeProvider = (m.current && m.current.provider) || (state.config && state.config.provider) || "ollama";
   provSel.value = state.activeProvider;
+  provSel.onchange = () => onProviderChange(provSel.value);
   renderModelInput();
   populateModelSuggestions();
+  syncSubagentInput();
+}
+
+// Switching provider prefills both the executive + subagent model ids with that provider's
+// defaults (the user can then type any id), persists them, and applies the executive model live.
+function onProviderChange(prov) {
+  state.activeProvider = prov;
+  const d = (state.providerDefaults && state.providerDefaults[prov]) || null;
+  if (d) { $("model-input").value = d.executive; const si = $("subagent-input"); if (si) si.value = d.subagent; }
+  renderModelInput();
+  populateModelSuggestions();
+  syncSubagentInput();
+  const patch = { provider: prov };
+  if (d) { patch.executiveModel = d.executive; patch.subagentModel = d.subagent; }
+  persistConfig(patch);
+  if (d) setModel({ provider: prov, modelId: d.executive });
+}
+
+// The SUBAGENT knob: the model every dispersed subagent runs on. Persisted to dotz config,
+// which sets DOTZ_SUBAGENT_MODEL server-side for future subagent spawns.
+function syncSubagentInput() {
+  const input = $("subagent-input");
+  if (!input) return;
+  if (state.config && state.config.subagentModel && !input.value) input.value = state.config.subagentModel;
+  const dl = $("subagent-suggestions");
+  if (dl) { dl.innerHTML = ""; (state.modelCatalog || []).filter((x) => x.provider === state.activeProvider).slice(0, 400).forEach((x) => { const o = el("option"); o.value = x.modelId; dl.appendChild(o); }); }
+  input.onchange = () => { const v = input.value.trim(); if (v) persistConfig({ subagentModel: v, provider: state.activeProvider }); };
 }
 function providerIsFreeForm(id) {
   const meta = (state.providers || []).find((p) => p.id === id);
@@ -832,15 +874,15 @@ function populateModelSuggestions() {
   state.modelCatalog.filter((x) => x.provider === state.activeProvider).slice(0, 400).forEach((x) => { const o = el("option"); o.value = x.modelId; dl.appendChild(o); });
 }
 function updateModelUI(model) {
-  const id = model ? model.modelId : "nex-agi/nex-n2-pro:free";
-  const prov = model ? model.provider : "openrouter";
+  const id = model ? model.modelId : "glm-5.2";
+  const prov = model ? model.provider : "ollama";
   const free = providerIsFreeForm(prov);
   if (free) $("model-input").value = id;
   else $("model-select").value = id;
   const cc = $("cc-model");
   if (cc) cc.textContent = prov + "/" + id;
 }
-async function submitModel() { const id = $("model-input").value.trim(); if (id) await setModel({ provider: state.activeProvider, modelId: id }); }
+async function submitModel() { const id = $("model-input").value.trim(); if (id) { await setModel({ provider: state.activeProvider, modelId: id }); persistConfig({ provider: state.activeProvider, executiveModel: id }); } }
 async function submitModelSelect() { const id = $("model-select").value; if (id) await setModel({ provider: state.activeProvider, modelId: id }); }
 async function setModel(ref) {
   try { const s = await post(`/api/sessions/${state.sessionId}/model`, ref); state.summary = s; updateModelUI(s.model); renderReasoning(s); }
@@ -858,7 +900,7 @@ function renderReasoning(summary) {
     b.disabled = !summary.supportsThinking || !avail.includes(lvl);
     if (lvl === summary.thinkingLevel) b.classList.add("active");
     b.onclick = async () => {
-      try { const r = await post(`/api/sessions/${state.sessionId}/thinking`, { level: lvl }); state.summary = Object.assign({}, state.summary, r); renderReasoning(state.summary); }
+      try { const r = await post(`/api/sessions/${state.sessionId}/thinking`, { level: lvl }); state.summary = Object.assign({}, state.summary, r); renderReasoning(state.summary); persistConfig({ thinkingLevel: lvl }); }
       catch (e) { pushError("thinking: " + e.message); }
     };
     seg.appendChild(b);

@@ -29,4 +29,7 @@ ok(prof.profiles.length === 5, `/api/profiles → ${prof.profiles.length} profil
 
 await app.close();
 console.log("\n" + (fails.length ? `${fails.length} FAIL` : "UI SMOKE PASSED"));
-process.exit(fails.length ? 1 : 0);
+// Let the event loop drain naturally instead of process.exit(): forcing exit here races libuv's
+// handle teardown on Windows (UV_HANDLE_CLOSING assertion → exit 127). app.close() has already
+// released the server handles, so the process exits on its own with the code set below.
+process.exitCode = fails.length ? 1 : 0;

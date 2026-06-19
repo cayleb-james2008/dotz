@@ -13,10 +13,13 @@
  *
  * Cursor interaction model:
  *  The agent (or user) sends cursor events {x, y, action:"move"|"click"|"type", text?} over
- *  the WS. The UI renders a visual cursor at (x,y) over the iframe and, for click/type,
- *  dispatches synthetic DOM events into the iframe so the agent truly controls the frontend.
- *  This is the lean visual bridge — no heavy browser-automation dependency, just coordinate
- *  events + postMessage into the iframe.
+ *  the WS. The UI ALWAYS renders a visual cursor at (x,y) overlaid on the iframe — this works for
+ *  any preview, including cross-origin pages, because the overlay is a dotz-side element, not part
+ *  of the iframe document. For click/type the UI ALSO dispatches synthetic DOM events directly into
+ *  the iframe; that DOM injection is SAME-ORIGIN ONLY — on a cross-origin preview the contentDocument
+ *  access throws a SecurityError, which the renderer catches and skips, so the visual cursor still
+ *  moves but the click/type is a no-op. This is the lean visual bridge — no heavy browser-automation
+ *  dependency, just coordinate events + same-origin DOM dispatch.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
@@ -249,7 +252,8 @@ export class Sandbox {
     return () => ar.listeners.delete(listener);
   }
 
-  /** Emit a cursor event for a run — the UI renders the agent's cursor at (x,y) over the iframe. */
+  /** Emit a cursor event for a run. The UI always renders the visual cursor at (x,y) over the
+   *  iframe (works cross-origin); click/type DOM injection into the iframe is same-origin only. */
   cursor(runId: string, x: number, y: number, action: "move" | "click" | "type", text?: string): void {
     const ar = this.active.get(runId);
     if (!ar) return;

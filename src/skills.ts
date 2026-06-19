@@ -29,20 +29,30 @@ import type { Skill } from "./types";
 
 const DOTZ_PI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".pi");
 
-/** Ordered scan roots. Later entries win on name-collision (see dedupe note above — we reverse). */
-const SCAN_ROOTS: Array<{ dir: string; source: Skill["source"] }> = [
-  // lowest priority first (so higher priority overwrites in the map)
-  { dir: path.join(os.homedir(), ".hermes", "skills"), source: "hermes" },
-  {
-    dir: path.join(os.homedir(), ".codex", "plugins", "cache", "openai-curated", "superpowers"),
-    source: "superpowers",
-  },
-  { dir: path.join(os.homedir(), ".codex", "marketplaces", "ecc-local", "plugins", "ecc", "skills"), source: "ecc" },
-  { dir: path.join(os.homedir(), ".codex", "skills"), source: "codex" },
-  { dir: path.join(os.homedir(), ".claude", "skills"), source: "claude" },
-  { dir: path.join(os.homedir(), ".config", "opencode", "skills"), source: "opencode" },
-  { dir: path.join(DOTZ_PI, "skills"), source: "dotz" },
-];
+/** Max skills listed in the system-prompt index (overflow is summarized; full pool via /api/skills). */
+const INDEX_CAP = 80;
+
+/** Ordered scan roots (lowest priority first, so higher-priority pools overwrite in the map).
+ *  Computed per load() so the DOTZ_SKILLS_PATHS override is read fresh from the environment. */
+function scanRoots(): Array<{ dir: string; source: Skill["source"] }> {
+  const roots: Array<{ dir: string; source: Skill["source"] }> = [
+    { dir: path.join(os.homedir(), ".hermes", "skills"), source: "hermes" },
+    {
+      dir: path.join(os.homedir(), ".codex", "plugins", "cache", "openai-curated", "superpowers"),
+      source: "superpowers",
+    },
+    { dir: path.join(os.homedir(), ".codex", "marketplaces", "ecc-local", "plugins", "ecc", "skills"), source: "ecc" },
+    { dir: path.join(os.homedir(), ".codex", "skills"), source: "codex" },
+    { dir: path.join(os.homedir(), ".claude", "skills"), source: "claude" },
+    { dir: path.join(os.homedir(), ".config", "opencode", "skills"), source: "opencode" },
+    { dir: path.join(DOTZ_PI, "skills"), source: "dotz" },
+  ];
+  // Operator override: DOTZ_SKILLS_PATHS=dir1<sep>dir2 (path.delimiter). Each existing dir is
+  // appended at the end (highest priority) so custom skill pools win over the built-in roots.
+  const extra = (process.env.DOTZ_SKILLS_PATHS || "").split(path.delimiter).map((d) => d.trim()).filter(Boolean);
+  for (const dir of extra) if (existsSync(dir)) roots.push({ dir, source: "dotz" });
+  return roots;
+}
 
 const HOST_PLATFORM = (() => {
   switch (process.platform) {
@@ -181,7 +191,7 @@ export class SkillLoader {
   async load(): Promise<void> {
     if (this.loaded) return;
     const all: Skill[] = [];
-    for (const root of SCAN_ROOTS) {
+    for (const root of scanRoots()) {
       const files = await findSkillFiles(root.dir);
       for (const f of files) {
         const s = await parseSkillFile(f, root.source);
@@ -222,12 +232,19 @@ export class SkillLoader {
     }
   }
 
-  /** Render a compact name+description index for system-prompt injection. */
+  /** Render a compact name+description index for system-prompt injection. Capped at INDEX_CAP
+   *  entries so a large skill pool doesn't bloat the system prompt; the overflow is summarized in
+   *  a footer (the agent can still load any skill by name via the `skill` tool). */
   renderIndex(): string {
     const skills = this.list();
     if (skills.length === 0) return "";
-    const lines = skills.map((s) => `- ${s.name}: ${s.description.slice(0, 160)}`);
-    return `\n# dotz unified skill index (${skills.length} skills)\nInvoke a skill's full instructions by calling the \`skill\` tool with its name. Skills are auto-discovered from opencode, claude, codex, ecc, superpowers, hermes, and bundled .pi pools.\n${lines.join("\n")}\n`;
+    const shown = skills.slice(0, INDEX_CAP);
+    const lines = shown.map((s) => `- ${s.name}: ${s.description.slice(0, 160)}`);
+    if (skills.length > INDEX_CAP) {
+      lines.push(`- …and ${skills.length - INDEX_CAP} more — call the \`skill\` tool by name, or GET /api/skills to browse/filter the full pool.`);
+    }
+    const heading = skills.length > INDEX_CAP ? `${skills.length} skills, showing first ${INDEX_CAP}` : `${skills.length} skills`;
+    return `\n# dotz unified skill index (${heading})\nInvoke a skill's full instructions by calling the \`skill\` tool with its name. Skills are auto-discovered from opencode, claude, codex, ecc, superpowers, hermes, and bundled .pi pools.\n${lines.join("\n")}\n`;
   }
 
   invalidate(): void {

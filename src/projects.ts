@@ -9,7 +9,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import type { Project, ModelRef, ThinkingLevel } from "./types";
+import { DEFAULT_MODEL, type Project, type ModelRef, type ThinkingLevel } from "./types";
 
 const DOTZ_DIR = path.join(os.homedir(), ".dotz");
 const PROJECTS_FILE = path.join(DOTZ_DIR, "projects.json");
@@ -56,7 +56,7 @@ export class ProjectStore {
       name: input.name,
       cwd: input.cwd,
       profileId: input.profileId || "workflow",
-      model: input.model || { provider: "openrouter", modelId: "nex-agi/nex-n2-pro:free" },
+      model: input.model || DEFAULT_MODEL,
       thinkingLevel: input.thinkingLevel || "high",
       createdAt: now,
       updatedAt: now,

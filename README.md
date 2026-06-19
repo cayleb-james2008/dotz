@@ -78,8 +78,16 @@ the full UI↔backend contract, and [docs/design-prompt.md](docs/design-prompt.m
 npm install
 ```
 
-dotz uses pi's normal auth resolution (`~/.pi/agent/auth.json` → env vars). Provide a working
-provider key, e.g. `ANTHROPIC_API_KEY` or `OPENROUTER_API_KEY`, before running live turns.
+dotz uses pi's normal auth resolution (`~/.pi/agent/auth.json` → env vars). Set keys for the
+providers you use — **Ollama Cloud** is the primary (executive `glm-5.2`, subagent `minimax-m3`)
+and **OpenRouter** is the free fallback (`nex-agi/nex-n2-pro:free`):
+
+```bash
+OLLAMA_API_KEY=...        # primary — Ollama Cloud
+OPENROUTER_API_KEY=...    # fallback — OpenRouter :free models
+```
+
+See [.env.example](.env.example). Never commit real keys.
 
 ## Run
 
@@ -116,8 +124,9 @@ Dev builds (`npm run dev:server`, `npm run electron`) skip the update check.
 ## Notes & caveats
 
 - **Multi-provider auth**: dotz uses pi's normal auth resolution (`~/.pi/agent/auth.json` → env
-  vars). Provide a working provider key for whichever provider you select (e.g.
-  `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`). **OpenRouter credits**: provider errors surface
+  vars). Provide a working provider key for whichever provider you select — **Ollama Cloud**
+  (`OLLAMA_API_KEY`, the primary: executive `glm-5.2`, subagent `minimax-m3`) or **OpenRouter**
+  (`OPENROUTER_API_KEY`, the free fallback). **OpenRouter credits**: provider errors surface
   in-chat (e.g. `402 … can only afford N tokens`). Use `:free` models (the default
   `nex-agi/nex-n2-pro:free`) when the account balance is low.
 - **Subagents** spawn separate `pi` processes (each an LLM run); the bundled agents default to the
