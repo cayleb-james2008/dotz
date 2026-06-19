@@ -126,6 +126,14 @@ export interface WorkflowStep {
   error?: string;
   /** Usage stats from the subagent run. */
   usage?: { input?: number; output?: number; cost?: number; turns?: number };
+  /** Sandbox run attached to this step (e.g. code execution produced by the agent). */
+  sandboxRunId?: string | null;
+  /** Browser session attached to this step (e.g. in-app browser used by the agent). */
+  browserSessionId?: string | null;
+  /** Tool call IDs produced by this step (some subagent extensions emit these). */
+  toolCallIds?: string[];
+  /** Agentic reasoning / chain-of-thought captured for this step. */
+  thinking?: string;
   startedAt?: number;
   endedAt?: number;
 }

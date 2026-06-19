@@ -25,7 +25,7 @@ type WorkflowListener = (runId: string, event: WorkflowEvent) => void;
 export type WorkflowEvent =
   | { type: "workflow_start"; run: WorkflowRun }
   | { type: "workflow_end"; run: WorkflowRun }
-  | { type: "step_state"; stepId: string; status: WorkflowStep["status"]; output?: string; error?: string; usage?: WorkflowStep["usage"] }
+  | { type: "step_state"; stepId: string; status: WorkflowStep["status"]; output?: string; error?: string; usage?: WorkflowStep["usage"]; sandboxRunId?: string | null; browserSessionId?: string | null; toolCallIds?: string[]; thinking?: string }
   | { type: "step_added"; step: WorkflowStep };
 
 async function ensureDir() {
@@ -51,6 +51,10 @@ export interface CreateStepInput {
   task: string;
   parents?: string[];
   batch?: string;
+  sandboxRunId?: string | null;
+  browserSessionId?: string | null;
+  toolCallIds?: string[];
+  thinking?: string;
 }
 
 export class WorkflowStore {
@@ -89,6 +93,10 @@ export class WorkflowStore {
       parents: s.parents ?? [],
       children: [],
       batch: s.batch,
+      sandboxRunId: s.sandboxRunId,
+      browserSessionId: s.browserSessionId,
+      toolCallIds: s.toolCallIds,
+      thinking: s.thinking,
     }));
     // resolve children from parents
     for (const step of steps) {
@@ -141,7 +149,7 @@ export class WorkflowStore {
   async stepState(
     runId: string,
     stepId: string,
-    patch: Partial<Pick<WorkflowStep, "status" | "output" | "error" | "usage">>
+    patch: Partial<Pick<WorkflowStep, "status" | "output" | "error" | "usage" | "sandboxRunId" | "browserSessionId" | "toolCallIds" | "thinking">>
   ): Promise<void> {
     const run = this.active.get(runId);
     if (!run) return;
@@ -151,10 +159,14 @@ export class WorkflowStore {
     if (patch.output !== undefined) step.output = patch.output;
     if (patch.error !== undefined) step.error = patch.error;
     if (patch.usage !== undefined) step.usage = patch.usage;
+    if (patch.sandboxRunId !== undefined) step.sandboxRunId = patch.sandboxRunId;
+    if (patch.browserSessionId !== undefined) step.browserSessionId = patch.browserSessionId;
+    if (patch.toolCallIds !== undefined) step.toolCallIds = patch.toolCallIds;
+    if (patch.thinking !== undefined) step.thinking = patch.thinking;
     if (step.status === "running" && !step.startedAt) step.startedAt = Date.now();
     if ((step.status === "done" || step.status === "error") && !step.endedAt) step.endedAt = Date.now();
     run.updatedAt = Date.now();
-    this.emit(runId, { type: "step_state", stepId, status: step.status, output: step.output, error: step.error, usage: step.usage });
+    this.emit(runId, { type: "step_state", stepId, status: step.status, output: step.output, error: step.error, usage: step.usage, sandboxRunId: step.sandboxRunId, browserSessionId: step.browserSessionId, toolCallIds: step.toolCallIds, thinking: step.thinking });
 
     // propagate readiness: when all parents done, pending → ready
     if (step.status === "done") {

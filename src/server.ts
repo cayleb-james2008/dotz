@@ -4,6 +4,7 @@
  * session creation, controls, projects, memory, and sandbox runs.
  */
 import path from "node:path";
+import fs from "node:fs/promises";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import Fastify, { type FastifyInstance } from "fastify";
@@ -36,6 +37,26 @@ const HOST = "127.0.0.1";
 const PORT = Number(process.env.DOTZ_PORT || 4317);
 const SELF = fileURLToPath(import.meta.url);
 const WEB_DIR = path.resolve(path.dirname(SELF), "../web");
+const FILE_TREE_MAX_DEPTH = 3;
+
+/** Recursive, depth-limited file tree used by `GET /api/projects/:id/files`. */
+async function buildFileTree(cwd: string, depth = 0): Promise<Array<{ path: string; type: "file" | "dir"; children?: unknown }>> {
+  if (depth >= FILE_TREE_MAX_DEPTH) return [];
+  const entries = await fs.readdir(cwd, { withFileTypes: true }).catch(() => [] as import("node:fs").Dirent[]);
+  const result: Array<{ path: string; type: "file" | "dir"; children?: unknown }> = [];
+  for (const ent of entries) {
+    const name = ent.name;
+    if (name === "node_modules" || name === ".git") continue;
+    const full = path.join(cwd, name);
+    if (ent.isDirectory()) {
+      const children = await buildFileTree(full, depth + 1);
+      result.push({ path: full, type: "dir", children });
+    } else if (ent.isFile() || ent.isSymbolicLink()) {
+      result.push({ path: full, type: "file" });
+    }
+  }
+  return result;
+}
 
 /** Public-facing snapshot of a session's control state. */
 function sessionSummary(id: string, s: AgentSession, profileId?: string | null, projectId?: string | null) {
@@ -95,6 +116,11 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     return p;
   });
   app.delete("/api/projects/:id", async (req) => ({ ok: await projectStore.remove((req.params as { id: string }).id) }));
+  app.get("/api/projects/:id/files", async (req, reply) => {
+    const p = await projectStore.get((req.params as { id: string }).id);
+    if (!p) { reply.code(404).send({ error: "no such project" }); return; }
+    return { tree: await buildFileTree(p.cwd) };
+  });
 
   // ---- memory ----
   app.get("/api/memory", async (req) => {

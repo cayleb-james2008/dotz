@@ -49,8 +49,11 @@ Session summary `= { sessionId, profileId:string|null, projectId:string|null, mo
 | GET | `/api/projects/:id` | — | `Project` |
 | PATCH | `/api/projects/:id` | partial `Project` | `Project` |
 | DELETE | `/api/projects/:id` | — | `{ ok }` |
+| GET | `/api/projects/:id/files` | — | `{ tree: FileTreeNode[] }` |
 
 `Project = { id, name, cwd, profileId, model:ModelRef, thinkingLevel, createdAt, updatedAt }`.
+`FileTreeNode = { path, type:"file"|"dir", children?:FileTreeNode[] }`. The tree is recursive to a
+maximum depth of 3 and skips `node_modules` and `.git`. Paths are absolute on the server.
 A project is a **persistent named workspace** (cwd + profile + model + thinking defaults) that
 survives server restarts. Sessions created with `projectId` inherit the project's `cwd`,
 `profileId`, `model`, and `thinkingLevel` unless overridden on `POST /api/sessions`.
@@ -81,6 +84,18 @@ again.
 | POST | `/api/sandbox/runs/:id/kill` | — | `{ ok }` |
 | GET | `/api/sandbox/runs/:id/port` | — | `{ port }` (404 if no web port) |
 
+### In-app browser (Electron only; no-ops in browser dev mode)
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/api/browser/state` | — | browser state object |
+| POST | `/api/browser/navigate` | `{ url }` | browser state object |
+| POST | `/api/browser/back` | — | browser state object |
+| POST | `/api/browser/forward` | — | browser state object |
+| POST | `/api/browser/reload` | — | browser state object |
+| GET | `/api/browser/screenshot` | — | `{ dataUrl }` |
+| POST | `/api/browser/eval` | `{ js }` | `{ result }` |
+
 `SandboxRun = { id, projectId, language, code, status:"pending"|"running"|"done"|"error"|"killed", output, exitCode, startedAt, endedAt }`.
 `mode:"terminal"` runs the code as a plain process (stdout/stderr streamed back). `mode:"web"`
 starts a long-lived process bound to a local port and returns that port via `.../port` and the
@@ -90,17 +105,21 @@ cursor over it.
 ## WebSocket
 
 **Client → server:** `{ kind:"prompt"|"steer"|"followUp"|"abort", text? }`
-(during streaming, a `prompt` is auto-queued as a follow-up). Sandbox control messages:
+(during streaming, a `prompt` is auto-queued as a follow-up). Human-gate and sandbox control messages:
 
 - `{ kind:"sandbox.start", language, code, mode:"terminal"|"web", projectId?, timeoutMs? }`
   — start a sandbox run (equivalent to `POST /api/sandbox/runs`).
 - `{ kind:"sandbox.kill", runId }` — terminate a running sandbox.
 - `{ kind:"sandbox.cursor", runId, x, y, action:"move"|"click"|"type", cursorText? }` — drive the
   agent cursor over a `mode:"web"` run's preview (move, click, or type at `(x, y)`).
+- `{ kind:"gate.approve", gateId, feedback? }` / `{ kind:"gate.reject", gateId, feedback? }` —
+  approve or reject a pending `human_gate` request.
 
 **Server → client:** `{ kind:"ready", sessionId }` | `{ kind:"error", error }` |
 `{ kind:"event", sessionId, event }` where `event` is a pi AgentSession event |
-`{ kind:"sandbox", sessionId, event }` where `event` is a sandbox event (below).
+`{ kind:"sandbox", sessionId, event }` where `event` is a sandbox event (below) |
+`{ kind:"workflow", sessionId, runId, event }` where `event` is a workflow event |
+`{ kind:"gate", gateId, plan }` where `plan` is the human-gate plan text.
 
 ### Sandbox event types (server → client, inside `{ kind:"sandbox", sessionId, event }`)
 
@@ -128,6 +147,23 @@ cursor over it.
 - `tool_execution_end` — `{ toolCallId, toolName, result:{content:[{type:"text",text}]}, isError }`.
 - `queue_update` — `{ steering:string[], followUp:string[] }` (pending-message badges).
 - `thinking_level_changed` / `session_info_changed` — reflect control state.
+
+### Workflow events (server → client, inside `{ kind:"workflow", sessionId, runId, event }`)
+
+- `workflow_start` — `{ type, run:WorkflowRun }`.
+- `workflow_end` — `{ type, run:WorkflowRun }`.
+- `step_added` — `{ type, step:WorkflowStep }`.
+- `step_state` — `{ type, stepId, status, output?, error?, usage?, sandboxRunId?, browserSessionId?, toolCallIds?, thinking? }`.
+
+`WorkflowStep = { id, agent, task, status:"pending"|"ready"|"running"|"done"|"error"|"skipped", parents, children, batch?, output?, error?, usage?, sandboxRunId?, browserSessionId?, toolCallIds?, thinking?, startedAt?, endedAt? }`.
+
+### Gate events (server ↔ client, human approval)
+
+- Server → client: `{ kind:"gate", gateId, plan }` — emitted when the agent calls the `human_gate`
+  tool. The UI should render an approval card showing `plan` and buttons to approve/reject.
+- Client → server: `{ kind:"gate.approve", gateId, feedback? }` or
+  `{ kind:"gate.reject", gateId, feedback? }` — resolves the awaiting `human_gate` call. Optional
+  `feedback` is passed back to the agent as the user's response.
 
 ### Content block shapes (in `message.content` / `partial.content`)
 
