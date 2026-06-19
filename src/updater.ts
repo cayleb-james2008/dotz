@@ -1,71 +1,78 @@
 /**
- * dotz auto-updater — user-controlled updates for the packaged Electron app.
+ * dotz source-rebuild updater — keeps dotz a single PORTABLE exe but updates it by
+ * git pull + rebuild + relaunch (NOT electron-updater, which cannot self-replace a
+ * running portable exe).
  *
- * On launch:
- *   - checks the configured generic feed (DOTZ_UPDATE_URL, package.json, or electron-builder.yml)
- *   - if an update is available, sends an IPC event to the renderer so the UI can show a popup
- *     with three choices:
- *       1. "Download now" — download in background, then prompt to install once ready.
- *       2. "Later" — dismiss popup; the update will auto-install on the next launch.
- *       3. "Settings" — opens the app settings where a manual "Check for updates" button lives.
+ * Model (operator's chosen update model — same as the other source-rebuild updaters):
+ *   - The machine has the dotz source repo + node/npm present.
+ *   - CHECK  = `git fetch` then count commits HEAD..origin/<branch> and detect a dirty
+ *              tree (which would block an ff pull). Surfaced to the renderer as
+ *              "update available" with behind-count + short sha.
+ *   - APPLY  = spawn a DETACHED helper (.bat) that waits for this app to exit, runs
+ *              `git pull --ff-only` + the portable rebuild npm script, then relaunches
+ *              the freshly-built portable exe. The helper is detached so the rebuild +
+ *              swap survive this process quitting (the exe being rebuilt may be the very
+ *              file that is running).
  *
- * Dev builds never check for updates. If no feed is configured, the app starts normally.
+ * Dev builds (unpackaged) still run the git check so the UI is exercisable, but APPLY
+ * relaunches `electron .` via the rebuild rather than a portable exe.
+ *
+ * The renderer UI (CHECK FOR UPDATES button + UPDATE AVAILABLE card) is unchanged; this
+ * module only changes what each control does. IPC channel is the same: "dotz-update-status".
  */
 import process from "node:process";
 import path from "node:path";
 import fs from "node:fs";
-import { app, dialog, ipcMain, BrowserWindow } from "electron";
-import pkg from "electron-updater";
-import type { UpdateInfo } from "electron-updater";
+import os from "node:os";
+import { spawn, execFile } from "node:child_process";
+import { app, ipcMain, BrowserWindow } from "electron";
+import { checkForUpdate, buildHelperScript, type GitRunner } from "./updater-core";
 
-const { autoUpdater } = pkg;
+export { checkForUpdate, buildHelperScript } from "./updater-core";
 
-const UPDATE_FEED_ENV = process.env.DOTZ_UPDATE_URL || "";
 const IS_DEV = !app.isPackaged;
-const IS_PORTABLE = process.env.PORTABLE_EXECUTABLE_DIR != null;
+/** Portable exe sets PORTABLE_EXECUTABLE_DIR; in dev there is no portable exe. */
+const PORTABLE_DIR = process.env.PORTABLE_EXECUTABLE_DIR || null;
+/** npm script that produces a fresh portable exe (build + portable-only electron-builder). */
+const REBUILD_SCRIPT = "dist:portable";
 
 let mainWindow: BrowserWindow | null = null;
 let checking = false;
-let downloadStarted = false;
-let pendingUpdate: UpdateInfo | null = null;
-let downloadPercent = 0;
-let eventsAttached = false;
-let errorEventFired = false;
-
-/** Resolve the update server config from env/package.json. */
-function resolveFeed(): string | undefined {
-  if (UPDATE_FEED_ENV) return UPDATE_FEED_ENV;
-  try {
-    const pkgPath = process.resourcesPath
-      ? path.join(process.resourcesPath, "app", "package.json")
-      : path.resolve("./package.json");
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-    const pub = pkg.build?.publish;
-    if (typeof pub === "string") return pub;
-    if (pub && pub.url) return pub.url;
-    if (pub && pub.provider === "github") return "github";
-    if (Array.isArray(pub)) {
-      const first = pub.find((p: any) => p.url);
-      if (first) return first.url;
-      if (pub.some((p: any) => p.provider === "github")) return "github";
-    }
-  } catch {
-    /* ignore */
-  }
-  return undefined;
-}
+let applying = false;
+/** Cached result of the last successful check, so APPLY knows there is something to do. */
+let lastCheck: { behind: number; localSha: string; remoteSha: string; dirty: boolean } | null = null;
 
 /** Current app version, falling back to package.json in dev. */
 export function getAppVersion(): string {
   try {
     if (app.isPackaged) return app.getVersion();
-    const pkgPath = process.resourcesPath
-      ? path.join(process.resourcesPath, "app", "package.json")
-      : path.resolve("./package.json");
-    return JSON.parse(fs.readFileSync(pkgPath, "utf-8")).version || "0.0.0";
+    return JSON.parse(fs.readFileSync(path.resolve("./package.json"), "utf-8")).version || "0.0.0";
   } catch {
     return "0.0.0";
   }
+}
+
+/**
+ * Resolve the dotz source repo dir (the git checkout to pull + rebuild).
+ *   1. DOTZ_REPO_DIR env override.
+ *   2. Walk up from the running exe / app dir until a `.git` entry is found
+ *      (portable exe lives in <repo>/release/, dev runs from <repo>).
+ */
+export function resolveRepoDir(): string | null {
+  const override = process.env.DOTZ_REPO_DIR;
+  if (override && fs.existsSync(path.join(override, ".git"))) return override;
+  const start = PORTABLE_DIR || path.dirname(process.execPath);
+  const candidates = [start, app.getAppPath(), process.cwd()];
+  for (const c of candidates) {
+    let dir = c;
+    for (let i = 0; i < 8 && dir; i++) {
+      if (fs.existsSync(path.join(dir, ".git"))) return dir;
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  return null;
 }
 
 function sendToRenderer(status: string, data?: any) {
@@ -74,161 +81,111 @@ function sendToRenderer(status: string, data?: any) {
   }
 }
 
-function attachUpdaterEvents() {
-  if (eventsAttached) return;
-  eventsAttached = true;
-  autoUpdater.on("checking-for-update", () => {
-    sendToRenderer("checked", { phase: "checking", currentVersion: getAppVersion(), portable: IS_PORTABLE });
-  });
-  autoUpdater.on("update-available", (info) => {
-    pendingUpdate = info;
-    sendToRenderer("checked", { phase: "available", version: info.version, currentVersion: getAppVersion(), portable: IS_PORTABLE });
-    sendToRenderer("available", { version: info.version, currentVersion: getAppVersion(), notes: info.releaseNotes,
-      portable: IS_PORTABLE, manual: IS_PORTABLE });
-  });
-
-  autoUpdater.on("update-not-available", () => {
-    sendToRenderer("checked", { phase: "current", currentVersion: getAppVersion(), portable: IS_PORTABLE });
-    sendToRenderer("not-available", { currentVersion: getAppVersion(), portable: IS_PORTABLE });
-  });
-
-  autoUpdater.on("download-progress", (p) => {
-    downloadPercent = p.percent;
-    sendToRenderer("downloading", { percent: Math.round(p.percent), bytesPerSecond: p.bytesPerSecond });
-  });
-
-  autoUpdater.on("update-downloaded", (info) => {
-    pendingUpdate = info;
-    sendToRenderer("downloaded", { version: info.version });
-    sendToRenderer("ready", { version: info.version });
-  });
-
-  autoUpdater.on("error", (err) => {
-    errorEventFired = true;
-    sendToRenderer("failed", { message: err.message });
-  });
+/** Build a repo-bound git runner via child_process; never throws — resolves { code, stdout, stderr }. */
+function makeGit(repo: string): GitRunner {
+  return (args: string[]) =>
+    new Promise((resolve) => {
+      execFile("git", args, { cwd: repo, windowsHide: true }, (err, stdout, stderr) => {
+        const code = err && typeof (err as any).code === "number" ? (err as any).code : err ? 1 : 0;
+        resolve({ code, stdout: stdout?.toString() ?? "", stderr: stderr?.toString() ?? "" });
+      });
+    });
 }
 
-function configureUpdater(feed: string): void {
-  autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = !IS_PORTABLE;
-  if (feed !== "github") autoUpdater.setFeedURL({ url: feed, provider: "generic" as any });
-}
-
-/** Start an update check. Call once the main window exists. */
-export async function checkForUpdatesOnLaunch(win: BrowserWindow): Promise<void> {
-  mainWindow = win;
-  if (IS_DEV) {
-    console.log("dotz updater: skipped in dev build");
-    return;
-  }
+/** Run a git check and surface the result to the renderer via the update status channel. */
+export async function runUpdateCheck(): Promise<void> {
   if (checking) return;
-  const feed = resolveFeed();
-  if (!feed) {
-    console.log("dotz updater: no feed configured");
-    return;
-  }
   checking = true;
-  downloadStarted = false;
-  errorEventFired = false;
   try {
-    attachUpdaterEvents();
-    configureUpdater(feed);
-    await autoUpdater.checkForUpdates();
-  } catch (e) {
-    // A thrown/failed check (network down, bad feed) must surface to the renderer so the UI can
-    // show a stale/failed indicator instead of appearing to silently succeed — but only if the
-    // autoUpdater "error" event didn't already report it (electron-updater commonly both emits
-    // "error" AND rejects the promise for the same failure).
-    if (!errorEventFired) sendToRenderer("failed", { message: String((e as Error)?.message ?? e) });
+    sendToRenderer("checked", { phase: "checking", currentVersion: getAppVersion() });
+    const repo = resolveRepoDir();
+    if (!repo) {
+      sendToRenderer("failed", { message: "dotz source repo not found (set DOTZ_REPO_DIR)." });
+      return;
+    }
+    const res = await checkForUpdate(makeGit(repo));
+    if (!res.ok) {
+      sendToRenderer("failed", { message: res.error || "update check failed" });
+      return;
+    }
+    lastCheck = { behind: res.behind, localSha: res.localSha, remoteSha: res.remoteSha, dirty: res.dirty };
+    if (res.behind > 0) {
+      sendToRenderer("available", {
+        behind: res.behind,
+        localSha: res.localSha,
+        remoteSha: res.remoteSha,
+        dirty: res.dirty,
+        currentVersion: getAppVersion(),
+      });
+    } else {
+      sendToRenderer("not-available", { currentVersion: getAppVersion(), localSha: res.localSha });
+    }
   } finally {
     checking = false;
   }
 }
 
-/** Download the discovered update. */
-export async function downloadUpdate(): Promise<void> {
-  if (IS_DEV || downloadStarted) return;
-  if (IS_PORTABLE) {
-    sendToRenderer("deferred", { portable: true, message: "Portable builds update manually from GitHub Releases." });
+/**
+ * APPLY: write the detached helper, spawn it detached, then signal the renderer and quit.
+ * The helper waits for this process to exit before pulling/rebuilding so the running exe
+ * (which may be the file being overwritten) is free.
+ */
+export async function applyUpdate(): Promise<void> {
+  if (applying) return;
+  applying = true;
+  const repo = resolveRepoDir();
+  if (!repo) {
+    sendToRenderer("failed", { message: "dotz source repo not found (set DOTZ_REPO_DIR)." });
+    applying = false;
     return;
   }
-  const feed = resolveFeed();
-  if (!feed) return;
-  downloadStarted = true;
-  try {
-    configureUpdater(feed);
-    await autoUpdater.downloadUpdate();
-  } catch (e) {
-    downloadStarted = false;
-    sendToRenderer("failed", { message: (e as Error).message });
-  }
-}
-
-/** Install a downloaded update and restart. */
-export function installUpdate(): void {
-  if (IS_DEV || !pendingUpdate) return;
-  if (IS_PORTABLE) {
-    sendToRenderer("deferred", { portable: true, message: "Portable builds cannot install updates automatically." });
+  if (lastCheck?.dirty) {
+    sendToRenderer("failed", {
+      message: "local source tree has uncommitted changes — commit/stash them before updating.",
+    });
+    applying = false;
     return;
   }
-  autoUpdater.quitAndInstall(false, true);
-}
-
-export function deferUpdate(): void {
-  sendToRenderer("deferred", {
-    version: pendingUpdate?.version,
-    portable: IS_PORTABLE,
-    message: IS_PORTABLE ? "Portable builds update manually from GitHub Releases." : "Update deferred until app exit.",
+  const helperPath = path.join(os.tmpdir(), `dotz-update-${Date.now()}.bat`);
+  const script = buildHelperScript({
+    repo,
+    pid: process.pid,
+    exePath: process.execPath,
+    rebuildScript: REBUILD_SCRIPT,
+    isPackaged: app.isPackaged,
   });
+  try {
+    fs.writeFileSync(helperPath, script, "utf-8");
+  } catch (e) {
+    sendToRenderer("failed", { message: `could not write updater helper: ${(e as Error).message}` });
+    applying = false;
+    return;
+  }
+  sendToRenderer("applying", { remoteSha: lastCheck?.remoteSha, behind: lastCheck?.behind });
+  // Detach the helper so it outlives this app; a new console hosts the build output.
+  const child = spawn("cmd.exe", ["/c", "start", '""', "cmd", "/c", helperPath], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore",
+    windowsHide: false, // user-facing build progress window
+  });
+  child.unref();
+  // Give the helper a moment to start watching our pid, then quit so it can swap the exe.
+  setTimeout(() => app.quit(), 400);
 }
 
-/** Manual check invoked from settings. */
-export async function manualUpdateCheck(parentWindow?: BrowserWindow): Promise<void> {
-  if (IS_DEV) {
-    dialog.showMessageBox(parentWindow || (mainWindow ?? undefined)!, {
-      type: "info",
-      title: "dotz updater",
-      message: "Updates are not checked in development builds.",
-    });
-    return;
-  }
-  const feed = resolveFeed();
-  if (!feed) {
-    dialog.showMessageBox(parentWindow || (mainWindow ?? undefined)!, {
-      type: "warning",
-      title: "dotz updater",
-      message: "No update feed is configured. Set DOTZ_UPDATE_URL or package.json build.publish.",
-    });
-    return;
-  }
-  try {
-    attachUpdaterEvents();
-    configureUpdater(feed);
-    await autoUpdater.checkForUpdates();
-  } catch (e) {
-    dialog.showErrorBox("dotz updater", (e as Error).message);
-  }
+/** Start an update check on launch (background). Call once the main window exists. */
+export async function checkForUpdatesOnLaunch(win: BrowserWindow): Promise<void> {
+  mainWindow = win;
+  await runUpdateCheck();
 }
 
 /** Wire IPC handlers for renderer-driven updater actions. */
 export function wireUpdaterIpc() {
-  ipcMain.on("dotz-update-download", () => {
-    downloadUpdate();
-  });
   ipcMain.on("dotz-update-check", () => {
-    manualUpdateCheck(mainWindow ?? undefined);
+    runUpdateCheck();
   });
-  ipcMain.on("dotz-update-install", () => {
-    installUpdate();
+  ipcMain.on("dotz-update-apply", () => {
+    applyUpdate();
   });
-  ipcMain.on("dotz-update-defer", () => {
-    deferUpdate();
-  });
-}
-
-/** Called by main.ts to defer install to the next launch (silent fallback). */
-export function enableInstallOnQuit(): void {
-  if (IS_DEV || IS_PORTABLE) return;
-  autoUpdater.autoInstallOnAppQuit = true;
 }
