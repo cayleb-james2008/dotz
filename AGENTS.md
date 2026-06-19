@@ -41,14 +41,24 @@ resolves the `{provider, modelId}` pair per provider; `src/types.ts` carries the
 
 `src/projects.ts` is the **persistent projects layer**: each `Project` binds a name, a `cwd`, and
 default `profileId` / `model` / `thinkingLevel`. Sessions created with a `projectId` inherit those
-defaults. `src/memory.ts` is the **memory store**: `MemoryEntry`s are scoped `project` or `global`
-and are injected into the agent's system prompt at session-build time via the project's
-`buildResourceLoader`, so the agent sees durable notes without re-prompting. Storage lives under the
-`.ai-agents` namespace: `~/.dotz/ai-agents/memory.json` (global) + `<cwd>/.ai-agents/memory.json`
-(project). AGENTS.md files (project root + global `~/.config/opencode/AGENTS.md`) are the **doctrine**
-layer — read by `buildResourceLoader`, written by the agent via the `agents_md` tool. Memory entries
-are the **knowledge** layer — structured, agent-curated. Don't blur them. Both persist across
-server restarts.
+defaults. `src/memory.ts` is the **memory store**, now backed by **mem0** (self-hosted OSS, fully
+on-device): one embedded mem0 `Memory` under `~/.dotz/ai-agents/mem0/` (sqlite vector + history via
+`better-sqlite3`), with embeddings from a **bundled local transformers.js model** (`src/embedder.ts`,
+all-MiniLM-L6-v2, 384-dim) injected in-process, and mem0's fact-extraction/consolidation LLM pointed
+at the SAME Ollama Cloud chat dotz already uses (no new SaaS/key). Scope is partitioned by mem0
+`userId` (`__global__` vs `proj:<cwd>`); typed-memory `category`, `folder`, and a timestamp live in
+mem0 metadata. The git-committable **source of truth is `MEMORY.md`** (global `~/.dotz/ai-agents/`,
+project `<cwd>/.ai-agents/`), regenerated on every write — the vector index is a derived cache.
+
+**Memory is AUTONOMOUS** (the operator never manages it): the dotz-tools `before_agent_start` hook
+does pre-task recall (semantic search of folder + global memory, relevance-thresholded, recency- and
+graph-boosted) and injects it into the turn; the `agent_end` hook auto-captures durable facts from the
+exchange and triggers threshold-based consolidation. `src/memory-graph.ts` is a lean on-device
+entity/relationship layer (a second `better-sqlite3` table — no external graph DB) giving a 1-hop
+recall boost + an observable graph. AGENTS.md files (project root + global
+`~/.config/opencode/AGENTS.md`) remain the **doctrine** layer — read by `buildResourceLoader`, written
+via the `agents_md` tool; mem0 memory is the **knowledge** layer. Don't blur them. Both persist across
+restarts. Legacy `memory.json` files are imported once on first run and kept as a backup.
 
 ## Unified skills pool
 
@@ -207,7 +217,9 @@ placeholder. REST endpoints: `/api/browser/state|navigate|back|forward|reload|sc
 - `src/design.ts` — Open-Design baked-in frontend tooling (palettes, typography, UX audit).
 - `src/browser.ts` — in-app Electron browser (WebContentsView + dedicated profile).
 - `src/projects.ts` — persistent projects layer (name + cwd + profile/model/thinking defaults).
-- `src/memory.ts` — memory store (`project` / `global` scope) under `.ai-agents` namespace + AGENTS.md read/write helpers. Injected into the system prompt via `buildResourceLoader`.
+- `src/memory.ts` — mem0-backed memory store (`project` / `global` scope) under `~/.dotz/ai-agents/mem0/` + `MEMORY.md` mirrors + AGENTS.md read/write helpers + autonomy flag + recall event emitter. Build-time seed via `buildResourceLoader`; live per-turn recall + capture via the dotz-tools hooks.
+- `src/embedder.ts` — bundled local transformers.js embedder (all-MiniLM-L6-v2, 384-dim), injected in-process into mem0 (no embeddings API/route).
+- `src/memory-graph.ts` — lean on-device entity/relationship graph (`better-sqlite3`) for recall boost + observability; no external graph DB.
 - `src/sandbox.ts` — sandbox runner (`terminal` + `web` modes, agent cursor, lifecycle events).
 - `src/types.ts` — shared types (`ModelRef`, `ProviderMeta`, `Project`, `MemoryEntry`, `SandboxRun`,
   `Skill`, `WorkflowRun`, `WorkflowStep`, `ThinkingLevel`, `DEFAULT_MODEL`, `LOW_COST_MODELS`,
@@ -220,9 +232,12 @@ placeholder. REST endpoints: `/api/browser/state|navigate|back|forward|reload|sc
   on-the-fly SVG workflow graph, skills/memory/sandbox/brain panels).
 - `.pi/` — bundled agent resources (subagent extension, dotz-tools extension, agents, 6 workflow prompts).
   Shipped in the exe via `electron-builder.yml` `files:`.
-- `.pi/extensions/dotz-tools/index.ts` — registers 13 pi tools: `skill`, `memory_list`, `memory_add`,
-  `memory_delete`, `agents_md`, `rsi_baseline`, `rsi_compare`, `human_gate`, `design_system`,
-  `design_components`, `design_audit` + the `resolveHumanGate`/`onGateRequest` server hooks.
+- `.pi/extensions/dotz-tools/index.ts` — registers the dotz pi tools: `skill`; the mem0 memory tools
+  `memory_list`, `memory_search`, `memory_add`, `memory_update`, `memory_delete`, `memory_consolidate`;
+  `agents_md`; `rsi_baseline`, `rsi_compare`, `human_gate`; `browser_*`; `design_*` + the
+  `resolveHumanGate`/`onGateRequest` server hooks. **Also registers the autonomous-memory lifecycle
+  hooks** (`before_agent_start` → pre-task recall, `agent_end` → auto-capture + consolidation), gated
+  by `isMemoryAutonomyEnabled()` so only the main server process runs them (never spawned subagents).
 - `docs/api-contract.md` — the authoritative UI↔backend contract.
 
 ## Verification commands
@@ -233,6 +248,8 @@ npx tsx scripts/verify-profiles.mjs   # e2e: profiles + .pi bundle + subagent + 
 npx tsx scripts/verify-ui.mjs          # e2e: UI markup + profiles API
 npx tsx scripts/verify-features.mjs    # e2e: projects + memory + sandbox + multi-provider (11 providers)
 npx tsx scripts/verify-ultra.mjs       # e2e: 320 skills + workflows + .ai-agents memory + RSI/design/browser tools + 6 presets + Ollama
+npx tsx scripts/verify-memory.ts       # e2e: mem0 memory OFFLINE (add/search/consolidate/graph/MEMORY.md mirror) — no network/keys
+npx tsx scripts/verify-memory-live.ts  # e2e: live capture→recall against Ollama Cloud (needs $OLLAMA_API_KEY)
 npm run dev:server                      # http://127.0.0.1:4317 (browser dev loop)
 npm run build                           # esbuild → dist/main.js + dist/preload.cjs
 npm run dist                            # → release/dotz <version>.exe (Windows portable)
@@ -278,9 +295,11 @@ prompt for automatic task distribution.
 - Keep the backend lean (Fastify + pi SDK only). The UI is vanilla JS — no build step, no framework.
 - `profiles.ts` and `types.ts` keep `DEFAULT_MODEL`/`ModelRef`/`ThinkingLevel` separate from `pi.ts`
   to avoid a circular import. Don't merge them.
-- `projects.ts` and `memory.ts` are pure persistence layers (no agent runtime). Memory is injected
-  into the system prompt via `buildResourceLoader` in `profiles.ts` — keep that the single injection
-  point; don't add a second path.
+- `projects.ts` is a pure persistence layer. `memory.ts` wraps mem0; it has two intentional injection
+  paths: a build-time **seed** via `buildResourceLoader` in `profiles.ts`, and live **per-turn recall**
+  via the dotz-tools `before_agent_start` hook. Keep capture/recall gated by `isMemoryAutonomyEnabled()`
+  (main process only). The `MEMORY.md` mirror is the git-committable source of truth — don't hand-edit
+  the sqlite vector index; it's a derived cache.
 - `skills.ts` is the single skill-discovery path. Don't add a second skill loader. The skill index
   is injected via `buildResourceLoader` (same as memory); the `skill(name)` tool loads bodies on demand.
 - `workflows.ts` is the observability + control layer for multi-agent orchestration. It does NOT

@@ -11,6 +11,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 
+// Isolate config + mem0 memory in a temp dir so this never mutates the operator's real ~/.dotz.
+process.env.DOTZ_CONFIG_DIR = await fs.mkdtemp(path.join(os.tmpdir(), "dotz-cfg-"));
+
 const PORT = 4321;
 const { app, pi } = await buildServer();
 await app.listen({ host: "127.0.0.1", port: PORT });
@@ -45,19 +48,21 @@ const patched = await patch(`/api/projects/${proj.id}`, { name: "test-project-re
 assert(patched.name === "test-project-renamed", `project renamed: ${patched.name}`);
 assert(patched.updatedAt >= proj.updatedAt, "project updatedAt bumped");
 
-// ---- 3. memory CRUD ----
+// ---- 3. memory CRUD (mem0-backed) ----
 console.log("\n[3] memory CRUD");
-const mem = await post("/api/memory", { projectId: proj.id, key: "convention", value: "use tabs not spaces", scope: "project" });
-assert(mem.id && mem.key === "convention", `memory entry created: ${mem.id}`);
+const mem = await post("/api/memory", { projectId: proj.id, text: "use tabs not spaces", category: "convention", scope: "project" });
+assert(mem.id && /tabs/.test(mem.memory), `memory created: ${mem.id}`);
 const memList = await get(`/api/memory?projectId=${proj.id}`);
 assert(memList.entries.length === 1, `memory list for project = ${memList.entries.length} (expected 1)`);
-assert(memList.entries[0].value === "use tabs not spaces", "memory value matches");
-const globalMem = await post("/api/memory", { projectId: "", key: "global-rule", value: "always verify", scope: "global" });
+assert(/tabs/.test(memList.entries[0].memory), "memory text matches");
+const globalMem = await post("/api/memory", { projectId: "", text: "always verify before claiming done", scope: "global" });
 const memListGlobal = await get(`/api/memory?projectId=${proj.id}`);
 assert(memListGlobal.entries.length === 2, `memory list includes global entries = ${memListGlobal.entries.length} (expected 2)`);
-const patchedMem = await patch(`/api/memory/${mem.id}`, { value: "use 2-space indent" });
-assert(patchedMem.value === "use 2-space indent", `memory updated: ${patchedMem.value}`);
-const delMem = await del(`/api/memory/${mem.id}`);
+const searchRes = await post("/api/memory/search", { projectId: proj.id, query: "what indentation style", topK: 5, threshold: 0.1 });
+assert(Array.isArray(searchRes.results) && searchRes.results.some((r) => /tabs/.test(r.memory)), `semantic search surfaces the convention (${searchRes.results.length} hits)`);
+const patchedMem = await patch(`/api/memory/${mem.id}`, { text: "use 2-space indent", projectId: proj.id });
+assert(/2-space/.test(patchedMem.memory), `memory updated: ${patchedMem.memory}`);
+const delMem = await del(`/api/memory/${mem.id}?projectId=${proj.id}`);
 assert(delMem.ok, "memory entry deleted");
 
 // ---- 4. project-bound session ----
@@ -144,6 +149,7 @@ await del(`/api/memory/${globalMem.id}`);
 pi.disposeAll();
 await app.close();
 try { await fs.rm(tempCwd, { recursive: true, force: true }); } catch {}
+try { await fs.rm(process.env.DOTZ_CONFIG_DIR, { recursive: true, force: true }); } catch {}
 
 console.log("\n" + (failures.length === 0 ? "ALL NEW-FEATURE CHECKS PASSED" : `${failures.length} FAILURES:`));
 for (const f of failures) console.log("  - " + f);

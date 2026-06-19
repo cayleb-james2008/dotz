@@ -147,11 +147,12 @@ export async function buildResourceLoader(
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir);
   const prompts = [profile.appendSystemPrompt];
-  if (opts.projectId) {
-    const entries = await memoryStore.forProject(opts.projectId, cwd);
-    const memBlock = memoryStore.renderForPrompt(entries);
-    if (memBlock) prompts.push(memBlock);
-  }
+  // Seed the system prompt with a recent slice of durable memory (global always; project when a
+  // project is bound). Live, query-relevant recall happens per-turn via the dotz-tools
+  // before_agent_start hook — this is just the always-on baseline.
+  const seed = await memoryStore.forProject(opts.projectId ? cwd : null);
+  const memBlock = memoryStore.renderForPrompt(seed);
+  if (memBlock) prompts.push(memBlock);
   // Inject the unified skill index (names + one-line descriptions) so the agent knows what
   // skills are available without loading every full body. The `skill` tool loads bodies on demand.
   await skillLoader.load();

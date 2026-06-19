@@ -437,6 +437,7 @@ function connectWS() {
     else if (m.kind === "workflow") handleWorkflowEvent(m.runId, m.event);
     else if (m.kind === "browser") renderBrowserObservation(m.event);
     else if (m.kind === "gate") showGateCard(m.gateId, m.plan);
+    else if (m.kind === "memory_recall") handleMemoryRecall(m);
     else if (m.kind === "error") pushError(m.error);
   };
 }
@@ -936,29 +937,40 @@ function renderQuickChips() {
   });
 }
 
-/* ---------- memory ---------- */
+/* ---------- memory (mem0-backed, autonomous) ---------- */
 function wireMemoryPanel(node) {
-  const addBtn = node.querySelector("#mem-add");
   const form = node.querySelector("#mem-form");
-  addBtn.onclick = () => {
+  node.querySelector("#mem-add").onclick = () => {
     form.classList.toggle("hidden");
     if (!form.classList.contains("hidden")) {
-      node.querySelector("#mem-key").value = "";
-      node.querySelector("#mem-value").value = "";
-      node.querySelector("#mem-key").focus();
+      node.querySelector("#mem-text").value = "";
+      node.querySelector("#mem-category").value = "";
+      node.querySelector("#mem-text").focus();
     }
   };
   node.querySelector("#mem-cancel").onclick = () => form.classList.add("hidden");
   node.querySelector("#mem-create").onclick = async () => {
-    const key = node.querySelector("#mem-key").value.trim();
-    const value = node.querySelector("#mem-value").value;
-    if (!key) { pushError("memory key required"); return; }
+    const text = node.querySelector("#mem-text").value.trim();
+    if (!text) { pushError("memory text required"); return; }
     try {
-      await post("/api/memory", { projectId: state.activeProjectId || "", key, value, scope: node.querySelector("#mem-scope").value });
+      await post("/api/memory", {
+        projectId: state.activeProjectId || "",
+        text,
+        category: node.querySelector("#mem-category").value.trim() || undefined,
+        scope: node.querySelector("#mem-scope").value,
+      });
       form.classList.add("hidden");
       await refreshMemory();
     } catch (e) { pushError("memory add: " + e.message); }
   };
+  node.querySelector("#mem-consolidate").onclick = async () => {
+    try {
+      const r = await post("/api/memory/consolidate", { projectId: state.activeProjectId || "" });
+      pushError(`memory consolidated — removed ${r.removed}, kept ${r.kept}`);
+      await refreshMemory();
+    } catch (e) { pushError("consolidate: " + e.message); }
+  };
+  renderRecalled();
   refreshMemory();
 }
 
@@ -974,19 +986,23 @@ function renderMemory() {
   const box = document.querySelector('.panel[data-panel="memory"] #memory-list') || $("memory-list");
   if (!box) return;
   box.innerHTML = "";
-  if (!state.memory.length) { box.appendChild(el("span", "dim mono", "no entries")); return; }
+  if (!state.memory.length) { box.appendChild(el("span", "dim mono", "no memories yet — they're captured automatically")); return; }
   state.memory.forEach((m) => {
     const entry = el("div", "mem-entry");
     const head = el("div", "mem-entry-head");
-    head.appendChild(el("span", "mem-key", m.key));
+    if (m.category) head.appendChild(el("span", "mem-cat", m.category));
     head.appendChild(el("span", "mem-scope" + (m.scope === "global" ? " global" : ""), m.scope));
     entry.appendChild(head);
-    entry.appendChild(el("div", "mem-value", truncate(m.value, 80)));
+    entry.appendChild(el("div", "mem-value", truncate(m.memory || "", 200)));
     const actions = el("div", "mem-actions");
     const editBtn = el("button", null, "EDIT");
     editBtn.onclick = () => inlineEditMemory(entry, m);
     const delBtn = el("button", "del", "DEL");
-    delBtn.onclick = async (ev) => { ev.stopPropagation(); try { await del("/api/memory/" + m.id); await refreshMemory(); } catch (e) { pushError("memory delete: " + e.message); } };
+    delBtn.onclick = async (ev) => {
+      ev.stopPropagation();
+      try { await del("/api/memory/" + m.id + (state.activeProjectId ? "?projectId=" + encodeURIComponent(state.activeProjectId) : "")); await refreshMemory(); }
+      catch (e) { pushError("memory delete: " + e.message); }
+    };
     actions.appendChild(editBtn); actions.appendChild(delBtn);
     entry.appendChild(actions);
     box.appendChild(entry);
@@ -996,18 +1012,40 @@ function renderMemory() {
 function inlineEditMemory(entry, m) {
   entry.innerHTML = "";
   const row = el("div", "mem-edit-row");
-  const keyIn = el("input"); keyIn.value = m.key; keyIn.placeholder = "key";
-  const valIn = el("input"); valIn.value = m.value; valIn.placeholder = "value";
-  const scopeSel = el("select", "pf-select");
-  ["project", "global"].forEach((s) => { const o = el("option", null, s); o.value = s; if (s === m.scope) o.selected = true; scopeSel.appendChild(o); });
+  const txt = el("textarea"); txt.value = m.memory || ""; txt.placeholder = "fact";
   const actions = el("div", "pf-actions");
   const save = el("button", "btn-mini btn-go", "SAVE");
   const cancel = el("button", "btn-mini", "CANCEL");
-  save.onclick = async () => { try { await patch("/api/memory/" + m.id, { key: keyIn.value.trim(), value: valIn.value, scope: scopeSel.value }); await refreshMemory(); } catch (e) { pushError("memory edit: " + e.message); } };
+  save.onclick = async () => {
+    try { await patch("/api/memory/" + m.id, { text: txt.value.trim(), projectId: state.activeProjectId || "" }); await refreshMemory(); }
+    catch (e) { pushError("memory edit: " + e.message); }
+  };
   cancel.onclick = () => refreshMemory();
   actions.appendChild(save); actions.appendChild(cancel);
-  row.appendChild(keyIn); row.appendChild(valIn); row.appendChild(scopeSel); row.appendChild(actions);
+  row.appendChild(txt); row.appendChild(actions);
   entry.appendChild(row);
+}
+
+/* Recall observability — which memories were auto-injected for the current task. */
+function handleMemoryRecall(m) {
+  state.recalled = m.items || [];
+  renderRecalled();
+}
+
+function renderRecalled() {
+  const box = document.querySelector('.panel[data-panel="memory"] #mem-recalled') || $("mem-recalled");
+  if (!box) return;
+  const items = state.recalled || [];
+  if (!items.length) { box.classList.add("hidden"); box.innerHTML = ""; return; }
+  box.classList.remove("hidden");
+  box.innerHTML = "";
+  box.appendChild(el("div", "mem-recalled-title", "↳ recalled for this task"));
+  items.forEach((it) => {
+    const r = el("div", "mem-recalled-item");
+    r.appendChild(el("span", "mem-recalled-score", (it.score ?? 0).toFixed(2)));
+    r.appendChild(el("span", "mem-recalled-text", truncate(it.memory || "", 120)));
+    box.appendChild(r);
+  });
 }
 
 /* ---------- skills ---------- */

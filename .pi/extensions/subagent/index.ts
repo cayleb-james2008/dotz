@@ -353,6 +353,7 @@ async function runSingleAgent(
 				cwd: cwd ?? defaultCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
+				windowsHide: true,
 			});
 			let buffer = "";
 

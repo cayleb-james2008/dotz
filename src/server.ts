@@ -24,14 +24,14 @@ import {
   type ThinkingLevel,
 } from "./pi";
 import { projectStore } from "./projects";
-import { memoryStore } from "./memory";
+import { memoryStore, onMemoryRecall, enableMemoryAutonomy } from "./memory";
 import { sandbox, SANDBOX_LANGUAGES, type SandboxEvent } from "./sandbox";
 import { skillLoader } from "./skills";
 import { workflowStore, type WorkflowEvent } from "./workflows";
 import { workflowBridge } from "./workflow-bridge";
 import { resolveHumanGate, onGateRequest } from "../.pi/extensions/dotz-tools/index";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "./browser";
-import { PROVIDERS, PROVIDER_DEFAULTS, type Project, type MemoryEntry, type SandboxRun, type WorkflowRun } from "./types";
+import { PROVIDERS, PROVIDER_DEFAULTS, type Project, type SandboxRun, type WorkflowRun } from "./types";
 import { loadConfig, getConfig, updateConfig, type DotzConfig } from "./config";
 
 const HOST = "127.0.0.1";
@@ -96,8 +96,20 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       if (s.readyState === s.OPEN) s.send(JSON.stringify({ kind: "browser", event: observation }));
     }
   });
+  // Enable autonomous memory (capture / recall / consolidation) — ONLY in this main server
+  // process. Spawned subagents never call buildServer, so they never enable autonomy and never
+  // churn the shared memory store.
+  enableMemoryAutonomy();
+  void memoryStore.importLegacy(null).catch(() => { /* migration is best-effort */ });
+  // Forward pre-task memory recall to the UI so the operator can see which memories were injected.
+  const offMemoryRecall = onMemoryRecall((e) => {
+    for (const s of wsSockets) {
+      if (s.readyState === s.OPEN) s.send(JSON.stringify({ kind: "memory_recall", cwd: e.cwd, query: e.query, items: e.items }));
+    }
+  });
   app.addHook("onClose", async () => {
     offBrowserBroadcast();
+    offMemoryRecall();
     await browserController.disposeAll();
   });
 
@@ -143,60 +155,53 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     return { tree: await buildFileTree(p.cwd) };
   });
 
-  // ---- memory ----
+  // ---- memory (mem0-backed; see src/memory.ts) ----
+  const cwdForProject = async (projectId?: string | null): Promise<string | null> => {
+    if (!projectId) return null;
+    const p = await projectStore.get(projectId);
+    return p ? p.cwd : null;
+  };
   app.get("/api/memory", async (req) => {
     const projectId = (req.query as { projectId?: string }).projectId;
-    let cwd: string | null = null;
-    if (projectId) {
-      const p = await projectStore.get(projectId);
-      if (p) cwd = p.cwd;
-    }
-    return { entries: await memoryStore.list(projectId, cwd) };
+    return { entries: await memoryStore.list(await cwdForProject(projectId)) };
   });
   app.post("/api/memory", async (req, reply) => {
-    const body = (req.body ?? {}) as { projectId?: string; key?: string; value?: string; scope?: "project" | "global" };
-    if (!body.key || body.value === undefined) {
-      reply.code(400).send({ error: "key and value are required" });
-      return;
-    }
-    let cwd: string | null = null;
-    if (body.projectId) {
-      const p = await projectStore.get(body.projectId);
-      if (p) cwd = p.cwd;
-    }
-    return memoryStore.create({ projectId: body.projectId || "", key: body.key, value: body.value, scope: body.scope, projectCwd: cwd });
+    const body = (req.body ?? {}) as { projectId?: string; text?: string; value?: string; category?: string; folder?: string; scope?: "project" | "global" };
+    const text = (body.text ?? body.value ?? "").trim();
+    if (!text) { reply.code(400).send({ error: "text (or value) is required" }); return; }
+    const cwd = await cwdForProject(body.projectId);
+    const scope = body.scope ?? (body.projectId ? "project" : "global");
+    return memoryStore.create({ text, category: body.category, folder: body.folder, scope, projectCwd: cwd });
   });
   app.patch("/api/memory/:id", async (req, reply) => {
-    const body = (req.body ?? {}) as Partial<Pick<MemoryEntry, "key" | "value" | "scope">> & { projectId?: string };
-    const id = (req.params as { id: string }).id;
-    // Resolve cwd: explicit projectId in body, else search the entry's location across projects.
-    let cwd: string | null = null;
-    if (body.projectId) {
-      const p = await projectStore.get(body.projectId);
-      if (p) cwd = p.cwd;
-    }
-    if (!cwd) {
-      // search all projects for the entry
-      const projects = await projectStore.list();
-      for (const p of projects) {
-        const entries = await memoryStore.list(p.id, p.cwd);
-        if (entries.some((e) => e.id === id)) { cwd = p.cwd; break; }
-      }
-    }
-    const e = await memoryStore.update(id, body, cwd);
+    const body = (req.body ?? {}) as { text?: string; value?: string; projectId?: string };
+    const text = (body.text ?? body.value ?? "").trim();
+    if (!text) { reply.code(400).send({ error: "text (or value) is required" }); return; }
+    const e = await memoryStore.update((req.params as { id: string }).id, text, await cwdForProject(body.projectId));
     if (!e) { reply.code(404).send({ error: "no such memory entry" }); return; }
     return e;
   });
   app.delete("/api/memory/:id", async (req) => {
-    const id = (req.params as { id: string }).id;
-    // search all projects for the entry to resolve its cwd
-    const projects = await projectStore.list();
-    let cwd: string | null = null;
-    for (const p of projects) {
-      const entries = await memoryStore.list(p.id, p.cwd);
-      if (entries.some((e) => e.id === id)) { cwd = p.cwd; break; }
-    }
-    return { ok: await memoryStore.remove(id, cwd) };
+    const projectId = (req.query as { projectId?: string }).projectId;
+    return { ok: await memoryStore.remove((req.params as { id: string }).id, await cwdForProject(projectId)) };
+  });
+  // Manual semantic search (recall observability + agent-independent lookup).
+  app.post("/api/memory/search", async (req) => {
+    const body = (req.body ?? {}) as { query?: string; projectId?: string; threshold?: number; topK?: number; folder?: string; scope?: "project" | "global"; category?: string };
+    const results = await memoryStore.search(body.query ?? "", {
+      projectCwd: await cwdForProject(body.projectId), threshold: body.threshold, topK: body.topK, folder: body.folder, scope: body.scope, category: body.category,
+    });
+    return { results };
+  });
+  // Operator-triggered consolidation (the automatic pass also runs on a capture threshold).
+  app.post("/api/memory/consolidate", async (req) => {
+    const body = (req.body ?? {}) as { projectId?: string };
+    return memoryStore.consolidate(await cwdForProject(body.projectId));
+  });
+  // Observable entity/relationship graph (global + current project).
+  app.get("/api/memory/graph", async (req) => {
+    const projectId = (req.query as { projectId?: string }).projectId;
+    return memoryStore.graphFor(await cwdForProject(projectId));
   });
 
   // ---- skills (unified pool) ----

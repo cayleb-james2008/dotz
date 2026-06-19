@@ -68,7 +68,9 @@ assert(list.length === 1 && list[0].profileId === "workflow", `sessions list = $
 // cleanup
 pi.dispose(sid);
 await app.close();
-fs.rmSync(process.env.DOTZ_CONFIG_DIR, { recursive: true, force: true });
+// Best-effort: the mem0 sqlite store keeps its files open for the process lifetime, so Windows may
+// refuse to delete the temp dir here (EPERM). The OS reclaims it on exit — don't fail the run over it.
+try { fs.rmSync(process.env.DOTZ_CONFIG_DIR, { recursive: true, force: true }); } catch {}
 
 console.log("\n" + (failures.length === 0 ? "ALL CHECKS PASSED" : `${failures.length} FAILURES:`));
 for (const f of failures) console.log("  - " + f);

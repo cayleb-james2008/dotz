@@ -1,6 +1,7 @@
 node_modules/
 dist/
 release/
+assets/models/
 .env
 .env.local
 data/

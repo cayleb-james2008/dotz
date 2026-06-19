@@ -69,15 +69,35 @@ export interface Project {
   updatedAt: number;
 }
 
-/** A persistent memory entry attached to a project (injected into agent context). */
-export interface MemoryEntry {
+/** Memory scope: "project" entries apply only when that project/folder is active; "global"
+ *  entries apply everywhere. */
+export type MemoryScope = "project" | "global";
+
+/** Typed-memory category (Hermes-style typing + coding-agent categories). Used for filtered
+ *  recall and the MEMORY.md mirror grouping. Free-form strings are also accepted. */
+export type MemoryCategory =
+  | "user"
+  | "feedback"
+  | "project"
+  | "reference"
+  | "convention"
+  | "architecture"
+  | "command"
+  | "gotcha";
+
+/** A memory as surfaced to the REST/UI/tool layers. Backed by mem0 (semantic vector store);
+ *  `memory` is the fact text, `score` is only present on search/recall results. */
+export interface MemoryView {
   id: string;
-  projectId: string;
-  key: string;
-  value: string;
-  scope: "project" | "global";
-  createdAt: number;
-  updatedAt: number;
+  memory: string;
+  scope: MemoryScope;
+  category?: MemoryCategory | string;
+  /** Folder this memory is scoped/most-relevant to (relative to the project root), if any. */
+  folder?: string;
+  /** Relevance score (0..1) — present only on search/recall results. */
+  score?: number;
+  createdAt?: number;
+  updatedAt?: number;
 }
 
 /** A sandbox run — isolated code execution with captured output. */

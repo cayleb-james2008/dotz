@@ -691,7 +691,8 @@ code { font-family: var(--mono); color: var(--peach); }
 .mem-key { font-family: var(--mono); font-size: 11px; color: var(--text); font-weight: 700; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mem-scope { font-family: var(--mono); font-size: 8px; letter-spacing: 1px; color: var(--crust); background: var(--lav); padding: 1px 5px; text-transform: uppercase; border-radius: var(--radius-sm); }
 .mem-scope.global { background: var(--cyan); }
-.mem-value { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mem-value { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 3px; white-space: normal; word-break: break-word; line-height: 1.4; }
+.mem-cat { font-family: var(--mono); font-size: 8px; letter-spacing: 1px; color: var(--crust); background: var(--green); padding: 1px 5px; text-transform: uppercase; border-radius: var(--radius-sm); }
 .mem-actions { display: flex; gap: 6px; margin-top: 4px; }
 .mem-actions button { font-family: var(--mono); font-size: 9px; letter-spacing: 1px; color: var(--dim); background: transparent; border: 1px solid var(--border); padding: 2px 5px; cursor: pointer; border-radius: var(--radius-sm); }
 .mem-actions button:hover { color: var(--peach); border-color: var(--peach); }
@@ -699,7 +700,15 @@ code { font-family: var(--mono); color: var(--peach); }
 .mem-add-btn { margin-top: 8px; }
 .mem-form { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 .mem-edit-row { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
-.mem-edit-row input, .mem-edit-row select { font-family: var(--mono); font-size: 11px; padding: 4px 6px; }
+.mem-edit-row input, .mem-edit-row textarea, .mem-edit-row select { font-family: var(--mono); font-size: 11px; padding: 4px 6px; }
+.mem-edit-row textarea, .mem-form textarea { min-height: 44px; resize: vertical; background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+.mem-toolbar { display: flex; gap: 6px; margin-top: 8px; }
+.mem-toolbar button { font-family: var(--mono); font-size: 9px; letter-spacing: 1px; }
+.mem-recalled { border: 1px solid var(--green); background: rgba(166,227,161,0.06); border-radius: var(--radius-sm); padding: 6px 8px; margin-bottom: 8px; }
+.mem-recalled-title { font-family: var(--mono); font-size: 8px; letter-spacing: 1px; color: var(--green); text-transform: uppercase; margin-bottom: 4px; }
+.mem-recalled-item { display: flex; gap: 6px; align-items: baseline; margin-top: 2px; }
+.mem-recalled-score { font-family: var(--mono); font-size: 9px; color: var(--green); min-width: 26px; }
+.mem-recalled-text { font-family: var(--mono); font-size: 10px; color: var(--muted); word-break: break-word; }
 
 /* ---- SANDBOX PANEL ---- */
 .sandbox-body { display: flex; flex-direction: column; overflow: hidden; }

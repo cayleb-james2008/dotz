@@ -58,20 +58,31 @@ A project is a **persistent named workspace** (cwd + profile + model + thinking 
 survives server restarts. Sessions created with `projectId` inherit the project's `cwd`,
 `profileId`, `model`, and `thinkingLevel` unless overridden on `POST /api/sessions`.
 
-### Memory
+### Memory (mem0-backed, autonomous)
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/api/memory?projectId=<id>` | — | `{ entries: MemoryEntry[] }` |
-| POST | `/api/memory` | `{ projectId, key, value, scope? }` | `MemoryEntry` |
-| PATCH | `/api/memory/:id` | `{ key?, value?, scope? }` | `MemoryEntry` |
-| DELETE | `/api/memory/:id` | — | `{ ok }` |
+| GET | `/api/memory?projectId=<id>` | — | `{ entries: MemoryView[] }` |
+| POST | `/api/memory` | `{ projectId?, text, category?, folder?, scope? }` | `MemoryView` |
+| PATCH | `/api/memory/:id` | `{ text, projectId? }` | `MemoryView` |
+| DELETE | `/api/memory/:id?projectId=<id>` | — | `{ ok }` |
+| POST | `/api/memory/search` | `{ query, projectId?, threshold?, topK?, folder?, scope?, category? }` | `{ results: MemoryView[] }` |
+| POST | `/api/memory/consolidate` | `{ projectId? }` | `{ removed, kept }` |
+| GET | `/api/memory/graph?projectId=<id>` | — | `{ global, project }` graph (`{nodes,edges}`) |
 
-`MemoryEntry = { id, projectId, key, value, scope:"project"|"global", createdAt, updatedAt }`.
-Memory entries (`scope:"project"`) are scoped to a `projectId`; `scope:"global"` entries apply
-across all sessions. Entries are injected into the agent's system prompt at session build time via
-the project's `buildResourceLoader`, so the agent sees them as durable context without being told
-again.
+`MemoryView = { id, memory, scope:"project"|"global", category?, folder?, score?, createdAt?, updatedAt? }`
+(`score` only on search/recall results). Memory is backed by **mem0** (self-hosted OSS, on-device):
+the sqlite vector store + bundled local embedder live under `~/.dotz/ai-agents/mem0/`; the LLM that
+powers extraction/consolidation is dotz's Ollama Cloud chat. Storage is partitioned by scope
+(`"project"` by folder, `"global"` everywhere). A human-readable, git-committable `MEMORY.md` mirror
+is written per scope (global `~/.dotz/ai-agents/MEMORY.md`, project `<cwd>/.ai-agents/MEMORY.md`) and
+is the source of truth — the vector index is a derived cache.
+
+Capture, update, consolidation, and recall are **automatic** (no operator action): the dotz-tools
+`before_agent_start` hook injects the most relevant memories into each turn (broadcast to the UI as a
+`{kind:"memory_recall", items}` WS event for observability), and the `agent_end` hook extracts
+durable facts from the completed exchange. Legacy `~/.dotz/ai-agents/memory.json` + project
+`memory.json` are imported once on first run (the JSON files are kept as a backup).
 
 ### Sandbox (visual web preview + agent cursor)
 

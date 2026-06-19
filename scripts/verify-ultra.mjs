@@ -1,6 +1,12 @@
 /** E2E: skills + workflows endpoints (ultra-code mode Phase 1).
  *  Boots the server in-process, exercises the unified skills pool and the workflow domain. */
 import { buildServer } from "../src/server.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// Isolate config + mem0 memory so this never mutates the operator's real ~/.dotz.
+process.env.DOTZ_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "dotz-ultra-"));
 
 const PORT = 4322;
 const { app, pi } = await buildServer();
@@ -37,6 +43,8 @@ const tools = await (await fetch(base + `/api/sessions/${sess.sessionId}/tools`)
 ok(tools.all.includes("skill"), `skill tool registered`);
 ok(tools.all.includes("memory_list"), `memory_list tool registered`);
 ok(tools.all.includes("memory_add"), `memory_add tool registered`);
+ok(tools.all.includes("memory_search"), `memory_search tool registered`);
+ok(tools.all.includes("memory_consolidate"), `memory_consolidate tool registered`);
 ok(tools.all.includes("agents_md"), `agents_md tool registered`);
 ok(tools.active.includes("skill"), `skill tool active in workflow profile`);
 
@@ -76,14 +84,19 @@ const abortRes = await (await fetch(base + `/api/workflows/${wfRun.id}/abort`, {
 })).json();
 ok(abortRes.ok, `workflow abort returned ok`);
 
-// [9] memory in .ai-agents namespace — create a global entry
+// [9] memory (mem0-backed) — create a global memory + recall it semantically
 const memRes = await (await fetch(base + "/api/memory", {
   method: "POST", headers: { "content-type": "application/json" },
-  body: JSON.stringify({ key: "test:ultra", value: "verify-ultra-memory", scope: "global" }),
+  body: JSON.stringify({ text: "verify-ultra sentinel: the dashboard runs on port 4317", scope: "global" }),
 })).json();
-ok(!!memRes.id, `global memory entry created in .ai-agents namespace`);
+ok(!!memRes.id, `global memory created in mem0 store`);
 const memList = await (await fetch(base + "/api/memory")).json();
-ok(memList.entries.some((e) => e.key === "test:ultra"), `global memory entry retrievable`);
+ok(memList.entries.some((e) => /verify-ultra sentinel/.test(e.memory)), `global memory retrievable`);
+const memSearch = await (await fetch(base + "/api/memory/search", {
+  method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ query: "which port does the dashboard use", topK: 5, threshold: 0.1 }),
+})).json();
+ok(memSearch.results.some((r) => /4317/.test(r.memory)), `semantic recall surfaces the sentinel memory`);
 
 // [10] Phase 2 tools — rsi_baseline, rsi_compare, human_gate, design_system, design_components, design_audit
 ok(tools.all.includes("rsi_baseline"), `rsi_baseline tool registered`);
@@ -111,9 +124,9 @@ ok(!!ollama, `ollama provider registered`);
 ok(!!ollama.freeForm, `ollama provider is free-form`);
 
 // cleanup
-const memEntry = memList.entries.find((e) => e.key === "test:ultra");
-if (memEntry) await fetch(base + "/api/memory/" + memEntry.id, { method: "DELETE" });
+if (memRes.id) await fetch(base + "/api/memory/" + memRes.id, { method: "DELETE" });
 pi.disposeAll();
 await app.close();
+try { fs.rmSync(process.env.DOTZ_CONFIG_DIR, { recursive: true, force: true }); } catch {}
 console.log("\n" + (fails.length ? `${fails.length} FAILURES:\n` + fails.map((f) => "  - " + f).join("\n") : "ALL ULTRA-CODE CHECKS PASSED"));
 process.exit(fails.length ? 1 : 0);
