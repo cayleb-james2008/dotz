@@ -14,8 +14,10 @@
     "build": "npm run check && node esbuild.config.mjs",
     "fetch-model": "node scripts/fetch-embed-model.mjs",
     "verify-memory": "tsx scripts/verify-memory.ts",
+    "test:updater": "node --test --import tsx scripts/verify-updater.ts",
     "electron": "npm run build && electron .",
     "dist": "npm run check && npm run fetch-model && npm run build && electron-builder --win nsis portable",
+    "dist:portable": "npm run check && npm run fetch-model && npm run build && electron-builder --win portable",
     "dist:publish": "npm run fetch-model && npm run build && electron-builder --win nsis portable --publish always"
   },
   "build": {
@@ -44,7 +46,6 @@
     "@huggingface/transformers": "^4.2.0",
     "agent-browser": "0.27.0",
     "better-sqlite3": "^12.11.1",
-    "electron-updater": "^6.8.9",
     "fastify": "^5.8.5",
     "gray-matter": "^4.0.3",
     "mem0ai": "^3.0.9"

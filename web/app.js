@@ -1529,19 +1529,19 @@ function bindSettings() {
 }
 
 function bindUpdateCard() {
-  $("update-download").onclick = () => {
-    if (window.dotz && window.dotz.update && window.dotz.update.download) {
-      window.dotz.update.download();
-      state.updateStatus = "downloading…";
+  // Source-rebuild updater: APPLY = git pull + portable rebuild + relaunch (out of process).
+  $("update-apply").onclick = () => {
+    if (window.dotz && window.dotz.update && window.dotz.update.apply) {
+      window.dotz.update.apply();
+      state.updateStatus = "updating…";
       $("settings-update-status").textContent = state.updateStatus;
       $("update-actions").classList.add("hidden");
-      $("update-progress").classList.remove("hidden");
+      $("update-body").textContent = "Pulling, rebuilding the portable exe, and relaunching. dotz will close shortly…";
     }
   };
   $("update-later").onclick = () => {
-    if (window.dotz && window.dotz.update && window.dotz.update.defer) window.dotz.update.defer();
     $("update-card").classList.add("hidden");
-    state.updateStatus = "deferred — will install on next launch";
+    state.updateStatus = "update deferred";
     $("settings-update-status").textContent = state.updateStatus;
   };
   $("update-settings").onclick = () => {
@@ -1555,44 +1555,32 @@ function wireUpdaterIpc() {
   window.dotz.update.onStatus((status, data) => {
     state.updateStatus = status;
     if (status === "available") {
-      const behavior = data.portable ? "Portable builds update manually from GitHub Releases." : "Download now, install, and restart when ready.";
-      $("update-body").innerHTML = `dotz <strong>${esc(data.version)}</strong> is available (you have ${esc(data.currentVersion)}). ${behavior}`;
-      if (data.notes) $("update-body").innerHTML += `\n\n${esc(String(data.notes))}`;
+      const n = data.behind || 0;
+      const plural = n === 1 ? "commit" : "commits";
+      const dirtyWarn = data.dirty
+        ? ` <strong>Note:</strong> the local source tree has uncommitted changes — commit or stash them first or the update will be blocked.`
+        : "";
+      $("update-body").innerHTML =
+        `dotz is <strong>${n}</strong> ${plural} behind (${esc(data.localSha)} → ${esc(data.remoteSha)}). ` +
+        `UPDATE & RESTART pulls, rebuilds the portable exe, and relaunches.${dirtyWarn}`;
       $("update-card").classList.remove("hidden");
       $("update-actions").classList.remove("hidden");
       $("update-progress").classList.add("hidden");
-      $("update-download").classList.toggle("hidden", !!data.portable);
-      $("update-later").textContent = data.portable ? "CLOSE" : "LATER";
-      $("settings-update-status").textContent = `update available: ${data.version}`;
+      $("update-apply").classList.toggle("hidden", !!data.dirty);
+      $("update-later").textContent = "LATER";
+      $("settings-update-status").textContent = `update available: ${n} ${plural} behind`;
     } else if (status === "not-available") {
-      $("settings-update-status").textContent = "up to date";
-    } else if (status === "downloading") {
-      const pct = data.percent || 0;
-      document.documentElement.style.setProperty("--upd-pct", pct + "%");
-      $("update-progress-text").textContent = pct + "%";
-      $("settings-update-status").textContent = `downloading ${pct}%`;
-    } else if (status === "ready") {
-      $("update-body").textContent = `dotz ${esc(data.version)} has been downloaded and is ready to install.`;
-      $("update-actions").classList.remove("hidden");
-      $("update-progress").classList.add("hidden");
-      $("update-download").textContent = "INSTALL & RESTART";
-      $("update-download").onclick = () => {
-        if (window.dotz && window.dotz.update && window.dotz.update.install) {
-          window.dotz.update.install();
-        }
-      };
-      $("update-later").textContent = "INSTALL ON QUIT";
-      $("update-settings").classList.add("hidden");
-      $("settings-update-status").textContent = `ready to install ${data.version}`;
-    } else if (status === "deferred") {
-      state.updateStatus = (data && data.message) || "update deferred";
-      $("settings-update-status").textContent = state.updateStatus;
-      $("update-card").classList.add("hidden");
+      $("settings-update-status").textContent = `up to date (${esc(data.localSha || "")})`;
+    } else if (status === "applying") {
+      $("update-actions").classList.add("hidden");
+      $("update-body").textContent = "Pulling, rebuilding the portable exe, and relaunching. dotz will close shortly…";
+      $("settings-update-status").textContent = "updating…";
     } else if (status === "failed") {
       $("update-body").textContent = "Update error: " + esc(data.message);
+      $("update-card").classList.remove("hidden");
       $("update-actions").classList.remove("hidden");
       $("update-progress").classList.add("hidden");
-      $("update-download").classList.add("hidden");
+      $("update-apply").classList.add("hidden");
       $("update-later").textContent = "CLOSE";
       $("settings-update-status").textContent = "error: " + esc(data.message);
     }

@@ -10,7 +10,7 @@ import { app, BrowserWindow, shell } from "electron";
 import { buildServer } from "./server";
 import { sandbox } from "./sandbox";
 import { browserController } from "./browser";
-import { checkForUpdatesOnLaunch, wireUpdaterIpc, enableInstallOnQuit } from "./updater";
+import { checkForUpdatesOnLaunch, wireUpdaterIpc } from "./updater";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.DOTZ_PORT || 4317);
@@ -58,9 +58,10 @@ app.whenReady().then(async () => {
     console.error("dotz: server failed to start", e);
   }
   const win = createWindow();
-  // Check for updates after the window is ready. The renderer will show a popup when an
-  // update is discovered; the user chooses to download now, defer, or open settings.
-  await checkForUpdatesOnLaunch(win);
+  // Background git check after the window is ready. If the local checkout is behind
+  // origin, the renderer shows the UPDATE AVAILABLE card; the user chooses UPDATE & RESTART
+  // (git pull + portable rebuild + relaunch) via the source-rebuild updater.
+  checkForUpdatesOnLaunch(win).catch((e) => console.error("dotz: update check failed", e));
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -69,7 +70,6 @@ app.whenReady().then(async () => {
 app.on("window-all-closed", () => {
   sandbox.disposeAll();
   browserController.disposeAll().catch(() => undefined);
-  enableInstallOnQuit();
   if (runtime) runtime.pi.disposeAll();
   app.quit();
 });

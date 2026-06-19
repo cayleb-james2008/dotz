@@ -7,7 +7,9 @@ self-improvement wiring**, packaged as a single Electron `.exe`.
 
 ## Distribution
 
-**Operator preference: ship a single self-contained Windows exe.** dotz packages as one Electron executable (portable `release/dotz <version>.exe` + NSIS installer) that auto-updates via electron-updater — Node, the pi SDK, and the UI are all bundled. The operator runs the exe directly; assume no dev shell or separate runtime on the target machine. Don't split into a second executable or add an external-runtime dependency without operator sign-off.
+**Operator preference: ship a single self-contained Windows exe.** dotz packages as one Electron executable (portable `release/dotz <version>.exe` + NSIS installer) — Node, the pi SDK, and the UI are all bundled. The operator runs the exe directly.
+
+**Updates: SOURCE-REBUILD, not electron-updater.** A portable exe cannot self-replace while running, so dotz updates by `git pull --ff-only` + rebuild + relaunch (`src/updater.ts` + the pure core `src/updater-core.ts`). On launch it runs a background git check (fetch + `HEAD...@{u}` behind-count + dirty-tree detect) and surfaces "update available" to the renderer; the UPDATE & RESTART action spawns a **detached** `.bat` helper that waits for the app to exit, pulls, runs `npm run dist:portable`, and relaunches the rebuilt exe. **This assumes the dotz source repo + node/npm are present on the machine** (same assumption as the operator's other source-rebuild updaters). Don't reintroduce electron-updater for the portable target. Don't split into a second executable or add an external-runtime dependency without operator sign-off.
 
 ## Architecture in one paragraph
 
@@ -226,7 +228,7 @@ placeholder. REST endpoints: `/api/browser/state|navigate|back|forward|reload|sc
   `renderLowCostModels`). Kept separate from `pi.ts` to avoid a circular import — do not merge.
 - `src/server.ts` — Fastify REST + WS + static. Routes: sessions, projects, memory, skills, workflows,
   sandbox, browser, human-gate.
-- `src/updater.ts` — auto-updater using `electron-updater`; checks the configured generic feed on every launch, downloads updates silently, and installs before the app starts.
+- `src/updater.ts` / `src/updater-core.ts` — source-rebuild updater (git pull + `npm run dist:portable` + relaunch). Core is electron-free + unit-tested (`npm run test:updater`); the shell wires the IPC + detached helper.
 - `src/main.ts` / `src/preload.ts` — Electron main + contextIsolation preload.
 - `web/` — vanilla JS bento dashboard (project launcher, progressive panel disclosure, drag-and-drop,
   on-the-fly SVG workflow graph, skills/memory/sandbox/brain panels).
@@ -256,19 +258,27 @@ npm run dist                            # → release/dotz <version>.exe (Window
 npm run dist:publish                    # same as dist + publish the portable exe to the configured generic feed
 ```
 
-## Auto-updater
+## Source-rebuild updater
 
-`src/updater.ts` wires `electron-updater` into `src/main.ts`. On every launch of the packaged `.exe`:
+`src/updater.ts` (electron shell) + `src/updater-core.ts` (pure, unit-tested) update the portable
+exe by **git pull + rebuild + relaunch** — electron-updater can't self-replace a running portable exe.
 
-1. It reads the update feed URL from `DOTZ_UPDATE_URL`, then `package.json` `build.publish.url`, then `electron-builder.yml` `publish.url`.
-2. If no feed is configured, the app starts normally (no update check).
-3. If a feed is configured, it checks `latest.yml` / generic metadata for a newer version.
-4. When an update is found, it downloads silently in the background.
-5. For portable builds, it calls `quitAndInstall(true, true)` after the download so the next launch runs the new `.exe`.
-6. For installed NSIS builds, it installs on quit.
-7. Dev builds (`npm run dev:server`, `npm run electron`) skip auto-updates.
+1. On launch, `checkForUpdatesOnLaunch` runs a background git check: `git fetch`, then
+   `git rev-list --left-right --count HEAD...@{u}` for the behind-count, plus short shas and a
+   `git status --porcelain` dirty-tree check. The tracking branch (`@{u}`) drives it; falls back to
+   `origin/main`. The repo dir is resolved from `DOTZ_REPO_DIR` or by walking up from `process.execPath`
+   to the nearest `.git`.
+2. If behind > 0, the renderer shows the UPDATE AVAILABLE card (behind-count + `localSha → remoteSha`).
+   A dirty tree is surfaced and blocks APPLY (an ff pull would fail).
+3. CHECK FOR UPDATES (settings) re-runs the same git check on demand.
+4. UPDATE & RESTART → `applyUpdate`: writes a detached `.bat` helper to the temp dir, spawns it
+   detached (its own console for build output), then quits after 400ms. The helper waits for the app
+   pid to exit, runs `git pull --ff-only`, `npm run dist:portable`, and relaunches the rebuilt exe
+   (in dev: `npm run electron`).
+5. The machine must have the dotz source repo + node/npm present (same as the operator's other
+   source-rebuild updaters).
 
-Configure the feed by replacing `https://dotz-releases.example.com` in `package.json` / `electron-builder.yml` with the public URL hosting your `latest.yml` and `dotz <version>.exe` files.
+Test the core offline with `npm run test:updater` (fake git runner; no network, no electron-builder).
 
 ## Provider config
 
