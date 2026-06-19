@@ -31,7 +31,26 @@ interface SubagentDetailsLike {
     browserSessionId?: string | null;
     toolCallIds?: string[];
     thinking?: string;
+    // The subagent's full message stream travels in the details already — we use it to surface the
+    // REAL final output in the graph node instead of a "(subagent completed on …)" placeholder.
+    messages?: Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
+    errorMessage?: string;
   }>;
+}
+
+/** Last assistant text part across the subagent's messages — the same value the subagent tool
+ *  returns to the lead. Used to show real findings in the graph node detail. */
+function finalOutputOf(res: SubagentDetailsLike["results"][number]): string {
+  const msgs = res.messages || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.role === "assistant") {
+      for (const p of m.content || []) {
+        if (p.type === "text" && p.text && p.text.trim()) return p.text;
+      }
+    }
+  }
+  return "";
 }
 
 /** Extract SubagentDetails from a tool_execution event's result/partialResult. */
@@ -145,7 +164,12 @@ export class WorkflowBridge {
       }
       const status = stepStatus(res.exitCode, res.stopReason);
       const patch: { status: "running" | "done" | "error"; output?: string; error?: string; usage?: { input?: number; output?: number; cost?: number; turns?: number }; sandboxRunId?: string | null; browserSessionId?: string | null; toolCallIds?: string[]; thinking?: string } = { status };
-      if (status === "done") patch.output = `(subagent completed on ${res.model || "default model"})`;
+      if (status === "done") {
+        const real = finalOutputOf(res);
+        patch.output = real
+          ? (real.length > 8000 ? real.slice(0, 8000) + "\n\n…(truncated)" : real)
+          : `(completed on ${res.model || "default model"} — no text output)`;
+      }
       if (status === "error") patch.error = res.stopReason || `exit code ${res.exitCode}`;
       if (res.usage) patch.usage = { input: res.usage.input, output: res.usage.output, cost: res.usage.cost, turns: res.usage.turns };
       if (res.sandboxRunId !== undefined) patch.sandboxRunId = res.sandboxRunId;

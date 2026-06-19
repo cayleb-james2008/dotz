@@ -40,24 +40,63 @@ function createWindow() {
     },
   });
   win.removeMenu();
+  win.webContents.on("did-fail-load", (_e, code, desc, url) => {
+    if (code === -3) return; // ABORTED — ignore benign in-page navigations
+    win.loadURL("data:text/html," + encodeURIComponent(
+      `<body style="background:#1e1e2e;color:#f38ba8;font-family:monospace;padding:40px">` +
+      `<h2>dotz could not reach its backend</h2>` +
+      `<p>${desc} (${url}). The local agent server may not be running. Relaunch dotz.</p></body>`));
+  });
   win.loadURL(`http://${HOST}:${PORT}`);
   // External links open in the system browser, never in-app.
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/.test(url)) shell.openExternal(url);
     return { action: "deny" };
   });
+  // In-window navigation is locked to the app origin; anything else is blocked, and
+  // http(s) targets are handed to the system browser instead of navigating in-app.
+  win.webContents.on("will-navigate", (e, url) => {
+    if (!url.startsWith(`http://${HOST}:${PORT}`)) {
+      e.preventDefault();
+      if (/^https?:/.test(url)) shell.openExternal(url);
+    }
+  });
   return win;
 }
 
-app.whenReady().then(async () => {
+// Single-instance lock: a second launch of dotz must not spawn a duplicate window or a
+// second server that collides on the port. Hand focus to the existing window instead.
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    const existing = BrowserWindow.getAllWindows()[0];
+    if (existing) {
+      if (existing.isMinimized()) existing.restore();
+      existing.focus();
+    }
+  });
+}
+
+if (gotTheLock) app.whenReady().then(async () => {
   wireUpdaterIpc();
   // Start the server before opening the window so the renderer has a live backend.
+  let serverOk = true;
   try {
     await startServer();
   } catch (e) {
+    serverOk = false;
     console.error("dotz: server failed to start", e);
   }
   const win = createWindow();
+  if (!serverOk) {
+    win.loadURL("data:text/html," + encodeURIComponent(
+      `<body style="background:#1e1e2e;color:#f38ba8;font-family:monospace;padding:40px">` +
+      `<h2>dotz failed to start its backend</h2>` +
+      `<p>The local agent server could not start (port ${PORT} may be in use by another process). ` +
+      `Close any other instance using that port and relaunch dotz.</p></body>`));
+  }
   // Background git check after the window is ready. If the local checkout is behind
   // origin, the renderer shows the UPDATE AVAILABLE card; the user chooses UPDATE & RESTART
   // (git pull + portable rebuild + relaunch) via the source-rebuild updater.

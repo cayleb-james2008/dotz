@@ -13,15 +13,14 @@ Dispatch 5 reviewer subagents in PARALLEL via the `subagent` tool (`tasks: [...]
 4. **Prior PRs / context** — does this repeat a previously-rejected approach? Are there related merged PRs?
 5. **Code comments + intent** — are comments honest? Does the code do what the comments claim?
 
-Use the `reviewer` agent for each. Select a low-cost model for each reviewer via the `model` parameter.
+Use the `reviewer` agent for each. Do NOT pass a `model` override — the reviewers run on the configured low-cost subagent model by default (inventing a model id breaks the fan-out with auth/credit errors).
 
-## Phase 2: Isolated scoring (parallel, separate fan-out)
-For EACH finding from Phase 1, dispatch a SCORER subagent (separate from the reviewers). Each scorer gets:
-- The finding verbatim
-- The rubric: "Score this finding 0-100 for confidence it's a real issue. 0 = noise/already handled, 100 = definitely a bug."
-- NO exposure to other findings or other scorers' justifications (anti-bias)
-
-Filter to confidence ≥ 80. Dedupe on `file:line`.
+## Phase 2: Score + filter (do this yourself — no scorer fan-out)
+You now hold every finding the 5 reviewers returned. Score them YOURSELF — do NOT dispatch a scorer
+subagent per finding (that spawns dozens of extra subagents and stalls the run for many minutes for
+no quality gain). For each finding, assign a 0-100 confidence it's a real issue (0 = noise/already
+handled, 100 = definitely a bug), judging it against the actual code you and the reviewers read.
+Filter to confidence ≥ 80 and dedupe on `file:line`. Then go straight to Phase 3.
 
 ## Phase 3: Synthesize
 Produce a numbered report:

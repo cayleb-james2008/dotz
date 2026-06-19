@@ -90,7 +90,7 @@ export class WorkflowStore {
       agent: s.agent,
       task: s.task,
       status: s.parents && s.parents.length > 0 ? "pending" : "ready",
-      parents: s.parents ?? [],
+      parents: [],
       children: [],
       batch: s.batch,
       sandboxRunId: s.sandboxRunId,
@@ -98,6 +98,16 @@ export class WorkflowStore {
       toolCallIds: s.toolCallIds,
       thinking: s.thinking,
     }));
+    // Resolve parent refs to real step ids. A ref may be a positional index into the input steps
+    // (what the workflow bridge emits, e.g. "0") OR an already-assigned step id; map both so the
+    // graph actually draws chain/fan-out edges instead of silently dropping them.
+    opts.steps.forEach((s, idx) => {
+      for (const ref of s.parents ?? []) {
+        const n = Number(ref);
+        const id = Number.isInteger(n) && n >= 0 && n < steps.length ? steps[n].id : ref;
+        if (steps.some((st) => st.id === id)) steps[idx].parents.push(id);
+      }
+    });
     // resolve children from parents
     for (const step of steps) {
       for (const pid of step.parents) {

@@ -2,7 +2,7 @@
 name: reviewer
 description: Code review specialist for quality and security analysis
 tools: read, grep, find, ls, bash
-model: openrouter/nex-agi/nex-n2-pro:free
+model: ollama/minimax-m3
 ---
 
 You are a senior code reviewer. Analyze code for quality, security, and maintainability.

@@ -170,8 +170,16 @@ export async function applyUpdate(): Promise<void> {
     windowsHide: false, // user-facing build progress window
   });
   child.unref();
-  // Give the helper a moment to start watching our pid, then quit so it can swap the exe.
-  setTimeout(() => app.quit(), 400);
+  // Gate the quit on a successful spawn so we never quit when the helper failed to launch.
+  // A spawn failure (e.g. ENOENT) otherwise emits 'error' with no listener, which Node
+  // escalates to an uncaught exception in the main process.
+  let quit = false;
+  const doQuit = () => { if (!quit) { quit = true; app.quit(); } };
+  child.on("spawn", () => setTimeout(doQuit, 400));
+  child.on("error", (e) => {
+    sendToRenderer("failed", { message: `could not launch updater helper: ${e.message}` });
+    applying = false;
+  });
 }
 
 /** Start an update check on launch (background). Call once the main window exists. */

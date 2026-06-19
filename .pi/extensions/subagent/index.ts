@@ -14,6 +14,7 @@
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -251,7 +252,61 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 	return { dir: tmpDir, filePath };
 }
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
+// Resolve the bundled pi CLI entry JS from the @earendil-works/pi-coding-agent package.
+// Returns the absolute path to the CLI entry (e.g. <pkg>/dist/cli.js) or null if anything
+// fails — so the caller can fall back to the existing invocation strategies.
+function resolveBundledPiCli(): string | null {
+	// Collect candidate package dirs from the most robust strategies first. require.resolve alone
+	// FAILS under pi's jiti .ts loader (import.meta.url is virtual), so we also resolve relative to
+	// this file (the proven pattern getBundledAgentsDir uses) and via Electron's resourcesPath (the
+	// same pattern the agent-browser resolver uses) — without these the Electron branch silently
+	// never fires and subagents fall back to relaunching the app → "(no output)".
+	const pkgDirs: string[] = [];
+	if (process.resourcesPath) {
+		pkgDirs.push(path.join(process.resourcesPath, "app", "node_modules", "@earendil-works", "pi-coding-agent"));
+	}
+	try {
+		// <app>/.pi/extensions/subagent/index.ts -> <app>/node_modules/@earendil-works/pi-coding-agent
+		const here = path.dirname(fileURLToPath(import.meta.url));
+		pkgDirs.push(path.join(here, "..", "..", "..", "node_modules", "@earendil-works", "pi-coding-agent"));
+	} catch { /* ignore */ }
+	try {
+		const require = createRequire(import.meta.url);
+		pkgDirs.push(path.dirname(require.resolve("@earendil-works/pi-coding-agent/package.json")));
+	} catch { /* ignore */ }
+
+	for (const dir of pkgDirs) {
+		try {
+			let relBin = "dist/cli.js";
+			const pkgJson = path.join(dir, "package.json");
+			if (fs.existsSync(pkgJson)) {
+				const bin = (JSON.parse(fs.readFileSync(pkgJson, "utf-8")) as { bin?: string | Record<string, string> }).bin;
+				if (typeof bin === "string") relBin = bin;
+				else if (bin && typeof bin === "object") relBin = bin.pi ?? Object.values(bin)[0] ?? relBin;
+			}
+			const cliPath = path.join(dir, relBin);
+			if (fs.existsSync(cliPath)) return cliPath;
+		} catch { /* try next candidate */ }
+	}
+	return null;
+}
+
+function getPiInvocation(args: string[]): { command: string; args: string[]; env?: NodeJS.ProcessEnv } {
+	// In a packaged Electron app, process.execPath is the app binary and process.argv[1] is the
+	// app's main.js — spawning that would relaunch the app (which the single-instance lock then
+	// quits), yielding zero subagent output. Instead, run the bundled pi CLI JS under
+	// Electron-as-Node (ELECTRON_RUN_AS_NODE=1), bypassing the app lifecycle entirely.
+	if (process.versions.electron) {
+		const piCli = resolveBundledPiCli();
+		if (piCli) {
+			return {
+				command: process.execPath,
+				args: [piCli, ...args],
+				env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+			};
+		}
+	}
+
 	const currentScript = process.argv[1];
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
 	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
@@ -354,6 +409,7 @@ async function runSingleAgent(
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 				windowsHide: true,
+				env: invocation.env ?? process.env,
 			});
 			let buffer = "";
 
