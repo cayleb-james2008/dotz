@@ -66,6 +66,7 @@
             <div id="reasoning-seg" class="seg-mini"></div>
           </div>
           <button id="panels-btn" class="knob-btn" title="add panels (Ctrl+P)">+ PANELS</button>
+          <button id="settings-btn" class="knob-btn" title="settings">⚙</button>
           <span id="conn-chip" class="chip chip-off"><span class="blk">█</span> OFFLINE</span>
         </div>
       </header>
@@ -132,6 +133,47 @@
         <div class="gate-actions">
           <button id="gate-approve" class="btn-go">APPROVE ✓</button>
           <button id="gate-reject" class="btn-stop">REJECT ✕</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="settings-card" class="settings-card hidden">
+      <div class="settings-card-inner">
+        <div class="settings-head">⚙ SETTINGS</div>
+        <div class="settings-body">
+          <div class="settings-row">
+            <span class="settings-label">Version</span>
+            <span id="settings-version" class="settings-value">—</span>
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Update feed</span>
+            <span id="settings-feed" class="settings-value">not configured</span>
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Status</span>
+            <span id="settings-update-status" class="settings-value">—</span>
+          </div>
+          <button id="settings-check-update" class="btn-go">CHECK FOR UPDATES</button>
+        </div>
+        <div class="settings-foot">
+          <button id="settings-close" class="btn-mini">CLOSE</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- UPDATE DISCOVERY POPUP -->
+    <div id="update-card" class="update-card hidden">
+      <div class="update-card-inner">
+        <div class="update-head">⬆ UPDATE AVAILABLE</div>
+        <div id="update-body" class="update-body">A new version of dotz is available.</div>
+        <div id="update-progress" class="update-progress hidden">
+          <div class="update-progress-bar" id="update-progress-bar"></div>
+          <span id="update-progress-text" class="update-progress-text">0%</span>
+        </div>
+        <div class="update-actions" id="update-actions">
+          <button id="update-download" class="btn-go">DOWNLOAD NOW</button>
+          <button id="update-later" class="btn-mini">LATER</button>
+          <button id="update-settings" class="btn-mini">SETTINGS</button>
         </div>
       </div>
     </div>

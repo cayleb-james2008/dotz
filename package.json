@@ -1,6 +1,6 @@
 {
   "name": "dotz",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "dotz — ultra code mode. A pi.dev-based Claude-Code-style multi-agent coding dashboard with on-the-fly workflow graphs, unified skills, and bento UI.",
   "type": "module",
@@ -12,8 +12,8 @@
     "typecheck": "tsc --noEmit",
     "build": "node esbuild.config.mjs",
     "electron": "npm run build && electron .",
-    "dist": "npm run build && electron-builder --win portable",
-    "dist:publish": "npm run build && electron-builder --win portable --publish always"
+    "dist": "npm run build && electron-builder --win nsis portable",
+    "dist:publish": "npm run build && electron-builder --win nsis portable --publish always"
   },
   "build": {
     "appId": "dev.dotz.app",
@@ -23,17 +23,19 @@
     },
     "asar": false,
     "win": {
-      "target": "portable"
+      "target": ["nsis", "portable"]
     },
     "publish": {
-      "provider": "generic",
-      "url": "https://dotz-releases.example.com"
+      "provider": "github",
+      "owner": "cayleb-james2008",
+      "repo": "dotz"
     }
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.79.6",
     "@fastify/static": "^9.1.3",
     "@fastify/websocket": "^11.2.0",
+    "agent-browser": "0.27.0",
     "electron-updater": "^6.8.9",
     "fastify": "^5.8.5",
     "gray-matter": "^4.0.3"

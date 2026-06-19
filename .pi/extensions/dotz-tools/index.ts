@@ -12,6 +12,7 @@ import { skillLoader } from "../../../src/skills";
 import { memoryStore, readAgentsMd, writeAgentsMd, appendAgentsMdSection } from "../../../src/memory";
 import { captureBaseline, compare, renderBaseline, type MetricsBaseline } from "../../../src/metrics";
 import { getDesignSystem, getComponents, auditDesign, renderDesignSystem, renderComponents, renderAudit } from "../../../src/design";
+import { browserController, type BrowserActInput, type BrowserStartInput } from "../../../src/browser";
 
 /** In-memory baseline registry (per session) — the RSI brain captures a baseline, then
  *  compares after the improvement. Keyed by a caller-provided label. */
@@ -39,6 +40,71 @@ export function registerGateListener(gateId: string, fn: GateResolver): void {
 }
 
 export default function (pi: ExtensionAPI) {
+  // ---- monitored browser tools: the complete Pi-facing browser surface ----
+  pi.registerTool({
+    name: "browser_start",
+    label: "Browser Start",
+    description: "Start an isolated monitored browser session owned by a Dotz project/workflow. Only http(s) origins on the explicit allowlist are permitted.",
+    parameters: Type.Object({
+      projectId: Type.String(),
+      workflowId: Type.Optional(Type.String()),
+      stepId: Type.Optional(Type.String()),
+      url: Type.String(),
+      allowedOrigins: Type.Optional(Type.Array(Type.String())),
+      viewport: Type.Optional(Type.Object({ width: Type.Number(), height: Type.Number() })),
+    }),
+    async execute(_id, params) {
+      try {
+        const observation = await browserController.start(params as BrowserStartInput);
+        return { content: [{ type: "text", text: JSON.stringify(observation) }], details: observation };
+      } catch (error) {
+        return { content: [{ type: "text", text: (error as Error).message }], isError: true, details: undefined };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_act",
+    label: "Browser Act",
+    description: "Perform one typed browser action and return the next versioned observation. Element refs require their observation sequence; raw evaluation, uploads, downloads, and clipboard access are unavailable.",
+    parameters: Type.Object({
+      sessionId: Type.String(),
+      action: Type.Union(["navigate", "observe", "click", "type", "key", "select", "scroll", "wait"].map((value) => Type.Literal(value))),
+      expectedSeq: Type.Optional(Type.Number()),
+      url: Type.Optional(Type.String()),
+      targetRef: Type.Optional(Type.String()),
+      text: Type.Optional(Type.String()),
+      key: Type.Optional(Type.String()),
+      values: Type.Optional(Type.Array(Type.String())),
+      direction: Type.Optional(Type.Union([Type.Literal("up"), Type.Literal("down"), Type.Literal("left"), Type.Literal("right")])),
+      pixels: Type.Optional(Type.Number()),
+      milliseconds: Type.Optional(Type.Number()),
+    }),
+    async execute(_id, params) {
+      try {
+        const observation = await browserController.act(params as BrowserActInput);
+        return { content: [{ type: "text", text: JSON.stringify(observation) }], details: observation };
+      } catch (error) {
+        return { content: [{ type: "text", text: (error as Error).message }], isError: true, details: undefined };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_stop",
+    label: "Browser Stop",
+    description: "Stop an isolated browser session and remove its disposable profile and event stream.",
+    parameters: Type.Object({ sessionId: Type.String() }),
+    async execute(_id, params) {
+      try {
+        const observation = await browserController.stop((params as { sessionId: string }).sessionId);
+        return { content: [{ type: "text", text: JSON.stringify(observation) }], details: observation };
+      } catch (error) {
+        return { content: [{ type: "text", text: (error as Error).message }], isError: true, details: undefined };
+      }
+    },
+  });
+
   // ---- skill tool: load a skill's full body by name ----
   pi.registerTool({
     name: "skill",

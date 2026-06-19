@@ -48,6 +48,7 @@ const state = {
   wfView: { x: 0, y: 0, w: 800, h: 600 },
   pendingGate: null,
   brainFloat: true,
+  updateStatus: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -76,13 +77,14 @@ async function init() {
   bindCommandCenter();
   bindProjectSelector();
   bindComposer();
-  bindSandbox();
-  bindMemory();
   bindPalette();
   bindKeyboard();
   bindBrainFloat();
   bindGateCard();
   bindNodeDetail();
+  bindSettings();
+  bindUpdateCard();
+  wireUpdaterIpc();
   loadLayout();
   loadBrainFloat();
   await loadProfiles();
@@ -417,6 +419,7 @@ function connectWS() {
     else if (m.kind === "event") handleEvent(m.event);
     else if (m.kind === "sandbox") handleSandboxEvent(m.event);
     else if (m.kind === "workflow") handleWorkflowEvent(m.runId, m.event);
+    else if (m.kind === "browser") renderBrowserObservation(m.event);
     else if (m.kind === "gate") showGateCard(m.gateId, m.plan);
     else if (m.kind === "error") pushError(m.error);
   };
@@ -1426,6 +1429,96 @@ function resolveGate(approved) {
   state.pendingGate = null;
 }
 
+/* ---------- settings + updater ---------- */
+function bindSettings() {
+  $("settings-btn").onclick = () => {
+    $("settings-card").classList.remove("hidden");
+    $("settings-version").textContent = (window.dotz && window.dotz.version) || "browser";
+    $("settings-feed").textContent = (window.dotz && window.dotz.electron) ? "configured" : "not configured (browser/dev)";
+    $("settings-update-status").textContent = state.updateStatus || "—";
+  };
+  $("settings-close").onclick = () => $("settings-card").classList.add("hidden");
+  $("settings-check-update").onclick = () => {
+    if (window.dotz && window.dotz.update && window.dotz.update.check) {
+      window.dotz.update.check();
+      $("settings-update-status").textContent = "checking…";
+    } else {
+      $("settings-update-status").textContent = "updates only available in packaged app with feed";
+    }
+  };
+}
+
+function bindUpdateCard() {
+  $("update-download").onclick = () => {
+    if (window.dotz && window.dotz.update && window.dotz.update.download) {
+      window.dotz.update.download();
+      state.updateStatus = "downloading…";
+      $("settings-update-status").textContent = state.updateStatus;
+      $("update-actions").classList.add("hidden");
+      $("update-progress").classList.remove("hidden");
+    }
+  };
+  $("update-later").onclick = () => {
+    if (window.dotz && window.dotz.update && window.dotz.update.defer) window.dotz.update.defer();
+    $("update-card").classList.add("hidden");
+    state.updateStatus = "deferred — will install on next launch";
+    $("settings-update-status").textContent = state.updateStatus;
+  };
+  $("update-settings").onclick = () => {
+    $("update-card").classList.add("hidden");
+    $("settings-card").classList.remove("hidden");
+  };
+}
+
+function wireUpdaterIpc() {
+  if (!window.dotz || !window.dotz.update || !window.dotz.update.onStatus) return;
+  window.dotz.update.onStatus((status, data) => {
+    state.updateStatus = status;
+    if (status === "available") {
+      const behavior = data.portable ? "Portable builds update manually from GitHub Releases." : "Download now, install, and restart when ready.";
+      $("update-body").innerHTML = `dotz <strong>${esc(data.version)}</strong> is available (you have ${esc(data.currentVersion)}). ${behavior}`;
+      if (data.notes) $("update-body").innerHTML += `\n\n${esc(String(data.notes))}`;
+      $("update-card").classList.remove("hidden");
+      $("update-actions").classList.remove("hidden");
+      $("update-progress").classList.add("hidden");
+      $("update-download").classList.toggle("hidden", !!data.portable);
+      $("update-later").textContent = data.portable ? "CLOSE" : "LATER";
+      $("settings-update-status").textContent = `update available: ${data.version}`;
+    } else if (status === "not-available") {
+      $("settings-update-status").textContent = "up to date";
+    } else if (status === "downloading") {
+      const pct = data.percent || 0;
+      document.documentElement.style.setProperty("--upd-pct", pct + "%");
+      $("update-progress-text").textContent = pct + "%";
+      $("settings-update-status").textContent = `downloading ${pct}%`;
+    } else if (status === "ready") {
+      $("update-body").textContent = `dotz ${esc(data.version)} has been downloaded and is ready to install.`;
+      $("update-actions").classList.remove("hidden");
+      $("update-progress").classList.add("hidden");
+      $("update-download").textContent = "INSTALL & RESTART";
+      $("update-download").onclick = () => {
+        if (window.dotz && window.dotz.update && window.dotz.update.install) {
+          window.dotz.update.install();
+        }
+      };
+      $("update-later").textContent = "INSTALL ON QUIT";
+      $("update-settings").classList.add("hidden");
+      $("settings-update-status").textContent = `ready to install ${data.version}`;
+    } else if (status === "deferred") {
+      state.updateStatus = (data && data.message) || "update deferred";
+      $("settings-update-status").textContent = state.updateStatus;
+      $("update-card").classList.add("hidden");
+    } else if (status === "failed") {
+      $("update-body").textContent = "Update error: " + esc(data.message);
+      $("update-actions").classList.remove("hidden");
+      $("update-progress").classList.add("hidden");
+      $("update-download").classList.add("hidden");
+      $("update-later").textContent = "CLOSE";
+      $("settings-update-status").textContent = "error: " + esc(data.message);
+    }
+  });
+}
+
 /* ---------- brain panel ---------- */
 function wireBrainPanel(node) {
   node.querySelector("#brain-selfimprove").onclick = () => {
@@ -1448,32 +1541,36 @@ function logBrain(msg) {
 /* ---------- browser panel ---------- */
 function wireBrowserPanel(node) {
   const url = node.querySelector("#br-url");
-  const navigate = () => { if (url.value.trim()) browserAction("navigate", { url: url.value.trim() }); };
-  node.querySelector("#br-back").onclick = () => browserAction("back");
-  node.querySelector("#br-forward").onclick = () => browserAction("forward");
-  node.querySelector("#br-reload").onclick = () => browserAction("reload");
-  node.querySelector("#br-navigate").onclick = navigate;
-  node.querySelector("#br-shot-btn").onclick = refreshBrowserScreenshot;
-  node.querySelector("#br-eval-btn").onclick = () => {
-    const row = node.querySelector("#br-eval-row");
-    row.classList.toggle("hidden");
-    if (!row.classList.contains("hidden")) node.querySelector("#br-eval").focus();
+  const start = async () => {
+    const target = url.value.trim();
+    if (!target || !state.activeProjectId) return pushError("browser: open a project and enter an http(s) URL");
+    try {
+      const origin = new URL(target).origin;
+      const observation = await browserAction("start", { projectId: state.activeProjectId, url: target, allowedOrigins: [origin] });
+      renderBrowserObservation(observation);
+    } catch (e) { pushError("browser start: " + e.message); }
   };
-  node.querySelector("#br-eval-run").onclick = () => {
-    const js = node.querySelector("#br-eval").value;
-    if (!js.trim()) return;
-    browserAction("eval", { js }).then(({ result }) => {
-      const res = node.querySelector("#br-eval-result");
-      res.classList.remove("hidden");
-      res.textContent = String(result);
-    }).catch((e) => pushError("browser eval: " + e.message));
+  node.querySelector("#br-navigate").textContent = "START";
+  node.querySelector("#br-navigate").onclick = start;
+  node.querySelector("#br-back").textContent = "STOP";
+  node.querySelector("#br-back").onclick = async () => {
+    if (!state.browserSessionId) return;
+    try { renderBrowserObservation(await browserAction("stop", { sessionId: state.browserSessionId })); }
+    catch (e) { pushError("browser stop: " + e.message); }
   };
-  url.addEventListener("keydown", (e) => { if (e.key === "Enter") navigate(); });
+  node.querySelector("#br-forward").classList.add("hidden");
+  node.querySelector("#br-reload").classList.add("hidden");
+  node.querySelector("#br-shot-btn").classList.add("hidden");
+  node.querySelector("#br-eval-btn")?.remove();
+  node.querySelector("#br-eval-row").remove();
+  node.querySelector("#br-eval-result").remove();
+  url.addEventListener("keydown", (e) => { if (e.key === "Enter") start(); });
+  refreshBrowserScreenshot();
 }
 
 async function browserAction(action, body) {
-  let path = "/api/browser/" + action;
-  const opts = { method: body ? "POST" : (action === "state" || action === "screenshot" ? "GET" : "POST"), headers: {} };
+  const path = "/api/browser/" + action;
+  const opts = { method: body ? "POST" : "GET", headers: {} };
   if (body) { opts.headers["content-type"] = "application/json"; opts.body = JSON.stringify(body); }
   return api(path, opts);
 }
@@ -1482,21 +1579,49 @@ async function refreshBrowserScreenshot() {
   const panel = document.querySelector('.panel[data-panel="browser"]');
   if (!panel) return;
   try {
-    const state = await browserAction("state");
-    if (state.url) panel.querySelector("#br-url").value = state.url;
-    const { dataUrl } = await browserAction("screenshot");
-    const shot = panel.querySelector("#br-shot");
-    const ph = panel.querySelector("#br-placeholder");
-    if (dataUrl) {
-      shot.src = dataUrl;
-      shot.classList.remove("hidden");
-      ph.classList.add("hidden");
-    } else {
-      shot.classList.add("hidden");
-      ph.classList.remove("hidden");
-      ph.textContent = "browser not available (dev mode / no Electron)";
-    }
+    const result = await browserAction("state");
+    renderBrowserObservation(result.observation);
   } catch (e) { pushError("browser: " + e.message); }
+}
+
+function renderBrowserObservation(observation) {
+  const panel = document.querySelector('.panel[data-panel="browser"]');
+  if (!panel) return;
+  const shot = panel.querySelector("#br-shot");
+  const ph = panel.querySelector("#br-placeholder");
+  if (!observation) {
+    state.browserSessionId = null;
+    shot.classList.add("hidden"); ph.classList.remove("hidden");
+    ph.textContent = "waiting for a Pi browser session";
+    return;
+  }
+  state.browserSessionId = observation.status === "stopped" ? null : observation.sessionId;
+  panel.querySelector("#br-url").value = observation.page?.url || "";
+  const action = observation.currentAction;
+  const owner = observation.owner || {};
+  ph.textContent = `${observation.status} | ${owner.projectId || "unowned"} | seq ${observation.seq}`;
+  if (observation.frame?.available && observation.status !== "stopped") {
+    shot.src = `/api/browser/frame?sessionId=${encodeURIComponent(observation.sessionId)}&afterSeq=${Math.max(-1, observation.frame.seq - 1)}&t=${observation.frame.seq}`;
+    shot.classList.remove("hidden"); ph.classList.add("hidden");
+  } else { shot.classList.add("hidden"); ph.classList.remove("hidden"); }
+  let details = panel.querySelector(".browser-observation");
+  if (!details) { details = el("div", "browser-observation mono"); panel.querySelector(".browser-body").appendChild(details); }
+  const errors = [...(observation.consoleErrors || []), ...(observation.networkErrors || [])];
+  const refs = (observation.elements || []).slice(0, 10).map((item) => `@${item.ref} ${item.role} ${item.name}`).join("\n");
+  details.textContent = [
+    `owner ${owner.projectId || "-"} / workflow ${owner.workflowId || "-"}`,
+    `viewport ${observation.page?.viewport?.width || 0}x${observation.page?.viewport?.height || 0} | recording off`,
+    `active ${action ? `${action.name} ${action.targetRef || ""}` : "observe"}`,
+    `console ${observation.counters?.consoleErrors || 0} | network ${observation.counters?.networkErrors || 0}`,
+    errors.slice(-3).join(" | "), refs,
+  ].filter(Boolean).join("\n");
+  let cursor = panel.querySelector(".browser-agent-cursor");
+  if (observation.cursor && shot.clientWidth) {
+    if (!cursor) { cursor = el("span", "browser-agent-cursor"); panel.querySelector(".browser-shot-host").appendChild(cursor); }
+    const viewport = observation.page.viewport;
+    cursor.style.left = `${Math.max(0, Math.min(100, observation.cursor.x / viewport.width * 100))}%`;
+    cursor.style.top = `${Math.max(0, Math.min(100, observation.cursor.y / viewport.height * 100))}%`;
+  } else if (cursor) cursor.remove();
 }
 
 /* ---------- sandbox ---------- */

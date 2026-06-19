@@ -9,8 +9,8 @@ import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, shell } from "electron";
 import { buildServer } from "./server";
 import { sandbox } from "./sandbox";
-import * as browser from "./browser";
-import { checkForUpdatesOnLaunch } from "./updater";
+import { browserController } from "./browser";
+import { checkForUpdatesOnLaunch, wireUpdaterIpc, enableInstallOnQuit } from "./updater";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.DOTZ_PORT || 4317);
@@ -46,21 +46,21 @@ function createWindow() {
     if (/^https?:/.test(url)) shell.openExternal(url);
     return { action: "deny" };
   });
-  // Attach the in-app browser view (hidden until the UI opens the browser panel).
-  browser.attach(win).catch(() => {});
-  win.on("closed", () => browser.detach());
+  return win;
 }
 
 app.whenReady().then(async () => {
-  // Check for updates before doing anything else. On portable builds this may quit
-  // and relaunch if an update is ready, keeping the app current on every start.
-  await checkForUpdatesOnLaunch();
+  wireUpdaterIpc();
+  // Start the server before opening the window so the renderer has a live backend.
   try {
     await startServer();
   } catch (e) {
     console.error("dotz: server failed to start", e);
   }
-  createWindow();
+  const win = createWindow();
+  // Check for updates after the window is ready. The renderer will show a popup when an
+  // update is discovered; the user chooses to download now, defer, or open settings.
+  await checkForUpdatesOnLaunch(win);
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -68,7 +68,8 @@ app.whenReady().then(async () => {
 
 app.on("window-all-closed", () => {
   sandbox.disposeAll();
-  browser.detach();
+  browserController.disposeAll().catch(() => undefined);
+  enableInstallOnQuit();
   if (runtime) runtime.pi.disposeAll();
   app.quit();
 });

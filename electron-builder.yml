@@ -13,9 +13,12 @@ files:
   - package.json
   - node_modules/**/*
 win:
-  target: portable
-# Update feed for electron-updater. Override at build/publish time or via DOTZ_UPDATE_URL env.
+  target:
+    - nsis
+    - portable
+# NSIS updates through GitHub Releases; portable builds remain manual-download artifacts.
 publish:
-  provider: generic
-  url: https://dotz-releases.example.com
+  provider: github
+  owner: cayleb-james2008
+  repo: dotz
 # icon: assets/dotz.ico
