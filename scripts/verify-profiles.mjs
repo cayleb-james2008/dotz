@@ -7,7 +7,13 @@
  *   - /commands surfaces the workflow prompts (/implement, /scout-and-plan, /implement-and-review)
  * Then shuts down and exits 0 on success, non-zero on failure.
  */
-import { buildServer } from "../src/server.ts";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
+// Isolate config to a throwaway dir so the glm-5.2 default assertion is deterministic and the
+// operator's real ~/.dotz/config.json is never read/mutated (config.ts resolves the dir lazily).
+process.env.DOTZ_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "dotz-cfgtest-"));
+const { buildServer } = await import("../src/server.ts");
 
 const PORT = 4319;
 
@@ -30,7 +36,7 @@ assert(profiles.some((p) => p.id === "workflow" && p.workflow), "workflow profil
 console.log("\n[2] POST /api/sessions {profileId:workflow}");
 const sess = await post("/api/sessions", { profileId: "workflow" });
 assert(sess.profileId === "workflow", `session.profileId = ${sess.profileId} (expected workflow)`);
-assert(sess.model && sess.model.modelId === "nex-agi/nex-n2-pro:free", `default model = ${sess.model && sess.model.modelId}`);
+assert(sess.model && sess.model.modelId === "glm-5.2", `default executive model = ${sess.model && sess.model.modelId} (expected glm-5.2 — Ollama Cloud is primary)`);
 const sid = sess.sessionId;
 
 console.log("\n[3] GET /api/sessions/:id/tools — expect subagent tool active");
@@ -62,7 +68,9 @@ assert(list.length === 1 && list[0].profileId === "workflow", `sessions list = $
 // cleanup
 pi.dispose(sid);
 await app.close();
+fs.rmSync(process.env.DOTZ_CONFIG_DIR, { recursive: true, force: true });
 
 console.log("\n" + (failures.length === 0 ? "ALL CHECKS PASSED" : `${failures.length} FAILURES:`));
 for (const f of failures) console.log("  - " + f);
-process.exit(failures.length === 0 ? 0 : 1);
+// process.exitCode (not process.exit) so the loop drains and we avoid the Windows libuv teardown race.
+process.exitCode = failures.length === 0 ? 0 : 1;

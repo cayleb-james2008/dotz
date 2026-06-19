@@ -16,6 +16,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -26,6 +27,16 @@ import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
+
+// Path to the bundled Ollama Cloud provider extension, passed to each spawned subagent `pi`
+// process via -e so subagents on the "ollama/" provider (e.g. the default ollama/minimax-m3)
+// can authenticate — Ollama Cloud is not a built-in pi provider.
+let OLLAMA_PROVIDER_EXT = "";
+try {
+	OLLAMA_PROVIDER_EXT = fileURLToPath(new URL("../ollama-cloud/index.ts", import.meta.url));
+} catch {
+	OLLAMA_PROVIDER_EXT = "";
+}
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
@@ -286,11 +297,19 @@ async function runSingleAgent(
 		};
 	}
 
-	// Model override (from the `model` param) wins over the agent's default — this is the
-	// task-distribution hook: the main agent selects a low-cost sub-model per task.
-	const effectiveModel = modelOverride || agent.model;
+	// Model resolution: an explicit `model` param wins, then the agent's own default, then the
+	// dotz-configured subagent model (DOTZ_SUBAGENT_MODEL, default ollama/minimax-m3) so every
+	// dispersed subagent runs on the cheap worker unless a call deliberately overrides it.
+	const effectiveModel = modelOverride || agent.model || process.env.DOTZ_SUBAGENT_MODEL;
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (effectiveModel) args.push("--model", effectiveModel);
+	if (effectiveModel) {
+		args.push("--model", effectiveModel);
+		// Ollama Cloud isn't a built-in pi provider; load the provider extension so the subprocess
+		// can authenticate ollama/* models (e.g. the default subagent model ollama/minimax-m3).
+		if (effectiveModel.startsWith("ollama/") && OLLAMA_PROVIDER_EXT && fs.existsSync(OLLAMA_PROVIDER_EXT)) {
+			args.push("-e", OLLAMA_PROVIDER_EXT);
+		}
+	}
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;

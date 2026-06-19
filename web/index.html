@@ -56,10 +56,15 @@
           </div>
           <div class="knob-group">
             <label class="knob-label">MODEL</label>
-            <input id="model-input" class="knob-input" list="model-suggestions" spellcheck="false" placeholder="model id" />
+            <input id="model-input" class="knob-input" list="model-suggestions" spellcheck="false" placeholder="executive model id" title="executive (lead) model" />
             <datalist id="model-suggestions"></datalist>
             <select id="model-select" class="knob-select hidden"></select>
             <span id="model-badge" class="model-badge hidden">—</span>
+          </div>
+          <div class="knob-group">
+            <label class="knob-label">SUBAGENT</label>
+            <input id="subagent-input" class="knob-input" list="subagent-suggestions" spellcheck="false" placeholder="subagent model id" title="model every dispersed subagent runs on" />
+            <datalist id="subagent-suggestions"></datalist>
           </div>
           <div class="knob-group">
             <label class="knob-label">REASONING</label>

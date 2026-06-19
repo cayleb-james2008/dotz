@@ -31,7 +31,8 @@ import { workflowStore, type WorkflowEvent } from "./workflows";
 import { workflowBridge } from "./workflow-bridge";
 import { resolveHumanGate, onGateRequest } from "../.pi/extensions/dotz-tools/index";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "./browser";
-import { PROVIDERS, type Project, type MemoryEntry, type SandboxRun, type WorkflowRun } from "./types";
+import { PROVIDERS, PROVIDER_DEFAULTS, type Project, type MemoryEntry, type SandboxRun, type WorkflowRun } from "./types";
+import { loadConfig, getConfig, updateConfig, type DotzConfig } from "./config";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.DOTZ_PORT || 4317);
@@ -77,6 +78,9 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   const app = Fastify({ logger: false });
   const pi = new PiSessions();
 
+  // Load the operator's persisted provider/model/reasoning defaults (sets DOTZ_SUBAGENT_MODEL).
+  await loadConfig();
+
   await app.register(fastifyWebsocket);
 
   // Human-gate: when the agent calls the `human_gate` tool, forward the gate request to all
@@ -100,6 +104,14 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   // ---- health + providers ----
   app.get("/api/health", async () => ({ ok: true, sessions: pi.list().length, sandboxRuns: sandbox.list().length }));
   app.get("/api/providers", async () => ({ providers: PROVIDERS }));
+
+  // ---- global config: provider + executive/subagent model + reasoning defaults ----
+  app.get("/api/config", async () => ({ config: getConfig(), providerDefaults: PROVIDER_DEFAULTS, providers: PROVIDERS }));
+  app.post("/api/config", async (req) => {
+    const patch = (req.body ?? {}) as Partial<DotzConfig>;
+    const config = await updateConfig(patch);
+    return { config };
+  });
 
   // ---- profiles ----
   app.get("/api/profiles", async () => ({ profiles: PROFILES.map(profileSummary), default: "workflow" }));
@@ -398,6 +410,27 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     if (!e) return;
     await e.session.abort();
     return { ok: true };
+  });
+
+  // Rebuild a session so its system prompt re-injects fresh project memory + the latest skill index
+  // + AGENTS.md (all read once at session-build time, so mid-session edits to memory/AGENTS.md never
+  // reach a live session). Reuses create/dispose: the new session keeps the same project/profile and
+  // the current model + reasoning effort, but starts a FRESH conversation (history resets — the
+  // caller should re-bind to the returned sessionId).
+  app.post("/api/sessions/:id/reload-context", async (req, reply) => {
+    const e = need((req.params as { id: string }).id, reply);
+    if (!e) return;
+    const s = e.session;
+    const m = s.model as { provider?: string; id?: string } | undefined;
+    const opts: CreateOpts = {
+      projectId: e.projectId ?? undefined,
+      profileId: e.profile.id,
+      model: m && m.provider && m.id ? { provider: m.provider, modelId: m.id } : undefined,
+      thinkingLevel: s.thinkingLevel as ThinkingLevel,
+    };
+    pi.dispose(s.sessionId);
+    const fresh = await pi.create(opts);
+    return sessionSummary(fresh.id, fresh.session, fresh.profile.id, fresh.projectId);
   });
 
   // WebSocket: stream a session's agent events AND sandbox events; accept prompt/steer/followUp/abort.

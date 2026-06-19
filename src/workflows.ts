@@ -191,11 +191,15 @@ export class WorkflowStore {
         this.emit(runId, { type: "workflow_end", run });
       }
     } else if (step.status === "error") {
-      // mark run errored but leave remaining steps pending
-      run.status = "error";
-      run.endedAt = Date.now();
+      // Mark the run errored but leave remaining steps as-is. Emit workflow_end only on the FIRST
+      // transition to a terminal state, so a multi-step error sweep (workflow-bridge onEnd) doesn't
+      // fire workflow_end once per swept step.
+      if (run.status !== "error" && run.status !== "aborted" && run.status !== "done") {
+        run.status = "error";
+        run.endedAt = Date.now();
+        this.emit(runId, { type: "workflow_end", run });
+      }
       run.updatedAt = Date.now();
-      this.emit(runId, { type: "workflow_end", run });
     }
     await this.persist(run);
   }

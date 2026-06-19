@@ -9,8 +9,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, SettingsManager, DefaultResourceLoader, type ResourceLoader } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MODEL, renderLowCostModels, type ModelRef, type ThinkingLevel } from "./types";
-import { memoryStore, type MemoryStore } from "./memory";
-import { skillLoader, type SkillLoader } from "./skills";
+import { memoryStore } from "./memory";
+import { skillLoader } from "./skills";
 
 /** Bundled .pi (skills / extensions / prompts) — resolved relative to this module so it works
  *  both in dev (src/) and in the packaged app (dist/, with .pi shipped alongside). */
@@ -40,14 +40,11 @@ You are the dotz lead agent. For EVERY non-trivial task you operate in WORKFLOW 
      • /scout-and-plan  — map the codebase and produce a plan (no edits)
      • /implement       — scout → plan → worker implements
      • /implement-and-review — worker builds, reviewer audits, worker fixes
-3. **AUTOMATIC TASK DISTRIBUTION** — for each subagent call, select a model from the low-cost
-   sub-model list (injected below) via the \`model\` parameter. You (the main agent) retain the
-   high-quality orchestrator role; subagents run on low-cost models to keep cost down while
-   maximizing throughput. Match model capability to task complexity:
-     • Simple/lookup tasks → the cheapest model
-     • Implementation tasks → a capable-but-low-cost model
-     • Review/critique tasks → a model with strong reasoning
-   This is the dotz task-distribution philosophy: one smart orchestrator, many cheap workers.
+3. **AUTOMATIC TASK DISTRIBUTION** — every subagent you disperse runs on the configured sub-model
+   (minimax-m3 on Ollama Cloud by default) automatically; you do NOT need to pick a model per call.
+   You (the lead) keep the high-quality executive model. Override a single subagent's \`model\`
+   parameter only when a task genuinely needs a stronger or cheaper model. One smart orchestrator,
+   many cheap workers.
 4. VERIFY ADVERSARIALLY before claiming done — spawn a reviewer subagent (or use
    /implement-and-review) to hunt for bugs, regressions, and missed requirements. Treat its
    findings as required work, not optional polish.
@@ -145,22 +142,20 @@ export function profileSummary(p: Profile) {
 export async function buildResourceLoader(
   cwd: string,
   profile: Profile,
-  opts: { projectId?: string | null; memory?: MemoryStore; skills?: SkillLoader } = {}
+  opts: { projectId?: string | null } = {}
 ): Promise<ResourceLoader> {
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir);
   const prompts = [profile.appendSystemPrompt];
   if (opts.projectId) {
-    const store = opts.memory ?? memoryStore;
-    const entries = await store.forProject(opts.projectId, cwd);
-    const memBlock = store.renderForPrompt(entries);
+    const entries = await memoryStore.forProject(opts.projectId, cwd);
+    const memBlock = memoryStore.renderForPrompt(entries);
     if (memBlock) prompts.push(memBlock);
   }
   // Inject the unified skill index (names + one-line descriptions) so the agent knows what
   // skills are available without loading every full body. The `skill` tool loads bodies on demand.
-  const loader = opts.skills ?? skillLoader;
-  await loader.load();
-  const skillIndex = loader.renderIndex();
+  await skillLoader.load();
+  const skillIndex = skillLoader.renderIndex();
   if (skillIndex) prompts.push(skillIndex);
   // Inject the low-cost sub-model list so the main model can select sub-models for task distribution.
   prompts.push(renderLowCostModels());
@@ -170,6 +165,7 @@ export async function buildResourceLoader(
     settingsManager,
     appendSystemPrompt: prompts,
     additionalExtensionPaths: [
+      path.join(DOTZ_PI, "extensions", "ollama-cloud"),
       path.join(DOTZ_PI, "extensions", "subagent"),
       path.join(DOTZ_PI, "extensions", "dotz-tools"),
     ],

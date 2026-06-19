@@ -113,9 +113,18 @@ export class WorkflowBridge {
     if (!runId) return;
     const details = extractDetails(result);
     if (details) this.syncSteps(runId, details, true);
-    // If error and no details, mark the run errored
-    if (isError && !details) {
-      workflowStore.stepState(runId, "__run_error__", { status: "error", error: "subagent tool call failed" }).catch(() => {});
+    // The subagent tool call has ended, so every step's result should have arrived. Sweep any step
+    // still in a non-terminal state (no result reported, or a result that never matched even
+    // positionally) to error so the graph never shows a permanently "running"/"ready" node after
+    // the run completes. This also covers a tool-call failure that returned no details.
+    const run = workflowStore.get(runId);
+    if (run) {
+      const reason = isError && !details ? "subagent tool call failed" : "step result not reported";
+      for (const step of run.steps) {
+        if (step.status === "running" || step.status === "ready" || step.status === "pending") {
+          workflowStore.stepState(runId, step.id, { status: "error", error: reason }).catch(() => {});
+        }
+      }
     }
     this.runsByToolCall.delete(toolCallId);
   }
@@ -127,8 +136,9 @@ export class WorkflowBridge {
       const key = `${runId}:${idx}:${res.agent}:${res.task.slice(0, 40)}`;
       let stepId = this.stepIds.get(key);
       if (!stepId) {
-        // find the matching step in the run by agent+task
-        const step = run.steps.find((s) => s.agent === res.agent && s.task === res.task);
+        // Match the step by agent+task; if the extension reordered or truncated the task string
+        // so the exact match misses, fall back to positional match (results arrive in step order).
+        const step = run.steps.find((s) => s.agent === res.agent && s.task === res.task) ?? run.steps[idx];
         if (!step) return;
         stepId = step.id;
         this.stepIds.set(key, stepId);

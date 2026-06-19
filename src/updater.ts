@@ -30,6 +30,7 @@ let downloadStarted = false;
 let pendingUpdate: UpdateInfo | null = null;
 let downloadPercent = 0;
 let eventsAttached = false;
+let errorEventFired = false;
 
 /** Resolve the update server config from env/package.json. */
 function resolveFeed(): string | undefined {
@@ -103,6 +104,7 @@ function attachUpdaterEvents() {
   });
 
   autoUpdater.on("error", (err) => {
+    errorEventFired = true;
     sendToRenderer("failed", { message: err.message });
   });
 }
@@ -128,10 +130,17 @@ export async function checkForUpdatesOnLaunch(win: BrowserWindow): Promise<void>
   }
   checking = true;
   downloadStarted = false;
+  errorEventFired = false;
   try {
     attachUpdaterEvents();
     configureUpdater(feed);
     await autoUpdater.checkForUpdates();
+  } catch (e) {
+    // A thrown/failed check (network down, bad feed) must surface to the renderer so the UI can
+    // show a stale/failed indicator instead of appearing to silently succeed — but only if the
+    // autoUpdater "error" event didn't already report it (electron-updater commonly both emits
+    // "error" AND rejects the promise for the same failure).
+    if (!errorEventFired) sendToRenderer("failed", { message: String((e as Error)?.message ?? e) });
   } finally {
     checking = false;
   }

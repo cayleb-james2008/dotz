@@ -1,4 +1,6 @@
 /** Shared value/type constants (kept separate so pi.ts and profiles.ts don't import each other). */
+import process from "node:process";
+
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export interface ModelRef {
@@ -6,8 +8,18 @@ export interface ModelRef {
   modelId: string;
 }
 
-/** dotz default: OpenRouter custom model id (Cayleb's preference), a free model. */
-export const DEFAULT_MODEL: ModelRef = { provider: "openrouter", modelId: "nex-agi/nex-n2-pro:free" };
+/** dotz default provider + executive model: Ollama Cloud glm-5.2 (operator's primary). */
+export const DEFAULT_PROVIDER = "ollama";
+export const DEFAULT_MODEL: ModelRef = { provider: "ollama", modelId: "glm-5.2" };
+
+/** Provider-aware default model ids — the executive (lead) model and the subagent worker model.
+ *  Ollama Cloud is the primary; OpenRouter is the free fallback. The UI prefills these when the
+ *  operator switches provider, and either can be overridden with any model id. */
+export interface ProviderDefault { executive: string; subagent: string; }
+export const PROVIDER_DEFAULTS: Record<string, ProviderDefault> = {
+  ollama: { executive: "glm-5.2", subagent: "minimax-m3" },
+  openrouter: { executive: "nex-agi/nex-n2-pro:free", subagent: "nex-agi/nex-n2-pro:free" },
+};
 
 /** Known provider display metadata — keeps the UI readable without hard-coding catalog logic. */
 export interface ProviderMeta {
@@ -31,20 +43,18 @@ export const PROVIDERS: ProviderMeta[] = [
   { id: "local", label: "Local (Ollama/LM Studio)", freeForm: true },
 ];
 
-/** Low-cost sub-models per provider — used by automatic task distribution.
- *  The main model selects from this list when dispersing subtasks to subagents,
- *  keeping cost down while the main agent retains the high-quality orchestrator role.
- *  Format: `{provider}/{modelId}` (the same shape pi's --model flag expects). */
+/** Suggested low-cost worker model ids (surfaced as model-id suggestions in the UI). */
 export const LOW_COST_MODELS: ModelRef[] = [
   { provider: "ollama", modelId: "minimax-m3" },
-  { provider: "openrouter", modelId: "nvidia/nemotron-3-ultra-550b-a55b:free" },
   { provider: "openrouter", modelId: "nex-agi/nex-n2-pro:free" },
 ];
 
-/** Render the low-cost model list for system-prompt injection. */
+/** Render the subagent-model directive for system-prompt injection. Every dispersed subagent
+ *  runs on the configured sub-model (DOTZ_SUBAGENT_MODEL, default ollama/minimax-m3) by default;
+ *  the lead keeps the high-quality executive model. */
 export function renderLowCostModels(): string {
-  const lines = LOW_COST_MODELS.map((m) => `- ${m.provider}/${m.modelId}`);
-  return `\n# dotz low-cost sub-model list (for automatic task distribution)\nWhen dispersing subtasks to subagents via the \`subagent\` tool, select a model from this list\n(using the \`model\` parameter) to keep cost down. The main agent (you) retains the\nhigh-quality orchestrator role; subagents run on these low-cost models.\n${lines.join("\n")}\n`;
+  const sub = process.env.DOTZ_SUBAGENT_MODEL || `${DEFAULT_PROVIDER}/${PROVIDER_DEFAULTS[DEFAULT_PROVIDER].subagent}`;
+  return `\n# dotz subagent model\nEvery subagent you disperse via the \`subagent\` tool runs on \`${sub}\` by default (the configured low-cost worker). You (the lead) keep the high-quality executive model. Override a single call with the \`model\` parameter only when a task genuinely needs a different model.\n`;
 }
 
 /** Project definition — persistent workspace with its own cwd, profile, model, and memory. */
