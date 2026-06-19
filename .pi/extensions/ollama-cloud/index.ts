@@ -6,10 +6,12 @@
  *   - the dotz lead session, via additionalExtensionPaths in src/profiles.ts;
  *   - each spawned subagent `pi` process, via `-e <this file>` (see .pi/extensions/subagent).
  *
- * `apiKey` MUST be the bare env-var NAME — pi's resolveConfigValue replaces a value that names
- * an env var with process.env[value]. Passing "$OLLAMA_API_KEY" would be sent as a literal bearer
- * token and Ollama would 401. The few seeded models act as free-form templates; any other Ollama
- * Cloud model id (kimi-k2.7-code, deepseek-v4-pro, qwen3-coder-next, …) resolves by cloning one.
+ * `apiKey` MUST be "$OLLAMA_API_KEY" (the env-var reference, with the leading `$`). pi's
+ * resolveConfigValue only interpolates a value from the environment when it contains a `$ENV_VAR`
+ * (or `${ENV_VAR}`) reference; a BARE "OLLAMA_API_KEY" is treated as a literal and sent verbatim as
+ * the bearer token, which Ollama rejects with 401 (pi then swallows it into an empty reply). The `$`
+ * form still keeps the secret out of source (resolved from process.env at request time). The seeded
+ * models act as free-form templates; any other Ollama Cloud model id resolves by cloning one.
  */
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -26,7 +28,7 @@ const MODEL = (id: string, name: string) => ({
 export default function (pi: ExtensionAPI) {
   pi.registerProvider("ollama", {
     baseUrl: "https://ollama.com/v1",
-    apiKey: "OLLAMA_API_KEY",
+    apiKey: "$OLLAMA_API_KEY",
     api: "openai-completions",
     models: [
       MODEL("glm-5.2", "GLM 5.2"),

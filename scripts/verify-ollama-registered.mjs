@@ -29,6 +29,20 @@ const kimi = resolveModel(e.session, { provider: "ollama", modelId: "kimi-k2.6" 
 ok(!!kimi, `free-form ollama/kimi-k2.6 resolves (clone)`);
 console.log("    kimi clone object:", JSON.stringify(kimi));
 
+// Auth resolution regression guard (no live call): the provider's "$OLLAMA_API_KEY" reference must
+// resolve to a REAL key value. A bare "OLLAMA_API_KEY" (or a stray "$") would reach the bearer
+// header as a literal and Ollama returns 401 — which pi swallows into an empty reply. Key shape
+// only is checked; the value is never logged. Skipped when the env key is absent.
+if (process.env.OLLAMA_API_KEY) {
+  const auth = await reg.getApiKeyAndHeaders(glm);
+  ok(
+    !!auth?.ok && !!auth.apiKey && auth.apiKey !== "$OLLAMA_API_KEY" && auth.apiKey !== "OLLAMA_API_KEY" && String(auth.apiKey).length > 16,
+    `$OLLAMA_API_KEY resolves to a real key (not the literal reference → would 401)`
+  );
+} else {
+  console.log("  ⚠ OLLAMA_API_KEY not set — skipping auth-resolution check");
+}
+
 pi.dispose(e.id);
 console.log(fails.length ? `\n${fails.length} FAILED` : "\nOLLAMA PROVIDER REGISTRATION OK");
 await app.close();
