@@ -27,6 +27,10 @@ interface SubagentDetailsLike {
     usage?: { input?: number; output?: number; cost?: number; turns?: number };
     model?: string;
     step?: number;
+    sandboxRunId?: string | null;
+    browserSessionId?: string | null;
+    toolCallIds?: string[];
+    thinking?: string;
   }>;
 }
 
@@ -130,10 +134,14 @@ export class WorkflowBridge {
         this.stepIds.set(key, stepId);
       }
       const status = stepStatus(res.exitCode, res.stopReason);
-      const patch: { status: "running" | "done" | "error"; output?: string; error?: string; usage?: { input?: number; output?: number; cost?: number; turns?: number } } = { status };
+      const patch: { status: "running" | "done" | "error"; output?: string; error?: string; usage?: { input?: number; output?: number; cost?: number; turns?: number }; sandboxRunId?: string | null; browserSessionId?: string | null; toolCallIds?: string[]; thinking?: string } = { status };
       if (status === "done") patch.output = `(subagent completed on ${res.model || "default model"})`;
       if (status === "error") patch.error = res.stopReason || `exit code ${res.exitCode}`;
       if (res.usage) patch.usage = { input: res.usage.input, output: res.usage.output, cost: res.usage.cost, turns: res.usage.turns };
+      if (res.sandboxRunId !== undefined) patch.sandboxRunId = res.sandboxRunId;
+      if (res.browserSessionId !== undefined) patch.browserSessionId = res.browserSessionId;
+      if (res.toolCallIds !== undefined) patch.toolCallIds = res.toolCallIds;
+      if (res.thinking !== undefined) patch.thinking = res.thinking;
       workflowStore.stepState(runId, stepId, patch).catch(() => {});
     });
   }

@@ -14,20 +14,42 @@
   </head>
   <body>
     <div id="app">
-      <!-- TOP BAR: the four knobs + brand + workflows -->
+      <!-- TOP BAR: brand + project selector + the four knobs -->
       <header class="topbar">
         <div class="brand">
           <span class="wordmark">dotz</span>
           <span class="subtitle">ultra code · pi.dev</span>
         </div>
+
         <div class="topbar-center">
-          <span class="ascii-dim">▓▒░</span>
-          <span id="session-name" class="session-name">no session</span>
-          <span class="ascii-dim">░▒▓</span>
+          <div class="project-selector-wrap">
+            <button id="project-select" class="project-select" title="current project">
+              <span id="project-name" class="project-name">NO PROJECT</span>
+              <span class="project-caret">▾</span>
+            </button>
+            <div id="project-dropdown" class="project-dropdown hidden">
+              <div id="project-list" class="project-list"></div>
+              <div class="project-dropdown-foot">
+                <button id="project-new-btn" class="btn-mini btn-go">+ NEW PROJECT</button>
+              </div>
+              <div id="project-form" class="project-form hidden">
+                <input id="pf-name" class="pf-input" placeholder="project name" />
+                <input id="pf-cwd" class="pf-input" placeholder="cwd (absolute path)" />
+                <select id="pf-profile" class="pf-select"></select>
+                <input id="pf-model" class="pf-input" placeholder="model id" value="nex-agi/nex-n2-pro:free" />
+                <div class="pf-actions">
+                  <button id="pf-create" class="btn-mini btn-go">CREATE &amp; OPEN</button>
+                  <button id="pf-cancel" class="btn-mini">CANCEL</button>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
+
         <div class="topbar-right">
           <!-- hidden profile-picker kept for verify-ui compatibility -->
           <div id="profile-picker" class="profile-picker hidden" title="dotz operating profile"></div>
+
           <div class="knob-group">
             <label class="knob-label">PROVIDER</label>
             <select id="provider-select" class="knob-select" title="provider"></select>
@@ -43,53 +65,37 @@
             <label class="knob-label">REASONING</label>
             <div id="reasoning-seg" class="seg-mini"></div>
           </div>
-          <button id="workflows-btn" class="knob-btn" title="open workflow graph">
-            ◐ WORKFLOWS <span id="wf-badge" class="wf-badge hidden">0</span>
-          </button>
           <button id="panels-btn" class="knob-btn" title="add panels (Ctrl+P)">+ PANELS</button>
-          <span id="conn-chip" class="chip chip-off"><span class="blk">█</span> CONNECTING</span>
+          <span id="conn-chip" class="chip chip-off"><span class="blk">█</span> OFFLINE</span>
         </div>
       </header>
 
-      <!-- PROJECT LAUNCHER (initial state — shown until a session exists) -->
-      <section id="launcher" class="launcher">
-        <div class="launcher-card">
-          <div class="launcher-head">
-            <span class="launcher-glyph">◆</span>
-            <h1>dotz</h1>
-            <span class="launcher-sub">ultra code · pi.dev coding agent</span>
-          </div>
-          <p class="launcher-prompt">Open a project to start, or create a new workspace.</p>
-          <div id="launcher-projects" class="launcher-projects"></div>
-          <div class="launcher-new">
-            <button id="launcher-new-btn" class="btn-launch">+ NEW PROJECT</button>
-          </div>
-          <div id="launcher-form" class="launcher-form hidden">
-            <input id="lf-name" class="pf-input" placeholder="project name" />
-            <input id="lf-cwd" class="pf-input" placeholder="cwd (absolute path)" />
-            <select id="lf-profile" class="pf-select"></select>
-            <input id="lf-model" class="pf-input" placeholder="model id (openrouter)" value="nex-agi/nex-2-pro:free" />
-            <div class="pf-actions">
-              <button id="lf-create" class="btn-mini btn-go">CREATE &amp; OPEN</button>
-              <button id="lf-cancel" class="btn-mini">CANCEL</button>
+      <!-- MAIN STAGE -->
+      <main id="stage" class="stage">
+        <!-- COMMAND CENTER: launch surface before a session starts -->
+        <section id="command-center" class="command-center">
+          <div class="cc-card">
+            <div class="cc-meta">
+              <span id="cc-project" class="cc-project">no project selected</span>
+              <span id="cc-profile" class="cc-profile">workflow</span>
+              <span id="cc-model" class="cc-model">—</span>
+            </div>
+            <h1 class="cc-wordmark">dotz</h1>
+            <p class="cc-sub">ultra-code agent dashboard</p>
+            <div class="cc-composer-wrap">
+              <div id="quick-chips" class="quick-chips"></div>
+              <textarea id="composer-input" class="composer-input" rows="1" placeholder="tell dotz what to build…   / slash commands · @ skills · # files"></textarea>
+              <div class="cc-actions">
+                <button id="send-btn" class="btn-send">SEND ▹</button>
+                <button id="stop-btn" class="btn-stop hidden">STOP ■</button>
+              </div>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <!-- BENTO GRID (shown after a session starts) -->
-      <section id="bento" class="bento hidden">
-        <!-- panels are inserted here dynamically by the panel registry -->
-      </section>
-
-      <!-- PANEL PALETTE (Ctrl+P overlay) -->
-      <div id="palette" class="palette hidden">
-        <div class="palette-card">
-          <div class="palette-head">ADD PANEL</div>
-          <div id="palette-grid" class="palette-grid"></div>
-          <button id="palette-close" class="btn-mini">CLOSE (Esc)</button>
-        </div>
-      </div>
+        <!-- BENTO GRID: hidden until a project/session opens -->
+        <section id="bento" class="bento hidden"></section>
+      </main>
 
       <!-- STATUS BAR -->
       <footer class="statusbar">
@@ -110,6 +116,52 @@
       </footer>
     </div>
 
+    <!-- OVERLAYS -->
+    <div id="cmd-palette" class="cmd-palette hidden">
+      <div class="cmd-palette-card">
+        <input id="cmd-palette-input" class="cmd-palette-input" placeholder="type to filter…" />
+        <div id="cmd-palette-list" class="cmd-palette-list"></div>
+      </div>
+    </div>
+
+    <div id="gate-card" class="gate-card hidden">
+      <div class="gate-card-inner">
+        <div class="gate-head">◆ HUMAN GATE</div>
+        <div id="gate-plan" class="gate-plan"></div>
+        <textarea id="gate-feedback" class="gate-feedback" placeholder="optional feedback (sent back to agent)"></textarea>
+        <div class="gate-actions">
+          <button id="gate-approve" class="btn-go">APPROVE ✓</button>
+          <button id="gate-reject" class="btn-stop">REJECT ✕</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="node-detail" class="node-detail hidden">
+      <div class="node-detail-inner">
+        <div class="node-detail-head">
+          <span>STEP DETAIL</span>
+          <button id="node-detail-close" class="node-detail-close">×</button>
+        </div>
+        <div id="node-detail-body" class="node-detail-body"></div>
+      </div>
+    </div>
+
+    <div id="brain-float" class="brain-float hidden">
+      <div class="bf-row"><span class="bf-label">TOKENS</span><span id="bf-tok" class="bf-val">0</span></div>
+      <div class="bf-row"><span class="bf-label">COST</span><span id="bf-cost" class="bf-val">$0.00</span></div>
+      <div class="bf-row"><span class="bf-label">CTX</span><span id="bf-ctx" class="bf-val">0%</span></div>
+      <button id="brain-float-toggle" class="bf-toggle" title="toggle brain float">◆</button>
+    </div>
+
+    <!-- PANEL PALETTE (Ctrl+P overlay) -->
+    <div id="palette" class="palette hidden">
+      <div class="palette-card">
+        <div class="palette-head">ADD PANEL</div>
+        <div id="palette-grid" class="palette-grid"></div>
+        <button id="palette-close" class="btn-mini">CLOSE (Esc)</button>
+      </div>
+    </div>
+
     <!-- panel templates (hidden, cloned by the registry) -->
     <template id="tpl-chat">
       <div class="panel" data-panel="chat">
@@ -119,8 +171,8 @@
           <div class="composer">
             <div id="quick-chips" class="quick-chips"></div>
             <div class="composer-row">
-              <textarea id="composer-input" class="composer-input" rows="1" placeholder="message dotz…   / skills · @ files"></textarea>
-              <button id="send-btn" class="btn-send">SEND ▸</button>
+              <textarea id="composer-input" class="composer-input" rows="1" placeholder="message dotz…   / slash · @ skills · # files"></textarea>
+              <button id="send-btn" class="btn-send">SEND ▹</button>
               <button id="stop-btn" class="btn-stop hidden">STOP ■</button>
             </div>
           </div>
@@ -132,7 +184,11 @@
       <div class="panel" data-panel="graph">
         <div class="panel-head" draggable="true"><span class="panel-icon">◐</span> WORKFLOW GRAPH <button class="panel-close">×</button></div>
         <div class="panel-body graph-body">
-          <div id="wf-tabs" class="wf-tabs"></div>
+          <div id="wf-toolbar" class="wf-toolbar">
+            <button id="wf-fit" class="btn-mini" title="fit graph">FIT</button>
+            <button id="wf-reset" class="btn-mini" title="reset view">RESET</button>
+            <span id="wf-status" class="wf-status dim mono"></span>
+          </div>
           <div id="wf-detail" class="wf-detail hidden"></div>
           <svg id="wf-svg" class="wf-svg" xmlns="http://www.w3.org/2000/svg">
             <defs>
@@ -143,6 +199,7 @@
             <g id="wf-edges"></g>
             <g id="wf-nodes"></g>
           </svg>
+          <div id="wf-tabs" class="wf-tabs"></div>
           <div id="wf-empty" class="wf-empty">No active workflow runs. Start one via /implement or /implement-and-review.</div>
         </div>
       </div>
@@ -168,11 +225,23 @@
       <div class="panel" data-panel="browser">
         <div class="panel-head" draggable="true"><span class="panel-icon">▣</span> BROWSER <button class="panel-close">×</button></div>
         <div class="panel-body browser-body">
-          <div class="placeholder">
-            <div class="ph-glyph">▣</div>
-            <p>In-app browser (Phase 2)</p>
-            <p class="dim">Will connect to your local Chrome via browser-harness.</p>
-            <button class="btn-mini" disabled>CONNECT</button>
+          <div class="browser-toolbar">
+            <button id="br-back" class="btn-mini" title="back">◀</button>
+            <button id="br-forward" class="btn-mini" title="forward">▶</button>
+            <button id="br-reload" class="btn-mini" title="reload">↻</button>
+            <input id="br-url" class="br-url" placeholder="https://…" />
+            <button id="br-navigate" class="btn-mini btn-go">GO</button>
+            <button id="br-shot-btn" class="btn-mini" title="screenshot">📷</button>
+            <button id="br-eval-btn" class="btn-mini" title="eval js">JS</button>
+          </div>
+          <div class="browser-eval-row hidden" id="br-eval-row">
+            <input id="br-eval" class="br-eval" placeholder="JS expression…" />
+            <button id="br-eval-run" class="btn-mini btn-go">RUN</button>
+          </div>
+          <div id="br-eval-result" class="br-eval-result hidden"></div>
+          <div class="browser-shot-host">
+            <img id="br-shot" class="br-shot" alt="browser screenshot" />
+            <div id="br-placeholder" class="br-placeholder">navigate to capture a screenshot</div>
           </div>
         </div>
       </div>
@@ -205,9 +274,8 @@
       <div class="panel" data-panel="files">
         <div class="panel-head" draggable="true"><span class="panel-icon">▥</span> FILES <button class="panel-close">×</button></div>
         <div class="panel-body files-body">
-          <div class="placeholder">
-            <div class="ph-glyph">▥</div>
-            <p>File browser (Phase 2)</p>
+          <div id="files-tree" class="files-tree">
+            <div class="dim mono">loading…</div>
           </div>
         </div>
       </div>

@@ -72,16 +72,43 @@ promote to `ready` when all parents are `done`. REST: `/api/workflows` (CRUD + s
 
 ## Bento UI
 
-`web/` is a **vanilla JS bento dashboard** (no framework, no build step). Initial state: a project
-launcher (pick or create a project → opens agent directly). Once a session is active, a CSS-grid
-bento layout with progressive panel disclosure: only `chat` is visible initially; a `+ PANELS`
-button (or `Ctrl+P`) opens a palette to add panels (`graph`, `brain`, `browser`, `memory`, `files`,
-`sandbox`, `skills`). Panels auto-open on relevant events (workflow start → `graph`; sandbox start →
-`sandbox`; memory tool call → `memory`). Drag-and-drop repositioning via HTML5 DnD on panel headers
-(swaps grid spans). Layout persists to `localStorage.dotz.layout.v1`. The **workflow graph panel**
-renders live SVG DAGs with layered topological layout, node state colors (pending/ready/running/
-done/error/skipped), animated transitions, click-to-inspect step detail, and pan/zoom. The four
-control knobs (model, provider, reasoning, workflows) live in the top bar.
+`web/` is a **vanilla JS bento dashboard** (no framework, no build step). Initial state: a minimal
+**command center** launch surface — a large centered composer with project/profile/model badges and
+quick chips, plus a compact top bar holding the brand, project selector, provider/model/reasoning
+knobs, connection chip, and `+ PANELS` button. Opening a project hides the command center and reveals
+the CSS-grid bento layout.
+
+Progressive panel disclosure: only `chat` is visible initially; `+ PANELS` (or `Ctrl+P`) opens a
+palette to add panels (`graph`, `brain`, `browser`, `memory`, `files`, `sandbox`, `skills`). Panels
+auto-open on relevant events (workflow start → `graph`; sandbox start → `sandbox`). Drag-and-drop
+repositioning via HTML5 DnD on panel headers swaps CSS grid spans **without re-cloning DOM**,
+preserving panel state. Layout persists to `localStorage.dotz.layout.v1`.
+
+The **composer** has an inline slash/skills/files palette: type `/` to filter workflow commands from
+`GET /api/sessions/:id/commands`, `@` to filter skills, or `#` to filter project files from
+`GET /api/projects/:id/files`. Arrow keys navigate, Enter inserts the selected item. Selected skills
+are sent as `@{skill}` prompts; files as `#{path}` prompts.
+
+The **workflow graph panel** auto-opens when a workflow starts. It renders live SVG DAGs with layered
+topological layout, larger nodes, agent-icon initials, status rings (with animated pulses for
+running steps), dashed animated edges for active paths, and click-to-inspect detail. A toolbar provides
+fit/reset view controls. The side **node detail drawer** shows the step's task, status, output,
+error, usage, thinking, sandbox run link (opens the sandbox panel), browser session link (opens the
+browser panel and refreshes the screenshot), and tool-call IDs.
+
+The **human-gate UI** renders a centered modal when a `{kind:"gate", gateId, plan}` WS event arrives,
+showing the plan and optional feedback textarea; approval/rejection sends `gate.approve`/`gate.reject`
+messages.
+
+The **browser panel** provides real in-app browser controls: back/forward/reload, URL input + GO,
+screenshot capture, and JS eval. Screenshots are displayed in the panel and auto-refreshed when opened
+from a workflow step link. In browser-dev mode the backend stubs return a placeholder.
+
+The **files panel** fetches and renders the recursive `GET /api/projects/:id/files` tree with
+expandable directories.
+
+The **brain float** is a compact top-right overlay showing live token/cost/ctx stats; toggled via the
+brain icon or the brain panel. It updates from session stats and can be collapsed to a toggle button.
 
 ## Sandbox
 
@@ -253,3 +280,7 @@ prompt for automatic task distribution.
   environment, the agent may also use it directly — but `design_*` tools must work standalone.
 - esbuild leaves `node_modules` external so pi's jiti `.ts` extension loading works at runtime;
   `electron-builder.yml` sets `asar: false` for the same reason.
+- **Frontend panels use class-scoped selectors or per-panel `querySelector` lookups.** Because panel
+  templates are cloned, avoid global `getElementById` for panel internals that could appear twice.
+  The default layout only contains one panel of each type, but the code should be robust to swapping
+  without re-cloning DOM.
