@@ -210,6 +210,7 @@ placeholder. REST endpoints: `/api/browser/state|navigate|back|forward|reload|sc
   `renderLowCostModels`). Kept separate from `pi.ts` to avoid a circular import — do not merge.
 - `src/server.ts` — Fastify REST + WS + static. Routes: sessions, projects, memory, skills, workflows,
   sandbox, browser, human-gate.
+- `src/updater.ts` — auto-updater using `electron-updater`; checks the configured generic feed on every launch, downloads updates silently, and installs before the app starts.
 - `src/main.ts` / `src/preload.ts` — Electron main + contextIsolation preload.
 - `web/` — vanilla JS bento dashboard (project launcher, progressive panel disclosure, drag-and-drop,
   on-the-fly SVG workflow graph, skills/memory/sandbox/brain panels).
@@ -231,7 +232,22 @@ npx tsx scripts/verify-ultra.mjs       # e2e: 320 skills + workflows + .ai-agent
 npm run dev:server                      # http://127.0.0.1:4317 (browser dev loop)
 npm run build                           # esbuild → dist/main.js + dist/preload.cjs
 npm run dist                            # → release/dotz <version>.exe (Windows portable)
+npm run dist:publish                    # same as dist + publish the portable exe to the configured generic feed
 ```
+
+## Auto-updater
+
+`src/updater.ts` wires `electron-updater` into `src/main.ts`. On every launch of the packaged `.exe`:
+
+1. It reads the update feed URL from `DOTZ_UPDATE_URL`, then `package.json` `build.publish.url`, then `electron-builder.yml` `publish.url`.
+2. If no feed is configured, the app starts normally (no update check).
+3. If a feed is configured, it checks `latest.yml` / generic metadata for a newer version.
+4. When an update is found, it downloads silently in the background.
+5. For portable builds, it calls `quitAndInstall(true, true)` after the download so the next launch runs the new `.exe`.
+6. For installed NSIS builds, it installs on quit.
+7. Dev builds (`npm run dev:server`, `npm run electron`) skip auto-updates.
+
+Configure the feed by replacing `https://dotz-releases.example.com` in `package.json` / `electron-builder.yml` with the public URL hosting your `latest.yml` and `dotz <version>.exe` files.
 
 ## Provider config
 

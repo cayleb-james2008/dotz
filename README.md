@@ -100,6 +100,19 @@ npm run dist        # → release/dotz <version>.exe  (Windows portable)
 `npm run build` bundles `src/` into `dist/` with esbuild (node_modules left external so pi's
 runtime extension loading works); `electron-builder` then produces the portable executable.
 
+## Auto-updater
+
+The packaged `.exe` checks for updates on every launch via `electron-updater` and a generic HTTP(S)
+release feed. If a newer version is available, it downloads silently and — for portable builds —
+quits and installs so the next launch runs the new `.exe`.
+
+To enable updates, host `latest.yml` plus `dotz <version>.exe` at a public URL, then point dotz at it:
+
+- set the env var `DOTZ_UPDATE_URL=https://your-domain.com/releases`, or
+- edit `build.publish.url` in `package.json` / `electron-builder.yml`.
+
+Dev builds (`npm run dev:server`, `npm run electron`) skip the update check.
+
 ## Notes & caveats
 
 - **Multi-provider auth**: dotz uses pi's normal auth resolution (`~/.pi/agent/auth.json` → env
