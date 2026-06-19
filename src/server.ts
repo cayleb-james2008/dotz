@@ -30,7 +30,7 @@ import { skillLoader } from "./skills";
 import { workflowStore, type WorkflowEvent } from "./workflows";
 import { workflowBridge } from "./workflow-bridge";
 import { resolveHumanGate, onGateRequest } from "../.pi/extensions/dotz-tools/index";
-import * as browser from "./browser";
+import { browserController, type BrowserActInput, type BrowserStartInput } from "./browser";
 import { PROVIDERS, type Project, type MemoryEntry, type SandboxRun, type WorkflowRun } from "./types";
 
 const HOST = "127.0.0.1";
@@ -86,6 +86,15 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     for (const s of wsSockets) {
       if (s.readyState === s.OPEN) s.send(JSON.stringify({ kind: "gate", gateId, plan }));
     }
+  });
+  const offBrowserBroadcast = browserController.subscribe((observation) => {
+    for (const s of wsSockets) {
+      if (s.readyState === s.OPEN) s.send(JSON.stringify({ kind: "browser", event: observation }));
+    }
+  });
+  app.addHook("onClose", async () => {
+    offBrowserBroadcast();
+    await browserController.disposeAll();
   });
 
   // ---- health + providers ----
@@ -227,21 +236,37 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     return { ok: true };
   });
 
-  // ---- in-app browser (Electron only; stubs in browser dev mode) ----
-  app.get("/api/browser/state", async () => browser.state());
-  app.post("/api/browser/navigate", async (req, reply) => {
-    const body = (req.body ?? {}) as { url?: string };
-    if (!body.url) { reply.code(400).send({ error: "url required" }); return; }
-    return browser.navigate(body.url);
+  // ---- isolated Pi browser controller ----
+  app.get("/api/browser/state", async (req) => {
+    const sessionId = (req.query as { sessionId?: string }).sessionId;
+    return { available: true, observation: browserController.state(sessionId), sessions: browserController.list() };
   });
-  app.post("/api/browser/back", async () => browser.back());
-  app.post("/api/browser/forward", async () => browser.forward());
-  app.post("/api/browser/reload", async () => browser.reload());
-  app.get("/api/browser/screenshot", async () => ({ dataUrl: await browser.screenshot() }));
-  app.post("/api/browser/eval", async (req, reply) => {
-    const body = (req.body ?? {}) as { js?: string };
-    if (!body.js) { reply.code(400).send({ error: "js required" }); return; }
-    return { result: await browser.evalJs(body.js) };
+  app.get("/api/browser/frame", async (req, reply) => {
+    const query = req.query as { sessionId?: string; afterSeq?: string };
+    if (!query.sessionId) { reply.code(400).send({ error: "sessionId required" }); return; }
+    const frame = browserController.frame(query.sessionId, Number(query.afterSeq ?? -1));
+    if (!frame) { reply.code(204).send(); return; }
+    reply.header("content-type", frame.mime);
+    reply.header("cache-control", "no-store");
+    reply.header("x-dotz-frame-seq", String(frame.seq));
+    return reply.send(frame.data);
+  });
+  app.post("/api/browser/start", async (req, reply) => {
+    try { return await browserController.start((req.body ?? {}) as BrowserStartInput); }
+    catch (error) { reply.code(400).send({ error: (error as Error).message }); }
+  });
+  app.post("/api/browser/act", async (req, reply) => {
+    try { return await browserController.act((req.body ?? {}) as BrowserActInput); }
+    catch (error) {
+      const message = (error as Error).message;
+      reply.code(/stale browser ref/i.test(message) ? 409 : 400).send({ error: message });
+    }
+  });
+  app.post("/api/browser/stop", async (req, reply) => {
+    const sessionId = ((req.body ?? {}) as { sessionId?: string }).sessionId;
+    if (!sessionId) { reply.code(400).send({ error: "sessionId required" }); return; }
+    try { return await browserController.stop(sessionId); }
+    catch (error) { reply.code(404).send({ error: (error as Error).message }); }
   });
 
   // ---- sandbox ----
