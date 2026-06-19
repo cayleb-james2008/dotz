@@ -5,6 +5,10 @@ multi-agent coding interface with **on-the-fly workflow graphs, unified skills a
 opencode/claude/codex/ecc/superpowers pools, `.ai-agents` global memory, and recursive
 self-improvement wiring**, packaged as a single Electron `.exe`.
 
+## Distribution
+
+**Operator preference: ship a single self-contained Windows exe.** dotz packages as one Electron executable (portable `release/dotz <version>.exe` + NSIS installer) that auto-updates via electron-updater — Node, the pi SDK, and the UI are all bundled. The operator runs the exe directly; assume no dev shell or separate runtime on the target machine. Don't split into a second executable or add an external-runtime dependency without operator sign-off.
+
 ## Architecture in one paragraph
 
 dotz embeds pi's SDK **directly** (`@earendil-works/pi-coding-agent`), so the dashboard server *is*
