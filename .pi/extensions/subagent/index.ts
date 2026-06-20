@@ -27,6 +27,7 @@ import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
 const MAX_PARALLEL_TASKS = 8;
+const MAX_CHAIN_STEPS = 16;
 const MAX_CONCURRENCY = 4;
 
 // Path to the bundled Ollama Cloud provider extension, passed to each spawned subagent `pi`
@@ -636,6 +637,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.chain && params.chain.length > 0) {
+				if (params.chain.length > MAX_CHAIN_STEPS)
+					return {
+						content: [{ type: "text", text: `Chain too long (${params.chain.length}). Max is ${MAX_CHAIN_STEPS}.` }],
+						details: makeDetails("chain")([]),
+					};
 				const results: SingleResult[] = [];
 				let previousOutput = "";
 

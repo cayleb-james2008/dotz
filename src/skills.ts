@@ -212,12 +212,13 @@ async function parseSkillFile(file: string, source: Skill["source"]): Promise<Sk
   try {
     const raw = await fs.readFile(file, "utf-8");
     const fm = parseFrontmatter(raw);
-    // Coerce to string (numeric frontmatter like `name: 2048` parses to a JS number, which would
-    // become a non-string Map key the string-typed skill() tool could never resolve), keeping the
-    // dirname fallback for an empty/missing name.
-    const name = String(fm.name ?? "").trim() || path.basename(path.dirname(file));
+    // Accept only string/number scalars: numeric frontmatter (`name: 2048`) is coerced to a resolvable
+    // string key, while an empty value the parser turned into {} must NOT become the literal
+    // "[object Object]" — treat a non-scalar as absent so the dirname fallback fires.
+    const name = (typeof fm.name === "string" || typeof fm.name === "number" ? String(fm.name) : "").trim()
+      || path.basename(path.dirname(file));
     // Collapse a block-scalar / multi-line description to a single clean line for the compact index.
-    const description = String(fm.description ?? "").replace(/\s+/g, " ").trim();
+    const description = (typeof fm.description === "string" || typeof fm.description === "number" ? String(fm.description) : "").replace(/\s+/g, " ").trim();
     if (!name) return null;
     const platforms = (fm.platforms as string[] | undefined) ?? undefined;
     const skill: Skill = {

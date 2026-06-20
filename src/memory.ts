@@ -182,7 +182,7 @@ export class MemoryStore {
   }
 
   /** Add a memory. Manual adds use infer:false (verbatim); auto-capture uses infer:true. */
-  async add(input: AddMemoryInput): Promise<MemoryView[]> {
+  async add(input: AddMemoryInput, opts: { skipMirror?: boolean } = {}): Promise<MemoryView[]> {
     const scope: MemoryScope = input.scope ?? (input.projectCwd ? "project" : "global");
     const userId = scopeUser(scope, input.projectCwd);
     const mem = await this.engine();
@@ -201,7 +201,7 @@ export class MemoryStore {
       return v;
     });
     for (const v of views) if (v.id) memoryGraph.indexMemory(userId, v.id, v.memory);
-    await this.writeMirror(scope, input.projectCwd);
+    if (!opts.skipMirror) await this.writeMirror(scope, input.projectCwd);
     return views;
   }
 
@@ -305,8 +305,12 @@ export class MemoryStore {
     );
     const views = (res.results || []).map((r) => this.toView(r, scope));
     for (const v of views) if (v.id) memoryGraph.indexMemory(userId, v.id, v.memory);
-    if (views.length) await this.writeMirror(scope, projectCwd);
-    this.capturesSinceConsolidate += 1;
+    if (views.length) {
+      await this.writeMirror(scope, projectCwd);
+      // Count actual CAPTURES (facts stored), not exchanges — mem0 extracts nothing from trivial turns,
+      // and consolidation should fire per AUTO_CONSOLIDATE_EVERY captures, not once every 25 turns.
+      this.capturesSinceConsolidate += views.length;
+    }
     return views;
   }
 
@@ -424,7 +428,8 @@ export class MemoryStore {
     const gMarker = path.join(mem0Dir(), ".migrated-global");
     if (!existsSync(gMarker)) {
       const old = await readOld(path.join(aiAgentsDir(), "memory.json"));
-      for (const e of old) if (e.value) { await this.add({ text: e.key ? `${e.key}: ${e.value}` : e.value, scope: "global", category: e.key, infer: false }); n++; }
+      for (const e of old) if (e.value) { await this.add({ text: e.key ? `${e.key}: ${e.value}` : e.value, scope: "global", category: e.key, infer: false }, { skipMirror: true }); n++; }
+      if (n > 0) await this.writeMirror("global"); // one mirror write, not one full rewrite per entry
       await fs.mkdir(mem0Dir(), { recursive: true });
       await fs.writeFile(gMarker, new Date().toISOString(), "utf-8");
     }
@@ -433,7 +438,9 @@ export class MemoryStore {
       const pMarker = path.join(projectCwd, ".ai-agents", ".mem0-migrated");
       if (!existsSync(pMarker)) {
         const old = await readOld(path.join(projectCwd, ".ai-agents", "memory.json"));
-        for (const e of old) if (e.value) { await this.add({ text: e.key ? `${e.key}: ${e.value}` : e.value, scope: "project", category: e.key, projectCwd, infer: false }); n++; }
+        let pn = 0;
+        for (const e of old) if (e.value) { await this.add({ text: e.key ? `${e.key}: ${e.value}` : e.value, scope: "project", category: e.key, projectCwd, infer: false }, { skipMirror: true }); n++; pn++; }
+        if (pn > 0) await this.writeMirror("project", projectCwd); // one mirror write, not one per entry
         await fs.mkdir(path.join(projectCwd, ".ai-agents"), { recursive: true });
         await fs.writeFile(pMarker, new Date().toISOString(), "utf-8");
       }

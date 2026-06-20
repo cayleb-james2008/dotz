@@ -169,9 +169,11 @@ export class WorkflowBridge {
       const key = `${runId}:${idx}:${res.agent}:${res.task.slice(0, 40)}`;
       let stepId = this.stepIds.get(key);
       if (!stepId) {
-        // Match the step by agent+task; if the extension reordered or truncated the task string
-        // so the exact match misses, fall back to positional match (results arrive in step order).
-        const step = run.steps.find((s) => s.agent === res.agent && s.task === res.task) ?? run.steps[idx];
+        // Map result idx → step idx directly (onStart builds steps positionally from the same
+        // tasks/chain array and results arrive in step order). Positional-FIRST so duplicate
+        // agent+task steps don't all collapse onto the first find() match; fall back to agent+task
+        // matching only when counts/order diverge.
+        const step = run.steps[idx] ?? run.steps.find((s) => s.agent === res.agent && s.task === res.task);
         if (!step) return;
         stepId = step.id;
         this.stepIds.set(key, stepId);

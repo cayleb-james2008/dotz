@@ -319,7 +319,12 @@ function bindPanel(node, name) {
   });
   head.addEventListener("dragend", () => node.classList.remove("dragging"));
   head.addEventListener("dragover", (e) => { e.preventDefault(); head.classList.add("drag-over"); });
-  head.addEventListener("dragleave", () => head.classList.remove("drag-over"));
+  head.addEventListener("dragleave", (e) => {
+    // Ignore dragleave fired when the cursor crosses onto a child of the header (icon/label/close
+    // button) — only clear the highlight when focus truly leaves the header, to avoid flicker.
+    if (e.relatedTarget && head.contains(e.relatedTarget)) return;
+    head.classList.remove("drag-over");
+  });
   head.addEventListener("drop", (e) => {
     e.preventDefault();
     head.classList.remove("drag-over");
@@ -364,7 +369,11 @@ function bindTopbar() {
 
 function updateBrainFloat() {
   const bf = $("brain-float");
-  bf.classList.toggle("hidden", !state.brainFloat || !state.sessionId);
+  // Only fully hide when there's no session; otherwise toggle the collapsed state so the ◆ button
+  // (which lives inside #brain-float) stays visible/clickable to re-expand — hiding the whole
+  // container would hide its own toggle, making the collapse irreversible.
+  bf.classList.toggle("hidden", !state.sessionId);
+  bf.classList.toggle("collapsed", !state.brainFloat);
 }
 
 function bindBrainFloat() {
@@ -545,7 +554,15 @@ function connectWS() {
     if (m.kind === "ready") { /* session confirmed */ }
     else if (m.kind === "event") handleEvent(m.event);
     else if (m.kind === "sandbox") handleSandboxEvent(m.event);
-    else if (m.kind === "workflow") handleWorkflowEvent(m.runId, m.event);
+    else if (m.kind === "workflow") {
+      // The server broadcasts every run's events to every socket. Ignore runs that aren't this
+      // client's: workflow_start carries event.run (filter by sessionId/projectId); later events
+      // (step_state/end) lack it, so gate on whether this client is already tracking the run.
+      const r = m.event && m.event.run;
+      if (r ? (r.sessionId === state.sessionId || r.projectId === state.activeProjectId) : state.workflows.has(m.runId)) {
+        handleWorkflowEvent(m.runId, m.event);
+      }
+    }
     else if (m.kind === "browser") renderBrowserObservation(m.event);
     else if (m.kind === "gate") showGateCard(m.gateId, m.plan);
     else if (m.kind === "memory_recall") handleMemoryRecall(m);
@@ -558,6 +575,9 @@ function setConn(kind, txt) {
   c.className = "chip chip-" + kind;
   const label = kind === "on" ? "PI ONLINE" : kind === "err" ? "WS ERROR" : "OFFLINE";
   c.innerHTML = '<span class="blk">█</span> ' + label;
+  // Surface the transient detail (connecting…/reconnecting…/ws closed/✓ host) as a tooltip so the
+  // three "off" sub-states aren't all flattened to a static OFFLINE label.
+  c.title = txt || "";
 }
 
 /* ---------- event handling ---------- */
@@ -613,14 +633,17 @@ function wireChatPanel(node) {
   });
   attachComposerPalette(input);
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendFrom(input); }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      // When the palette is open, Enter inserts the highlighted item (matching the palette input's
+      // own handler) instead of submitting the half-typed trigger text.
+      if (isPaletteOpen()) { selectPaletteItem(input); return; }
+      sendFrom(input);
+    }
     else if (e.key === "Escape") hideCmdPalette();
     else if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Tab") {
       const palette = $("cmd-palette");
       if (!palette.classList.contains("hidden")) { e.preventDefault(); navigatePalette(e.key === "ArrowDown" || e.key === "Tab" ? 1 : -1); }
-    } else if (e.key === "Enter" && isPaletteOpen()) {
-      e.preventDefault();
-      selectPaletteItem(input);
     }
   });
   sendBtn.onclick = () => sendFrom(input);
@@ -1418,7 +1441,10 @@ function renderFiles() {
 async function refreshWorkflows() {
   try {
     const { runs } = await api("/api/workflows/active");
-    runs.forEach((r) => state.workflows.set(r.id, r));
+    // /api/workflows/active returns ALL globally-active runs; keep only this project/session's so a
+    // foreign project's runs don't bleed into this client's graph (newSession just cleared them).
+    runs.filter((r) => r.projectId === state.activeProjectId || r.sessionId === state.sessionId)
+      .forEach((r) => state.workflows.set(r.id, r));
     refreshWfCount();
     refreshWorkflowGraph();
   } catch {}
@@ -1459,6 +1485,12 @@ function handleWorkflowEvent(runId, event) {
         if (event.thinking !== undefined) step.thinking = event.thinking;
       }
       refreshWorkflowGraph();
+      // Repaint the node-detail drawer in place if it's showing the step that just updated, so the
+      // primary live-inspection surface doesn't freeze on the snapshot from when it was opened.
+      if (step && state.openNodeDetail && state.openNodeDetail.runId === runId &&
+          state.openNodeDetail.stepId === event.stepId && !$("node-detail").classList.contains("hidden")) {
+        showNodeDetail(run, step);
+      }
       break;
     }
     case "step_added": {
@@ -1702,12 +1734,13 @@ function computeLayers(steps) {
 
 /* ---------- node detail side drawer ---------- */
 function bindNodeDetail() {
-  $("node-detail-close").onclick = () => $("node-detail").classList.add("hidden");
+  $("node-detail-close").onclick = () => { $("node-detail").classList.add("hidden"); state.openNodeDetail = null; };
 }
 
 function showNodeDetail(run, step) {
   const drawer = $("node-detail");
   const body = $("node-detail-body");
+  state.openNodeDetail = { runId: run.id, stepId: step.id };
   drawer.classList.remove("hidden");
   body.innerHTML = "";
   body.appendChild(makeNdRow("AGENT", step.agent));
