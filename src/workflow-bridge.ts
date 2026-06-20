@@ -72,6 +72,8 @@ export class WorkflowBridge {
   private runsByToolCall = new Map<string, string>();
   /** Step id per (runId, agent, task, stepIndex) — stable across updates. */
   private stepIds = new Map<string, string>();
+  /** tool_execution_end events that arrived before the async create() resolved — replayed after. */
+  private pendingEnds = new Map<string, { result: unknown; isError?: boolean }>();
 
   /** Process a pi session event. Call this for every event from a subscribed session. */
   handleEvent(sessionId: string, projectId: string | null, event: unknown): void {
@@ -115,6 +117,10 @@ export class WorkflowBridge {
             workflowStore.stepState(run.id, step.id, { status: "running" });
           }
         }
+        // If the tool already ended before create() resolved, replay the buffered end now so the
+        // sweep + cleanup run (otherwise the steps stay "running" and the maps leak).
+        const pe = this.pendingEnds.get(toolCallId);
+        if (pe) { this.pendingEnds.delete(toolCallId); this.onEnd(toolCallId, pe.result, pe.isError); }
       })
       .catch(() => { /* bridge is best-effort */ });
   }
@@ -129,7 +135,12 @@ export class WorkflowBridge {
 
   private onEnd(toolCallId: string, result: unknown, isError?: boolean): void {
     const runId = this.runsByToolCall.get(toolCallId);
-    if (!runId) return;
+    if (!runId) {
+      // The end raced ahead of the async create(); buffer it and replay once the run is registered,
+      // otherwise the steps stay stuck "running" and the runsByToolCall/stepIds entries leak.
+      this.pendingEnds.set(toolCallId, { result, isError });
+      return;
+    }
     const details = extractDetails(result);
     if (details) this.syncSteps(runId, details, true);
     // The subagent tool call has ended, so every step's result should have arrived. Sweep any step

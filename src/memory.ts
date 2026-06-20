@@ -51,7 +51,10 @@ const CODING_INSTRUCTIONS = [
 
 function scopeUser(scope: MemoryScope, projectCwd?: string | null): string {
   if (scope === "global" || !projectCwd) return GLOBAL_USER;
-  return "proj:" + path.resolve(projectCwd).replace(/\\/g, "/").toLowerCase();
+  // Case-fold only on Windows (case-insensitive FS). Lowercasing on Linux/macOS would merge two
+  // genuinely distinct project dirs that differ only in case into one shared memory scope.
+  const norm = path.resolve(projectCwd).replace(/\\/g, "/");
+  return "proj:" + (process.platform === "win32" ? norm.toLowerCase() : norm);
 }
 
 function cosine(a: number[], b: number[]): number {
@@ -119,6 +122,8 @@ export class MemoryStore {
   private mem: Mem0 | null = null;
   private memInit: Promise<Mem0> | null = null;
   private capturesSinceConsolidate = 0;
+  /** Project cwds whose legacy memory.json import has been attempted (idempotent in-memory guard). */
+  private legacyTried = new Set<string>();
 
   /** Lazily construct the mem0 engine (after the app is up so embeddings can run). Memoized via
    *  memInit so concurrent first callers share one init — otherwise two Memory instances would be
@@ -167,11 +172,21 @@ export class MemoryStore {
     };
   }
 
+  /** Import a project's legacy <cwd>/.ai-agents/memory.json into mem0 once, on first project use.
+   *  engine() only imports the GLOBAL legacy store, so without this the per-project branch is dead.
+   *  Idempotent: guarded by the in-memory legacyTried set + importLegacy's own `.mem0-migrated` marker. */
+  private async ensureProjectLegacy(projectCwd?: string | null): Promise<void> {
+    if (!projectCwd || this.legacyTried.has(projectCwd)) return;
+    this.legacyTried.add(projectCwd);
+    await this.importLegacy(projectCwd).catch(() => { /* migration is best-effort */ });
+  }
+
   /** Add a memory. Manual adds use infer:false (verbatim); auto-capture uses infer:true. */
   async add(input: AddMemoryInput): Promise<MemoryView[]> {
     const scope: MemoryScope = input.scope ?? (input.projectCwd ? "project" : "global");
     const userId = scopeUser(scope, input.projectCwd);
     const mem = await this.engine();
+    await this.ensureProjectLegacy(input.projectCwd);
     const metadata: Record<string, unknown> = { scope, ts: Date.now() };
     if (input.category) metadata.category = input.category;
     if (input.folder) metadata.folder = input.folder;
@@ -219,6 +234,7 @@ export class MemoryStore {
   async search(query: string, opts: SearchOpts = {}): Promise<MemoryView[]> {
     if (!query.trim()) return [];
     const mem = await this.engine();
+    await this.ensureProjectLegacy(opts.projectCwd);
     const threshold = opts.threshold ?? 0.3;
     const topK = opts.topK ?? 8;
     const scopes: MemoryScope[] = opts.scope ? [opts.scope] : (opts.projectCwd ? ["project", "global"] : ["global"]);
@@ -282,6 +298,7 @@ export class MemoryStore {
     const scope: MemoryScope = projectCwd ? "project" : "global";
     const userId = scopeUser(scope, projectCwd);
     const mem = await this.engine();
+    await this.ensureProjectLegacy(projectCwd);
     const res = await mem.add(
       [{ role: "user", content: u }, { role: "assistant", content: a }],
       { userId, metadata: { scope, ts: Date.now() }, infer: true },

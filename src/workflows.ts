@@ -57,6 +57,9 @@ export interface CreateStepInput {
   thinking?: string;
 }
 
+/** Thrown by WorkflowStore.create() when the submitted steps form a cycle (no topological order). */
+export class WorkflowCycleError extends Error {}
+
 export class WorkflowStore {
   private active = new Map<string, WorkflowRun>();
   private listeners = new Set<WorkflowListener>();
@@ -118,6 +121,24 @@ export class WorkflowStore {
         const parent = steps.find((s) => s.id === pid);
         if (parent) parent.children.push(step.id);
       }
+    }
+    // Reject cyclic graphs (Kahn's algorithm): a cycle has no zero-parent entry point, so its steps
+    // could never become `ready` and the run would be permanently non-terminal (workflow_end never
+    // fires). If a topological order can't cover every step, a cycle exists.
+    {
+      const indeg = new Map(steps.map((s) => [s.id, s.parents.length]));
+      const queue = steps.filter((s) => s.parents.length === 0).map((s) => s.id);
+      let ordered = 0;
+      for (let q = 0; q < queue.length; q++) {
+        ordered++;
+        const step = steps.find((s) => s.id === queue[q]);
+        for (const childId of step?.children ?? []) {
+          const d = (indeg.get(childId) ?? 0) - 1;
+          indeg.set(childId, d);
+          if (d === 0) queue.push(childId);
+        }
+      }
+      if (ordered < steps.length) throw new WorkflowCycleError("workflow steps form a cycle");
     }
     // A step left with no valid parents after resolution must be runnable, not stuck "pending"
     // (e.g. all its parent refs were self-references and got filtered out above).

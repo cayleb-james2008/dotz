@@ -40,6 +40,10 @@ try {
 }
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+// Chain {previous} feed-forward is substituted into the next task, which is passed as a single CLI
+// arg; cap it well under the Windows ~32767-char command-line limit so a large prior output can't
+// overflow the child-process command line — the system prompt already uses a temp file; the task doesn't.
+const CHAIN_PREVIOUS_CAP = 24 * 1024;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -196,12 +200,12 @@ function getResultOutput(result: SingleResult): string {
 	return getFinalOutput(result.messages) || "(no output)";
 }
 
-function truncateParallelOutput(output: string): string {
+function truncateParallelOutput(output: string, cap = PER_TASK_OUTPUT_CAP): string {
 	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
+	if (byteLength <= cap) return output;
 
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
+	let truncated = output.slice(0, cap);
+	while (Buffer.byteLength(truncated, "utf8") > cap) {
 		truncated = truncated.slice(0, -1);
 	}
 	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
@@ -679,7 +683,7 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					previousOutput = getFinalOutput(result.messages);
+					previousOutput = truncateParallelOutput(getFinalOutput(result.messages), CHAIN_PREVIOUS_CAP);
 				}
 				return {
 					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
