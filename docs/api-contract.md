@@ -95,17 +95,25 @@ durable facts from the completed exchange. Legacy `~/.dotz/ai-agents/memory.json
 | POST | `/api/sandbox/runs/:id/kill` | — | `{ ok }` |
 | GET | `/api/sandbox/runs/:id/port` | — | `{ port }` (404 if no web port) |
 
-### In-app browser (Electron only; no-ops in browser dev mode)
+### Isolated interactive browser
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/api/browser/state` | — | browser state object |
-| POST | `/api/browser/navigate` | `{ url }` | browser state object |
-| POST | `/api/browser/back` | — | browser state object |
-| POST | `/api/browser/forward` | — | browser state object |
-| POST | `/api/browser/reload` | — | browser state object |
-| GET | `/api/browser/screenshot` | — | `{ dataUrl }` |
-| POST | `/api/browser/eval` | `{ js }` | `{ result }` |
+| GET | `/api/browser/state?sessionId?` | — | `{ available, observation, sessions }` |
+| GET | `/api/browser/frame?sessionId&afterSeq?` | — | JPEG bytes (`204` when no newer frame) |
+| POST | `/api/browser/start` | `{ projectId, url, allowedOrigins?, viewport?, workflowId?, stepId? }` | `BrowserObservation` |
+| POST | `/api/browser/act` | `BrowserActInput` | next `BrowserObservation` (`409` for stale sequence-bound actions) |
+| POST | `/api/browser/stop` | `{ sessionId }` | stopped `BrowserObservation` |
+
+`BrowserActInput.action` is one of `navigate`, `observe`, `back`, `forward`, `reload`, `click`,
+`clickAt`, `type`, `key`, `select`, `scroll`, or `wait`. Ref actions use `targetRef` + `expectedSeq`;
+user frame clicks use viewport `x` / `y` + `expectedSeq`; focused typing uses `text` +
+`expectedSeq`. Remote pages run in the pinned `agent-browser` worker with a disposable profile and
+origin allowlist. Raw page evaluation, uploads, downloads, and clipboard access are not exposed.
+
+`BrowserObservation` carries a monotonically increasing `seq`, the page URL/title/viewport,
+interactive refs, current action/cursor, error counters, and frame metadata. The binary JPEG stays
+on `/api/browser/frame`; it is never embedded in the JSON event stream.
 
 `SandboxRun = { id, projectId, language, code, status:"pending"|"running"|"done"|"error"|"killed", output, exitCode, startedAt, endedAt }`.
 `mode:"terminal"` runs the code as a plain process (stdout/stderr streamed back). `mode:"web"`

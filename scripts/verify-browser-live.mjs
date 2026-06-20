@@ -24,11 +24,27 @@ try {
   assert.ok(textbox, `expected a textbox in snapshot: ${observation.snapshot.slice(0, 500)}`);
   observation = await controller.act({
     sessionId: observation.sessionId,
-    action: "type",
+    action: "click",
     targetRef: textbox.ref,
+    expectedSeq: observation.seq,
+  });
+  observation = await controller.act({
+    sessionId: observation.sessionId,
+    action: "type",
     expectedSeq: observation.seq,
     text: "dotz browser acceptance",
   });
+  assert.equal(observation.currentAction?.summary, "type into focused element");
+
+  observation = await controller.act({
+    sessionId: observation.sessionId,
+    action: "clickAt",
+    expectedSeq: observation.seq,
+    x: 4,
+    y: 4,
+  });
+  assert.equal(observation.cursor?.kind, "clickAt");
+  observation = await controller.act({ sessionId: observation.sessionId, action: "reload" });
 
   const button = observation.elements.find((item) => /button/i.test(item.role));
   assert.ok(button, "expected a button in the observed page");

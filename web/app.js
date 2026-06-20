@@ -51,6 +51,10 @@ const state = {
   pendingGate: null,
   brainFloat: true,
   updateStatus: null,
+  browserSessionId: null,
+  browserObservation: null,
+  browserPollTimer: null,
+  browserBusy: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -272,6 +276,10 @@ function mountPanel(name) {
 }
 
 function unmountPanel(name) {
+  if (name === "browser" && state.browserPollTimer) {
+    clearInterval(state.browserPollTimer);
+    state.browserPollTimer = null;
+  }
   const node = document.querySelector(`.panel[data-panel="${name}"]`);
   if (node) node.remove();
   state.layout.open = state.layout.open.filter((n) => n !== name);
@@ -1786,30 +1794,77 @@ function logBrain(msg) {
 /* ---------- browser panel ---------- */
 function wireBrowserPanel(node) {
   const url = node.querySelector("#br-url");
-  const start = async () => {
+  const shot = node.querySelector("#br-shot");
+  const typeText = node.querySelector("#br-type-text");
+  const runAct = async (input) => {
+    if (!state.browserSessionId || state.browserBusy) return;
+    state.browserBusy = true;
+    try {
+      const observation = await browserAction("act", { sessionId: state.browserSessionId, ...input });
+      renderBrowserObservation(observation);
+      return observation;
+    } catch (e) { pushError("browser action: " + e.message); }
+    finally { state.browserBusy = false; }
+  };
+  const startOrNavigate = async () => {
     const target = url.value.trim();
     if (!target || !state.activeProjectId) return pushError("browser: open a project and enter an http(s) URL");
     try {
-      const origin = new URL(target).origin;
-      const observation = await browserAction("start", { projectId: state.activeProjectId, url: target, allowedOrigins: [origin] });
-      renderBrowserObservation(observation);
+      if (state.browserSessionId) {
+        await runAct({ action: "navigate", url: target });
+      } else {
+        const origin = new URL(target).origin;
+        state.browserBusy = true;
+        const observation = await browserAction("start", { projectId: state.activeProjectId, url: target, allowedOrigins: [origin] });
+        renderBrowserObservation(observation);
+      }
     } catch (e) { pushError("browser start: " + e.message); }
+    finally { state.browserBusy = false; }
   };
-  node.querySelector("#br-navigate").textContent = "START";
-  node.querySelector("#br-navigate").onclick = start;
-  node.querySelector("#br-back").textContent = "STOP";
-  node.querySelector("#br-back").onclick = async () => {
+  node.querySelector("#br-navigate").onclick = startOrNavigate;
+  node.querySelector("#br-back").onclick = () => runAct({ action: "back" });
+  node.querySelector("#br-forward").onclick = () => runAct({ action: "forward" });
+  node.querySelector("#br-reload").onclick = () => runAct({ action: "reload" });
+  node.querySelector("#br-shot-btn").onclick = () => runAct({ action: "observe" });
+  node.querySelector("#br-stop").onclick = async () => {
     if (!state.browserSessionId) return;
-    try { renderBrowserObservation(await browserAction("stop", { sessionId: state.browserSessionId })); }
+    try {
+      state.browserBusy = true;
+      renderBrowserObservation(await browserAction("stop", { sessionId: state.browserSessionId }));
+    }
     catch (e) { pushError("browser stop: " + e.message); }
+    finally { state.browserBusy = false; }
   };
-  node.querySelector("#br-forward").classList.add("hidden");
-  node.querySelector("#br-reload").classList.add("hidden");
-  node.querySelector("#br-shot-btn").classList.add("hidden");
-  node.querySelector("#br-eval-btn")?.remove();
-  node.querySelector("#br-eval-row").remove();
-  node.querySelector("#br-eval-result").remove();
-  url.addEventListener("keydown", (e) => { if (e.key === "Enter") start(); });
+
+  const sendType = () => {
+    const text = typeText.value;
+    if (!text || !state.browserObservation) return;
+    typeText.value = "";
+    runAct({ action: "type", text, expectedSeq: state.browserObservation.seq });
+  };
+  node.querySelector("#br-type-send").onclick = sendType;
+  typeText.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); sendType(); } });
+  node.querySelector("#br-scroll-up").onclick = () => runAct({ action: "scroll", direction: "up", pixels: 500 });
+  node.querySelector("#br-scroll-down").onclick = () => runAct({ action: "scroll", direction: "down", pixels: 500 });
+
+  shot.addEventListener("click", (e) => {
+    if (!state.browserObservation || state.browserObservation.status !== "ready") return;
+    const rect = shot.getBoundingClientRect();
+    const viewport = state.browserObservation.page?.viewport;
+    if (!rect.width || !rect.height || !viewport?.width || !viewport?.height) return;
+    const x = Math.round((e.clientX - rect.left) / rect.width * viewport.width);
+    const y = Math.round((e.clientY - rect.top) / rect.height * viewport.height);
+    shot.focus();
+    runAct({ action: "clickAt", x, y, expectedSeq: state.browserObservation.seq });
+  });
+  shot.addEventListener("keydown", (e) => {
+    if (!state.browserObservation || !["Enter", "Tab", "Escape", "Backspace", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) return;
+    e.preventDefault();
+    runAct({ action: "key", key: e.key });
+  });
+  url.addEventListener("keydown", (e) => { if (e.key === "Enter") startOrNavigate(); });
+  if (state.browserPollTimer) clearInterval(state.browserPollTimer);
+  state.browserPollTimer = setInterval(refreshBrowserScreenshot, 1200);
   refreshBrowserScreenshot();
 }
 
@@ -1822,9 +1877,10 @@ async function browserAction(action, body) {
 
 async function refreshBrowserScreenshot() {
   const panel = document.querySelector('.panel[data-panel="browser"]');
-  if (!panel) return;
+  if (!panel || state.browserBusy) return;
   try {
-    const result = await browserAction("state");
+    const query = state.browserSessionId ? `?sessionId=${encodeURIComponent(state.browserSessionId)}` : "";
+    const result = await browserAction("state" + query);
     renderBrowserObservation(result.observation);
   } catch (e) { pushError("browser: " + e.message); }
 }
@@ -1836,12 +1892,19 @@ function renderBrowserObservation(observation) {
   const ph = panel.querySelector("#br-placeholder");
   if (!observation) {
     state.browserSessionId = null;
+    state.browserObservation = null;
     shot.classList.add("hidden"); ph.classList.remove("hidden");
     ph.textContent = "waiting for a Pi browser session";
     return;
   }
   state.browserSessionId = observation.status === "stopped" ? null : observation.sessionId;
+  state.browserObservation = observation.status === "stopped" ? null : observation;
   panel.querySelector("#br-url").value = observation.page?.url || "";
+  panel.querySelector("#br-navigate").textContent = state.browserSessionId ? "GO" : "START";
+  for (const id of ["br-back", "br-forward", "br-reload", "br-shot-btn", "br-stop", "br-scroll-up", "br-scroll-down", "br-type-text", "br-type-send"]) {
+    const control = panel.querySelector("#" + id);
+    if (control) control.disabled = !state.browserSessionId;
+  }
   const action = observation.currentAction;
   const owner = observation.owner || {};
   ph.textContent = `${observation.status} | ${owner.projectId || "unowned"} | seq ${observation.seq}`;
