@@ -81,11 +81,17 @@ export default function (pi: ExtensionAPI) {
     description: "Perform one typed browser action and return the next versioned observation. Element refs require their observation sequence; raw evaluation, uploads, downloads, and clipboard access are unavailable.",
     parameters: Type.Object({
       sessionId: Type.String(),
-      action: Type.Union(["navigate", "observe", "click", "type", "key", "select", "scroll", "wait"].map((value) => Type.Literal(value))),
+      action: Type.Union([
+        Type.Literal("navigate"), Type.Literal("observe"), Type.Literal("back"), Type.Literal("forward"),
+        Type.Literal("reload"), Type.Literal("click"), Type.Literal("clickAt"), Type.Literal("type"),
+        Type.Literal("key"), Type.Literal("select"), Type.Literal("scroll"), Type.Literal("wait"),
+      ]),
       expectedSeq: Type.Optional(Type.Number()),
       url: Type.Optional(Type.String()),
       targetRef: Type.Optional(Type.String()),
       text: Type.Optional(Type.String()),
+      x: Type.Optional(Type.Number()),
+      y: Type.Optional(Type.Number()),
       key: Type.Optional(Type.String()),
       values: Type.Optional(Type.Array(Type.String())),
       direction: Type.Optional(Type.Union([Type.Literal("up"), Type.Literal("down"), Type.Literal("left"), Type.Literal("right")])),

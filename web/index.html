@@ -284,16 +284,18 @@
             <button id="br-reload" class="btn-mini" title="reload" aria-label="Reload"><span aria-hidden="true">↻</span></button>
             <input id="br-url" class="br-url" placeholder="https://…" />
             <button id="br-navigate" class="btn-mini btn-go">GO</button>
-            <button id="br-shot-btn" class="btn-mini" title="screenshot">📷</button>
-            <button id="br-eval-btn" class="btn-mini" title="eval js">JS</button>
+            <button id="br-shot-btn" class="btn-mini" title="refresh frame" aria-label="Refresh frame">◫</button>
+            <button id="br-stop" class="btn-mini btn-stop" title="stop browser">■</button>
           </div>
-          <div class="browser-eval-row hidden" id="br-eval-row">
-            <input id="br-eval" class="br-eval" placeholder="JS expression…" />
-            <button id="br-eval-run" class="btn-mini btn-go">RUN</button>
+          <div class="browser-interact-row">
+            <span class="browser-focus-hint">CLICK FRAME → TYPE</span>
+            <input id="br-type-text" class="br-type-text" placeholder="type into the focused page control…" />
+            <button id="br-type-send" class="btn-mini btn-go">TYPE</button>
+            <button id="br-scroll-up" class="btn-mini" title="scroll up" aria-label="Scroll up">↑</button>
+            <button id="br-scroll-down" class="btn-mini" title="scroll down" aria-label="Scroll down">↓</button>
           </div>
-          <div id="br-eval-result" class="br-eval-result hidden"></div>
           <div class="browser-shot-host">
-            <img id="br-shot" class="br-shot" alt="browser screenshot" />
+            <img id="br-shot" class="br-shot" alt="live interactive browser frame" tabindex="0" />
             <div id="br-placeholder" class="br-placeholder">navigate to capture a screenshot</div>
           </div>
         </div>

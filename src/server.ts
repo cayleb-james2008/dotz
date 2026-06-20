@@ -276,7 +276,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     try { return await browserController.act((req.body ?? {}) as BrowserActInput); }
     catch (error) {
       const message = (error as Error).message;
-      reply.code(/stale browser ref/i.test(message) ? 409 : 400).send({ error: message });
+      reply.code(/stale browser (?:ref|action)/i.test(message) ? 409 : 400).send({ error: message });
     }
   });
   app.post("/api/browser/stop", async (req, reply) => {

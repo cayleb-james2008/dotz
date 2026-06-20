@@ -16,7 +16,9 @@ const AGENT_BROWSER_VERSION = "0.27.0";
 const MAX_OUTPUT = 50_000;
 const REF_PATTERN = /(?:@|\bref=)(e\d+)\b/g;
 
-export type BrowserActionName = "navigate" | "observe" | "click" | "type" | "key" | "select" | "scroll" | "wait";
+export type BrowserActionName =
+  | "navigate" | "observe" | "back" | "forward" | "reload"
+  | "click" | "clickAt" | "type" | "key" | "select" | "scroll" | "wait";
 
 export interface BrowserOwner {
   app: "dotz";
@@ -63,6 +65,8 @@ export interface BrowserActInput {
   url?: string;
   targetRef?: string;
   text?: string;
+  x?: number;
+  y?: number;
   key?: string;
   values?: string[];
   direction?: "up" | "down" | "left" | "right";
@@ -211,8 +215,9 @@ export class BrowserController {
     const record = this.sessions.get(input.sessionId);
     if (!record) throw new Error("no such browser session");
     if (record.observation.status === "stopped") throw new Error("browser session is stopped");
-    if (input.targetRef && input.expectedSeq !== record.observation.seq) {
-      throw new Error(`stale browser ref: expected observation seq ${record.observation.seq}`);
+    const sequenceBound = Boolean(input.targetRef) || input.action === "clickAt" || (input.action === "type" && !input.targetRef);
+    if (sequenceBound && input.expectedSeq !== record.observation.seq) {
+      throw new Error(`stale browser action: expected observation seq ${record.observation.seq}`);
     }
     if (input.targetRef && !record.observation.refs.includes(input.targetRef.replace(/^@/, ""))) {
       throw new Error(`unknown browser ref: ${input.targetRef}`);
@@ -235,9 +240,24 @@ export class BrowserController {
             record.observation.cursor = { x: x + width / 2, y: y + height / 2, kind: input.action };
           }
         }
+      } else if (input.action === "clickAt" && Number.isFinite(input.x) && Number.isFinite(input.y)) {
+        record.observation.cursor = { x: Number(input.x), y: Number(input.y), kind: input.action };
       }
-      const args = this.actionArgs(record, input);
-      if (args) await this.run(record, args);
+      if (input.action === "clickAt") {
+        const x = Math.round(Number(input.x));
+        const y = Math.round(Number(input.y));
+        const viewport = record.observation.page.viewport;
+        if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error("clickAt requires finite x and y coordinates");
+        if (x < 0 || y < 0 || x > viewport.width || y > viewport.height) {
+          throw new Error(`clickAt coordinates must be inside ${viewport.width}x${viewport.height}`);
+        }
+        await this.run(record, ["mouse", "move", String(x), String(y)]);
+        await this.run(record, ["mouse", "down", "left"]);
+        await this.run(record, ["mouse", "up", "left"]);
+      } else {
+        const args = this.actionArgs(record, input);
+        if (args) await this.run(record, args);
+      }
       record.observation.counters.actions += 1;
       return await this.observe(record, record.observation.currentAction);
     } catch (error) {
@@ -271,6 +291,9 @@ export class BrowserController {
     const ref = input.targetRef?.startsWith("@") ? input.targetRef : input.targetRef ? `@${input.targetRef}` : "";
     switch (input.action) {
       case "observe": return null;
+      case "back": return ["back"];
+      case "forward": return ["forward"];
+      case "reload": return ["reload"];
       case "navigate": {
         if (!input.url) throw new Error("navigate requires url");
         const origin = normalizeOrigin(input.url);
@@ -278,7 +301,11 @@ export class BrowserController {
         return ["open", input.url];
       }
       case "click": if (!ref) throw new Error("click requires targetRef"); return ["click", ref];
-      case "type": if (!ref || input.text === undefined) throw new Error("type requires targetRef and text"); return ["fill", ref, input.text];
+      case "clickAt": return null; // handled as explicit Windows-safe mouse commands in act()
+      case "type": {
+        if (input.text === undefined) throw new Error("type requires text");
+        return ref ? ["fill", ref, input.text] : ["keyboard", "inserttext", input.text];
+      }
       case "key": if (!input.key) throw new Error("key requires key"); return ["press", input.key];
       case "select": if (!ref || !input.values?.length) throw new Error("select requires targetRef and values"); return ["select", ref, ...input.values];
       case "scroll": return ["scroll", input.direction ?? "down", String(Math.max(1, input.pixels ?? 500))];
@@ -288,6 +315,8 @@ export class BrowserController {
 
   private actionSummary(input: BrowserActInput): string {
     if (input.action === "navigate") return `navigate ${input.url ?? ""}`;
+    if (input.action === "clickAt") return `click (${Math.round(Number(input.x))}, ${Math.round(Number(input.y))})`;
+    if (input.action === "type" && !input.targetRef) return "type into focused element";
     if (input.targetRef) return `${input.action} ${input.targetRef}`;
     return input.action;
   }

@@ -33,14 +33,16 @@ assert.match(serverSource, /\/api\/browser\/stop/, "browser stop REST endpoint e
 assert.match(serverSource, /\/api\/browser\/frame/, "binary frames use a separate endpoint");
 
 const preloadSource = await fs.readFile(new URL("../src/preload.ts", import.meta.url), "utf8");
-assert.match(preloadSource, /install:\s*\(\)/, "updater install bridge is exposed");
+assert.match(preloadSource, /check:\s*\(\)/, "source-rebuild update check bridge is exposed");
+assert.match(preloadSource, /apply:\s*\(\)/, "source-rebuild update apply bridge is exposed");
 const mainSource = await fs.readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 assert.doesNotMatch(mainSource, /WebContentsView|browser\.attach/, "remote pages are never embedded with the Dotz preload");
 const updaterSource = await fs.readFile(new URL("../src/updater.ts", import.meta.url), "utf8");
-assert.match(updaterSource, /eventsAttached/, "updater listeners are attached once");
-for (const state of ["checked", "downloading", "downloaded", "ready", "deferred", "failed"]) {
+assert.match(updaterSource, /ipcMain\.on\(["']dotz-update-check["']/, "update check IPC is registered");
+assert.match(updaterSource, /ipcMain\.on\(["']dotz-update-apply["']/, "update apply IPC is registered");
+for (const state of ["checked", "available", "not-available", "applying", "failed"]) {
   assert.match(updaterSource, new RegExp(`sendToRenderer\\(["']${state}["']`), `updater models ${state}`);
 }
-assert.match(updaterSource, /Portable builds update manually from GitHub Releases/, "portable update behavior is truthful");
+assert.match(updaterSource, /git pull --ff-only/, "portable updates use the source-rebuild contract");
 
 console.log("BROWSER CONTROLLER CONTRACT PASSED");

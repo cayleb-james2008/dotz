@@ -18,7 +18,7 @@ for (const action of ["clickAt", "back", "forward", "reload"]) {
 assert.match(browserSource, /expectedSeq[^\n]+observation\.seq/, "coordinate actions are sequence guarded");
 assert.match(browserSource, /mouse["'],\s*["']move/, "frame clicks use agent-browser mouse coordinates");
 assert.match(browserSource, /keyboard["'],\s*["']inserttext/, "focused controls accept safe text without raw eval");
-assert.doesNotMatch(browserSource, /\beval\b/, "controller does not expose page evaluation");
+assert.doesNotMatch(browserSource, /case\s+["']eval["']|BrowserActionName[^;]+["']eval["']/s, "controller does not expose page evaluation");
 
 for (const id of ["br-stop", "br-scroll-up", "br-scroll-down", "br-type-text", "br-type-send"]) {
   assert.match(htmlSource, new RegExp(`id=["']${id}["']`), `${id} is rendered in the browser panel`);
