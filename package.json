@@ -6,6 +6,8 @@
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
+    "postinstall": "electron-rebuild -f -w better-sqlite3",
+    "rebuild:native": "electron-rebuild -f -w better-sqlite3",
     "dev:server": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
     "wsclient": "tsx scripts/wsclient.ts",
