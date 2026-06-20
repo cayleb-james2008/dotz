@@ -115,6 +115,20 @@ origin allowlist. Raw page evaluation, uploads, downloads, and clipboard access 
 interactive refs, current action/cursor, error counters, and frame metadata. The binary JPEG stays
 on `/api/browser/frame`; it is never embedded in the JSON event stream.
 
+### Local connections (provider CLI browser login)
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/api/connections` | — | `{ connections: ConnectionStatus[] }` |
+| POST | `/api/connections/:provider/login` | — | `LoginState` (spawns the CLI browser login) |
+| GET | `/api/connections/:provider/login` | — | `LoginState` (poll the streamed output) |
+| POST | `/api/connections/:provider/logout` | — | `{ ok, output }` |
+
+`:provider` is `github` \| `vercel` \| `neon`. `ConnectionStatus = { id, label, cli, installed, loggedIn, account?, hint? }`
+is read from each provider's own CLI (`gh` / `vercel` / `neonctl`). `LoginState = { provider, running, exitCode, output }`
+— `output` is the CLI's device-code / URL prompt streamed for the user to finish in a normal browser tab.
+There is no OAuth app registration and no client secret; dotz never reads, stores, or logs the token.
+
 `SandboxRun = { id, projectId, language, code, status:"pending"|"running"|"done"|"error"|"killed", output, exitCode, startedAt, endedAt }`.
 `mode:"terminal"` runs the code as a plain process (stdout/stderr streamed back). `mode:"web"`
 starts a long-lived process bound to a local port and returns that port via `.../port` and the
