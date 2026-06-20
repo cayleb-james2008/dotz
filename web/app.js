@@ -11,7 +11,7 @@
 const THINK_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const LAYOUT_KEY = "dotz.layout.v1";
 const BRAIN_FLOAT_KEY = "dotz.brainFloat.v1";
-const PANEL_NAMES = ["chat", "graph", "brain", "browser", "memory", "files", "sandbox", "skills"];
+const PANEL_NAMES = ["chat", "graph", "brain", "browser", "memory", "files", "sandbox", "skills", "connections"];
 const PANEL_META = {
   chat: { icon: "▓", label: "CHAT" },
   graph: { icon: "◐", label: "WORKFLOW GRAPH" },
@@ -21,6 +21,7 @@ const PANEL_META = {
   files: { icon: "▥", label: "FILES" },
   sandbox: { icon: "▩", label: "SANDBOX" },
   skills: { icon: "✦", label: "SKILLS" },
+  connections: { icon: "⊕", label: "CONNECTIONS" },
 };
 
 const state = {
@@ -55,6 +56,8 @@ const state = {
   browserObservation: null,
   browserPollTimer: null,
   browserBusy: false,
+  connectionsPollTimer: null,
+  connectionsLoginProvider: null,
   chatAutoScroll: true,
 };
 
@@ -274,12 +277,18 @@ function mountPanel(name) {
   else if (name === "skills") wireSkillsPanel(node);
   else if (name === "browser") wireBrowserPanel(node);
   else if (name === "files") wireFilesPanel(node);
+  else if (name === "connections") wireConnectionsPanel(node);
 }
 
 function unmountPanel(name) {
   if (name === "browser" && state.browserPollTimer) {
     clearInterval(state.browserPollTimer);
     state.browserPollTimer = null;
+  }
+  if (name === "connections" && state.connectionsPollTimer) {
+    clearInterval(state.connectionsPollTimer);
+    state.connectionsPollTimer = null;
+    state.connectionsLoginProvider = null;
   }
   const node = document.querySelector(`.panel[data-panel="${name}"]`);
   if (node) node.remove();
@@ -1954,6 +1963,73 @@ function renderBrowserObservation(observation) {
     cursor.style.left = `${Math.max(0, Math.min(100, observation.cursor.x / viewport.width * 100))}%`;
     cursor.style.top = `${Math.max(0, Math.min(100, observation.cursor.y / viewport.height * 100))}%`;
   } else if (cursor) cursor.remove();
+}
+
+/* ---------- connections (local browser-CLI login) ---------- */
+function wireConnectionsPanel(node) {
+  refreshConnections();
+  if (state.connectionsPollTimer) clearInterval(state.connectionsPollTimer);
+  state.connectionsPollTimer = setInterval(refreshConnections, 4000);
+}
+
+async function refreshConnections() {
+  const panel = document.querySelector('.panel[data-panel="connections"]');
+  if (!panel) return;
+  try {
+    const { connections } = await api("/api/connections");
+    renderConnections(panel, connections || []);
+  } catch (e) { /* transient; keep the last render */ }
+  if (state.connectionsLoginProvider) {
+    try {
+      const st = await api(`/api/connections/${state.connectionsLoginProvider}/login`);
+      const out = panel.querySelector("#conn-login-output");
+      if (out) { out.classList.remove("hidden"); out.textContent = st.output || "starting browser login…"; }
+      if (!st.running) { state.connectionsLoginProvider = null; }
+    } catch (e) { state.connectionsLoginProvider = null; }
+  }
+}
+
+function renderConnections(panel, connections) {
+  const list = panel.querySelector("#conn-list");
+  if (!list) return;
+  list.innerHTML = "";
+  for (const c of connections) {
+    const row = el("div", "conn-row");
+    row.appendChild(el("span", "conn-dot " + (c.loggedIn ? "ok" : c.installed ? "off" : "missing")));
+    const meta = el("div", "conn-meta");
+    meta.appendChild(el("span", "conn-name", c.label));
+    const sub = c.loggedIn
+      ? "connected" + (c.account ? " · " + c.account : "")
+      : (c.hint || (c.installed ? "not logged in" : "CLI not installed"));
+    meta.appendChild(el("span", "conn-sub dim mono", sub));
+    row.appendChild(meta);
+    const actions = el("div", "conn-actions");
+    const loginBtn = el("button", "btn-mini btn-go conn-login", c.loggedIn ? "RE-LOGIN" : "LOG IN");
+    loginBtn.onclick = () => startConnectionLogin(c.id);
+    actions.appendChild(loginBtn);
+    if (c.loggedIn) {
+      const outBtn = el("button", "btn-mini conn-logout", "LOG OUT");
+      outBtn.onclick = () => connectionLogout(c.id);
+      actions.appendChild(outBtn);
+    }
+    row.appendChild(actions);
+    list.appendChild(row);
+  }
+}
+
+async function startConnectionLogin(provider) {
+  try {
+    await post(`/api/connections/${provider}/login`);
+    state.connectionsLoginProvider = provider;
+    const panel = document.querySelector('.panel[data-panel="connections"]');
+    const out = panel && panel.querySelector("#conn-login-output");
+    if (out) { out.classList.remove("hidden"); out.textContent = "starting browser login — follow the device code / browser tab that opens…"; }
+  } catch (e) { pushError("connection login: " + e.message); }
+}
+
+async function connectionLogout(provider) {
+  try { await post(`/api/connections/${provider}/logout`); refreshConnections(); }
+  catch (e) { pushError("connection logout: " + e.message); }
 }
 
 /* ---------- sandbox ---------- */

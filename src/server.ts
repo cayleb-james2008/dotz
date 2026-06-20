@@ -31,6 +31,7 @@ import { workflowStore, type WorkflowEvent } from "./workflows";
 import { workflowBridge } from "./workflow-bridge";
 import { resolveHumanGate, onGateRequest } from "../.pi/extensions/dotz-tools/index";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "./browser";
+import { connectionsController } from "./connections";
 import { PROVIDERS, PROVIDER_DEFAULTS, type Project, type SandboxRun, type WorkflowRun } from "./types";
 import { loadConfig, getConfig, updateConfig, type DotzConfig } from "./config";
 
@@ -111,6 +112,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     offBrowserBroadcast();
     offMemoryRecall();
     await browserController.disposeAll();
+    connectionsController.disposeAll();
   });
 
   // ---- health + providers ----
@@ -284,6 +286,21 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     if (!sessionId) { reply.code(400).send({ error: "sessionId required" }); return; }
     try { return await browserController.stop(sessionId); }
     catch (error) { reply.code(404).send({ error: (error as Error).message }); }
+  });
+
+  // ---- local connections (each provider's own browser-CLI login on this machine) ----
+  app.get("/api/connections", async () => ({ connections: await connectionsController.status() }));
+  app.post("/api/connections/:provider/login", async (req, reply) => {
+    try { return connectionsController.login((req.params as { provider: string }).provider); }
+    catch (error) { reply.code(400).send({ error: (error as Error).message }); }
+  });
+  app.get("/api/connections/:provider/login", async (req, reply) => {
+    try { return connectionsController.loginState((req.params as { provider: string }).provider); }
+    catch (error) { reply.code(404).send({ error: (error as Error).message }); }
+  });
+  app.post("/api/connections/:provider/logout", async (req, reply) => {
+    try { return await connectionsController.logout((req.params as { provider: string }).provider); }
+    catch (error) { reply.code(400).send({ error: (error as Error).message }); }
   });
 
   // ---- sandbox ----

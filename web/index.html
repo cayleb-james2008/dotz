@@ -391,6 +391,17 @@
       </div>
     </template>
 
+    <template id="tpl-connections">
+      <div class="panel" data-panel="connections" role="region" aria-label="Connections">
+        <div class="panel-head" draggable="true"><span class="panel-icon">⊕</span> CONNECTIONS <button class="panel-close">×</button></div>
+        <div class="panel-body connections-body">
+          <div class="conn-note">Browser login on this computer. dotz reads each provider's CLI auth and opens its own browser login — no OAuth app, no client secret stored.</div>
+          <div id="conn-list" class="conn-list"><div class="dim mono">checking local logins…</div></div>
+          <pre id="conn-login-output" class="conn-login-output hidden"></pre>
+        </div>
+      </div>
+    </template>
+
     <script src="/app.js"></script>
   </body>
 </html>
