@@ -187,13 +187,18 @@ targets, focus states, no AI-slop). Three pi tools expose it:
 
 The FRONTEND profile doctrine instructs the agent to use these tools for any frontend task.
 
-## In-app browser
+## Isolated browser
 
-`src/browser.ts` embeds a Chromium instance inside the Electron window via `WebContentsView` (the
-modern replacement for `BrowserView`). It uses a dedicated `--user-data-dir`
-(`~/.dotz/ai-agents/browser-profile`) so it never conflicts with the user's personal Chrome profile.
-In browser-dev mode (`npm run dev:server`, no Electron), it's a no-op stub — the UI shows the
-placeholder. REST endpoints: `/api/browser/state|navigate|back|forward|reload|screenshot|eval`.
+`src/browser.ts` is an **isolated `agent-browser` controller** — it spawns the pinned external
+`agent-browser` binary in a disposable worker. Remote pages never run inside Dotz's Electron renderer
+and never receive its preload; each session gets a throwaway profile (`mkdtemp` under the OS temp dir,
+removed on stop) and an explicit origin allowlist enforced on every navigation. Frames are served as
+JPEG bytes on `/api/browser/frame` (never embedded in the JSON event stream). REST endpoints:
+`/api/browser/state|frame|start|act|stop`. Navigation, clicks, typing, and scrolling all go through
+`act` as `BrowserActInput.action` values
+(`navigate|observe|back|forward|reload|click|clickAt|type|key|select|scroll|wait`) — there is no
+raw-JS `eval` (forbidden by `scripts/verify-browser-controller.mjs`). Full contract:
+`docs/api-contract.md` → "Isolated interactive browser".
 
 ## Workflow presets
 
@@ -217,7 +222,7 @@ placeholder. REST endpoints: `/api/browser/state|navigate|back|forward|reload|sc
 - `src/workflow-bridge.ts` — synthesizes WorkflowRuns from subagent tool_execution events (auto-populates the graph).
 - `src/metrics.ts` — RSI measurement layer (baseline + compare + anti-gaming).
 - `src/design.ts` — Open-Design baked-in frontend tooling (palettes, typography, UX audit).
-- `src/browser.ts` — in-app Electron browser (WebContentsView + dedicated profile).
+- `src/browser.ts` — isolated `agent-browser` controller (spawns the external binary in a throwaway `mkdtemp` profile + origin allowlist; remote pages never touch the Electron renderer or its preload).
 - `src/projects.ts` — persistent projects layer (name + cwd + profile/model/thinking defaults).
 - `src/memory.ts` — mem0-backed memory store (`project` / `global` scope) under `~/.dotz/ai-agents/mem0/` + `MEMORY.md` mirrors + AGENTS.md read/write helpers + autonomy flag + recall event emitter. Build-time seed via `buildResourceLoader`; live per-turn recall + capture via the dotz-tools hooks.
 - `src/embedder.ts` — bundled local transformers.js embedder (all-MiniLM-L6-v2, 384-dim), injected in-process into mem0 (no embeddings API/route).
@@ -319,9 +324,10 @@ prompt for automatic task distribution.
 - `sandbox.ts` owns process lifecycle for both `terminal` and `web` runs; never spawn sandbox
   processes directly from `server.ts`. The agent cursor is a UI overlay driven by `sandbox_cursor`
   WS events — both sides (agent send + UI render) must consume the same event shape.
-- `browser.ts` owns the in-app Electron browser (`WebContentsView`). It must never reuse the user's
-  personal Chrome profile — always use the dedicated `~/.dotz/ai-agents/browser-profile`. In
-  browser-dev mode it's a no-op stub.
+- `browser.ts` owns the isolated `agent-browser` controller. Remote pages never run inside Dotz's
+  Electron renderer and never receive its preload — each session spawns the external `agent-browser`
+  binary with a throwaway `mkdtemp` profile (never the user's personal Chrome profile) and an explicit
+  origin allowlist. There is no raw-JS `eval` boundary (enforced by `scripts/verify-browser-controller.mjs`).
 - `workflow-bridge.ts` is best-effort — it never blocks the agent loop. If it fails to synthesize a
   run, the subagent extension still works; the UI graph just doesn't populate for that call.
 - `metrics.ts` is a pure measurement layer — no agent runtime. The RSI brain (the `/self-improve`
