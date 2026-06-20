@@ -200,6 +200,17 @@ JPEG bytes on `/api/browser/frame` (never embedded in the JSON event stream). RE
 raw-JS `eval` (forbidden by `scripts/verify-browser-controller.mjs`). Full contract:
 `docs/api-contract.md` → "Isolated interactive browser".
 
+## Connections
+
+`src/connections.ts` is the **local connections** layer: a simple in-browser login for GitHub, Vercel,
+and Neon on this machine. It shells each provider's own CLI (`gh` / `vercel` / `neonctl`) for status,
+login, and logout — there is **no OAuth app registration and no client secret**; the CLIs own the
+device/browser flow and token storage. Login streams the CLI's device-code / URL prompt so the user
+finishes in a normal browser tab; dotz never reads, stores, or logs the token. The agent uses the same
+CLIs via `bash` once connected. REST endpoints: `GET /api/connections` (status of all three),
+`POST|GET /api/connections/:provider/login` (start + stream output), `POST /api/connections/:provider/logout`.
+Surfaced via the **CONNECTIONS** panel (`+ PANELS`).
+
 ## Workflow presets
 
 `.pi/prompts/` contains 6 slash-command presets:
@@ -223,6 +234,7 @@ raw-JS `eval` (forbidden by `scripts/verify-browser-controller.mjs`). Full contr
 - `src/metrics.ts` — RSI measurement layer (baseline + compare + anti-gaming).
 - `src/design.ts` — Open-Design baked-in frontend tooling (palettes, typography, UX audit).
 - `src/browser.ts` — isolated `agent-browser` controller (spawns the external binary in a throwaway `mkdtemp` profile + origin allowlist; remote pages never touch the Electron renderer or its preload).
+- `src/connections.ts` — local connections (GitHub/Vercel/Neon) via the provider CLIs; status + streamed browser login + logout. No OAuth app, no stored secrets; tokens never read or logged.
 - `src/projects.ts` — persistent projects layer (name + cwd + profile/model/thinking defaults).
 - `src/memory.ts` — mem0-backed memory store (`project` / `global` scope) under `~/.dotz/ai-agents/mem0/` + `MEMORY.md` mirrors + AGENTS.md read/write helpers + autonomy flag + recall event emitter. Build-time seed via `buildResourceLoader`; live per-turn recall + capture via the dotz-tools hooks.
 - `src/embedder.ts` — bundled local transformers.js embedder (all-MiniLM-L6-v2, 384-dim), injected in-process into mem0 (no embeddings API/route).
