@@ -234,7 +234,8 @@ placeholder. REST endpoints: `/api/browser/state|navigate|back|forward|reload|sc
   on-the-fly SVG workflow graph, skills/memory/sandbox/brain panels).
 - `.pi/` — bundled agent resources (subagent extension, dotz-tools extension, agents, 6 workflow prompts).
   Shipped in the exe via `electron-builder.yml` `files:`.
-- `.pi/extensions/dotz-tools/index.ts` — registers the dotz pi tools: `skill`; the mem0 memory tools
+- `.pi/extensions/dotz-tools/index.ts` — registers the dotz pi tools: dynamic resource tools
+  `create_agent` / `list_agents` / `create_skill` / `list_skills`; `skill`; the mem0 memory tools
   `memory_list`, `memory_search`, `memory_add`, `memory_update`, `memory_delete`, `memory_consolidate`;
   `agents_md`; `rsi_baseline`, `rsi_compare`, `human_gate`; `browser_*`; `design_*` + the
   `resolveHumanGate`/`onGateRequest` server hooks. **Also registers the autonomous-memory lifecycle
@@ -246,7 +247,7 @@ placeholder. REST endpoints: `/api/browser/state|navigate|back|forward|reload|sc
 
 ```bash
 npm run typecheck                      # tsc --noEmit — must be clean
-npx tsx scripts/verify-profiles.mjs   # e2e: profiles + .pi bundle + subagent + 13 dotz-tools tools
+npx tsx scripts/verify-profiles.mjs   # e2e: profiles + .pi bundle + subagent + dotz-tools surface
 npx tsx scripts/verify-ui.mjs          # e2e: UI markup + profiles API
 npx tsx scripts/verify-features.mjs    # e2e: projects + memory + sandbox + multi-provider (11 providers)
 npx tsx scripts/verify-ultra.mjs       # e2e: 320 skills + workflows + .ai-agents memory + RSI/design/browser tools + 6 presets + Ollama
