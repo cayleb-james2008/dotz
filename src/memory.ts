@@ -83,7 +83,10 @@ export async function appendAgentsMdSection(cwd: string, section: string, body: 
   const existing = await readAgentsMd(cwd);
   const block = `\n## ${section}\n${body}\n`;
   if (existing.includes(`## ${section}`)) {
-    const replaced = existing.replace(new RegExp(`\\n## ${section}[\\s\\S]*?(?=\\n## |$)`), block);
+    // Escape regex metachars in the heading (else `new RegExp` throws on e.g. "C++ notes") and use
+    // a function replacer so `$&`/`$1` in the body aren't interpreted as replacement-string specials.
+    const escSection = section.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const replaced = existing.replace(new RegExp(`\\n## ${escSection}[\\s\\S]*?(?=\\n## |$)`), () => block);
     await writeAgentsMd(cwd, replaced);
   } else {
     await writeAgentsMd(cwd, existing + block);
@@ -114,31 +117,39 @@ const AUTO_CONSOLIDATE_EVERY = 25; // captures between automatic consolidation p
 
 export class MemoryStore {
   private mem: Mem0 | null = null;
+  private memInit: Promise<Mem0> | null = null;
   private capturesSinceConsolidate = 0;
 
-  /** Lazily construct the mem0 engine (after the app is up so embeddings can run). */
-  private async engine(): Promise<Mem0> {
-    if (this.mem) return this.mem;
-    const { Memory } = await import("mem0ai/oss");
-    await fs.mkdir(mem0Dir(), { recursive: true });
-    const cfg = getConfig();
-    const baseURL = process.env.DOTZ_MEMORY_BASE_URL || "https://ollama.com/v1";
-    const model = process.env.DOTZ_MEMORY_MODEL || cfg.executiveModel || "glm-5.2";
-    const apiKey = process.env.DOTZ_MEMORY_API_KEY || process.env.OLLAMA_API_KEY || "dotz-no-key";
-    const mem = new Memory({
-      // Dummy openai embedder config (constructor needs a non-empty key) — replaced in-process below.
-      embedder: { provider: "openai", config: { apiKey: "local", model: "local", embeddingDims: EMBED_DIM } },
-      // mem0's extraction/consolidation LLM = the same Ollama Cloud chat dotz already uses.
-      llm: { provider: "openai", config: { apiKey, baseURL, model, temperature: 0.1 } },
-      vectorStore: { provider: "memory", config: { collectionName: "dotz_memories", dimension: EMBED_DIM, dbPath: path.join(mem0Dir(), "vectors.db") } },
-      historyStore: { provider: "sqlite", config: { historyDbPath: path.join(mem0Dir(), "history.db") } },
-      customInstructions: CODING_INSTRUCTIONS,
-    });
-    // mem0-ts has no custom-embedder provider — inject the bundled local embedder in-process.
-    (mem as unknown as { embedder: typeof localEmbedder }).embedder = localEmbedder;
-    this.mem = mem;
-    await this.importLegacy(null).catch(() => { /* migration is best-effort */ });
-    return mem;
+  /** Lazily construct the mem0 engine (after the app is up so embeddings can run). Memoized via
+   *  memInit so concurrent first callers share one init — otherwise two Memory instances would be
+   *  built over the same sqlite files and importLegacy would run twice (double-importing legacy). */
+  private engine(): Promise<Mem0> {
+    if (this.mem) return Promise.resolve(this.mem);
+    if (!this.memInit) {
+      this.memInit = (async () => {
+        const { Memory } = await import("mem0ai/oss");
+        await fs.mkdir(mem0Dir(), { recursive: true });
+        const cfg = getConfig();
+        const baseURL = process.env.DOTZ_MEMORY_BASE_URL || "https://ollama.com/v1";
+        const model = process.env.DOTZ_MEMORY_MODEL || cfg.executiveModel || "glm-5.2";
+        const apiKey = process.env.DOTZ_MEMORY_API_KEY || process.env.OLLAMA_API_KEY || "dotz-no-key";
+        const mem = new Memory({
+          // Dummy openai embedder config (constructor needs a non-empty key) — replaced in-process below.
+          embedder: { provider: "openai", config: { apiKey: "local", model: "local", embeddingDims: EMBED_DIM } },
+          // mem0's extraction/consolidation LLM = the same Ollama Cloud chat dotz already uses.
+          llm: { provider: "openai", config: { apiKey, baseURL, model, temperature: 0.1 } },
+          vectorStore: { provider: "memory", config: { collectionName: "dotz_memories", dimension: EMBED_DIM, dbPath: path.join(mem0Dir(), "vectors.db") } },
+          historyStore: { provider: "sqlite", config: { historyDbPath: path.join(mem0Dir(), "history.db") } },
+          customInstructions: CODING_INSTRUCTIONS,
+        });
+        // mem0-ts has no custom-embedder provider — inject the bundled local embedder in-process.
+        (mem as unknown as { embedder: typeof localEmbedder }).embedder = localEmbedder;
+        this.mem = mem;
+        await this.importLegacy(null).catch(() => { /* migration is best-effort */ });
+        return mem;
+      })().catch((e) => { this.memInit = null; throw e; }); // reset on failure so a later call retries
+    }
+    return this.memInit;
   }
 
   private toView(it: MemoryItem, scopeFallback: MemoryScope): MemoryView {
@@ -307,7 +318,11 @@ export class MemoryStore {
           for (let j = i + 1; j < all.length; j++) {
             if (dropped.has(all[j].id)) continue;
             if (cosine(embs[i], embs[j]) > 0.97) {
-              dropped.add(tsOf(all[j]) >= tsOf(all[i]) ? all[i].id : all[j].id);
+              const dropI = tsOf(all[j]) >= tsOf(all[i]);
+              dropped.add(dropI ? all[i].id : all[j].id);
+              // If all[i] itself was just dropped, stop using it as the comparison anchor — else a
+              // dropped item keeps matching later items and transitively prunes non-duplicates.
+              if (dropI) break;
             }
           }
         }
@@ -325,6 +340,13 @@ export class MemoryStore {
     const mem = await this.engine();
     try { await mem.update(id, text); } catch { return null; }
     const it = await mem.get(id).catch(() => null);
+    // Re-sync the entity graph with the edited text (add()/remove() maintain it — update() must too,
+    // or the graph keeps the OLD text's entities and never gains the new ones).
+    memoryGraph.removeMemory(id);
+    if (it) {
+      const scope = (it.metadata?.scope as MemoryScope) || "global";
+      memoryGraph.indexMemory(scopeUser(scope, projectCwd), id, text);
+    }
     await this.writeMirrorAll(projectCwd);
     return it ? this.toView(it, (it.metadata?.scope as MemoryScope) || "global") : null;
   }
