@@ -55,6 +55,7 @@ const state = {
   browserObservation: null,
   browserPollTimer: null,
   browserBusy: false,
+  chatAutoScroll: true,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -552,9 +553,27 @@ function stringifyResult(r) {
 
 /* ---------- chat / composer ---------- */
 function wireChatPanel(node) {
-  const input = node.querySelector("#composer-input");
-  const sendBtn = node.querySelector("#send-btn");
-  const stopBtn = node.querySelector("#stop-btn");
+  const input = node.querySelector('[data-role="composer-input"]');
+  const sendBtn = node.querySelector('[data-role="send-btn"]');
+  const stopBtn = node.querySelector('[data-role="stop-btn"]');
+  const transcript = node.querySelector('[data-role="transcript"]');
+  state.chatAutoScroll = true;
+  const updateFollowTail = () => {
+    const distanceFromTail = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight;
+    state.chatAutoScroll = distanceFromTail <= 48;
+  };
+  // Scroll events also fire for our own follow-tail writes. Listen to user intent instead so a
+  // fast-growing message cannot accidentally classify a programmatic scroll as "user scrolled up".
+  transcript.addEventListener("wheel", (event) => {
+    if (event.deltaY < 0) state.chatAutoScroll = false;
+    else requestAnimationFrame(updateFollowTail);
+  }, { passive: true });
+  transcript.addEventListener("pointerdown", () => { state.chatAutoScroll = false; });
+  transcript.addEventListener("pointerup", () => requestAnimationFrame(updateFollowTail));
+  transcript.addEventListener("keydown", (event) => {
+    if (["PageUp", "Home", "ArrowUp"].includes(event.key)) state.chatAutoScroll = false;
+    else requestAnimationFrame(updateFollowTail);
+  });
   attachComposerPalette(input);
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendFrom(input); }
@@ -569,7 +588,7 @@ function wireChatPanel(node) {
   });
   sendBtn.onclick = () => sendFrom(input);
   stopBtn.onclick = () => state.ws && state.ws.send(JSON.stringify({ kind: "abort" }));
-  const chips = node.querySelector("#quick-chips");
+  const chips = node.querySelector('[data-role="quick-chips"]');
   chips.innerHTML = "";
   ["implement", "scout-and-plan", "implement-and-review"].forEach((cmd) => {
     const chip = el("span", "qchip", "/" + cmd);
@@ -604,8 +623,8 @@ function setStreaming(b) {
   state.streaming = b;
   const chat = document.querySelector('.panel[data-panel="chat"]');
   if (chat) {
-    const sendBtn = chat.querySelector("#send-btn");
-    const stopBtn = chat.querySelector("#stop-btn");
+    const sendBtn = chat.querySelector('[data-role="send-btn"]');
+    const stopBtn = chat.querySelector('[data-role="stop-btn"]');
     if (sendBtn) sendBtn.classList.toggle("hidden", b);
     if (stopBtn) stopBtn.classList.toggle("hidden", !b);
   }
@@ -628,13 +647,13 @@ function insertCommand(name) {
 
 function activeComposerInput() {
   const chat = document.querySelector('.panel[data-panel="chat"]');
-  if (chat) return chat.querySelector("#composer-input");
+  if (chat) return chat.querySelector('[data-role="composer-input"]');
   return $("composer-input");
 }
 
 /* ---------- composer palette ---------- */
 // Reusable per-textarea palette trigger: closes over the passed input so it works for both
-// the command-center textarea and each chat-panel clone (which share the #composer-input id).
+// the command-center textarea and each class-scoped chat-panel clone.
 function attachComposerPalette(input) {
   if (!input) return;
   input.addEventListener("input", () => {
@@ -770,20 +789,26 @@ function hideCmdPalette() {
 
 /* ---------- transcript ---------- */
 function clearTranscript() {
-  const t = document.querySelector('.panel[data-panel="chat"] #transcript') || $("transcript");
-  if (t) { t.innerHTML = ""; state.cur = null; state.toolCards = {}; }
+  const t = document.querySelector('.panel[data-panel="chat"] [data-role="transcript"]');
+  if (t) { t.innerHTML = ""; state.cur = null; state.toolCards = {}; state.chatAutoScroll = true; }
 }
-function scrollBottom() {
-  const t = document.querySelector('.panel[data-panel="chat"] #transcript') || $("transcript");
-  if (t) t.scrollTop = t.scrollHeight;
+function scrollBottom(force = false) {
+  const t = document.querySelector('.panel[data-panel="chat"] [data-role="transcript"]');
+  if (!t || (!force && !state.chatAutoScroll)) return;
+  state.chatAutoScroll = true;
+  requestAnimationFrame(() => {
+    // Re-check inside the frame: a user scroll can occur after this callback was queued by a
+    // streaming token. In that case the stale callback must not yank them back to the tail.
+    if (force || state.chatAutoScroll) t.scrollTop = t.scrollHeight;
+  });
 }
 function renderUserMessage(message) {
   const text = (message.content || []).map((c) => c.text || "").join("");
   const m = el("div", "msg user");
   m.appendChild(el("div", "msg-role", "you"));
   m.appendChild(el("div", "bubble", text));
-  const t = document.querySelector('.panel[data-panel="chat"] #transcript') || $("transcript");
-  if (t) { t.appendChild(m); scrollBottom(); }
+  const t = document.querySelector('.panel[data-panel="chat"] [data-role="transcript"]');
+  if (t) { t.appendChild(m); scrollBottom(true); }
 }
 function ensureAssistantBubble() {
   if (state.cur && state.cur.bubble.isConnected) return state.cur;
@@ -791,7 +816,7 @@ function ensureAssistantBubble() {
   m.appendChild(el("div", "msg-role", "dotz"));
   const bubble = el("div", "bubble");
   m.appendChild(bubble);
-  const t = document.querySelector('.panel[data-panel="chat"] #transcript') || $("transcript");
+  const t = document.querySelector('.panel[data-panel="chat"] [data-role="transcript"]');
   if (!t) return state.cur;
   t.appendChild(m);
   state.cur = { bubble, partial: { content: [] } };
@@ -906,7 +931,7 @@ function toolCard(id, patch) {
     outEl.style.display = "none";
     body.appendChild(argsEl); body.appendChild(outEl);
     card.appendChild(head); card.appendChild(body);
-    const t = document.querySelector('.panel[data-panel="chat"] #transcript') || $("transcript");
+    const t = document.querySelector('.panel[data-panel="chat"] [data-role="transcript"]');
     if (!t) return;
     t.appendChild(card);
     tc = state.toolCards[id] = { card, nameEl, previewEl, badge, argsEl, outEl, data: {} };
@@ -927,7 +952,7 @@ function showToast(msg) {
   setTimeout(() => n.remove(), 6000);
 }
 function pushError(msg) {
-  const t = document.querySelector('.panel[data-panel="chat"] #transcript') || $("transcript");
+  const t = document.querySelector('.panel[data-panel="chat"] [data-role="transcript"]');
   if (!t) { showToast("⚠ " + msg); return; }
   const m = el("div", "msg assistant");
   m.appendChild(el("div", "msg-role", "system"));
@@ -935,7 +960,7 @@ function pushError(msg) {
   b.appendChild(el("div", "msg-error", "⚠ " + msg));
   m.appendChild(b);
   t.appendChild(m);
-  scrollBottom();
+  scrollBottom(true);
 }
 
 /* ---------- model + provider controls ---------- */
@@ -1080,22 +1105,21 @@ async function loadCommands() {
 
 function renderQuickChips() {
   const chat = document.querySelector('.panel[data-panel="chat"]');
-  const chips = chat ? chat.querySelector("#quick-chips") : $("quick-chips");
+  const chips = chat ? chat.querySelector('[data-role="quick-chips"]') : $("quick-chips");
   if (!chips) return;
   chips.innerHTML = "";
   const defaults = ["implement", "scout-and-plan", "implement-and-review"];
-  defaults.forEach((cmd) => {
-    const chip = el("span", "qchip", "/" + cmd);
-    chip.title = "";
-    chip.onclick = () => insertCommand(cmd);
+  const candidates = defaults.map((name) => ({ name, description: "" })).concat(state.commands);
+  const seen = new Set();
+  for (const command of candidates) {
+    if (!command.name || seen.has(command.name)) continue;
+    seen.add(command.name);
+    const chip = el("span", "qchip", "/" + command.name);
+    chip.title = command.description || "";
+    chip.onclick = () => insertCommand(command.name);
     chips.appendChild(chip);
-  });
-  state.commands.slice(0, 6).forEach((c) => {
-    const chip = el("span", "qchip", "/" + c.name);
-    chip.title = c.description || "";
-    chip.onclick = () => insertCommand(c.name);
-    chips.appendChild(chip);
-  });
+    if (seen.size >= 6) break;
+  }
 }
 
 /* ---------- memory (mem0-backed, autonomous) ---------- */
@@ -2164,19 +2188,20 @@ async function refreshStats() {
     const s = await api(`/api/sessions/${state.sessionId}`);
     const st = s.stats || {};
     const tok = st.tokens || {};
-    const tin = $("st-tok-in"); if (tin) tin.textContent = "↑" + fmtNum(tok.input || 0);
-    const tout = $("st-tok-out"); if (tout) tout.textContent = "↓" + fmtNum(tok.output || 0);
+    const tokenText = formatTokenBreakdown(tok);
+    const tin = $("st-tok-in"); if (tin) tin.textContent = "↑" + tokenText.input;
+    const tout = $("st-tok-out"); if (tout) tout.textContent = "↓" + tokenText.output;
     const cost = $("st-cost"); if (cost) cost.textContent = "$" + (st.cost || 0).toFixed(4).replace(/0+$/, "0");
     const cu = st.contextUsage;
+    const pct = cu?.percent || 0;
     if (cu) {
       // contextUsage.percent is already a percentage (tokens/contextWindow*100), not a 0-1
       // fraction — multiplying by 100 again printed a nonsensical 800%+ context gauge.
-      const pct = cu.percent || 0;
       const p = $("st-ctx-pct"); if (p) p.textContent = pct.toFixed(1) + "%";
       const bar = $("st-ctx-bar"); if (bar) bar.style.width = Math.min(100, pct) + "%";
       const win = $("st-ctx-win"); if (win) win.textContent = "of " + fmtCtx(cu.contextWindow);
-      updateBrainStats(fmtNum((tok.input || 0) + (tok.output || 0)), "$" + (st.cost || 0).toFixed(2), pct.toFixed(0) + "%");
     }
+    updateBrainStats(tokenText.combined, "$" + (st.cost || 0).toFixed(2), pct.toFixed(0) + "%");
   } catch {}
 }
 
@@ -2192,6 +2217,12 @@ function updateBrainStats(tokens, cost, ctx) {
   if ($("bf-tok")) $("bf-tok").textContent = tokens;
   if ($("bf-cost")) $("bf-cost").textContent = cost;
   if ($("bf-ctx")) $("bf-ctx").textContent = ctx;
+}
+
+function formatTokenBreakdown(tokens) {
+  const input = fmtNum(tokens.input || 0);
+  const output = fmtNum(tokens.output || 0);
+  return { input, output, combined: `↑${input} ↓${output}` };
 }
 
 function fmtNum(n) { return n >= 1000 ? (n / 1000).toFixed(1) + "K" : String(n || 0); }
