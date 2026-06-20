@@ -203,13 +203,15 @@ raw-JS `eval` (forbidden by `scripts/verify-browser-controller.mjs`). Full contr
 ## Connections
 
 `src/connections.ts` is the **local connections** layer: a simple in-browser login for GitHub, Vercel,
-and Neon on this machine. It shells each provider's own CLI (`gh` / `vercel` / `neonctl`) for status,
-login, and logout — there is **no OAuth app registration and no client secret**; the CLIs own the
-device/browser flow and token storage. Login streams the CLI's device-code / URL prompt so the user
-finishes in a normal browser tab; dotz never reads, stores, or logs the token. The agent uses the same
-CLIs via `bash` once connected. REST endpoints: `GET /api/connections` (status of all three),
-`POST|GET /api/connections/:provider/login` (start + stream output), `POST /api/connections/:provider/logout`.
-Surfaced via the **CONNECTIONS** panel (`+ PANELS`).
+and Neon on this machine. It reads each provider's existing local auth and shells its own browser login —
+there is **no OAuth app registration and no client secret**; the provider tooling owns the device/browser
+flow and token storage. GitHub (`gh`) and Vercel (`vercel`) use their CLI for status/login/logout. Neon
+logs in via `npx neonctl auth` (no global install) and keys status/logout off neonctl's `credentials.json`,
+because neonctl has no logout command and no on-PATH `me` here. Login streams the CLI's device-code / URL
+prompt so the user finishes in a normal browser tab; dotz never reads, stores, or logs the token. The
+agent uses the same CLIs via `bash` once connected. REST endpoints: `GET /api/connections` (status of all
+three), `POST|GET /api/connections/:provider/login` (start + stream output),
+`POST /api/connections/:provider/logout`. Surfaced via the **CONNECTIONS** panel (`+ PANELS`).
 
 ## Workflow presets
 

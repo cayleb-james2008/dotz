@@ -19,6 +19,8 @@ assert.match(connSource, /windowsHide:\s*true/, "CLI spawns hide the console win
 assert.match(connSource, /\bgh\b[\s\S]{0,80}auth/, "GitHub login shells the gh CLI");
 assert.match(connSource, /vercel/, "Vercel login shells the vercel CLI");
 assert.match(connSource, /neonctl/, "Neon login shells neonctl");
+assert.doesNotMatch(connSource, /auth\s+--logout/, "Neon logout never re-runs neonctl's (nonexistent) logout — that command actually launches login");
+assert.match(connSource, /credentials\.json/, "Neon status/logout key off the neonctl credentials file so an npx login is reflected");
 assert.doesNotMatch(connSource, /console\.log\([^)]*token/i, "tokens are never logged");
 
 // --- server exposes status + per-provider browser login (start + stream) + logout ---
