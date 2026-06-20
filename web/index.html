@@ -35,9 +35,14 @@
               </div>
               <div id="project-form" class="project-form hidden">
                 <input id="pf-name" class="pf-input" placeholder="project name" />
-                <input id="pf-cwd" class="pf-input" placeholder="cwd (absolute path)" />
+                <div class="pf-row">
+                  <input id="pf-cwd" class="pf-input" placeholder="cwd (absolute path)" />
+                  <button id="pf-browse" class="btn-mini" type="button" title="Pick a folder in File Explorer">Browse…</button>
+                </div>
                 <select id="pf-profile" class="pf-select"></select>
                 <input id="pf-model" class="pf-input" placeholder="model id" />
+                <input id="pf-appurl" class="pf-input" placeholder="app url (optional, e.g. http://127.0.0.1:5173)" />
+                <input id="pf-gate" class="pf-input" placeholder="gate/test cmd (optional, e.g. .venv\Scripts\python -m pytest)" />
                 <div class="pf-actions">
                   <button id="pf-create" class="btn-mini btn-go">CREATE &amp; OPEN</button>
                   <button id="pf-cancel" class="btn-mini">CANCEL</button>

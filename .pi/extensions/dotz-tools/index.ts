@@ -11,6 +11,7 @@ import { Type } from "typebox";
 import { createUserSkill, skillLoader } from "../../../src/skills";
 import { createUserAgent, discoverAgents } from "../subagent/agents";
 import { memoryStore, readAgentsMd, writeAgentsMd, appendAgentsMdSection, isMemoryAutonomyEnabled } from "../../../src/memory";
+import { projectStore } from "../../../src/projects";
 import { captureBaseline, compare, renderBaseline, type MetricsBaseline } from "../../../src/metrics";
 import { getDesignSystem, getComponents, auditDesign, renderDesignSystem, renderComponents, renderAudit } from "../../../src/design";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "../../../src/browser";
@@ -53,6 +54,27 @@ export function registerGateListener(gateId: string, fn: GateResolver): void {
 }
 
 export default function (pi: ExtensionAPI) {
+  // The SELECTED PROJECT's working dir. dotz's project tools (agents_md, rsi_baseline, memory_*,
+  // list_agents) must operate on the project — NOT on dotz's own `process.cwd()` (where electron
+  // launched, e.g. the dotz repo), which made `agents_md` return dotz's own doctrine and ran the gate
+  // in the wrong place. The framework's authoritative session cwd arrives on the agent-start hook;
+  // capture it and resolve every project tool against it (process.cwd() only as a pre-first-turn
+  // fallback). dotz runs one in-process agent at a time, so this module-scoped capture is race-free.
+  let sessionCwd: string | null = null;
+  const projectCwd = (): string => sessionCwd || process.cwd();
+  pi.on("before_agent_start", async (_event, ctx) => { if (ctx?.cwd) sessionCwd = ctx.cwd; });
+
+  // The bound project's configured gate/test command, looked up by cwd — so rsi_baseline/compare can
+  // run a NON-Node suite (e.g. a python venv's pytest) instead of the Node defaults. undefined when no
+  // project matches or none is configured (captureBaseline then falls back to its Node chain).
+  const gateCommandFor = async (cwd: string): Promise<string | undefined> => {
+    try {
+      const norm = (s: string) => s.replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase();
+      const proj = (await projectStore.list()).find((p) => norm(p.cwd) === norm(cwd));
+      return proj?.gateCommand?.trim() || undefined;
+    } catch { return undefined; }
+  };
+
   // ---- dynamic resources: create specialists and reusable procedures during a workflow ----
   pi.registerTool({
     name: "create_agent",
@@ -81,7 +103,7 @@ export default function (pi: ExtensionAPI) {
     description: "List bundled, user, and project agents available to the subagent tool in the current working directory.",
     parameters: Type.Object({}),
     async execute() {
-      const agents = discoverAgents(process.cwd(), "both").agents.map(({ name, description, source, model }) => ({ name, description, source, model }));
+      const agents = discoverAgents(projectCwd(), "both").agents.map(({ name, description, source, model }) => ({ name, description, source, model }));
       return { content: [{ type: "text", text: JSON.stringify(agents) }], details: agents };
     },
   });
@@ -225,7 +247,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params) {
       const p = params as { scope?: "project" | "global" };
-      const all = await memoryStore.list(p.scope === "global" ? null : process.cwd());
+      const all = await memoryStore.list(p.scope === "global" ? null : projectCwd());
       const items = p.scope ? all.filter((e) => e.scope === p.scope) : all;
       const text = items.length === 0 ? "No memories found." : items.map((e) => `[${e.scope}${e.category ? "/" + e.category : ""}] (${e.id.slice(0, 8)}) ${e.memory}`).join("\n");
       return { content: [{ type: "text", text }], details: undefined };
@@ -243,7 +265,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params) {
       const p = params as { query: string; scope?: "project" | "global"; topK?: number };
-      const items = await memoryStore.search(p.query, { projectCwd: process.cwd(), scope: p.scope, topK: p.topK ?? 8 });
+      const items = await memoryStore.search(p.query, { projectCwd: projectCwd(), scope: p.scope, topK: p.topK ?? 8 });
       const text = items.length === 0 ? "No relevant memories." : items.map((e) => `[${e.scope}${e.category ? "/" + e.category : ""}] (${(e.score ?? 0).toFixed(2)}) ${e.memory}`).join("\n");
       return { content: [{ type: "text", text }], details: undefined };
     },
@@ -262,7 +284,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params) {
       const p = params as { text: string; scope?: "project" | "global"; category?: string; folder?: string };
       const scope = p.scope ?? "project";
-      const v = await memoryStore.create({ text: p.text, category: p.category, folder: p.folder, scope, projectCwd: scope === "project" ? process.cwd() : null });
+      const v = await memoryStore.create({ text: p.text, category: p.category, folder: p.folder, scope, projectCwd: scope === "project" ? projectCwd() : null });
       return { content: [{ type: "text", text: `Memory saved: [${v.scope}${v.category ? "/" + v.category : ""}] ${v.memory}` }], details: undefined };
     },
   });
@@ -274,7 +296,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({ id: Type.String(), text: Type.String({ description: "Replacement fact" }) }),
     async execute(_id, params) {
       const p = params as { id: string; text: string };
-      const v = await memoryStore.update(p.id, p.text, process.cwd());
+      const v = await memoryStore.update(p.id, p.text, projectCwd());
       return { content: [{ type: "text", text: v ? `Memory updated: ${v.memory}` : "No such memory." }], isError: !v, details: undefined };
     },
   });
@@ -285,7 +307,7 @@ export default function (pi: ExtensionAPI) {
     description: "Delete a durable memory by id.",
     parameters: Type.Object({ id: Type.String() }),
     async execute(_id, params) {
-      const ok = await memoryStore.remove((params as { id: string }).id, process.cwd());
+      const ok = await memoryStore.remove((params as { id: string }).id, projectCwd());
       return { content: [{ type: "text", text: ok ? "Memory deleted." : "No such memory." }], details: undefined };
     },
   });
@@ -296,7 +318,7 @@ export default function (pi: ExtensionAPI) {
     description: "Merge near-duplicate memories and prune them now (this also runs automatically on a threshold).",
     parameters: Type.Object({}),
     async execute() {
-      const r = await memoryStore.consolidate(process.cwd());
+      const r = await memoryStore.consolidate(projectCwd());
       return { content: [{ type: "text", text: `Consolidated: removed ${r.removed} duplicate(s), ${r.kept} kept.` }], details: undefined };
     },
   });
@@ -317,7 +339,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params) {
       const p = params as { action: "read" | "append" | "write"; section?: string; body?: string };
-      const cwd = process.cwd();
+      const cwd = projectCwd();
       if (p.action === "read") {
         const content = await readAgentsMd(cwd);
         return { content: [{ type: "text", text: content || "(no AGENTS.md in project root)" }], details: undefined };
@@ -351,9 +373,9 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params) {
       const p = (params as { label?: string }) || {};
       const label = p.label || "current";
-      const cwd = process.cwd();
+      const cwd = projectCwd();
       try {
-        const baseline = await captureBaseline(cwd);
+        const baseline = await captureBaseline(cwd, await gateCommandFor(cwd));
         baselines.set(label, baseline);
         return { content: [{ type: "text", text: renderBaseline(baseline) }], details: undefined };
       } catch (e) {
@@ -380,7 +402,7 @@ export default function (pi: ExtensionAPI) {
       const baseline = baselines.get(label);
       if (!baseline) return { content: [{ type: "text", text: `no baseline found for label '${label}'. Capture one with rsi_baseline first.` }], isError: true, details: undefined };
       try {
-        const result = await compare(baseline);
+        const result = await compare(baseline, projectCwd(), await gateCommandFor(projectCwd()));
         baselines.delete(label);
         return { content: [{ type: "text", text: `RSI compare result:\n${result.summary}\nFiles: ${result.baseline.fileCount} → ${result.after.fileCount} (${result.fileCountDelta >= 0 ? "+" : ""}${result.fileCountDelta})` }], details: undefined };
       } catch (e) {

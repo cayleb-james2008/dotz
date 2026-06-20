@@ -5,6 +5,10 @@ import { contextBridge, ipcRenderer } from "electron";
 contextBridge.exposeInMainWorld("dotz", {
   electron: true,
   version: process.env.npm_package_version || "0.2.0",
+  // Native folder picker for the new-project form — returns the chosen absolute path, or null if
+  // the user cancelled. Lets the user SELECT a workspace via File Explorer instead of typing a path
+  // (which let relative / nonexistent cwds slip in).
+  pickDirectory: (): Promise<string | null> => ipcRenderer.invoke("dotz:pick-directory"),
   // Source-rebuild updater controls exposed to the renderer.
   update: {
     check: () => ipcRenderer.send("dotz-update-check"),

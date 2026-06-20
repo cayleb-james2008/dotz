@@ -7,3 +7,4 @@ assets/models/
 data/
 *.log
 .DS_Store
+.ai-agents/

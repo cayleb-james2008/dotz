@@ -55,6 +55,7 @@ export class PiSessions {
     let modelRef = opts.model;
     let thinkingLevel = opts.thinkingLevel;
     let projectId: string | null = null;
+    let appUrl: string | null = null;
     if (opts.projectId) {
       const project = await projectStore.get(opts.projectId);
       if (project) {
@@ -63,13 +64,14 @@ export class PiSessions {
         profileId = project.profileId;
         modelRef = opts.model ?? project.model;
         thinkingLevel = opts.thinkingLevel ?? project.thinkingLevel;
+        appUrl = project.appUrl ?? null;
       }
     }
     const profile = getProfile(profileId);
     // Load the bundled .pi (subagent extension, skills, workflow prompts) + inject the profile's
     // operating doctrine as an appendSystemPrompt. When a project is bound, its persistent memory
     // entries are also injected so the agent carries durable context across sessions.
-    const resourceLoader = await buildResourceLoader(cwd, profile, { projectId });
+    const resourceLoader = await buildResourceLoader(cwd, profile, { projectId, appUrl });
     const { session } = await createAgentSession({ cwd, resourceLoader });
 
     // A project/opts model override wins; otherwise the ad-hoc session starts on the operator's

@@ -147,7 +147,7 @@ export function profileSummary(p: Profile) {
 export async function buildResourceLoader(
   cwd: string,
   profile: Profile,
-  opts: { projectId?: string | null } = {}
+  opts: { projectId?: string | null; appUrl?: string | null } = {}
 ): Promise<ResourceLoader> {
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir);
@@ -158,6 +158,22 @@ export async function buildResourceLoader(
   const seed = await memoryStore.forProject(opts.projectId ? cwd : null);
   const memBlock = memoryStore.renderForPrompt(seed);
   if (memBlock) prompts.push(memBlock);
+  // Project context that dotz supplies AUTOMATICALLY so the agent never has to be hand-told it:
+  //  - the working directory (the selected project root) — so the agent doesn't guess a path and
+  //    `cd` somewhere nonexistent (e.g. /home/user/project); shell/git tools already run HERE.
+  //  - the app URL (when configured) — so VISUAL / E2E / BUG-BOUNTY work drives THE RIGHT app with
+  //    the in-app browser instead of grabbing whatever dev server is up (e.g. dotz's own UI).
+  prompts.push(
+    `# Project (dotz)\n` +
+    `Your working directory (the selected project's root) is: ${cwd}\n` +
+    `The shell, git, agents_md, and gate tools already operate HERE — do NOT \`cd\` to a guessed ` +
+    `path; run commands relative to this root.` +
+    (opts.appUrl
+      ? `\nThis project's running app is served at: ${opts.appUrl} — for any VISUAL, E2E, or ` +
+        `BUG-BOUNTY task, drive THAT url with the in-app browser (\`browser_start\` / \`browser_act\`); ` +
+        `do NOT target any other dev server (not dotz's own UI, not an unrelated localhost port).`
+      : ``)
+  );
   // Inject the unified skill index (names + one-line descriptions) so the agent knows what
   // skills are available without loading every full body. The `skill` tool loads bodies on demand.
   await skillLoader.load();
