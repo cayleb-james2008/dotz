@@ -84,14 +84,19 @@ function parseTestCounts(output: string): { passed: number; failed: number } {
 }
 
 /** Capture a baseline for a project cwd. */
-export async function captureBaseline(cwd: string): Promise<MetricsBaseline> {
+export async function captureBaseline(cwd: string, gateCommand?: string): Promise<MetricsBaseline> {
   const [typecheck, build, files] = await Promise.all([
     runCmd("npx tsc --noEmit", cwd, 90000),
     runCmd("npm run build", cwd, 90000).catch(() => ({ ok: false, output: "build not configured" })),
     countFiles(cwd),
   ]);
-  // tests: try common test commands; non-fatal if none configured
-  const tests = await runCmd("npm test -- --passWithNoTests 2>&1 || npx vitest run --passWithNoTests 2>&1 || npx jest --passWithNoTests 2>&1", cwd, 90000).catch(() => null);
+  // tests: prefer the project's configured gate command (so the gate works on NON-Node projects —
+  // e.g. a python venv's pytest); otherwise fall back to the common Node test runners. Non-fatal if
+  // none runs. A configured gate is the cure for "0 tests / wrong python" on Python/other stacks.
+  const testCmd = gateCommand?.trim()
+    ? gateCommand
+    : "npm test -- --passWithNoTests 2>&1 || npx vitest run --passWithNoTests 2>&1 || npx jest --passWithNoTests 2>&1";
+  const tests = await runCmd(testCmd, cwd, 90000).catch(() => null);
   const baseline: MetricsBaseline = {
     id: randomUUID(),
     cwd,
@@ -109,8 +114,8 @@ export async function captureBaseline(cwd: string): Promise<MetricsBaseline> {
 }
 
 /** Compare a new measurement against a baseline. */
-export async function compare(baseline: MetricsBaseline, afterCwd?: string): Promise<MetricsCompare> {
-  const after = await captureBaseline(afterCwd || baseline.cwd);
+export async function compare(baseline: MetricsBaseline, afterCwd?: string, gateCommand?: string): Promise<MetricsCompare> {
+  const after = await captureBaseline(afterCwd || baseline.cwd, gateCommand);
   const typecheckFixed = !!(!baseline.typecheck?.ok && after.typecheck?.ok);
   const buildFixed = !!(!baseline.build?.ok && after.build?.ok);
   // Require a real prior failure so a null/absent baseline can't be reported as RED → GREEN.

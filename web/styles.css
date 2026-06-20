@@ -307,6 +307,8 @@ code { font-family: var(--mono); color: var(--peach); }
 }
 .pf-input:focus, .pf-select:focus { border-color: var(--lav); }
 .pf-actions { display: flex; gap: 6px; }
+.pf-row { display: flex; gap: 6px; align-items: stretch; }
+.pf-row .pf-input { flex: 1; min-width: 0; }
 
 /* ---- BENTO GRID ---- */
 .bento {

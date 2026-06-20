@@ -4,7 +4,7 @@
  * Remote pages never run inside Dotz's Electron renderer and never receive its preload.
  * Each session uses a disposable profile and an explicit navigation allowlist.
  */
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -288,6 +288,27 @@ export class BrowserController {
 
   async disposeAll(): Promise<void> {
     await Promise.all([...this.sessions.keys()].map((id) => this.stop(id).catch(() => undefined)));
+    // Backstop: `agent-browser close` does NOT reliably reap the persistent browser daemon (and its
+    // headless Chrome) OS process — a force-stopped run leaves sessions whose daemons linger after
+    // quit (observed: 8 orphaned agent-browser + Chrome processes survived a graceful quit). disposeAll
+    // runs ONLY on app shutdown and dotz is the sole user of this binary, so force-kill any survivor
+    // (and its child tree) by image name so dotz never leaks browser processes.
+    await this.reapStrayBrowsers();
+  }
+
+  /** Force-kill any lingering agent-browser process (+ its child Chrome tree). Best-effort, resolves
+   *  even when none are found or the kill fails — it is a shutdown backstop, never a hard dependency. */
+  private reapStrayBrowsers(): Promise<void> {
+    return new Promise((resolve) => {
+      const [cmd, args]: [string, string[]] = process.platform === "win32"
+        ? ["taskkill", ["/IM", "agent-browser-win32-x64.exe", "/T", "/F"]]
+        : ["pkill", ["-f", "agent-browser"]];
+      try {
+        execFile(cmd, args, { windowsHide: true }, () => resolve());
+      } catch {
+        resolve();
+      }
+    });
   }
 
   private actionArgs(record: SessionRecord, input: BrowserActInput): string[] | null {

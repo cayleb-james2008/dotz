@@ -70,6 +70,15 @@ export interface Project {
   profileId: string;
   model: ModelRef;
   thinkingLevel: ThinkingLevel;
+  /** Optional URL where this project's running app is served (e.g. http://127.0.0.1:5173, or a
+   *  pywebview/desktop app's local server). When set, dotz injects it into the agent context so
+   *  visual/E2E/bug-bounty work drives THIS app with the in-app browser — no per-run instruction. */
+  appUrl?: string;
+  /** Optional shell command that runs the project's test/gate suite (e.g.
+   *  `.venv\Scripts\python -m pytest` or a non-default python). When set, rsi_baseline / rsi_compare
+   *  use it instead of the Node defaults (npm test / vitest / jest), so the gate works on non-Node
+   *  projects. Falls back to the Node chain when unset. */
+  gateCommand?: string;
   createdAt: number;
   updatedAt: number;
 }

@@ -19,8 +19,12 @@ loop onto dotz's own tools.
   do not re-report issues a prior cycle already skipped.
 - Capture the BEFORE gate with **`rsi_baseline`** (typecheck + build + tests). A missing gate is
   itself a finding.
-- Launch the app into the **monitored sandbox browser** and confirm it renders before hunting
-  (a crash on launch is the worst bug — fix that first, then relaunch).
+- Drive the app in the **in-app monitored browser** (`browser_start`). dotz injects this project's
+  app URL into your context under the **"# Project app"** heading — open THAT url and confirm it
+  renders before hunting (a crash on launch is the worst bug — fix that first, then relaunch). Do
+  NOT target any other dev server (not dotz's own UI, not an unrelated localhost port). Only if no
+  app URL is configured for this project: launch the project's own dev server in the sandbox and use
+  the detected port.
 
 ## Phase 1 — Scout (1 subagent)
 Use the **`subagent`** tool (`agentScope: "both"`) with the **`scout`** agent to map the 4–8

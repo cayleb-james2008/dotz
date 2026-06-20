@@ -200,6 +200,21 @@ function bindProjectSelector() {
   });
   $("project-new-btn").onclick = () => $("project-form").classList.remove("hidden");
   $("pf-cancel").onclick = () => $("project-form").classList.add("hidden");
+  // Browse… opens the native File Explorer folder picker (Electron only) and fills cwd with the
+  // chosen absolute path — so the user selects a real workspace instead of typing one.
+  {
+    const browseBtn = $("pf-browse");
+    if (browseBtn && window.dotz && typeof window.dotz.pickDirectory === "function") {
+      browseBtn.onclick = async () => {
+        try {
+          const dir = await window.dotz.pickDirectory();
+          if (dir) $("pf-cwd").value = dir;
+        } catch (e) { pushError("folder picker: " + e.message); }
+      };
+    } else if (browseBtn) {
+      browseBtn.style.display = "none";   // no native picker outside the Electron app
+    }
+  }
   $("pf-create").onclick = async () => {
     const name = $("pf-name").value.trim();
     const cwd = $("pf-cwd").value.trim();
@@ -212,6 +227,8 @@ function bindProjectSelector() {
       name, cwd,
       profileId: $("pf-profile").value,
       model: { provider: (state.config && state.config.provider) || "ollama", modelId: $("pf-model").value.trim() || (state.config && state.config.executiveModel) || "glm-5.2" },
+      appUrl: (($("pf-appurl") && $("pf-appurl").value) || "").trim(),
+      gateCommand: (($("pf-gate") && $("pf-gate").value) || "").trim(),
     };
     try {
       const p = await post("/api/projects", body);

@@ -6,7 +6,7 @@
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, shell } from "electron";
+import { app, BrowserWindow, shell, ipcMain, dialog } from "electron";
 import { buildServer } from "./server";
 import { sandbox } from "./sandbox";
 import { browserController } from "./browser";
@@ -81,6 +81,15 @@ if (!gotTheLock) {
 
 if (gotTheLock) app.whenReady().then(async () => {
   wireUpdaterIpc();
+  // Native directory picker for the new-project form (preload exposes window.dotz.pickDirectory).
+  // Returns the chosen absolute path or null — so the user selects a real workspace via File
+  // Explorer instead of typing a path that could be relative or nonexistent.
+  ipcMain.handle("dotz:pick-directory", async () => {
+    const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0] ?? null;
+    const opts = { properties: ["openDirectory" as const], title: "Select project workspace" };
+    const res = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts);
+    return res.canceled || res.filePaths.length === 0 ? null : res.filePaths[0];
+  });
   // Start the server before opening the window so the renderer has a live backend.
   let serverOk = true;
   try {

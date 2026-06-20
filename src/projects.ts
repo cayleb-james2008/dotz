@@ -41,6 +41,8 @@ export interface CreateProjectInput {
   profileId?: string;
   model?: ModelRef;
   thinkingLevel?: ThinkingLevel;
+  appUrl?: string;
+  gateCommand?: string;
 }
 
 export class ProjectStore {
@@ -61,6 +63,8 @@ export class ProjectStore {
       profileId: input.profileId || "workflow",
       model: input.model || DEFAULT_MODEL,
       thinkingLevel: input.thinkingLevel || "high",
+      ...(input.appUrl?.trim() ? { appUrl: input.appUrl.trim() } : {}),
+      ...(input.gateCommand?.trim() ? { gateCommand: input.gateCommand.trim() } : {}),
       createdAt: now,
       updatedAt: now,
     };

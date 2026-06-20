@@ -41,6 +41,21 @@ const SELF = fileURLToPath(import.meta.url);
 const WEB_DIR = path.resolve(path.dirname(SELF), "../web");
 const FILE_TREE_MAX_DEPTH = 3;
 
+/** Validate a project cwd before it is persisted: it must be an ABSOLUTE path that EXISTS and is a
+ *  DIRECTORY. Returns an error string for the caller to 400 on, or null when valid. Closes the gap
+ *  where a relative ("relative/path") or nonexistent ("C:\\no\\such\\dir") cwd was accepted by the
+ *  API and then broke the agent (invalid cwd, empty file tree). */
+async function validateCwd(cwd: string): Promise<string | null> {
+  if (!path.isAbsolute(cwd)) return "cwd must be an absolute path";
+  try {
+    const st = await fs.stat(cwd);
+    if (!st.isDirectory()) return "cwd is not a directory";
+  } catch {
+    return "cwd directory does not exist";
+  }
+  return null;
+}
+
 /** Recursive, depth-limited file tree used by `GET /api/projects/:id/files`. */
 async function buildFileTree(cwd: string, depth = 0): Promise<Array<{ path: string; type: "file" | "dir"; children?: unknown }>> {
   if (depth >= FILE_TREE_MAX_DEPTH) return [];
@@ -134,12 +149,14 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   // ---- projects ----
   app.get("/api/projects", async () => ({ projects: await projectStore.list() }));
   app.post("/api/projects", async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; cwd?: string; profileId?: string; model?: ModelRef; thinkingLevel?: ThinkingLevel };
+    const body = (req.body ?? {}) as { name?: string; cwd?: string; profileId?: string; model?: ModelRef; thinkingLevel?: ThinkingLevel; appUrl?: string; gateCommand?: string };
     if (!body.name || !body.cwd) {
       reply.code(400).send({ error: "name and cwd are required" });
       return;
     }
-    return projectStore.create({ name: body.name, cwd: body.cwd, profileId: body.profileId, model: body.model, thinkingLevel: body.thinkingLevel });
+    const cwdErr = await validateCwd(body.cwd);
+    if (cwdErr) { reply.code(400).send({ error: cwdErr }); return; }
+    return projectStore.create({ name: body.name, cwd: body.cwd, profileId: body.profileId, model: body.model, thinkingLevel: body.thinkingLevel, appUrl: body.appUrl, gateCommand: body.gateCommand });
   });
   app.get("/api/projects/:id", async (req, reply) => {
     const p = await projectStore.get((req.params as { id: string }).id);
@@ -147,7 +164,12 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     return p;
   });
   app.patch("/api/projects/:id", async (req, reply) => {
-    const p = await projectStore.update((req.params as { id: string }).id, (req.body ?? {}) as Partial<Project>);
+    const body = (req.body ?? {}) as Partial<Project>;
+    if (typeof body.cwd === "string") {
+      const cwdErr = await validateCwd(body.cwd);
+      if (cwdErr) { reply.code(400).send({ error: cwdErr }); return; }
+    }
+    const p = await projectStore.update((req.params as { id: string }).id, body);
     if (!p) { reply.code(404).send({ error: "no such project" }); return; }
     return p;
   });
