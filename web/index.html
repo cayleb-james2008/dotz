@@ -221,13 +221,13 @@
       <div class="panel" data-panel="chat" role="region" aria-label="Chat">
         <div class="panel-head" draggable="true"><span class="panel-icon">▓</span> CHAT <button class="panel-close" title="remove panel">×</button></div>
         <div class="panel-body chat-body">
-          <div id="transcript" class="transcript"></div>
+          <div class="transcript" data-role="transcript" tabindex="0" aria-label="Chat transcript"></div>
           <div class="composer">
-            <div id="quick-chips" class="quick-chips"></div>
+            <div class="quick-chips" data-role="quick-chips"></div>
             <div class="composer-row">
-              <textarea id="composer-input" class="composer-input" rows="1" placeholder="message dotz…   / slash · @ skills · # files"></textarea>
-              <button id="send-btn" class="btn-send">SEND ▹</button>
-              <button id="stop-btn" class="btn-stop hidden">STOP ■</button>
+              <textarea class="composer-input" data-role="composer-input" rows="1" placeholder="message dotz…   / slash · @ skills · # files"></textarea>
+              <button class="btn-send" data-role="send-btn">SEND ▹</button>
+              <button class="btn-stop hidden" data-role="stop-btn">STOP ■</button>
             </div>
           </div>
         </div>
