@@ -125,7 +125,9 @@ on `/api/browser/frame`; it is never embedded in the JSON event stream.
 | POST | `/api/connections/:provider/logout` | — | `{ ok, output }` |
 
 `:provider` is `github` \| `vercel` \| `neon`. `ConnectionStatus = { id, label, cli, installed, loggedIn, account?, hint? }`
-is read from each provider's own CLI (`gh` / `vercel` / `neonctl`). `LoginState = { provider, running, exitCode, output }`
+is read from each provider's local auth (`gh` / `vercel` via their CLI; Neon via its neonctl `credentials.json`,
+which `npx neonctl auth` writes — neonctl has no logout command, so Neon logout deletes that file).
+`LoginState = { provider, running, exitCode, output }`
 — `output` is the CLI's device-code / URL prompt streamed for the user to finish in a normal browser tab.
 There is no OAuth app registration and no client secret; dotz never reads, stores, or logs the token.
 

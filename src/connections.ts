@@ -7,6 +7,9 @@
  * normal browser tab.
  */
 import { spawn } from "node:child_process";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
 
 export type ConnectionProviderId = "github" | "vercel" | "neon";
 
@@ -33,6 +36,10 @@ const OUTPUT_CAP = 16_384;
 const LOGIN_TIMEOUT_MS = 180_000;
 const STATUS_TIMEOUT_MS = 12_000;
 const LOGOUT_TIMEOUT_MS = 30_000;
+// neonctl stores its OAuth credentials here (its default config dir, the same path across platforms).
+// neonctl has NO `logout` command and its `me`/`auth` aren't on PATH here, so Neon keys status + logout
+// off this file: present ⇒ connected; logout ⇒ delete it. `npx neonctl auth` writes this file on login.
+const NEON_CREDENTIALS = path.join(os.homedir(), ".config", "neonctl", "credentials.json");
 
 /** Run a fixed first-party command (no user input) through the shell, capturing combined output. */
 function runCommand(command: string, timeoutMs = STATUS_TIMEOUT_MS): Promise<CmdResult> {
@@ -61,14 +68,20 @@ function notInstalled(r: CmdResult): boolean {
   return r.code === 127 || s.includes("not recognized") || s.includes("command not found") || s.includes("no such file");
 }
 
+type ParsedStatus = { installed: boolean; loggedIn: boolean; account?: string; hint?: string };
+
 interface ProviderSpec {
   id: ConnectionProviderId;
   label: string;
   cli: string;
-  statusCommand: string;
   loginCommand: string;
-  logoutCommand: string;
-  parse(r: CmdResult): { installed: boolean; loggedIn: boolean; account?: string; hint?: string };
+  // Most providers read status from a CLI command + parse() and log out via a CLI command. Neon has
+  // no on-PATH CLI and no logout command, so it overrides both with filesystem checks (see neon spec).
+  statusCommand?: string;
+  logoutCommand?: string;
+  parse?(r: CmdResult): ParsedStatus;
+  statusOverride?(): ParsedStatus;
+  logoutOverride?(): { ok: boolean; output: string };
 }
 
 const PROVIDERS: ProviderSpec[] = [
@@ -102,14 +115,18 @@ const PROVIDERS: ProviderSpec[] = [
   },
   {
     id: "neon", label: "Neon", cli: "neonctl",
-    statusCommand: "neonctl me",
+    // Login bootstraps neonctl through npx (no global install) and writes NEON_CREDENTIALS.
     loginCommand: "npx -y neonctl@latest auth",
-    logoutCommand: "npx -y neonctl@latest auth --logout",
-    parse(r) {
-      if (notInstalled(r)) return { installed: false, loggedIn: false, hint: "click Log in — installs neonctl via npx, then opens the browser" };
-      const loggedIn = r.code === 0;
-      const account = `${r.stdout}\n${r.stderr}`.split(/\r?\n/).map((l) => l.trim()).find((l) => /@|\bid\b/i.test(l));
-      return { installed: true, loggedIn, account, hint: loggedIn ? undefined : "not logged in" };
+    // Status + logout key off the credentials file: neonctl has no on-PATH `me` here and no logout
+    // command at all — shelling its `--logout` flag is ignored and silently re-runs the LOGIN flow.
+    statusOverride() {
+      let loggedIn = false;
+      try { loggedIn = fs.statSync(NEON_CREDENTIALS).size > 0; } catch { loggedIn = false; }
+      return { installed: true, loggedIn, hint: loggedIn ? undefined : "click Log in — opens Neon's browser auth via npx neonctl (no global install needed)" };
+    },
+    logoutOverride() {
+      try { fs.rmSync(NEON_CREDENTIALS, { force: true }); return { ok: true, output: "cleared neonctl credentials" }; }
+      catch (err) { return { ok: false, output: String((err as Error).message) }; }
     },
   },
 ];
@@ -134,7 +151,7 @@ export class ConnectionsController {
   /** All three providers' live auth status, checked in parallel. */
   async status(): Promise<ConnectionStatus[]> {
     return Promise.all(PROVIDERS.map(async (p) => {
-      const parsed = p.parse(await runCommand(p.statusCommand));
+      const parsed = p.statusOverride ? p.statusOverride() : p.parse!(await runCommand(p.statusCommand!));
       const login = this.logins.get(p.id);
       return {
         id: p.id, label: p.label, cli: p.cli,
@@ -173,7 +190,8 @@ export class ConnectionsController {
   async logout(provider: string): Promise<{ ok: boolean; output: string }> {
     const spec = this.spec(provider);
     this.kill(spec.id);
-    const r = await runCommand(spec.logoutCommand, LOGOUT_TIMEOUT_MS);
+    if (spec.logoutOverride) return spec.logoutOverride();
+    const r = await runCommand(spec.logoutCommand!, LOGOUT_TIMEOUT_MS);
     return { ok: r.code === 0, output: `${r.stdout}\n${r.stderr}`.trim() };
   }
 
