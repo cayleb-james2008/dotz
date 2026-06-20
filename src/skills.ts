@@ -28,6 +28,45 @@ import { fileURLToPath } from "node:url";
 import type { Skill } from "./types";
 
 const DOTZ_PI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".pi");
+const dotzDataDir = () => process.env.DOTZ_CONFIG_DIR || path.join(os.homedir(), ".dotz");
+const userSkillsDir = () => path.join(dotzDataDir(), "ai-agents", "skills");
+
+export interface CreateSkillInput {
+  name: string;
+  description: string;
+  body: string;
+}
+
+const RESOURCE_NAME = /^[a-z][a-z0-9-]{1,63}$/;
+
+function requireResourceName(name: string): string {
+  const value = name.trim();
+  if (!RESOURCE_NAME.test(value)) {
+    throw new Error("skill name must start with a lowercase letter and contain only lowercase letters, digits, and hyphens (2-64 chars)");
+  }
+  return value;
+}
+
+/** Persist a dotz-native user skill in the unified loader's highest-priority root. */
+export async function createUserSkill(input: CreateSkillInput): Promise<Skill> {
+  const name = requireResourceName(input.name);
+  const description = input.description.replace(/\r?\n/g, " ").trim();
+  const body = input.body.trim();
+  if (!description) throw new Error("skill description is required");
+  if (!body) throw new Error("skill body is required");
+  const dir = path.join(userSkillsDir(), name);
+  const file = path.join(dir, "SKILL.md");
+  await fs.mkdir(dir, { recursive: true });
+  const content = `---\nname: ${JSON.stringify(name)}\ndescription: ${JSON.stringify(description)}\n---\n\n${body}\n`;
+  try {
+    await fs.writeFile(file, content, { encoding: "utf-8", flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`skill \"${name}\" already exists`);
+    throw error;
+  }
+  skillLoader.invalidate();
+  return { name, description, path: file, source: "dotz" };
+}
 
 /** Max skills listed in the system-prompt index (overflow is summarized; full pool via /api/skills). */
 const INDEX_CAP = 80;
@@ -46,6 +85,7 @@ function scanRoots(): Array<{ dir: string; source: Skill["source"] }> {
     { dir: path.join(os.homedir(), ".claude", "skills"), source: "claude" },
     { dir: path.join(os.homedir(), ".config", "opencode", "skills"), source: "opencode" },
     { dir: path.join(DOTZ_PI, "skills"), source: "dotz" },
+    { dir: userSkillsDir(), source: "dotz" },
   ];
   // Operator override: DOTZ_SKILLS_PATHS=dir1<sep>dir2 (path.delimiter). Each existing dir is
   // appended at the end (highest priority) so custom skill pools win over the built-in roots.

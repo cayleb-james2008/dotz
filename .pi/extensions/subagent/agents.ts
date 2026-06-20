@@ -24,6 +24,61 @@ export interface AgentDiscoveryResult {
 	projectAgentsDir: string | null;
 }
 
+export interface CreateAgentInput {
+	name: string;
+	description: string;
+	systemPrompt: string;
+	tools?: string[];
+	model?: string;
+}
+
+const RESOURCE_NAME = /^[a-z][a-z0-9-]{1,63}$/;
+
+function requireResourceName(name: string): string {
+	const value = name.trim();
+	if (!RESOURCE_NAME.test(value)) {
+		throw new Error("agent name must start with a lowercase letter and contain only lowercase letters, digits, and hyphens (2-64 chars)");
+	}
+	return value;
+}
+
+function yamlString(value: string): string {
+	return JSON.stringify(value.replace(/\r?\n/g, " ").trim());
+}
+
+/** Persist a user agent in Pi's native discovery directory without overwriting an existing agent. */
+export function createUserAgent(input: CreateAgentInput): AgentConfig {
+	const name = requireResourceName(input.name);
+	const description = input.description.trim();
+	const systemPrompt = input.systemPrompt.trim();
+	if (!description) throw new Error("agent description is required");
+	if (!systemPrompt) throw new Error("agent systemPrompt is required");
+
+	const tools = input.tools?.map((tool) => tool.trim()).filter(Boolean);
+	if (tools?.some((tool) => !/^[a-zA-Z0-9_-]+$/.test(tool))) {
+		throw new Error("agent tools may contain only letters, digits, underscores, and hyphens");
+	}
+	const model = input.model?.trim() || "ollama/minimax-m3";
+	const dir = path.join(getAgentDir(), "agents");
+	const filePath = path.join(dir, `${name}.md`);
+	fs.mkdirSync(dir, { recursive: true });
+	const lines = [
+		"---",
+		`name: ${yamlString(name)}`,
+		`description: ${yamlString(description)}`,
+		`model: ${yamlString(model)}`,
+	];
+	if (tools?.length) lines.push(`tools: ${yamlString(tools.join(", "))}`);
+	lines.push("---", "", systemPrompt, "");
+	try {
+		fs.writeFileSync(filePath, lines.join("\n"), { encoding: "utf-8", flag: "wx" });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`agent \"${name}\" already exists`);
+		throw error;
+	}
+	return { name, description, tools: tools?.length ? tools : undefined, model, systemPrompt, source: "user", filePath };
+}
+
 function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 

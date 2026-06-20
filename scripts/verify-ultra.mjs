@@ -47,6 +47,10 @@ ok(tools.all.includes("memory_search"), `memory_search tool registered`);
 ok(tools.all.includes("memory_consolidate"), `memory_consolidate tool registered`);
 ok(tools.all.includes("agents_md"), `agents_md tool registered`);
 ok(tools.active.includes("skill"), `skill tool active in workflow profile`);
+ok(tools.all.includes("create_agent"), `create_agent tool registered`);
+ok(tools.all.includes("list_agents"), `list_agents tool registered`);
+ok(tools.all.includes("create_skill"), `create_skill tool registered`);
+ok(tools.all.includes("list_skills"), `list_skills tool registered`);
 
 // [5] workflow create — a 3-step chain (scout → planner → worker)
 const wfRun = await (await fetch(base + "/api/workflows", {

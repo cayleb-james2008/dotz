@@ -8,7 +8,8 @@
  */
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { skillLoader } from "../../../src/skills";
+import { createUserSkill, skillLoader } from "../../../src/skills";
+import { createUserAgent, discoverAgents } from "../subagent/agents";
 import { memoryStore, readAgentsMd, writeAgentsMd, appendAgentsMdSection, isMemoryAutonomyEnabled } from "../../../src/memory";
 import { captureBaseline, compare, renderBaseline, type MetricsBaseline } from "../../../src/metrics";
 import { getDesignSystem, getComponents, auditDesign, renderDesignSystem, renderComponents, renderAudit } from "../../../src/design";
@@ -52,6 +53,66 @@ export function registerGateListener(gateId: string, fn: GateResolver): void {
 }
 
 export default function (pi: ExtensionAPI) {
+  // ---- dynamic resources: create specialists and reusable procedures during a workflow ----
+  pi.registerTool({
+    name: "create_agent",
+    label: "Create Agent",
+    description: "Create a persistent Pi user agent that is immediately discoverable by the subagent tool. Names are lowercase kebab-case and existing agents are never overwritten.",
+    parameters: Type.Object({
+      name: Type.String(),
+      description: Type.String(),
+      systemPrompt: Type.String(),
+      tools: Type.Optional(Type.Array(Type.String())),
+      model: Type.Optional(Type.String({ description: "Provider/model-id; defaults to ollama/minimax-m3" })),
+    }),
+    async execute(_id, params) {
+      try {
+        const agent = createUserAgent(params as Parameters<typeof createUserAgent>[0]);
+        return { content: [{ type: "text", text: JSON.stringify(agent) }], details: agent };
+      } catch (error) {
+        return { content: [{ type: "text", text: (error as Error).message }], isError: true, details: undefined };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "list_agents",
+    label: "List Agents",
+    description: "List bundled, user, and project agents available to the subagent tool in the current working directory.",
+    parameters: Type.Object({}),
+    async execute() {
+      const agents = discoverAgents(process.cwd(), "both").agents.map(({ name, description, source, model }) => ({ name, description, source, model }));
+      return { content: [{ type: "text", text: JSON.stringify(agents) }], details: agents };
+    },
+  });
+
+  pi.registerTool({
+    name: "create_skill",
+    label: "Create Skill",
+    description: "Create a persistent dotz skill in the unified skill pool. Names are lowercase kebab-case and existing skills are never overwritten.",
+    parameters: Type.Object({ name: Type.String(), description: Type.String(), body: Type.String() }),
+    async execute(_id, params) {
+      try {
+        const skill = await createUserSkill(params as Parameters<typeof createUserSkill>[0]);
+        return { content: [{ type: "text", text: JSON.stringify(skill) }], details: skill };
+      } catch (error) {
+        return { content: [{ type: "text", text: (error as Error).message }], isError: true, details: undefined };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "list_skills",
+    label: "List Skills",
+    description: "List every skill in dotz's unified skill pool with its source and one-line description.",
+    parameters: Type.Object({}),
+    async execute() {
+      await skillLoader.load();
+      const skills = skillLoader.list().map(({ name, description, source }) => ({ name, description, source }));
+      return { content: [{ type: "text", text: JSON.stringify(skills) }], details: skills };
+    },
+  });
+
   // ---- monitored browser tools: the complete Pi-facing browser surface ----
   pi.registerTool({
     name: "browser_start",
