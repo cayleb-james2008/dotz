@@ -223,8 +223,11 @@ export class WorkflowStore {
           }
         }
       }
-      // if all steps done, mark run done
-      if (run.steps.every((s) => s.status === "done" || s.status === "skipped")) {
+      // if all steps done, mark run done — but only from a non-terminal run state, so a late step
+      // update on an already aborted/errored/done run can't resurrect it or re-emit workflow_end
+      // (mirrors the error-branch guard below).
+      if (run.status !== "aborted" && run.status !== "error" && run.status !== "done" &&
+          run.steps.every((s) => s.status === "done" || s.status === "skipped")) {
         run.status = "done";
         run.endedAt = Date.now();
         run.updatedAt = Date.now();

@@ -380,6 +380,7 @@ code { font-family: var(--mono); color: var(--peach); }
 .panel[data-panel="files"] { grid-column: span 4; grid-row: span 3; }
 .panel[data-panel="sandbox"] { grid-column: span 6; grid-row: span 4; }
 .panel[data-panel="skills"] { grid-column: span 4; grid-row: span 4; }
+.panel[data-panel="connections"] { grid-column: span 4; grid-row: span 3; }
 
 /* ---- CHAT PANEL ---- */
 .chat-body { display: flex; flex-direction: column; overflow: hidden; }
@@ -720,6 +721,10 @@ code { font-family: var(--mono); color: var(--peach); }
   font-size: 12px;
 }
 .bf-toggle:hover { border-color: var(--lav); background: var(--surface-2); }
+/* Collapsed = stats hidden but the toggle survives (in-flow) so it can be clicked to re-expand. */
+.brain-float.collapsed { padding: 0; min-width: 0; background: transparent; border: none; box-shadow: none; }
+.brain-float.collapsed .bf-row { display: none; }
+.brain-float.collapsed .bf-toggle { position: static; }
 
 /* ---- AGENT BRAIN PANEL ---- */
 .brain-body { padding: 12px; overflow-y: auto; }

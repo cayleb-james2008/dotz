@@ -258,6 +258,9 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const run = workflowStore.get((req.params as { id: string }).id);
     if (!run) { reply.code(404).send({ error: "no such workflow run" }); return; }
     const body = (req.body ?? {}) as { stepId: string; status: WorkflowRun["steps"][number]["status"]; output?: string; error?: string; usage?: WorkflowRun["steps"][number]["usage"] };
+    if (!run.steps.some((s) => s.id === body.stepId)) { reply.code(404).send({ error: "no such step" }); return; }
+    const ALLOWED = ["pending", "ready", "running", "done", "error", "skipped"];
+    if (body.status !== undefined && !ALLOWED.includes(body.status)) { reply.code(400).send({ error: "invalid status" }); return; }
     await workflowStore.stepState(run.id, body.stepId, { status: body.status, output: body.output, error: body.error, usage: body.usage });
     return workflowStore.get(run.id);
   });
@@ -465,8 +468,12 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       model: m && m.provider && m.id ? { provider: m.provider, modelId: m.id } : undefined,
       thinkingLevel: s.thinkingLevel as ThinkingLevel,
     };
+    // Create the fresh session FIRST (it can throw — bad model/auth, init error); only dispose the
+    // old one once the replacement is live, so a failed reload doesn't strand the client on a dead id.
+    let fresh;
+    try { fresh = await pi.create(opts); }
+    catch (err) { reply.code(500).send({ error: "reload failed", detail: String(err) }); return; }
     pi.dispose(s.sessionId);
-    const fresh = await pi.create(opts);
     return sessionSummary(fresh.id, fresh.session, fresh.profile.id, fresh.projectId);
   });
 

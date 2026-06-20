@@ -44,6 +44,9 @@ interface ActiveRun {
   listeners: Set<(e: SandboxEvent) => void>;
   port: number | null;
   portDetector: PortDetector | null;
+  /** Set before a deliberate kill (timeout/kill/disposeAll) so the exit handler reports "killed",
+   *  not "error" — taskkill on win32 exits with code!=0 and signal=null, which Node can't tell apart. */
+  killedByUs?: boolean;
 }
 
 /** Language → { filename, command, defaultMode } mapping. */
@@ -76,12 +79,12 @@ class PortDetector {
 
   scan(text: string): void {
     if (this.found) return;
-    // Only treat a port as the child's OWN when it appears near a server-up keyword on the same
-    // line ("listening on port 3000", "Local: http://localhost:5173", "Serving HTTP on port 8000").
-    // This excludes ports the code merely talks to as a CLIENT ("connecting to localhost:6379",
-    // "redis on :6379", "fetch http://127.0.0.1:8080") — probing those could attach the preview to
-    // an unrelated local service. (\blocal\b matches "Local:" but not "localhost".)
-    const portRe = /\b(?:listening|serving|running|started|ready|server|available|local)\b[^\n]{0,40}?(?:port\s+|localhost:|127\.0\.0\.1:|:)(\d{2,5})/gi;
+    // Only treat a port as the child's OWN when a listener keyword sits near a port-with-prefix on the
+    // same line ("listening on port 3000", "Local: http://localhost:5173", "Serving HTTP on port 8000").
+    // Deliberately excludes the generic word "server" and a bare ":<port>" so client-talk lines like
+    // "redis server on :6379" / "postgres server at localhost:5432" / "connecting to localhost:6379"
+    // can't hijack the preview to an unrelated local service. (\blocal\b matches "Local:" not "localhost".)
+    const portRe = /\b(?:listening|serving|running|started|ready|local)\b[^\n]{0,40}?(?:port\s+|localhost:|127\.0\.0\.1:|0\.0\.0\.0:)(\d{2,5})/gi;
     const matches = text.matchAll(portRe);
     for (const m of matches) {
       const port = Number(m[1]);
@@ -230,12 +233,13 @@ export class Sandbox {
       finish("error", null);
     });
     proc.on("exit", (code, signal) => {
-      if (signal === "SIGTERM" || signal === "SIGKILL") finish("killed", null);
+      if (ar.killedByUs || signal === "SIGTERM" || signal === "SIGKILL") finish("killed", null);
       else finish(code === 0 ? "done" : "error", code);
     });
 
     if (timeoutMs > 0) {
       ar.timeout = setTimeout(() => {
+        ar.killedByUs = true;
         killTree(ar.proc);
         run.output += `\n[timeout] killed after ${timeoutMs}ms\n`;
       }, timeoutMs);
@@ -305,6 +309,7 @@ export class Sandbox {
   async kill(runId: string): Promise<boolean> {
     const ar = this.active.get(runId);
     if (!ar || !ar.proc || ar.proc.killed) return false;
+    ar.killedByUs = true;
     killTree(ar.proc);
     return true;
   }
@@ -314,6 +319,7 @@ export class Sandbox {
     for (const ar of [...this.active.values()]) {
       if (ar.timeout) clearTimeout(ar.timeout);
       if (ar.portDetector) ar.portDetector.dispose();
+      ar.killedByUs = true;
       killTree(ar.proc);
       fs.rm(ar.tempDir, { recursive: true, force: true }).catch(() => {});
     }
