@@ -866,6 +866,21 @@ code { font-family: var(--mono); color: var(--peach); }
 .sb-run-tab.killed .sb-run-dot { background: var(--dim); }
 
 /* ---- SKILLS PANEL ---- */
+/* connections panel — local browser-CLI login status */
+.connections-body { padding: 10px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.conn-note { font-family: var(--mono); font-size: 11px; color: var(--muted); line-height: 1.45; }
+.conn-list { display: flex; flex-direction: column; gap: 6px; }
+.conn-row { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); background: var(--surface); padding: 8px 10px; border-radius: var(--radius-sm); }
+.conn-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--dim); }
+.conn-dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.conn-dot.off { background: var(--peach); }
+.conn-dot.missing { background: var(--red); }
+.conn-meta { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0; }
+.conn-name { font-family: var(--mono); font-size: 12px; color: var(--text); font-weight: 700; }
+.conn-sub { font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conn-actions { display: flex; gap: 4px; flex: 0 0 auto; }
+.conn-login-output { font-family: var(--mono); font-size: 10px; color: var(--muted); background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px; max-height: 160px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0; }
+
 .skills-body { padding: 10px; overflow-y: auto; display: flex; flex-direction: column; }
 .skills-count { font-size: 10px; margin: 6px 0 8px 0; }
 .skills-list { display: flex; flex-direction: column; gap: 4px; flex: 1; overflow-y: auto; }
