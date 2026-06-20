@@ -76,13 +76,15 @@ class PortDetector {
 
   scan(text: string): void {
     if (this.found) return;
-    // Common patterns: "port 3000", ":3000", "localhost:5173", "http://localhost:8080",
-    // "listening on port 3000", "listening on 3000", "Server running at http://localhost:4321"
-    // Capture group is always the port number regardless of which alternative matched.
-    const portRe = /(?:(?:port|on|at)\s+(\d{2,5})|:(\d{2,5})\b|localhost:(\d{2,5})|127\.0\.0\.1:(\d{2,5}))/gi;
+    // Only treat a port as the child's OWN when it appears near a server-up keyword on the same
+    // line ("listening on port 3000", "Local: http://localhost:5173", "Serving HTTP on port 8000").
+    // This excludes ports the code merely talks to as a CLIENT ("connecting to localhost:6379",
+    // "redis on :6379", "fetch http://127.0.0.1:8080") — probing those could attach the preview to
+    // an unrelated local service. (\blocal\b matches "Local:" but not "localhost".)
+    const portRe = /\b(?:listening|serving|running|started|ready|server|available|local)\b[^\n]{0,40}?(?:port\s+|localhost:|127\.0\.0\.1:|:)(\d{2,5})/gi;
     const matches = text.matchAll(portRe);
     for (const m of matches) {
-      const port = Number(m[1] || m[2] || m[3] || m[4]);
+      const port = Number(m[1]);
       if (port && port > 1024 && port < 65536) this.candidates.add(port);
     }
     this.maybeProbe();
@@ -156,8 +158,19 @@ export class Sandbox {
       }
     };
 
+    // Per-stream carry buffer: a logical line split across chunk reads is reassembled, not dropped.
+    const lineBufs: Record<"stdout" | "stderr", string> = { stdout: "", stderr: "" };
+    const flushLine = (stream: "stdout" | "stderr") => {
+      const rest = lineBufs[stream];
+      if (!rest) return;
+      lineBufs[stream] = "";
+      run.output += rest + "\n";
+      emit({ type: "sandbox_output", runId: run.id, stream, line: rest });
+    };
+
     const finish = (status: "done" | "error" | "killed", exitCode: number | null) => {
       if (ar.timeout) { clearTimeout(ar.timeout); ar.timeout = null; }
+      flushLine("stdout"); flushLine("stderr");
       if (portDetector) portDetector.dispose();
       run.status = status;
       run.exitCode = exitCode;
@@ -172,21 +185,19 @@ export class Sandbox {
     };
 
     const processOutput = (chunk: Buffer, stream: "stdout" | "stderr") => {
-      let buf = chunk.toString();
-      const lines = buf.split("\n");
-      buf = lines.pop() || "";
+      // Prepend the partial line carried over from the previous chunk so a line split across reads
+      // is reassembled before we emit or scan it.
+      const text = lineBufs[stream] + chunk.toString();
+      const lines = text.split("\n");
+      lineBufs[stream] = lines.pop() ?? "";
       for (const line of lines) {
         run.output += line + "\n";
         emit({ type: "sandbox_output", runId: run.id, stream, line });
       }
-      // Web mode: scan output for a listening port. The PortDetector calls its onFound
-      // callback (which emits sandbox_port) asynchronously after probing the candidate.
-      if (portDetector) {
-        portDetector.scan(chunk.toString());
-      }
-      // Stash any partial line back onto the buffer by re-appending — handled by caller closure.
-      (ar as { _buf?: Record<string, string> })._buf = (ar as { _buf?: Record<string, string> })._buf || {};
-      (ar as { _buf?: Record<string, string> })._buf![stream] = buf;
+      // Web mode: scan the reassembled text (incl. the carried partial) so a port banner split
+      // across reads still matches. The PortDetector probes the candidate asynchronously and emits
+      // sandbox_port via its onFound callback.
+      if (portDetector) portDetector.scan(text);
     };
 
     if (proc.stdout) {

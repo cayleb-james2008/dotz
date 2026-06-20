@@ -145,6 +145,9 @@ export class WorkflowBridge {
         }
       }
     }
+    // Drop this run's stepId cache entries (all keyed by `${runId}:`) so the map doesn't grow
+    // unbounded over a long-lived server session.
+    for (const k of this.stepIds.keys()) { if (k.startsWith(`${runId}:`)) this.stepIds.delete(k); }
     this.runsByToolCall.delete(toolCallId);
   }
 

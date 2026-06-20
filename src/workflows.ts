@@ -105,7 +105,11 @@ export class WorkflowStore {
       for (const ref of s.parents ?? []) {
         const n = Number(ref);
         const id = Number.isInteger(n) && n >= 0 && n < steps.length ? steps[n].id : ref;
-        if (steps.some((st) => st.id === id)) steps[idx].parents.push(id);
+        // Skip self-references and duplicates — a step that is its own parent can never become
+        // `ready`, stalling the run as permanently non-terminal (workflow_end never fires).
+        if (id !== steps[idx].id && !steps[idx].parents.includes(id) && steps.some((st) => st.id === id)) {
+          steps[idx].parents.push(id);
+        }
       }
     });
     // resolve children from parents
@@ -114,6 +118,11 @@ export class WorkflowStore {
         const parent = steps.find((s) => s.id === pid);
         if (parent) parent.children.push(step.id);
       }
+    }
+    // A step left with no valid parents after resolution must be runnable, not stuck "pending"
+    // (e.g. all its parent refs were self-references and got filtered out above).
+    for (const step of steps) {
+      if (step.parents.length === 0 && step.status === "pending") step.status = "ready";
     }
     const run: WorkflowRun = {
       id: randomUUID(),
@@ -229,12 +238,21 @@ export class WorkflowStore {
     await this.persist(run);
   }
 
-  private async persist(run: WorkflowRun): Promise<void> {
-    const all = await readAll();
-    const idx = all.findIndex((r) => r.id === run.id);
-    if (idx >= 0) all[idx] = run;
-    else all.push(run);
-    await writeAll(all);
+  private writeQueue: Promise<void> = Promise.resolve();
+  private persist(run: WorkflowRun): Promise<void> {
+    // Serialize the read-modify-write of the shared workflows.json so concurrent persists (e.g. two
+    // different runs persisting at once) can't read the same snapshot and clobber each other's entry.
+    const result = this.writeQueue.then(async () => {
+      const all = await readAll();
+      const idx = all.findIndex((r) => r.id === run.id);
+      if (idx >= 0) all[idx] = run;
+      else all.push(run);
+      await writeAll(all);
+    });
+    // The queue tail swallows errors so one failed write can't poison later writes; the caller still
+    // gets `result` and can observe its own write's failure.
+    this.writeQueue = result.catch(() => {});
+    return result;
   }
 }
 

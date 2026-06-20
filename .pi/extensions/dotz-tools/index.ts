@@ -409,12 +409,17 @@ export default function (pi: ExtensionAPI) {
       try { if (gateNotify) gateNotify(gateId, p.plan); } catch { /* best-effort */ }
       // The UI will call resolveHumanGate(gateId, approved, feedback) via a WS message.
       // We await until that happens. Timeout after 5 minutes.
-      const approved = await new Promise<boolean>((resolve) => {
-        const timeout = setTimeout(() => { gateListeners.delete(gateId); resolve(false); }, 300000);
-        registerGateListener(gateId, (ok) => { clearTimeout(timeout); resolve(ok); });
+      const result = await new Promise<{ approved: boolean; feedback?: string }>((resolve) => {
+        const timeout = setTimeout(() => { gateListeners.delete(gateId); resolve({ approved: false }); }, 300000);
+        registerGateListener(gateId, (ok, fb) => { clearTimeout(timeout); resolve({ approved: ok, feedback: fb }); });
       });
-      if (approved) return { content: [{ type: "text", text: "✓ Plan approved by user. Proceed with implementation." }], details: undefined };
-      return { content: [{ type: "text", text: "✕ Plan not approved (or timed out after 5 min). Do NOT implement. Ask the user for guidance." }], details: undefined };
+      if (result.approved) return { content: [{ type: "text", text: "✓ Plan approved by user. Proceed with implementation." }], details: undefined };
+      // Surface the user's rejection feedback (the documented {approved:false, feedback} contract) so
+      // the agent can act on WHY it was rejected; an empty reason also covers the timeout case.
+      const reason = result.feedback && result.feedback.trim()
+        ? `User feedback: ${result.feedback.trim()}`
+        : "No reason given (or timed out after 5 min).";
+      return { content: [{ type: "text", text: `✕ Plan not approved. Do NOT implement. ${reason} Incorporate this guidance and revise.` }], details: undefined };
     },
   });
 

@@ -194,7 +194,10 @@ async function parseSkillFile(file: string, source: Skill["source"]): Promise<Sk
   try {
     const raw = await fs.readFile(file, "utf-8");
     const fm = parseFrontmatter(raw);
-    const name = (fm.name as string) || path.basename(path.dirname(file));
+    // Coerce to string (numeric frontmatter like `name: 2048` parses to a JS number, which would
+    // become a non-string Map key the string-typed skill() tool could never resolve), keeping the
+    // dirname fallback for an empty/missing name.
+    const name = String(fm.name ?? "").trim() || path.basename(path.dirname(file));
     const description = (fm.description as string) || "";
     if (!name) return null;
     const platforms = (fm.platforms as string[] | undefined) ?? undefined;

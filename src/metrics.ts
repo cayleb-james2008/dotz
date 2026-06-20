@@ -27,6 +27,7 @@ export interface MetricsBaseline {
   tests: { ok: boolean; passed: number; failed: number; output: string } | null;
   fileCount: number;
   loc: number;
+  testFiles: number;
 }
 
 export interface MetricsCompare {
@@ -60,17 +61,26 @@ async function runCmd(cmd: string, cwd: string, timeoutMs = 60000): Promise<{ ok
 }
 
 /** Count files (non-node_modules, non-dist, non-.git) + rough LOC. */
-async function countFiles(cwd: string): Promise<{ fileCount: number; loc: number }> {
+async function countFiles(cwd: string): Promise<{ fileCount: number; loc: number; testFiles: number }> {
   try {
     const { stdout } = await execAsync(
       `git ls-files --cached --others --exclude-standard | findstr /v /b "node_modules dist .git release" || echo ""`,
       { cwd, timeout: 15000, maxBuffer: 1024 * 1024 }
     ).catch(() => ({ stdout: "" }));
     const files = stdout.split("\n").map((s) => s.trim()).filter(Boolean);
-    return { fileCount: files.length, loc: 0 }; // LOC is expensive; skip for now
+    const testFiles = files.filter((f) => /\.(test|spec)\.[cm]?[jt]sx?$/i.test(f) || /(^|\/)(?:tests?|__tests__)\//i.test(f)).length;
+    return { fileCount: files.length, loc: 0, testFiles }; // LOC is expensive; skip for now
   } catch {
-    return { fileCount: 0, loc: 0 };
+    return { fileCount: 0, loc: 0, testFiles: 0 };
   }
+}
+
+/** Parse pass/fail counts from a test runner's output (vitest / jest / mocha / node:test TAP). */
+function parseTestCounts(output: string): { passed: number; failed: number } {
+  const num = (re: RegExp): number => { const m = output.match(re); return m ? Number(m[1]) : 0; };
+  const passed = num(/(\d+)\s+pass(?:ed|ing)\b/i) || num(/#\s*pass\s+(\d+)/i);
+  const failed = num(/(\d+)\s+fail(?:ed|ing)\b/i) || num(/#\s*fail\s+(\d+)/i);
+  return { passed, failed };
 }
 
 /** Capture a baseline for a project cwd. */
@@ -88,9 +98,10 @@ export async function captureBaseline(cwd: string): Promise<MetricsBaseline> {
     timestamp: Date.now(),
     typecheck,
     build,
-    tests: tests ? { ok: tests.ok, passed: 0, failed: 0, output: tests.output.slice(-1000) } : null,
+    tests: tests ? { ok: tests.ok, ...parseTestCounts(tests.output), output: tests.output.slice(-1000) } : null,
     fileCount: files.fileCount,
     loc: files.loc,
+    testFiles: files.testFiles,
   };
   await ensureDir();
   await fs.writeFile(path.join(RSI_DIR, `baseline-${baseline.id}.json`), JSON.stringify(baseline, null, 2), "utf-8");
@@ -102,17 +113,23 @@ export async function compare(baseline: MetricsBaseline, afterCwd?: string): Pro
   const after = await captureBaseline(afterCwd || baseline.cwd);
   const typecheckFixed = !!(!baseline.typecheck?.ok && after.typecheck?.ok);
   const buildFixed = !!(!baseline.build?.ok && after.build?.ok);
-  const testsImproved = !!after.tests && (!baseline.tests?.ok && after.tests.ok);
+  // Require a real prior failure so a null/absent baseline can't be reported as RED → GREEN.
+  const testsImproved = !!after.tests && !!baseline.tests && !baseline.tests.ok && after.tests.ok;
   const fileCountDelta = after.fileCount - baseline.fileCount;
   const locDelta = after.loc - baseline.loc;
-  // anti-gaming: if test count dropped >20% and wasn't already failing, flag
-  const testsDeleted = false; // simplified — full check would compare test file count
+  // anti-gaming: flag if the test-file count dropped >20%, or the passing-test count dropped >20%
+  // from a previously-green suite (deleting/disabling tests to flip the suite GREEN must not slip).
+  const testsDeleted =
+    (baseline.testFiles > 0 && after.testFiles < baseline.testFiles * 0.8) ||
+    (!!baseline.tests?.ok && (after.tests?.passed ?? 0) < (baseline.tests.passed ?? 0) * 0.8);
   const parts: string[] = [];
   if (typecheckFixed) parts.push("typecheck: RED → GREEN");
   if (buildFixed) parts.push("build: RED → GREEN");
   if (testsImproved) parts.push("tests: RED → GREEN");
   if (baseline.typecheck?.ok && !after.typecheck?.ok) parts.push("⚠ typecheck regressed");
   if (baseline.build?.ok && !after.build?.ok) parts.push("⚠ build regressed");
+  if (baseline.tests?.ok && after.tests && !after.tests.ok) parts.push("⚠ tests regressed");
+  if (testsDeleted) parts.push("⚠ tests removed/disabled (anti-gaming)");
   if (parts.length === 0) parts.push("no metric movement detected");
   const summary = parts.join("; ");
   return { baseline, after, typecheckFixed, buildFixed, testsImproved, fileCountDelta, locDelta, testsDeleted, summary };
@@ -124,8 +141,8 @@ export function renderBaseline(b: MetricsBaseline): string {
     `Baseline captured ${new Date(b.timestamp).toISOString()}`,
     `  typecheck: ${b.typecheck?.ok ? "✓ pass" : "✕ fail"}`,
     `  build: ${b.build?.ok ? "✓ pass" : "✕ fail"}`,
-    `  tests: ${b.tests?.ok ? "✓ pass" : b.tests ? "✕ fail" : "—"}`,
-    `  files: ${b.fileCount}`,
+    `  tests: ${b.tests?.ok ? `✓ ${b.tests.passed} pass` : b.tests ? `✕ ${b.tests.failed} fail` : "—"}`,
+    `  files: ${b.fileCount}${b.testFiles ? ` (${b.testFiles} test)` : ""}`,
   ];
   return lines.join("\n");
 }

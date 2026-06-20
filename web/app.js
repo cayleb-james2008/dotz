@@ -319,17 +319,21 @@ function bindPanel(node, name) {
   });
 }
 
+// Swap two panels' positions by reordering their DOM nodes (the CSS grid auto-flows in source
+// order), keeping each panel's data-panel + content intact. Swapping data-panel instead would
+// relocate the grid footprint but de-sync it from the node's content, since data-panel keys every
+// per-panel content lookup — that silently kills chat/graph/etc. (see styles.css [data-panel=…]).
 function swapPanels(from, to) {
   const fromNode = document.querySelector(`.panel[data-panel="${from}"]`);
   const toNode = document.querySelector(`.panel[data-panel="${to}"]`);
-  if (!fromNode || !toNode) return;
-  const fromClass = fromNode.className;
-  const toClass = toNode.className;
-  fromNode.className = toClass;
-  toNode.className = fromClass;
-  const tmp = fromNode.dataset.panel;
-  fromNode.dataset.panel = toNode.dataset.panel;
-  toNode.dataset.panel = tmp;
+  if (!fromNode || !toNode || fromNode === toNode) return;
+  const fromNext = fromNode.nextSibling === toNode ? fromNode : fromNode.nextSibling;
+  toNode.parentNode.insertBefore(fromNode, toNode);
+  fromNode.parentNode.insertBefore(toNode, fromNext);
+  // Persist the new order so renderBento reproduces the swap on reload.
+  const open = state.layout.open;
+  const i = open.indexOf(from), j = open.indexOf(to);
+  if (i >= 0 && j >= 0) { open[i] = to; open[j] = from; }
   saveLayout();
 }
 
@@ -674,7 +678,16 @@ function attachComposerPalette(input) {
       if (items.length) showCmdPalette(items, m[2], m[3]); else hideCmdPalette();
     } else hideCmdPalette();
   });
-  input.addEventListener("blur", () => { setTimeout(hideCmdPalette, 180); });
+  // Only dismiss when focus truly left BOTH the composer and the palette. showCmdPalette() moves
+  // focus into #cmd-palette-input, which blurs this textarea — without this guard the palette
+  // would force-close itself ~180ms after every open.
+  input.addEventListener("blur", (e) => {
+    if (e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest("#cmd-palette")) return;
+    setTimeout(() => {
+      const a = document.activeElement;
+      if (!(a && a.closest && a.closest("#cmd-palette"))) hideCmdPalette();
+    }, 180);
+  });
 }
 
 function bindComposer() {
@@ -687,6 +700,15 @@ function bindComposer() {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); navigatePalette(e.key === "ArrowDown" ? 1 : -1); }
     if (e.key === "Enter") { e.preventDefault(); selectPaletteItem(activeComposerInput()); }
     if (e.key === "Escape") hideCmdPalette();
+  });
+  // Dismiss the palette when focus leaves it entirely (click-away); keep it open for focus moves
+  // that stay inside the palette (e.g. clicking a result row).
+  pinput.addEventListener("blur", (e) => {
+    if (e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest("#cmd-palette")) return;
+    setTimeout(() => {
+      const a = document.activeElement;
+      if (!(a && a.closest && a.closest("#cmd-palette"))) hideCmdPalette();
+    }, 180);
   });
 }
 
@@ -744,7 +766,7 @@ function renderPaletteList(items, activeIdx) {
     row.appendChild(el("span", "cmd-desc", it.desc));
     row.appendChild(el("span", "cmd-source", it.source));
     row.onclick = () => {
-      _paletteItems = [it];
+      list.dataset.active = String(idx);
       selectPaletteItem(activeComposerInput());
     };
     list.appendChild(row);
@@ -838,7 +860,7 @@ function hasRenderable(partial) {
    then layers block + inline formatting so LLM replies render as real prose instead of a raw blob. */
 function renderMarkdown(src) {
   if (src == null) return "";
-  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   const fences = [];
   const s = String(src).replace(/```(\w*)\r?\n?([\s\S]*?)```/g, (_, _lang, code) => {
     fences.push(`<pre class="md-pre"><code>${esc(code.replace(/\n+$/, ""))}</code></pre>`);
@@ -1708,6 +1730,8 @@ function bindGateCard() {
 }
 
 function showGateCard(gateId, plan) {
+  // Ignore a replayed event for the gate we're already showing (e.g. after a WS reconnect).
+  if (state.pendingGate && state.pendingGate === gateId) return;
   state.pendingGate = gateId;
   const card = $("gate-card");
   $("gate-plan").textContent = plan || "(no plan provided)";
@@ -1717,11 +1741,18 @@ function showGateCard(gateId, plan) {
 }
 
 function resolveGate(approved) {
-  if (!state.pendingGate || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  if (!state.pendingGate) return;
+  const gateId = state.pendingGate;
   const feedback = $("gate-feedback").value.trim();
-  state.ws.send(JSON.stringify({ kind: approved ? "gate.approve" : "gate.reject", gateId: state.pendingGate, feedback }));
+  // Always release the modal so the user is never trapped behind inert buttons (the gate is
+  // intentionally non-dismissible via Escape, so a swallowed click would otherwise be a dead end).
   $("gate-card").classList.add("hidden");
   state.pendingGate = null;
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ kind: approved ? "gate.approve" : "gate.reject", gateId, feedback }));
+  } else {
+    pushError("not connected — gate decision could not be sent (the agent will time out waiting for approval)");
+  }
 }
 
 /* ---------- settings + updater ---------- */

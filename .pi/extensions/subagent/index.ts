@@ -461,30 +461,46 @@ async function runSingleAgent(
 				currentResult.stderr += data.toString();
 			});
 
+			let killTimer: ReturnType<typeof setTimeout> | undefined;
+			const killProc = () => {
+				wasAborted = true;
+				proc.kill("SIGTERM");
+				killTimer = setTimeout(() => {
+					if (!proc.killed) proc.kill("SIGKILL");
+				}, 5000);
+			};
+
 			proc.on("close", (code) => {
 				if (buffer.trim()) processLine(buffer);
+				// Clear the SIGKILL timer + abort listener on normal exit so they don't leak — the timer
+				// would otherwise hold the loop ~5s, and a listener per call accrues on the shared signal.
+				if (killTimer) clearTimeout(killTimer);
+				if (signal) signal.removeEventListener("abort", killProc);
 				resolve(code ?? 0);
 			});
 
 			proc.on("error", () => {
+				if (killTimer) clearTimeout(killTimer);
+				if (signal) signal.removeEventListener("abort", killProc);
 				resolve(1);
 			});
 
 			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
 			}
 		});
 
 		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		if (wasAborted) {
+			// Return a graceful failed result instead of throwing, so an abort during a parallel/chain
+			// dispersal keeps the already-completed siblings' output instead of rejecting the whole
+			// tool call. isFailedResult() treats stopReason "aborted" as a failure, so the assembly
+			// path (parallel summary / chain stop / single isError) handles it without discarding work.
+			currentResult.stopReason = "aborted";
+			if (!currentResult.errorMessage) currentResult.errorMessage = "Subagent was aborted";
+			if (currentResult.exitCode === 0) currentResult.exitCode = 1;
+		}
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -612,7 +628,9 @@ export default function (pi: ExtensionAPI) {
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					// Function replacer so $&/$1/$$ in the prior output are inserted literally rather than
+					// interpreted as String.replace replacement-string specials (which corrupt the task).
+					const taskWithContext = step.task.replace(/\{previous\}/g, () => previousOutput);
 
 					// Create update callback that includes all previous results
 					const chainUpdate: OnUpdateCallback | undefined = onUpdate

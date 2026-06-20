@@ -248,7 +248,7 @@ export class BrowserController {
         const y = Math.round(Number(input.y));
         const viewport = record.observation.page.viewport;
         if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error("clickAt requires finite x and y coordinates");
-        if (x < 0 || y < 0 || x > viewport.width || y > viewport.height) {
+        if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) {
           throw new Error(`clickAt coordinates must be inside ${viewport.width}x${viewport.height}`);
         }
         await this.run(record, ["mouse", "move", String(x), String(y)]);

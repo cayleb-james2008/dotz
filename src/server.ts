@@ -101,7 +101,8 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   // process. Spawned subagents never call buildServer, so they never enable autonomy and never
   // churn the shared memory store.
   enableMemoryAutonomy();
-  void memoryStore.importLegacy(null).catch(() => { /* migration is best-effort */ });
+  // Legacy migration runs once inside engine() on first memory use; a separate eager call here would
+  // re-enter importLegacy before the marker is written and double-import every legacy entry.
   // Forward pre-task memory recall to the UI so the operator can see which memories were injected.
   const offMemoryRecall = onMemoryRecall((e) => {
     for (const s of wsSockets) {
@@ -231,8 +232,12 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     if (!run) { reply.code(404).send({ error: "no such workflow run" }); return; }
     return run;
   });
-  app.post("/api/workflows", async (req) => {
+  app.post("/api/workflows", async (req, reply) => {
     const body = (req.body ?? {}) as { projectId?: string | null; sessionId?: string | null; label?: string; origin?: string; steps: Array<{ agent: string; task: string; parents?: string[]; batch?: string }> };
+    if (!Array.isArray(body.steps) || body.steps.length === 0) {
+      reply.code(400).send({ error: "steps (non-empty array) is required" });
+      return;
+    }
     const run = await workflowStore.create({
       projectId: body.projectId ?? null,
       sessionId: body.sessionId ?? null,
@@ -379,8 +384,12 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const e = need((req.params as { id: string }).id, reply);
     if (!e) return;
     const s = e.session;
-    const ref = req.body as ModelRef;
-    const m = resolveModel(s, ref);
+    const ref = (req.body ?? {}) as Partial<ModelRef>;
+    if (!ref.provider || !ref.modelId) {
+      reply.code(400).send({ error: "provider and modelId are required" });
+      return;
+    }
+    const m = resolveModel(s, ref as ModelRef);
     if (!m) {
       reply.code(404).send({ error: `model not found: ${ref.provider}/${ref.modelId}` });
       return;
@@ -398,7 +407,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const e = need((req.params as { id: string }).id, reply);
     if (!e) return;
     const s = e.session;
-    s.setThinkingLevel((req.body as { level: ThinkingLevel }).level);
+    s.setThinkingLevel(((req.body ?? {}) as { level: ThinkingLevel }).level);
     return {
       thinkingLevel: s.thinkingLevel,
       supportsThinking: s.supportsThinking(),
