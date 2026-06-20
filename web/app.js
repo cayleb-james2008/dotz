@@ -485,6 +485,13 @@ async function loadProjects() {
 
 /* ---------- session lifecycle ---------- */
 async function newSession() {
+  // Reset per-session client collections so a project switch doesn't bleed the previous project's
+  // workflow/sandbox runs into the new session (the refresh* calls below repopulate from scratch).
+  state.workflows.clear();
+  state.activeWfId = null;
+  state.sandbox.runs.clear();
+  state.sandbox.activeRunId = null;
+  state.recalled = [];
   const s = await post("/api/sessions", { profileId: state.activeProfileId, projectId: state.activeProjectId || undefined });
   setSession(s);
   clearTranscript();
@@ -514,7 +521,15 @@ function connectWS() {
   const ws = new WebSocket(`${proto}://${location.host}/ws?sessionId=${state.sessionId}`);
   state.ws = ws;
   setConn("off", "ws connecting…");
-  ws.onopen = () => { _wsAttempt = 0; setConn("on", "ws ✓ " + location.host); };
+  ws.onopen = () => {
+    const reconnected = _wsAttempt > 0;
+    _wsAttempt = 0;
+    setConn("on", "ws ✓ " + location.host);
+    // A reconnect gets no event replay; if the turn ended while we were offline its agent_end was
+    // lost, leaving the UI stuck in 'streaming'. Restore SEND — a still-running turn re-clears on its
+    // eventual agent_end.
+    if (reconnected && state.streaming) setStreaming(false);
+  };
   ws.onclose = () => {
     setConn("off", "ws closed");
     if (!_wsIntentional && state.sessionId && ws === state.ws) {
@@ -873,7 +888,7 @@ function renderMarkdown(src) {
   const fences = [];
   const s = String(src).replace(/```(\w*)\r?\n?([\s\S]*?)```/g, (_, _lang, code) => {
     fences.push(`<pre class="md-pre"><code>${esc(code.replace(/\n+$/, ""))}</code></pre>`);
-    return ` F${fences.length - 1} `;
+    return `\nFENCE_${fences.length - 1}_FENCE\n`;
   });
   const inline = (line) => esc(line)
     .replace(/`([^`]+)`/g, (_, c) => `<code class="md-code">${c}</code>`)
@@ -889,7 +904,7 @@ function renderMarkdown(src) {
   for (const raw of s.split("\n")) {
     const line = raw.replace(/\s+$/, "");
     let m;
-    if ((m = line.match(/^ F(\d+) $/))) { flush(); out.push(fences[+m[1]]); continue; }
+    if ((m = line.match(/^FENCE_(\d+)_FENCE$/))) { flush(); out.push(fences[+m[1]]); continue; }
     if (!line.trim()) { flush(); continue; }
     if ((m = line.match(/^(#{1,4})\s+(.*)$/))) { flush(); out.push(`<h${m[1].length} class="md-h">${inline(m[2])}</h${m[1].length}>`); continue; }
     if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) { flushPara(); if (!list || list.tag !== "ul") { flushList(); list = { tag: "ul", items: [] }; } list.items.push(`<li>${inline(m[1])}</li>`); continue; }
@@ -1110,6 +1125,9 @@ function updateModelUI(model) {
 async function submitModel() { const id = $("model-input").value.trim(); if (id) { await setModel({ provider: state.activeProvider, modelId: id }); persistConfig({ provider: state.activeProvider, executiveModel: id }); } }
 async function submitModelSelect() { const id = $("model-select").value; if (id) await setModel({ provider: state.activeProvider, modelId: id }); }
 async function setModel(ref) {
+  // Pre-session (command center): no sessionId yet — POSTing would hit /api/sessions/null/model (404).
+  // Reflect the choice in the UI; callers persist it to config and the real session inherits it on open.
+  if (!state.sessionId) { updateModelUI(ref); return; }
   try { const s = await post(`/api/sessions/${state.sessionId}/model`, ref); state.summary = s; updateModelUI(s.model); renderReasoning(s); }
   catch (e) { pushError("model: " + e.message); }
 }
@@ -1970,7 +1988,7 @@ async function refreshBrowserScreenshot() {
     const query = state.browserSessionId ? `?sessionId=${encodeURIComponent(state.browserSessionId)}` : "";
     const result = await browserAction("state" + query);
     renderBrowserObservation(result.observation);
-  } catch (e) { pushError("browser: " + e.message); }
+  } catch (e) { /* transient poll failure (backend down / network blip); keep the last render — do NOT flood the chat */ }
 }
 
 function renderBrowserObservation(observation) {

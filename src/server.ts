@@ -27,7 +27,7 @@ import { projectStore } from "./projects";
 import { memoryStore, onMemoryRecall, enableMemoryAutonomy } from "./memory";
 import { sandbox, SANDBOX_LANGUAGES, type SandboxEvent } from "./sandbox";
 import { skillLoader } from "./skills";
-import { workflowStore, type WorkflowEvent } from "./workflows";
+import { workflowStore, WorkflowCycleError, type WorkflowEvent } from "./workflows";
 import { workflowBridge } from "./workflow-bridge";
 import { resolveHumanGate, onGateRequest } from "../.pi/extensions/dotz-tools/index";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "./browser";
@@ -238,13 +238,19 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       reply.code(400).send({ error: "steps (non-empty array) is required" });
       return;
     }
-    const run = await workflowStore.create({
-      projectId: body.projectId ?? null,
-      sessionId: body.sessionId ?? null,
-      label: body.label || "untitled workflow",
-      origin: body.origin,
-      steps: body.steps,
-    });
+    let run;
+    try {
+      run = await workflowStore.create({
+        projectId: body.projectId ?? null,
+        sessionId: body.sessionId ?? null,
+        label: body.label || "untitled workflow",
+        origin: body.origin,
+        steps: body.steps,
+      });
+    } catch (err) {
+      if (err instanceof WorkflowCycleError) { reply.code(400).send({ error: err.message }); return; }
+      throw err;
+    }
     workflowStore.start(run.id);
     return run;
   });
@@ -426,7 +432,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const e = need((req.params as { id: string }).id, reply);
     if (!e) return;
     const s = e.session;
-    s.setActiveToolsByName((req.body as { tools: string[] }).tools ?? []);
+    s.setActiveToolsByName(((req.body ?? {}) as { tools?: string[] }).tools ?? []);
     return { active: s.getActiveToolNames(), all: s.getAllTools().map((t) => t.name) };
   });
 

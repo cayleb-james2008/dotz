@@ -21,7 +21,7 @@
  *  moves but the click/type is a no-op. This is the lean visual bridge — no heavy browser-automation
  *  dependency, just coordinate events + same-origin DOM dispatch.
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execFile, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -120,6 +120,21 @@ function isPortOpen(port: number): Promise<boolean> {
   });
 }
 
+/** Kill a child AND its descendants. Web-mode runs spawn a launcher (npx/node) that forks the real
+ *  server as a grandchild; a bare child.kill() reaps only the launcher and leaks the grandchild
+ *  server + its bound port. taskkill /T /F (win32) / process-group SIGKILL (posix) reclaims the whole
+ *  tree — mirroring connections.ts killTree(). */
+function killTree(proc: ChildProcess | null): void {
+  const pid = proc?.pid;
+  if (!pid || !proc || proc.killed) return;
+  if (process.platform === "win32") {
+    try { execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () => { /* best-effort */ }); } catch { /* ignore */ }
+  } else {
+    // The child is a process-group leader (spawned detached), so -pid signals the whole group.
+    try { process.kill(-pid, "SIGKILL"); } catch { try { proc.kill("SIGKILL"); } catch { /* already dead */ } }
+  }
+}
+
 export class Sandbox {
   private active = new Map<string, ActiveRun>();
 
@@ -142,6 +157,9 @@ export class Sandbox {
       env: { ...process.env, ...lang.env },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
+      // POSIX: become a process-group leader so killTree() can SIGKILL the whole tree (a launcher
+      // forks the real server as a grandchild). Windows uses taskkill /T instead.
+      detached: process.platform !== "win32",
     });
 
     const portDetector = mode === "web" ? new PortDetector((port) => {
@@ -218,9 +236,7 @@ export class Sandbox {
 
     if (timeoutMs > 0) {
       ar.timeout = setTimeout(() => {
-        if (ar.proc && !ar.proc.killed) {
-          try { ar.proc.kill("SIGKILL"); } catch { /* already dead */ }
-        }
+        killTree(ar.proc);
         run.output += `\n[timeout] killed after ${timeoutMs}ms\n`;
       }, timeoutMs);
     }
@@ -289,7 +305,8 @@ export class Sandbox {
   async kill(runId: string): Promise<boolean> {
     const ar = this.active.get(runId);
     if (!ar || !ar.proc || ar.proc.killed) return false;
-    try { ar.proc.kill("SIGKILL"); return true; } catch { return false; }
+    killTree(ar.proc);
+    return true;
   }
 
   /** Kill all active runs — called on server shutdown so dotz never leaks child processes. */
@@ -297,9 +314,7 @@ export class Sandbox {
     for (const ar of [...this.active.values()]) {
       if (ar.timeout) clearTimeout(ar.timeout);
       if (ar.portDetector) ar.portDetector.dispose();
-      if (ar.proc && !ar.proc.killed) {
-        try { ar.proc.kill("SIGKILL"); } catch { /* already dead */ }
-      }
+      killTree(ar.proc);
       fs.rm(ar.tempDir, { recursive: true, force: true }).catch(() => {});
     }
     this.active.clear();
