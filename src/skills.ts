@@ -105,35 +105,53 @@ const HOST_PLATFORM = (() => {
   }
 })();
 
-/** Minimal YAML frontmatter parser — handles flat + one-level-nested keys + inline arrays.
- *  We avoid a full YAML dep because skill frontmatter is uniformly simple. */
+/** Minimal YAML frontmatter parser — handles flat keys, ARBITRARY-depth nesting (via an indent
+ *  stack, so e.g. metadata.hermes.tags resolves), inline arrays, and block scalars (`|` literal /
+ *  `>` folded). We avoid a full YAML dep because skill frontmatter is otherwise simple. */
 function parseFrontmatter(raw: string): Record<string, unknown> {
   const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!m) return {};
-  const body = m[1];
   const out: Record<string, unknown> = {};
-  let currentKey = "";
-  for (const line of body.split(/\r?\n/)) {
-    if (!line.trim() || line.trim().startsWith("#")) continue;
-    // nested key under a known parent (e.g. "  tags: [...]" under "metadata:")
-    const nested = line.match(/^\s{2,}(\w[\w-]*):\s*(.*)$/);
-    if (nested && currentKey) {
-      const parent = (out[currentKey] ?? {}) as Record<string, unknown>;
-      parent[nested[1]] = parseScalar(nested[2]);
-      out[currentKey] = parent;
-      continue;
-    }
-    const top = line.match(/^(\w[\w-]*):\s*(.*)$/);
-    if (top) {
-      currentKey = top[1];
-      const rest = top[2];
-      if (rest === "") {
-        // could be a nested block or empty; treat as object-to-be-filled
-        out[currentKey] = {};
-      } else {
-        out[currentKey] = parseScalar(rest);
-        currentKey = "";
+  const lines = m[1].split(/\r?\n/);
+  const indentOf = (s: string) => s.length - s.trimStart().length;
+  // Each frame owns the object that more-indented keys attach to; the sentinel root holds top keys.
+  const stack: Array<{ indent: number; obj: Record<string, unknown> }> = [{ indent: -1, obj: out }];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim() || line.trimStart().startsWith("#")) continue;
+    const km = line.match(/^\s*(\w[\w-]*):[ \t]*(.*)$/);
+    if (!km) continue;
+    const indent = indentOf(line);
+    const key = km[1];
+    const value = km[2];
+    // Pop to the nearest strictly-shallower frame — that's this key's parent.
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
+    const parent = stack[stack.length - 1].obj;
+    const block = value.trim().match(/^([|>])[+-]?\d*$/);
+    if (block) {
+      // Block scalar: consume the following lines indented deeper than this key.
+      const fold = block[1] === ">";
+      const collected: string[] = [];
+      let blockIndent = -1;
+      let j = i + 1;
+      for (; j < lines.length; j++) {
+        const bl = lines[j];
+        if (!bl.trim()) { collected.push(""); continue; }
+        const bi = indentOf(bl);
+        if (bi <= indent) break;
+        if (blockIndent < 0) blockIndent = bi;
+        collected.push(bl.slice(Math.min(bi, blockIndent)));
       }
+      while (collected.length && collected[collected.length - 1] === "") collected.pop();
+      parent[key] = fold ? collected.join(" ").replace(/\s+/g, " ").trim() : collected.join("\n");
+      i = j - 1;
+    } else if (value.trim() === "") {
+      // Empty value → a nested object to be filled by deeper lines (stays {} if none follow).
+      const obj: Record<string, unknown> = {};
+      parent[key] = obj;
+      stack.push({ indent, obj });
+    } else {
+      parent[key] = parseScalar(value);
     }
   }
   return out;
@@ -198,12 +216,13 @@ async function parseSkillFile(file: string, source: Skill["source"]): Promise<Sk
     // become a non-string Map key the string-typed skill() tool could never resolve), keeping the
     // dirname fallback for an empty/missing name.
     const name = String(fm.name ?? "").trim() || path.basename(path.dirname(file));
-    const description = (fm.description as string) || "";
+    // Collapse a block-scalar / multi-line description to a single clean line for the compact index.
+    const description = String(fm.description ?? "").replace(/\s+/g, " ").trim();
     if (!name) return null;
     const platforms = (fm.platforms as string[] | undefined) ?? undefined;
     const skill: Skill = {
       name,
-      description: typeof description === "string" ? description : String(description),
+      description,
       path: file,
       source,
       tags: (fm.tags as string[] | undefined) ?? undefined,

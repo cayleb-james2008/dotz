@@ -78,6 +78,8 @@ interface SessionRecord {
   profileDir: string;
   observation: BrowserObservation;
   frameData?: Buffer;
+  /** Set the instant stop() begins so in-flight act()/run() calls abort before the profile dir is removed. */
+  disposed?: boolean;
 }
 
 function normalizeOrigin(value: string): string {
@@ -269,6 +271,7 @@ export class BrowserController {
   async stop(sessionId: string): Promise<BrowserObservation> {
     const record = this.sessions.get(sessionId);
     if (!record) throw new Error("no such browser session");
+    record.disposed = true; // abort any in-flight act() before we remove the profile dir below
     await this.closeProcess(record).catch(() => undefined);
     record.observation.status = "stopped";
     record.observation.seq += 1;
@@ -322,8 +325,15 @@ export class BrowserController {
   }
 
   private async observe(record: SessionRecord, action?: BrowserObservation["currentAction"]): Promise<BrowserObservation> {
-    const [urlResult, titleResult, snapshotResult, consoleResult, errorResult] = await Promise.all([
-      this.run(record, ["get", "url"]),
+    // Validate the post-navigation origin FIRST — before snapshot/console/screenshot — so a cross-port
+    // redirect to an off-allowlist origin is rejected without rendering or capturing the page. The
+    // agent-browser --allowed-domains flag is host-only and can't enforce the port itself.
+    const urlResult = await this.run(record, ["get", "url"]);
+    record.observation.page.url = stringValue(urlResult, "url") || record.observation.page.url;
+    if (!record.observation.allowedOrigins.includes(normalizeOrigin(record.observation.page.url))) {
+      throw new Error(`browser navigated outside the allowlist: ${record.observation.page.url}`);
+    }
+    const [titleResult, snapshotResult, consoleResult, errorResult] = await Promise.all([
       this.run(record, ["get", "title"]),
       this.run(record, ["snapshot", "-i", "-c"]),
       this.run(record, ["console"]),
@@ -340,10 +350,6 @@ export class BrowserController {
     record.observation.seq += 1;
     record.observation.status = "ready";
     record.observation.updatedAt = new Date().toISOString();
-    record.observation.page.url = stringValue(urlResult, "url") || record.observation.page.url;
-    if (!record.observation.allowedOrigins.includes(normalizeOrigin(record.observation.page.url))) {
-      throw new Error(`browser navigated outside the allowlist: ${record.observation.page.url}`);
-    }
     record.observation.page.title = stringValue(titleResult, "title");
     record.observation.snapshot = snapshot;
     record.observation.refs = [...new Set([...snapshot.matchAll(REF_PATTERN)].map((match) => match[1]))];
@@ -369,6 +375,9 @@ export class BrowserController {
   }
 
   private async run(record: SessionRecord, command: string[]): Promise<unknown> {
+    // A concurrent stop() may have torn the session down mid-action; abort before writing into the
+    // (possibly already-removed) profile dir. The teardown's own "close" command is exempt.
+    if (record.disposed && command[0] !== "close") throw new Error("browser session stopped");
     const executable = await this.resolveExecutable();
     const domains = record.observation.allowedOrigins.map((origin) => new URL(origin).hostname).join(",");
     const args = [
@@ -429,6 +438,7 @@ export class BrowserController {
   }
 
   private fail(record: SessionRecord, error: unknown): void {
+    if (record.disposed) return; // don't emit a ghost "error" observation for an already-stopped session
     record.observation.status = "error";
     record.observation.seq += 1;
     record.observation.updatedAt = new Date().toISOString();
