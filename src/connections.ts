@@ -6,7 +6,7 @@
  * the streamed output is the CLI's own device-code / URL prompt, which the user completes in a
  * normal browser tab.
  */
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
@@ -41,6 +41,19 @@ const LOGOUT_TIMEOUT_MS = 30_000;
 // off this file: present ⇒ connected; logout ⇒ delete it. `npx neonctl auth` writes this file on login.
 const NEON_CREDENTIALS = path.join(os.homedir(), ".config", "neonctl", "credentials.json");
 
+/** Kill a shell-spawned child AND its descendants. On Windows `{shell:true}` wraps the command in
+ *  cmd.exe, so child.kill() only terminates that wrapper and leaks the real CLI tree (gh / vercel /
+ *  npx→node→neonctl); taskkill /T /F kills the whole tree. */
+function killTree(child: ReturnType<typeof spawn> | undefined): void {
+  const pid = child?.pid;
+  if (!pid || child?.killed) return;
+  if (process.platform === "win32") {
+    try { execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () => { /* best-effort */ }); } catch { /* ignore */ }
+  } else {
+    try { child!.kill(); } catch { /* already gone */ }
+  }
+}
+
 /** Run a fixed first-party command (no user input) through the shell, capturing combined output. */
 function runCommand(command: string, timeoutMs = STATUS_TIMEOUT_MS): Promise<CmdResult> {
   return new Promise((resolve) => {
@@ -55,7 +68,7 @@ function runCommand(command: string, timeoutMs = STATUS_TIMEOUT_MS): Promise<Cmd
       resolve({ code: 127, stdout: "", stderr: String((err as Error).message) });
       return;
     }
-    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } finish(null); }, timeoutMs);
+    const timer = setTimeout(() => { killTree(child); finish(null); }, timeoutMs);
     child.stdout?.on("data", (d: Buffer) => { stdout = (stdout + d.toString()).slice(-OUTPUT_CAP); });
     child.stderr?.on("data", (d: Buffer) => { stderr = (stderr + d.toString()).slice(-OUTPUT_CAP); });
     child.on("error", (err) => { stderr += String(err.message); clearTimeout(timer); finish(127); });
@@ -197,7 +210,7 @@ export class ConnectionsController {
 
   private kill(provider: ConnectionProviderId): void {
     const s = this.logins.get(provider);
-    if (s) { clearTimeout(s.killTimer); try { s.child.kill(); } catch { /* already gone */ } s.running = false; }
+    if (s) { clearTimeout(s.killTimer); killTree(s.child); s.running = false; }
   }
 
   disposeAll(): void {

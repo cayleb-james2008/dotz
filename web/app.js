@@ -116,7 +116,13 @@ function loadLayout() {
     const raw = localStorage.getItem(LAYOUT_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (parsed.version === 1 && Array.isArray(parsed.open)) state.layout = parsed;
+      if (parsed.version === 1 && Array.isArray(parsed.open)) {
+        // Drop unknown panel names + collapse duplicates so renderBento can't mount two nodes of the
+        // same type (which would be undeletable and break per-panel [data-panel] lookups); keep chat.
+        const open = [...new Set(parsed.open.filter((n) => PANEL_NAMES.includes(n)))];
+        if (!open.includes("chat")) open.unshift("chat");
+        state.layout = { version: 1, open };
+      }
     }
   } catch {}
 }
@@ -264,6 +270,9 @@ function renderBento() {
 
 function mountPanel(name) {
   if (!PANEL_NAMES.includes(name)) return;
+  // Never mount a second node of the same type — duplicates are undeletable and shadow every
+  // per-panel [data-panel] lookup (only the first node ever resolves).
+  if (document.querySelector(`.panel[data-panel="${name}"]`)) return;
   const tpl = $("tpl-" + name);
   if (!tpl) return;
   const node = tpl.content.firstElementChild.cloneNode(true);
@@ -1326,7 +1335,8 @@ async function loadProjectFiles() {
   try {
     const { tree } = await api(`/api/projects/${state.activeProjectId}/files`);
     state.projectFiles = flattenFileTree(tree);
-    renderFiles();
+    // NOTE: do NOT call renderFiles() here — renderFiles() fetches the tree itself, and re-entering
+    // it would create a load→render→load loop (double fetch per render). This only feeds the '#' palette.
   } catch (e) { /* fail silently */ }
 }
 
@@ -1353,37 +1363,37 @@ function renderFiles() {
     treeEl.appendChild(el("div", "dim mono", "no project open"));
     return;
   }
-  loadProjectFiles().then(() => {
-    const build = (nodes) => {
-      const wrap = el("div", "ft-children");
-      (nodes || []).forEach((n) => {
-        const isDir = n.type === "dir";
-        const row = el("div", "ft-row" + (isDir ? " ft-dir" : ""));
-        row.appendChild(el("span", "ft-icon", isDir ? "▾" : "▹"));
-        const name = n.path.split(/[\\/]/).pop();
-        row.appendChild(el("span", "ft-name", name));
-        wrap.appendChild(row);
-        if (isDir && n.children && n.children.length) {
-          const childWrap = build(n.children);
-          childWrap.style.display = "";
-          row.onclick = () => {
-            const hidden = childWrap.style.display === "none";
-            childWrap.style.display = hidden ? "" : "none";
-            row.querySelector(".ft-icon").textContent = hidden ? "▾" : "▸";
-          };
-          wrap.appendChild(childWrap);
-        }
-      });
-      return wrap;
-    };
-    api(`/api/projects/${state.activeProjectId}/files`).then(({ tree }) => {
-      treeEl.innerHTML = "";
-      if (!tree.length) { treeEl.appendChild(el("div", "dim mono", "empty directory")); return; }
-      const root = build(tree);
-      root.className = "files-tree";
-      treeEl.appendChild(root);
-    }).catch(() => { treeEl.innerHTML = ""; treeEl.appendChild(el("div", "dim mono", "failed to load files")); });
-  });
+  const build = (nodes) => {
+    const wrap = el("div", "ft-children");
+    (nodes || []).forEach((n) => {
+      const isDir = n.type === "dir";
+      const row = el("div", "ft-row" + (isDir ? " ft-dir" : ""));
+      row.appendChild(el("span", "ft-icon", isDir ? "▾" : "▹"));
+      const name = n.path.split(/[\\/]/).pop();
+      row.appendChild(el("span", "ft-name", name));
+      wrap.appendChild(row);
+      if (isDir && n.children && n.children.length) {
+        const childWrap = build(n.children);
+        childWrap.style.display = "";
+        row.onclick = () => {
+          const hidden = childWrap.style.display === "none";
+          childWrap.style.display = hidden ? "" : "none";
+          row.querySelector(".ft-icon").textContent = hidden ? "▾" : "▸";
+        };
+        wrap.appendChild(childWrap);
+      }
+    });
+    return wrap;
+  };
+  // Single fetch: paints the tree AND refreshes state.projectFiles for the '#' palette (no recursion).
+  api(`/api/projects/${state.activeProjectId}/files`).then(({ tree }) => {
+    state.projectFiles = flattenFileTree(tree);
+    treeEl.innerHTML = "";
+    if (!tree.length) { treeEl.appendChild(el("div", "dim mono", "empty directory")); return; }
+    const root = build(tree);
+    root.className = "files-tree";
+    treeEl.appendChild(root);
+  }).catch(() => { treeEl.innerHTML = ""; treeEl.appendChild(el("div", "dim mono", "failed to load files")); });
 }
 
 /* ---------- workflows ---------- */
@@ -1528,16 +1538,20 @@ function renderWorkflowDag(run, panel) {
   const positions = {};
   const NODE_W = 160, NODE_H = 58, LAYER_GAP = 190, NODE_GAP = 24;
   const DOTZ_Y = 24, DOTZ_DROP = 150;
+  // Lay out nodes in a FIXED user-space canvas, not the live (zoom/pan/fit-mutated) viewBox width,
+  // so a workflow event mid-run doesn't re-center every node and make them visibly jump. Zoom/pan/fit
+  // only move the SVG viewBox; node coordinates stay put.
+  const CANVAS_W = 800;
   layers.forEach((layer, i) => {
     const layerWidth = layer.length * (NODE_W + NODE_GAP) - NODE_GAP;
-    const startX = (state.wfView.w - layerWidth) / 2;
+    const startX = (CANVAS_W - layerWidth) / 2;
     layer.forEach((stepId, j) => {
       positions[stepId] = { x: startX + j * (NODE_W + NODE_GAP), y: DOTZ_Y + DOTZ_DROP + i * LAYER_GAP };
     });
   });
   // The main dotz agent (lead orchestrator) sits above the whole graph; every ROOT step (a subagent
   // it dispersed) hangs off it, so the fan-out reads as "dotz → reviewers" with real connector lines.
-  const dotzPos = { x: state.wfView.w / 2 - NODE_W / 2, y: DOTZ_Y };
+  const dotzPos = { x: CANVAS_W / 2 - NODE_W / 2, y: DOTZ_Y };
   const rootSteps = run.steps.filter((s) => !s.parents || s.parents.length === 0);
   const dotzStatus = run.status === "done" ? "done" : (run.status === "error" || run.status === "aborted") ? "error" : "running";
   // dotz → each root subagent (the dispersal edges)
@@ -1732,6 +1746,13 @@ function bindGateCard() {
 function showGateCard(gateId, plan) {
   // Ignore a replayed event for the gate we're already showing (e.g. after a WS reconnect).
   if (state.pendingGate && state.pendingGate === gateId) return;
+  state.gateQueue = state.gateQueue || [];
+  // If a DIFFERENT gate is already up (concurrent sessions), queue this one instead of overwriting —
+  // otherwise the first gate becomes unanswerable and its agent hangs until timeout.
+  if (state.pendingGate && state.pendingGate !== gateId) {
+    if (!state.gateQueue.some((g) => g.gateId === gateId)) state.gateQueue.push({ gateId, plan });
+    return;
+  }
   state.pendingGate = gateId;
   const card = $("gate-card");
   $("gate-plan").textContent = plan || "(no plan provided)";
@@ -1753,6 +1774,9 @@ function resolveGate(approved) {
   } else {
     pushError("not connected — gate decision could not be sent (the agent will time out waiting for approval)");
   }
+  // Surface the next queued gate, if any (concurrent-session gates aren't dropped).
+  const next = (state.gateQueue || []).shift();
+  if (next) showGateCard(next.gateId, next.plan);
 }
 
 /* ---------- settings + updater ---------- */

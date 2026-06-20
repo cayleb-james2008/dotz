@@ -216,6 +216,14 @@ export class WorkflowStore {
       if (run.status !== "error" && run.status !== "aborted" && run.status !== "done") {
         run.status = "error";
         run.endedAt = Date.now();
+        // The run is now terminal — sweep every still-runnable step to "skipped" (mirroring abort())
+        // so a child of the errored step isn't left stuck "pending" under a finished run.
+        for (const s of run.steps) {
+          if (s.status === "pending" || s.status === "ready" || s.status === "running") {
+            s.status = "skipped";
+            this.emit(runId, { type: "step_state", stepId: s.id, status: "skipped" });
+          }
+        }
         this.emit(runId, { type: "workflow_end", run });
       }
       run.updatedAt = Date.now();

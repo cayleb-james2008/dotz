@@ -21,7 +21,10 @@ async function ensureDir() {
 async function readAll(): Promise<Project[]> {
   try {
     const raw = await fs.readFile(PROJECTS_FILE, "utf-8");
-    return JSON.parse(raw) as Project[];
+    const parsed = JSON.parse(raw);
+    // Guard a hand-edited non-array store ({}, null, 42, …) — without this the array consumers
+    // (push/findIndex/filter/find) throw TypeError and every project op 500s until the file is fixed.
+    return Array.isArray(parsed) ? (parsed as Project[]) : [];
   } catch {
     return [];
   }

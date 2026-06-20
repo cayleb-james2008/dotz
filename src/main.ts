@@ -106,9 +106,16 @@ if (gotTheLock) app.whenReady().then(async () => {
   });
 });
 
-app.on("window-all-closed", () => {
+// Quit cleanly: browserController.disposeAll() is async (spawns `agent-browser close` and rm's the
+// throwaway mkdtemp profile dirs), so gate the quit on before-quit and await it before exiting —
+// a bare app.quit() tears down the event loop first and leaks those profile dirs in %TEMP%.
+let quitting = false;
+app.on("before-quit", (e) => {
+  if (quitting) return;
+  e.preventDefault();
+  quitting = true;
   sandbox.disposeAll();
-  browserController.disposeAll().catch(() => undefined);
   if (runtime) runtime.pi.disposeAll();
-  app.quit();
+  browserController.disposeAll().catch(() => undefined).finally(() => app.exit(0));
 });
+app.on("window-all-closed", () => app.quit());

@@ -502,6 +502,15 @@ async function runSingleAgent(
 			if (currentResult.exitCode === 0) currentResult.exitCode = 1;
 		}
 		return currentResult;
+	} catch (err) {
+		// A throw before/around the run (e.g. writePromptToTempFile I/O failure under fd exhaustion or
+		// disk-full) must not reject the whole parallel/chain dispersal and discard completed siblings —
+		// return a graceful failed result, mirroring the abort handling above (isFailedResult treats it
+		// as a failure, so the assembly paths handle it without throwing away completed work).
+		currentResult.stopReason = "error";
+		if (!currentResult.errorMessage) currentResult.errorMessage = err instanceof Error ? err.message : String(err);
+		if (currentResult.exitCode === 0) currentResult.exitCode = 1;
+		return currentResult;
 	} finally {
 		if (tmpPromptPath)
 			try {
@@ -938,7 +947,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
+				const successCount = details.results.filter((r) => !isFailedResult(r)).length;
 				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
 
 				if (expanded) {
@@ -955,7 +964,7 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+						const rIcon = !isFailedResult(r) ? theme.fg("success", "✓") : theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -1007,7 +1016,7 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
 				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const rIcon = !isFailedResult(r) ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
