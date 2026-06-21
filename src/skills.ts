@@ -151,8 +151,11 @@ async function parseSkillFile(file: string, source: Skill["source"]): Promise<Sk
       description,
       path: file,
       source,
-      tags: (fm.tags as string[] | undefined) ?? undefined,
-      platforms: (fm.platforms as string[] | undefined) ?? undefined,
+      // Coerce defensively: a non-array tags/platforms (e.g. `platforms: 5` or a mapping) is treated
+      // as absent rather than trusted — platformsOk() does .length/.includes on it and would otherwise
+      // throw uncaught in load(), 500-ing /api/skills AND the system-prompt skill index.
+      tags: Array.isArray(fm.tags) ? (fm.tags as unknown[]).filter((x) => typeof x === "string") as string[] : undefined,
+      platforms: Array.isArray(fm.platforms) ? (fm.platforms as unknown[]).filter((x) => typeof x === "string") as string[] : undefined,
     };
     // Hermes nests under metadata.hermes
     const hermesMeta = (fm.metadata as { hermes?: Record<string, unknown> } | undefined)?.hermes;

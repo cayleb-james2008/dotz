@@ -150,7 +150,10 @@ export async function applyUpdate(): Promise<void> {
   const script = buildHelperScript({
     repo,
     pid: process.pid,
-    exePath: process.execPath,
+    // For a portable build, process.execPath is the TEMP extraction dir that electron-builder deletes
+    // on exit; PORTABLE_EXECUTABLE_FILE is the real on-disk exe the user launched. The helper prefers
+    // the freshly-rebuilt release\ exe anyway and only uses this as a last-resort fallback.
+    exePath: (app.isPackaged && process.env.PORTABLE_EXECUTABLE_FILE) || process.execPath,
     rebuildScript: REBUILD_SCRIPT,
     isPackaged: app.isPackaged,
   });
