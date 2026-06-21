@@ -39,6 +39,13 @@ try {
 } catch {
 	OLLAMA_PROVIDER_EXT = "";
 }
+// Same, for subagents on a "local/" (Ollama/LM Studio) model — "local" is not a built-in pi provider.
+let LOCAL_PROVIDER_EXT = "";
+try {
+	LOCAL_PROVIDER_EXT = fileURLToPath(new URL("../local/index.ts", import.meta.url));
+} catch {
+	LOCAL_PROVIDER_EXT = "";
+}
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 // Chain {previous} feed-forward is substituted into the next task, which is passed as a single CLI
@@ -368,6 +375,11 @@ async function runSingleAgent(
 		// can authenticate ollama/* models (e.g. the default subagent model ollama/minimax-m3).
 		if (effectiveModel.startsWith("ollama/") && OLLAMA_PROVIDER_EXT && fs.existsSync(OLLAMA_PROVIDER_EXT)) {
 			args.push("-e", OLLAMA_PROVIDER_EXT);
+		}
+		// Same for "local/" models — load the local provider extension so a subagent on a local
+		// (Ollama/LM Studio) model resolves it instead of falling through to a relabeled OpenRouter model.
+		if (effectiveModel.startsWith("local/") && LOCAL_PROVIDER_EXT && fs.existsSync(LOCAL_PROVIDER_EXT)) {
+			args.push("-e", LOCAL_PROVIDER_EXT);
 		}
 	}
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
