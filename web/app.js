@@ -2124,8 +2124,16 @@ async function refreshConnections() {
   if (!panel) return;
   try {
     const { connections } = await api("/api/connections");
+    state.connectionsLoaded = true;
     renderConnections(panel, connections || []);
-  } catch (e) { /* transient; keep the last render */ }
+  } catch (e) {
+    // Keep the last good render on a transient poll failure — but if the FIRST load fails, replace the
+    // "checking local logins…" seed with an error state instead of leaving it stuck forever.
+    if (!state.connectionsLoaded) {
+      const list = panel.querySelector("#conn-list");
+      if (list) { list.innerHTML = ""; list.appendChild(el("div", "dim mono", "⚠ couldn't reach the server — retrying…")); }
+    }
+  }
   if (state.connectionsLoginProvider) {
     try {
       const st = await api(`/api/connections/${state.connectionsLoginProvider}/login`);
@@ -2140,6 +2148,7 @@ function renderConnections(panel, connections) {
   const list = panel.querySelector("#conn-list");
   if (!list) return;
   list.innerHTML = "";
+  if (!connections.length) { list.appendChild(el("div", "dim mono", "no providers")); return; }
   for (const c of connections) {
     const row = el("div", "conn-row");
     row.appendChild(el("span", "conn-dot " + (c.loggedIn ? "ok" : c.installed ? "off" : "missing")));

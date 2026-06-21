@@ -104,8 +104,12 @@ export class WorkflowStore {
     // graph actually draws chain/fan-out edges instead of silently dropping them.
     opts.steps.forEach((s, idx) => {
       for (const ref of s.parents ?? []) {
-        const n = Number(ref);
-        const id = Number.isInteger(n) && n >= 0 && n < steps.length ? steps[n].id : ref;
+        // Only a NON-EMPTY all-digits ref is a positional index; otherwise treat it as a literal id.
+        // (Number('') and Number('  ') are 0, which previously coerced a blank/whitespace ref into an
+        // unintended edge to step 0.)
+        const trimmed = String(ref).trim();
+        const n = Number(trimmed);
+        const id = /^\d+$/.test(trimmed) && n < steps.length ? steps[n].id : ref;
         // Skip self-references and duplicates — a step that is its own parent can never become
         // `ready`, stalling the run as permanently non-terminal (workflow_end never fires).
         if (id !== steps[idx].id && !steps[idx].parents.includes(id) && steps.some((st) => st.id === id)) {
