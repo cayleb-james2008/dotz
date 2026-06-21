@@ -55,7 +55,14 @@ export function getConfig(): DotzConfig {
 }
 
 export async function updateConfig(patch: Partial<DotzConfig>): Promise<DotzConfig> {
-  const next = { ...getConfig(), ...patch };
+  // Allow-list known string fields so a junk key or a non-string value (e.g. an array `provider`)
+  // can't be persisted and then corrupt DOTZ_SUBAGENT_MODEL via applyEnv.
+  const clean: Partial<DotzConfig> = {};
+  if (typeof patch.provider === "string") clean.provider = patch.provider;
+  if (typeof patch.executiveModel === "string") clean.executiveModel = patch.executiveModel;
+  if (typeof patch.subagentModel === "string") clean.subagentModel = patch.subagentModel;
+  if (typeof patch.thinkingLevel === "string") clean.thinkingLevel = patch.thinkingLevel;
+  const next = { ...getConfig(), ...clean };
   cache = next;
   applyEnv(next);
   await fs.mkdir(dotzDir(), { recursive: true });

@@ -255,7 +255,10 @@ export class Sandbox {
     };
     const listeners = new Set<(e: SandboxEvent) => void>();
     if (opts.onEvent) listeners.add(opts.onEvent);
-    const ar = await this.spawnRun(run, code, language, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, listeners, mode);
+    // A non-number timeoutMs (NaN/Infinity/string from an untrusted body) must not silently disable
+    // the timeout and leak a runaway child — coerce anything non-finite to the default.
+    const timeoutMs = typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
+    const ar = await this.spawnRun(run, code, language, timeoutMs, listeners, mode);
     this.active.set(run.id, ar);
     for (const l of [...ar.listeners]) l({ type: "sandbox_start", runId: run.id, run });
     return run;
