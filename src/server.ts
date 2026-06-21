@@ -75,6 +75,13 @@ async function buildFileTree(cwd: string, depth = 0): Promise<Array<{ path: stri
   return result;
 }
 
+/** Trust-boundary helpers: a request body is untrusted JSON, so a field that the handler will
+ *  later .trim()/path.join()/spread MUST be type-checked first — otherwise a non-string truthy
+ *  value (number/array/object) reaches a string op and throws an uncaught 500 instead of a 400. */
+const isNonEmptyStr = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
+const isValidModel = (m: unknown): m is ModelRef =>
+  !!m && typeof m === "object" && typeof (m as ModelRef).provider === "string" && typeof (m as ModelRef).modelId === "string";
+
 /** Public-facing snapshot of a session's control state. */
 function sessionSummary(id: string, s: AgentSession, profileId?: string | null, projectId?: string | null) {
   const m = s.model as (typeof s.model & { provider?: string; reasoning?: boolean }) | undefined;
@@ -150,9 +157,17 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   app.get("/api/projects", async () => ({ projects: await projectStore.list() }));
   app.post("/api/projects", async (req, reply) => {
     const body = (req.body ?? {}) as { name?: string; cwd?: string; profileId?: string; model?: ModelRef; thinkingLevel?: ThinkingLevel; appUrl?: string; gateCommand?: string };
-    if (!body.name || !body.cwd) {
-      reply.code(400).send({ error: "name and cwd are required" });
+    if (!isNonEmptyStr(body.name) || !isNonEmptyStr(body.cwd)) {
+      reply.code(400).send({ error: "name and cwd are required (non-empty strings)" });
       return;
+    }
+    if (body.model !== undefined && !isValidModel(body.model)) { reply.code(400).send({ error: "model must be { provider, modelId }" }); return; }
+    // The remaining optional fields must be strings — projectStore.create later does appUrl?.trim()/
+    // gateCommand?.trim() (a non-string 500s), and a non-string profileId/thinkingLevel persists a
+    // corrupt project. Keep this in lockstep with the PATCH handler below.
+    const b = body as Record<string, unknown>;
+    for (const k of ["profileId", "thinkingLevel", "appUrl", "gateCommand"]) {
+      if (b[k] !== undefined && typeof b[k] !== "string") { reply.code(400).send({ error: `${k} must be a string` }); return; }
     }
     const cwdErr = await validateCwd(body.cwd);
     if (cwdErr) { reply.code(400).send({ error: cwdErr }); return; }
@@ -164,12 +179,24 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     return p;
   });
   app.patch("/api/projects/:id", async (req, reply) => {
-    const body = (req.body ?? {}) as Partial<Project>;
-    if (typeof body.cwd === "string") {
-      const cwdErr = await validateCwd(body.cwd);
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    // Allow-list the patchable fields and type-check each — never spread the raw body into the
+    // persisted record. Closes mass-assignment (arbitrary keys persisted) AND the prior gap where a
+    // non-string cwd skipped validateCwd and persisted a corrupt project that then broke the agent.
+    const patch: Partial<Project> = {};
+    if (raw.name !== undefined) { if (!isNonEmptyStr(raw.name)) { reply.code(400).send({ error: "name must be a non-empty string" }); return; } patch.name = raw.name.trim(); }
+    if (raw.cwd !== undefined) {
+      if (typeof raw.cwd !== "string") { reply.code(400).send({ error: "cwd must be a string" }); return; }
+      const cwdErr = await validateCwd(raw.cwd);
       if (cwdErr) { reply.code(400).send({ error: cwdErr }); return; }
+      patch.cwd = raw.cwd;
     }
-    const p = await projectStore.update((req.params as { id: string }).id, body);
+    if (raw.profileId !== undefined) { if (typeof raw.profileId !== "string") { reply.code(400).send({ error: "profileId must be a string" }); return; } patch.profileId = raw.profileId; }
+    if (raw.model !== undefined) { if (!isValidModel(raw.model)) { reply.code(400).send({ error: "model must be { provider, modelId }" }); return; } patch.model = raw.model; }
+    if (raw.thinkingLevel !== undefined) { if (typeof raw.thinkingLevel !== "string") { reply.code(400).send({ error: "thinkingLevel must be a string" }); return; } patch.thinkingLevel = raw.thinkingLevel as ThinkingLevel; }
+    if (raw.appUrl !== undefined) { if (typeof raw.appUrl !== "string") { reply.code(400).send({ error: "appUrl must be a string" }); return; } patch.appUrl = raw.appUrl; }
+    if (raw.gateCommand !== undefined) { if (typeof raw.gateCommand !== "string") { reply.code(400).send({ error: "gateCommand must be a string" }); return; } patch.gateCommand = raw.gateCommand; }
+    const p = await projectStore.update((req.params as { id: string }).id, patch);
     if (!p) { reply.code(404).send({ error: "no such project" }); return; }
     return p;
   });
@@ -192,16 +219,18 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   });
   app.post("/api/memory", async (req, reply) => {
     const body = (req.body ?? {}) as { projectId?: string; text?: string; value?: string; category?: string; folder?: string; scope?: "project" | "global" };
-    const text = (body.text ?? body.value ?? "").trim();
-    if (!text) { reply.code(400).send({ error: "text (or value) is required" }); return; }
+    const rawText = body.text ?? body.value;
+    if (typeof rawText !== "string" || !rawText.trim()) { reply.code(400).send({ error: "text (or value) is required" }); return; }
+    const text = rawText.trim();
     const cwd = await cwdForProject(body.projectId);
     const scope = body.scope ?? (body.projectId ? "project" : "global");
     return memoryStore.create({ text, category: body.category, folder: body.folder, scope, projectCwd: cwd });
   });
   app.patch("/api/memory/:id", async (req, reply) => {
     const body = (req.body ?? {}) as { text?: string; value?: string; projectId?: string };
-    const text = (body.text ?? body.value ?? "").trim();
-    if (!text) { reply.code(400).send({ error: "text (or value) is required" }); return; }
+    const rawText = body.text ?? body.value;
+    if (typeof rawText !== "string" || !rawText.trim()) { reply.code(400).send({ error: "text (or value) is required" }); return; }
+    const text = rawText.trim();
     const e = await memoryStore.update((req.params as { id: string }).id, text, await cwdForProject(body.projectId));
     if (!e) { reply.code(404).send({ error: "no such memory entry" }); return; }
     return e;
@@ -211,8 +240,9 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     return { ok: await memoryStore.remove((req.params as { id: string }).id, await cwdForProject(projectId)) };
   });
   // Manual semantic search (recall observability + agent-independent lookup).
-  app.post("/api/memory/search", async (req) => {
+  app.post("/api/memory/search", async (req, reply) => {
     const body = (req.body ?? {}) as { query?: string; projectId?: string; threshold?: number; topK?: number; folder?: string; scope?: "project" | "global"; category?: string };
+    if (body.query !== undefined && typeof body.query !== "string") { reply.code(400).send({ error: "query must be a string" }); return; }
     const results = await memoryStore.search(body.query ?? "", {
       projectCwd: await cwdForProject(body.projectId), threshold: body.threshold, topK: body.topK, folder: body.folder, scope: body.scope, category: body.category,
     });
@@ -343,8 +373,12 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   });
   app.post("/api/sandbox/runs", async (req, reply) => {
     const body = (req.body ?? {}) as { projectId?: string; language?: string; code?: string; timeoutMs?: number; mode?: "terminal" | "web" };
-    if (!body.language || body.code === undefined) {
-      reply.code(400).send({ error: "language and code are required" });
+    if (typeof body.language !== "string" || typeof body.code !== "string") {
+      reply.code(400).send({ error: "language and code are required (strings)" });
+      return;
+    }
+    if (!SANDBOX_LANGUAGES.includes(body.language)) {
+      reply.code(400).send({ error: `unsupported language: ${body.language}. Available: ${SANDBOX_LANGUAGES.join(", ")}` });
       return;
     }
     const run = await sandbox.start(body.projectId || null, body.language, body.code, { timeoutMs: body.timeoutMs, mode: body.mode });
@@ -514,6 +548,10 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const sandboxSub = (e: SandboxEvent) => {
       if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ kind: "sandbox", sessionId, event: e }));
     };
+    // Unsubscribe handles for every run this socket attaches to — runs are kept in `active` after
+    // they finish (by design, for REST inspection), so without this the closed socket's listener
+    // would leak in each run's listener Set forever. Drained in socket.on("close").
+    const sandboxOffs = new Set<() => void>();
     // Fan workflow events (step state transitions, run lifecycle) to the same socket so the UI
     // can render the live workflow graph. All active workflow runs broadcast here; the UI filters
     // by sessionId/projectId as needed.
@@ -540,8 +578,10 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
           const run = await sandbox.start(msg.projectId || entry.projectId || null, msg.language || "bash", msg.code || "", {
             timeoutMs: msg.timeoutMs,
             mode: msg.mode,
-            onEvent: sandboxSub,
           });
+          // Subscribe AFTER start (not via onEvent) so we get an unsubscribe handle to clean up on
+          // close; the single sandbox_start is sent explicitly below (avoids a duplicate emit).
+          sandboxOffs.add(sandbox.subscribe(run.id, sandboxSub));
           if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ kind: "sandbox", sessionId, event: { type: "sandbox_start", runId: run.id, run } }));
         } else if (msg.kind === "sandbox.kill") {
           await sandbox.kill(msg.runId || "");
@@ -559,7 +599,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       }
     });
 
-    socket.on("close", () => { offAgent(); offWorkflow(); wsSockets.delete(socket); });
+    socket.on("close", () => { offAgent(); offWorkflow(); for (const off of sandboxOffs) off(); sandboxOffs.clear(); wsSockets.delete(socket); });
   });
 
   // Static chat UI last, so explicit /api and /ws routes win.
