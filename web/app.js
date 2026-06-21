@@ -1980,6 +1980,10 @@ function wireBrowserPanel(node) {
     finally { state.browserBusy = false; }
   };
   const startOrNavigate = async () => {
+    // Guard the start path against a double-click: browserSessionId isn't set until the first start
+    // resolves, so without this a second click would spawn a SECOND browser session. (runAct already
+    // guards navigate/back/etc.; this covers the initial start.)
+    if (state.browserBusy) return;
     const target = url.value.trim();
     if (!target || !state.activeProjectId) return pushError("browser: open a project and enter an http(s) URL");
     try {
