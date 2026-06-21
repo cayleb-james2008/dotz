@@ -354,3 +354,12 @@ prompt for automatic task distribution.
   templates are cloned, avoid global `getElementById` for panel internals that could appear twice.
   The default layout only contains one panel of each type, but the code should be robust to swapping
   without re-cloning DOM.
+
+## Code style — ponytail
+
+Follow `.claude/skills/ponytail` (vendored MIT skill): YAGNI, stdlib first, native platform
+features before dependencies, one line over fifty, shortest working diff, deletion over addition.
+Never simplify away input validation at trust boundaries, error/data-loss handling, security,
+accessibility, or tests. Mark a deliberate shortcut with a `# ponytail:` comment naming its ceiling
+and the upgrade path. Commands: `/ponytail-review` (flag over-engineering in a diff),
+`/ponytail-audit` (scan the repo).
