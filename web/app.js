@@ -581,7 +581,10 @@ function connectWS() {
       // client's: workflow_start carries event.run (filter by sessionId/projectId); later events
       // (step_state/end) lack it, so gate on whether this client is already tracking the run.
       const r = m.event && m.event.run;
-      if (r ? (r.sessionId === state.sessionId || r.projectId === state.activeProjectId) : state.workflows.has(m.runId)) {
+      // Gate null explicitly: state.sessionId / activeProjectId default to null, and a run created
+      // with null sessionId+projectId would otherwise match EVERY client via null===null, bleeding
+      // other sessions' runs into this client's graph.
+      if (r ? ((r.sessionId != null && r.sessionId === state.sessionId) || (r.projectId != null && r.projectId === state.activeProjectId)) : state.workflows.has(m.runId)) {
         handleWorkflowEvent(m.runId, m.event);
       }
     }
@@ -1477,7 +1480,7 @@ async function refreshWorkflows() {
     const { runs } = await api("/api/workflows/active");
     // /api/workflows/active returns ALL globally-active runs; keep only this project/session's so a
     // foreign project's runs don't bleed into this client's graph (newSession just cleared them).
-    runs.filter((r) => r.projectId === state.activeProjectId || r.sessionId === state.sessionId)
+    runs.filter((r) => (r.projectId != null && r.projectId === state.activeProjectId) || (r.sessionId != null && r.sessionId === state.sessionId))
       .forEach((r) => state.workflows.set(r.id, r));
     refreshWfCount();
     refreshWorkflowGraph();
