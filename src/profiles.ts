@@ -186,6 +186,7 @@ export async function buildResourceLoader(
     appendSystemPrompt: prompts,
     additionalExtensionPaths: [
       path.join(DOTZ_PI, "extensions", "ollama-cloud"),
+      path.join(DOTZ_PI, "extensions", "local"),
       path.join(DOTZ_PI, "extensions", "subagent"),
       path.join(DOTZ_PI, "extensions", "dotz-tools"),
     ],

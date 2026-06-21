@@ -19,6 +19,9 @@ export interface ProviderDefault { executive: string; subagent: string; }
 export const PROVIDER_DEFAULTS: Record<string, ProviderDefault> = {
   ollama: { executive: "glm-5.2", subagent: "minimax-m3" },
   openrouter: { executive: "nex-agi/nex-n2-pro:free", subagent: "nex-agi/nex-n2-pro:free" },
+  // Local server (Ollama :11434 / LM Studio :1234, via the .pi/extensions/local provider). These are
+  // prefilled placeholders the operator edits to whatever model their local server actually serves.
+  local: { executive: "qwen2.5-coder", subagent: "qwen2.5-coder" },
 };
 
 /** Known provider display metadata — keeps the UI readable without hard-coding catalog logic. */
