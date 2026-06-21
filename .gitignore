@@ -8,3 +8,6 @@ data/
 *.log
 .DS_Store
 .ai-agents/
+
+# Solomon RSI host venv (interpreter only, created to satisfy run_improver launcher)
+.venv/
