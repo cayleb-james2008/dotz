@@ -223,12 +223,6 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const body = (req.body ?? {}) as { projectId?: string };
     return memoryStore.consolidate(await cwdForProject(body.projectId));
   });
-  // Observable entity/relationship graph (global + current project).
-  app.get("/api/memory/graph", async (req) => {
-    const projectId = (req.query as { projectId?: string }).projectId;
-    return memoryStore.graphFor(await cwdForProject(projectId));
-  });
-
   // ---- skills (unified pool) ----
   app.get("/api/skills", async () => {
     await skillLoader.load();
@@ -255,7 +249,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     return run;
   });
   app.post("/api/workflows", async (req, reply) => {
-    const body = (req.body ?? {}) as { projectId?: string | null; sessionId?: string | null; label?: string; origin?: string; steps: Array<{ agent: string; task: string; parents?: string[]; batch?: string }> };
+    const body = (req.body ?? {}) as { projectId?: string | null; sessionId?: string | null; label?: string; origin?: string; steps: Array<{ agent: string; task: string; parents?: string[] }> };
     if (!Array.isArray(body.steps) || body.steps.length === 0) {
       reply.code(400).send({ error: "steps (non-empty array) is required" });
       return;

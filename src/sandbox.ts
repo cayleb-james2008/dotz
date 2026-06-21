@@ -21,13 +21,14 @@
  *  moves but the click/type is a no-op. This is the lean visual bridge — no heavy browser-automation
  *  dependency, just coordinate events + same-origin DOM dispatch.
  */
-import { spawn, execFile, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
 import type { SandboxRun } from "./types";
+import { killTree } from "./kill-tree";
 
 export type SandboxEvent =
   | { type: "sandbox_start"; runId: string; run: SandboxRun }
@@ -121,21 +122,6 @@ function isPortOpen(port: number): Promise<boolean> {
     sock.once("error", () => { sock.destroy(); resolve(false); });
     sock.connect(port, "127.0.0.1");
   });
-}
-
-/** Kill a child AND its descendants. Web-mode runs spawn a launcher (npx/node) that forks the real
- *  server as a grandchild; a bare child.kill() reaps only the launcher and leaks the grandchild
- *  server + its bound port. taskkill /T /F (win32) / process-group SIGKILL (posix) reclaims the whole
- *  tree — mirroring connections.ts killTree(). */
-function killTree(proc: ChildProcess | null): void {
-  const pid = proc?.pid;
-  if (!pid || !proc || proc.killed) return;
-  if (process.platform === "win32") {
-    try { execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () => { /* best-effort */ }); } catch { /* ignore */ }
-  } else {
-    // The child is a process-group leader (spawned detached), so -pid signals the whole group.
-    try { process.kill(-pid, "SIGKILL"); } catch { try { proc.kill("SIGKILL"); } catch { /* already dead */ } }
-  }
 }
 
 export class Sandbox {
@@ -240,7 +226,7 @@ export class Sandbox {
     if (timeoutMs > 0) {
       ar.timeout = setTimeout(() => {
         ar.killedByUs = true;
-        killTree(ar.proc);
+        killTree(ar.proc, "group");
         run.output += `\n[timeout] killed after ${timeoutMs}ms\n`;
       }, timeoutMs);
     }
@@ -310,7 +296,7 @@ export class Sandbox {
     const ar = this.active.get(runId);
     if (!ar || !ar.proc || ar.proc.killed) return false;
     ar.killedByUs = true;
-    killTree(ar.proc);
+    killTree(ar.proc, "group");
     return true;
   }
 
@@ -320,7 +306,7 @@ export class Sandbox {
       if (ar.timeout) clearTimeout(ar.timeout);
       if (ar.portDetector) ar.portDetector.dispose();
       ar.killedByUs = true;
-      killTree(ar.proc);
+      killTree(ar.proc, "group");
       fs.rm(ar.tempDir, { recursive: true, force: true }).catch(() => {});
     }
     this.active.clear();

@@ -8,11 +8,9 @@
  * This is the single skill-discovery path. It is deliberately separate from pi.ts and profiles.ts
  * to respect the no-circular-import convention (types.ts is the shared leaf).
  *
- * Frontmatter dialects handled:
- *   - Claude/OpenCode: `name`, `description`, optional `compatibility`, `tags`, `related_skills`
- *   - Hermes: nested `metadata.hermes.tags`, `platforms`, `related_skills`, `version`, `author`
- *   - ECC: `name`, `description`, `origin: ECC`
- *   - Superpowers: same as Claude
+ * Frontmatter dialects handled (we read `name`, `description`, `tags`, `platforms`):
+ *   - Claude/OpenCode/Superpowers/ECC: flat `name`, `description`, `tags`
+ *   - Hermes: nested `metadata.hermes.tags`, plus `platforms`
  *
  * Dedupe priority (highest wins): dotz (.pi) > opencode > claude > codex > ecc > superpowers > hermes.
  * Platform filter: skills declaring `platforms: [...]` are filtered to the current host (win32).
@@ -25,6 +23,7 @@ import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import matter from "gray-matter";
 import type { Skill } from "./types";
 
 const DOTZ_PI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".pi");
@@ -105,82 +104,6 @@ const HOST_PLATFORM = (() => {
   }
 })();
 
-/** Minimal YAML frontmatter parser — handles flat keys, ARBITRARY-depth nesting (via an indent
- *  stack, so e.g. metadata.hermes.tags resolves), inline arrays, and block scalars (`|` literal /
- *  `>` folded). We avoid a full YAML dep because skill frontmatter is otherwise simple. */
-function parseFrontmatter(raw: string): Record<string, unknown> {
-  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-  if (!m) return {};
-  const out: Record<string, unknown> = {};
-  const lines = m[1].split(/\r?\n/);
-  const indentOf = (s: string) => s.length - s.trimStart().length;
-  // Each frame owns the object that more-indented keys attach to; the sentinel root holds top keys.
-  const stack: Array<{ indent: number; obj: Record<string, unknown> }> = [{ indent: -1, obj: out }];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim() || line.trimStart().startsWith("#")) continue;
-    const km = line.match(/^\s*(\w[\w-]*):[ \t]*(.*)$/);
-    if (!km) continue;
-    const indent = indentOf(line);
-    const key = km[1];
-    const value = km[2];
-    // Pop to the nearest strictly-shallower frame — that's this key's parent.
-    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
-    const parent = stack[stack.length - 1].obj;
-    const block = value.trim().match(/^([|>])[+-]?\d*$/);
-    if (block) {
-      // Block scalar: consume the following lines indented deeper than this key.
-      const fold = block[1] === ">";
-      const collected: string[] = [];
-      let blockIndent = -1;
-      let j = i + 1;
-      for (; j < lines.length; j++) {
-        const bl = lines[j];
-        if (!bl.trim()) { collected.push(""); continue; }
-        const bi = indentOf(bl);
-        if (bi <= indent) break;
-        if (blockIndent < 0) blockIndent = bi;
-        collected.push(bl.slice(Math.min(bi, blockIndent)));
-      }
-      while (collected.length && collected[collected.length - 1] === "") collected.pop();
-      parent[key] = fold ? collected.join(" ").replace(/\s+/g, " ").trim() : collected.join("\n");
-      i = j - 1;
-    } else if (value.trim() === "") {
-      // Empty value → a nested object to be filled by deeper lines (stays {} if none follow).
-      const obj: Record<string, unknown> = {};
-      parent[key] = obj;
-      stack.push({ indent, obj });
-    } else {
-      parent[key] = parseScalar(value);
-    }
-  }
-  return out;
-}
-
-function parseScalar(s: string): unknown {
-  const t = s.trim();
-  if (t === "") return "";
-  // quoted string
-  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
-    return t.slice(1, -1);
-  }
-  // inline array
-  if (t.startsWith("[") && t.endsWith("]")) {
-    return t
-      .slice(1, -1)
-      .split(",")
-      .map((x) => x.trim().replace(/^["']|["']$/g, ""))
-      .filter(Boolean);
-  }
-  // number
-  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
-  // boolean
-  if (t === "true") return true;
-  if (t === "false") return false;
-  // multi-line description (folded) — return as-is, caller may strip
-  return t;
-}
-
 function platformsOk(skill: Skill): boolean {
   if (!skill.platforms || skill.platforms.length === 0) return true;
   return skill.platforms.includes(HOST_PLATFORM);
@@ -211,34 +134,31 @@ async function findSkillFiles(root: string): Promise<string[]> {
 async function parseSkillFile(file: string, source: Skill["source"]): Promise<Skill | null> {
   try {
     const raw = await fs.readFile(file, "utf-8");
-    const fm = parseFrontmatter(raw);
+    // gray-matter (js-yaml) parses flat keys, nesting (metadata.hermes.tags), inline arrays, and
+    // block scalars. A malformed-frontmatter throw falls back to {} so the skill still loads by dirname.
+    let fm: Record<string, unknown> = {};
+    let body = raw;
+    try { const parsed = matter(raw); fm = parsed.data as Record<string, unknown>; body = parsed.content; } catch { /* keep dirname fallback */ }
     // Accept only string/number scalars: numeric frontmatter (`name: 2048`) is coerced to a resolvable
-    // string key, while an empty value the parser turned into {} must NOT become the literal
-    // "[object Object]" — treat a non-scalar as absent so the dirname fallback fires.
+    // string key; a non-scalar (null/object) is treated as absent so the dirname fallback fires.
     const name = (typeof fm.name === "string" || typeof fm.name === "number" ? String(fm.name) : "").trim()
       || path.basename(path.dirname(file));
     // Collapse a block-scalar / multi-line description to a single clean line for the compact index.
     const description = (typeof fm.description === "string" || typeof fm.description === "number" ? String(fm.description) : "").replace(/\s+/g, " ").trim();
     if (!name) return null;
-    const platforms = (fm.platforms as string[] | undefined) ?? undefined;
     const skill: Skill = {
       name,
       description,
       path: file,
       source,
       tags: (fm.tags as string[] | undefined) ?? undefined,
-      compatibility: (fm.compatibility as string | undefined) ?? undefined,
-      platforms,
-      relatedSkills: (fm.related_skills as string[] | undefined) ?? undefined,
+      platforms: (fm.platforms as string[] | undefined) ?? undefined,
     };
     // Hermes nests under metadata.hermes
     const hermesMeta = (fm.metadata as { hermes?: Record<string, unknown> } | undefined)?.hermes;
-    if (hermesMeta) {
-      if (hermesMeta.tags && Array.isArray(hermesMeta.tags)) skill.tags = (skill.tags ?? []).concat(hermesMeta.tags as string[]);
-    }
+    if (hermesMeta?.tags && Array.isArray(hermesMeta.tags)) skill.tags = (skill.tags ?? []).concat(hermesMeta.tags as string[]);
     // detect umbrella (body header heuristics)
-    const bodyStart = raw.replace(/^---[\s\S]*?---\r?\n/, "");
-    skill.isUmbrella = /Class-level umbrella|umbrella skill/i.test(bodyStart.slice(0, 400));
+    skill.isUmbrella = /Class-level umbrella|umbrella skill/i.test(body.slice(0, 400));
     return skill;
   } catch {
     return null;

@@ -21,7 +21,6 @@ dotz.exe  (Electron)
  │    src/projects.ts — persistent named workspaces (cwd + profile + model + thinking defaults)
  │    src/memory.ts   — mem0-backed autonomous memory (on-device; capture/recall/consolidate)
  │    src/embedder.ts — bundled local transformers.js embedder (all-MiniLM-L6-v2, 384-dim)
- │    src/memory-graph.ts — on-device entity/relationship graph for recall boost
  │    src/sandbox.ts  — terminal + web sandbox runner with agent-cursor overlay
  │    src/types.ts    — shared types (ModelRef, ProviderMeta, Project, MemoryView, SandboxRun)
  │    src/server.ts   — Fastify: REST controls + WS event stream + static UI

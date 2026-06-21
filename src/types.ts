@@ -139,12 +139,8 @@ export interface Skill {
   body?: string;
   /** Optional tags from frontmatter. */
   tags?: string[];
-  /** Compatibility flag (e.g. "opencode"). */
-  compatibility?: string;
   /** Platforms this skill is valid on (from Hermes-style frontmatter). */
   platforms?: string[];
-  /** Related skill names (from Hermes/Claude frontmatter). */
-  relatedSkills?: string[];
   /** Is this an umbrella skill that routes to leaf SKILL.md files? */
   isUmbrella?: boolean;
 }
@@ -162,8 +158,6 @@ export interface WorkflowStep {
   parents: string[];
   /** Child step ids — steps waiting on this one. */
   children: string[];
-  /** Batch label — steps in the same batch were dispatched together (parallel fan-out). */
-  batch?: string;
   /** Captured output (filled when status → done). */
   output?: string;
   /** Error message (filled when status → error). */
