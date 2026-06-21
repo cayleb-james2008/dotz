@@ -27,12 +27,12 @@ import { projectStore } from "./projects";
 import { memoryStore, onMemoryRecall, enableMemoryAutonomy } from "./memory";
 import { sandbox, SANDBOX_LANGUAGES, type SandboxEvent } from "./sandbox";
 import { skillLoader } from "./skills";
-import { workflowStore, WorkflowCycleError, type WorkflowEvent } from "./workflows";
+import { workflowStore, WorkflowCycleError } from "./workflows";
 import { workflowBridge } from "./workflow-bridge";
 import { resolveHumanGate, onGateRequest } from "../.pi/extensions/dotz-tools/index";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "./browser";
 import { connectionsController } from "./connections";
-import { PROVIDERS, PROVIDER_DEFAULTS, type Project, type SandboxRun, type WorkflowRun } from "./types";
+import { PROVIDERS, PROVIDER_DEFAULTS, type Project, type WorkflowRun } from "./types";
 import { loadConfig, getConfig, updateConfig, type DotzConfig } from "./config";
 
 const HOST = "127.0.0.1";

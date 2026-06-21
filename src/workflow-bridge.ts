@@ -11,7 +11,6 @@
  * This is the glue between the subagent extension (execution backend) and WorkflowStore
  * (observability layer). It does NOT spawn agents — it only observes and records.
  */
-import type { WorkflowRun } from "./types";
 import { workflowStore } from "./workflows";
 
 /** The shape of SubagentDetails from the subagent extension (kept loose to avoid a hard dep). */
@@ -142,7 +141,7 @@ export class WorkflowBridge {
       return;
     }
     const details = extractDetails(result);
-    if (details) this.syncSteps(runId, details, true);
+    if (details) this.syncSteps(runId, details);
     // The subagent tool call has ended, so every step's result should have arrived. Sweep any step
     // still in a non-terminal state (no result reported, or a result that never matched even
     // positionally) to error so the graph never shows a permanently "running"/"ready" node after
@@ -162,7 +161,7 @@ export class WorkflowBridge {
     this.runsByToolCall.delete(toolCallId);
   }
 
-  private syncSteps(runId: string, details: SubagentDetailsLike, final = false): void {
+  private syncSteps(runId: string, details: SubagentDetailsLike): void {
     const run = workflowStore.get(runId);
     if (!run) return;
     details.results.forEach((res, idx) => {

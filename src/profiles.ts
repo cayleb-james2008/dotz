@@ -129,8 +129,6 @@ export const PROFILES: Profile[] = [
   },
 ];
 
-export const DEFAULT_PROFILE_ID = "workflow";
-
 export function getProfile(id?: string): Profile {
   return PROFILES.find((p) => p.id === id) || PROFILES[0];
 }
