@@ -225,16 +225,19 @@ export class WorkflowStore {
           }
         }
       }
-      // if all steps done, mark run done — but only from a non-terminal run state, so a late step
-      // update on an already aborted/errored/done run can't resurrect it or re-emit workflow_end
-      // (mirrors the error-branch guard below).
-      if (run.status !== "aborted" && run.status !== "error" && run.status !== "done" &&
-          run.steps.every((s) => s.status === "done" || s.status === "skipped")) {
-        run.status = "done";
-        run.endedAt = Date.now();
-        run.updatedAt = Date.now();
-        this.emit(runId, { type: "workflow_end", run });
-      }
+    }
+    // If every step is now terminal, finish the run — evaluated after a "done" OR a "skipped"
+    // transition (both count as terminal in the every() below). Nesting this inside the "done" branch
+    // left a run whose LAST step is set to "skipped" (or an all-skipped run) stranded in "running"
+    // forever, never emitting workflow_end. Guarded so a late update on an already aborted/errored/done
+    // run can't resurrect it or re-emit (mirrors the error-branch guard below).
+    if ((step.status === "done" || step.status === "skipped") &&
+        run.status !== "aborted" && run.status !== "error" && run.status !== "done" &&
+        run.steps.every((s) => s.status === "done" || s.status === "skipped")) {
+      run.status = "done";
+      run.endedAt = Date.now();
+      run.updatedAt = Date.now();
+      this.emit(runId, { type: "workflow_end", run });
     } else if (step.status === "error") {
       // Mark the run errored but leave remaining steps as-is. Emit workflow_end only on the FIRST
       // transition to a terminal state, so a multi-step error sweep (workflow-bridge onEnd) doesn't
