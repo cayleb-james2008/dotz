@@ -53,11 +53,9 @@ mem0 metadata. The git-committable **source of truth is `MEMORY.md`** (global `~
 project `<cwd>/.ai-agents/`), regenerated on every write — the vector index is a derived cache.
 
 **Memory is AUTONOMOUS** (the operator never manages it): the dotz-tools `before_agent_start` hook
-does pre-task recall (semantic search of folder + global memory, relevance-thresholded, recency- and
-graph-boosted) and injects it into the turn; the `agent_end` hook auto-captures durable facts from the
-exchange and triggers threshold-based consolidation. `src/memory-graph.ts` is a lean on-device
-entity/relationship layer (a second `better-sqlite3` table — no external graph DB) giving a 1-hop
-recall boost + an observable graph. AGENTS.md files (project root + global
+does pre-task recall (semantic search of folder + global memory, relevance-thresholded, recency-
+boosted) and injects it into the turn; the `agent_end` hook auto-captures durable facts from the
+exchange and triggers threshold-based consolidation. AGENTS.md files (project root + global
 `~/.config/opencode/AGENTS.md`) remain the **doctrine** layer — read by `buildResourceLoader`, written
 via the `agents_md` tool; mem0 memory is the **knowledge** layer. Don't blur them. Both persist across
 restarts. Legacy `memory.json` files are imported once on first run and kept as a backup.
@@ -175,18 +173,6 @@ The `/self-improve` workflow preset (`/self-improve`) runs the full 7-phase loop
 measure → research → pick → plan (HUMAN GATE) → implement (TDD) → review (5-reviewer fan-out) →
 simplify → verify. The brain panel's SELF-IMPROVE button sends this prompt.
 
-## Open-Design (baked-in frontend tooling)
-
-`src/design.ts` is the **baked-in design system**: bundled palettes (Catppuccin Mocha, fintech SaaS,
-landing modern), typography pairings with Google Fonts imports, layout patterns, platform guidelines,
-Lucide icon guidance, chart recommendations, and a UX/accessibility audit rubric (WCAG 2.2 AA, touch
-targets, focus states, no AI-slop). Three pi tools expose it:
-- `design_system(query)` — returns CSS tokens + palette + typography + layout
-- `design_components(query)` — returns Lucide icons + chart types + framework rules
-- `design_audit(target)` — returns UX/accessibility findings with specific fixes
-
-The FRONTEND profile doctrine instructs the agent to use these tools for any frontend task.
-
 ## Isolated browser
 
 `src/browser.ts` is an **isolated `agent-browser` controller** — it spawns the pinned external
@@ -234,13 +220,11 @@ three), `POST|GET /api/connections/:provider/login` (start + stream output),
 - `src/workflows.ts` — workflow store (first-class `WorkflowRun` DAG, status propagation, event emitter, JSON-persisted).
 - `src/workflow-bridge.ts` — synthesizes WorkflowRuns from subagent tool_execution events (auto-populates the graph).
 - `src/metrics.ts` — RSI measurement layer (baseline + compare + anti-gaming).
-- `src/design.ts` — Open-Design baked-in frontend tooling (palettes, typography, UX audit).
 - `src/browser.ts` — isolated `agent-browser` controller (spawns the external binary in a throwaway `mkdtemp` profile + origin allowlist; remote pages never touch the Electron renderer or its preload).
 - `src/connections.ts` — local connections (GitHub/Vercel/Neon) via the provider CLIs; status + streamed browser login + logout. No OAuth app, no stored secrets; tokens never read or logged.
 - `src/projects.ts` — persistent projects layer (name + cwd + profile/model/thinking defaults).
 - `src/memory.ts` — mem0-backed memory store (`project` / `global` scope) under `~/.dotz/ai-agents/mem0/` + `MEMORY.md` mirrors + AGENTS.md read/write helpers + autonomy flag + recall event emitter. Build-time seed via `buildResourceLoader`; live per-turn recall + capture via the dotz-tools hooks.
 - `src/embedder.ts` — bundled local transformers.js embedder (all-MiniLM-L6-v2, 384-dim), injected in-process into mem0 (no embeddings API/route).
-- `src/memory-graph.ts` — lean on-device entity/relationship graph (`better-sqlite3`) for recall boost + observability; no external graph DB.
 - `src/sandbox.ts` — sandbox runner (`terminal` + `web` modes, agent cursor, lifecycle events).
 - `src/types.ts` — shared types (`ModelRef`, `ProviderMeta`, `Project`, `MemoryEntry`, `SandboxRun`,
   `Skill`, `WorkflowRun`, `WorkflowStep`, `ThinkingLevel`, `DEFAULT_MODEL`, `LOW_COST_MODELS`,
@@ -256,7 +240,7 @@ three), `POST|GET /api/connections/:provider/login` (start + stream output),
 - `.pi/extensions/dotz-tools/index.ts` — registers the dotz pi tools: dynamic resource tools
   `create_agent` / `list_agents` / `create_skill` / `list_skills`; `skill`; the mem0 memory tools
   `memory_list`, `memory_search`, `memory_add`, `memory_update`, `memory_delete`, `memory_consolidate`;
-  `agents_md`; `rsi_baseline`, `rsi_compare`, `human_gate`; `browser_*`; `design_*` + the
+  `agents_md`; `rsi_baseline`, `rsi_compare`, `human_gate`; `browser_*` + the
   `resolveHumanGate`/`onGateRequest` server hooks. **Also registers the autonomous-memory lifecycle
   hooks** (`before_agent_start` → pre-task recall, `agent_end` → auto-capture + consolidation), gated
   by `isMemoryAutonomyEnabled()` so only the main server process runs them (never spawned subagents).
@@ -269,8 +253,8 @@ npm run typecheck                      # tsc --noEmit — must be clean
 npx tsx scripts/verify-profiles.mjs   # e2e: profiles + .pi bundle + subagent + dotz-tools surface
 npx tsx scripts/verify-ui.mjs          # e2e: UI markup + profiles API
 npx tsx scripts/verify-features.mjs    # e2e: projects + memory + sandbox + multi-provider (11 providers)
-npx tsx scripts/verify-ultra.mjs       # e2e: 320 skills + workflows + .ai-agents memory + RSI/design/browser tools + 6 presets + Ollama
-npx tsx scripts/verify-memory.ts       # e2e: mem0 memory OFFLINE (add/search/consolidate/graph/MEMORY.md mirror) — no network/keys
+npx tsx scripts/verify-ultra.mjs       # e2e: 320 skills + workflows + .ai-agents memory + RSI/browser tools + 6 presets + Ollama
+npx tsx scripts/verify-memory.ts       # e2e: mem0 memory OFFLINE (add/search/consolidate/MEMORY.md mirror) — no network/keys
 npx tsx scripts/verify-memory-live.ts  # e2e: live capture→recall against Ollama Cloud (needs $OLLAMA_API_KEY)
 npm run dev:server                      # http://127.0.0.1:4317 (browser dev loop)
 npm run build                           # esbuild → dist/main.js + dist/preload.cjs
@@ -346,8 +330,6 @@ prompt for automatic task distribution.
   run, the subagent extension still works; the UI graph just doesn't populate for that call.
 - `metrics.ts` is a pure measurement layer — no agent runtime. The RSI brain (the `/self-improve`
   preset + the `rsi_*`/`human_gate` tools) drives the loop; `metrics.ts` provides the evidence.
-- `design.ts` is bundled offline design knowledge. If the `ui-ux-pro` MCP is available in the dev
-  environment, the agent may also use it directly — but `design_*` tools must work standalone.
 - esbuild leaves `node_modules` external so pi's jiti `.ts` extension loading works at runtime;
   `electron-builder.yml` sets `asar: false` for the same reason.
 - **Frontend panels use class-scoped selectors or per-panel `querySelector` lookups.** Because panel

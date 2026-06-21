@@ -61,15 +61,6 @@ try {
   const after = (await memoryStore.list(projectCwd)).filter((m) => m.scope === "project").length;
   ok(con.removed >= 1 && after < before, `consolidate removed ${con.removed} near-duplicate(s) (${before} → ${after})`);
 
-  // 7. entity/relationship graph (offline, heuristic extraction + co-occurrence edges)
-  await memoryStore.create({ text: "buildResourceLoader injects memory via appendSystemPrompt.", scope: "project", category: "architecture", projectCwd });
-  await memoryStore.create({ text: "buildResourceLoader also loads the skillLoader index.", scope: "project", category: "architecture", projectCwd });
-  const graph = memoryStore.graphFor(projectCwd);
-  const hasNode = graph.project?.nodes.some((n) => /buildResourceLoader/i.test(n.entity)) ?? false;
-  const hasEdge = (graph.project?.edges.length ?? 0) > 0;
-  ok(hasNode, `graph extracted entity node (buildResourceLoader)`);
-  ok(hasEdge, `graph recorded co-occurrence edge(s) (${graph.project?.edges.length ?? 0})`);
-
   console.log(failures === 0 ? "\nALL MEMORY CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
 } catch (e) {
   console.error("VERIFY_MEMORY_ERROR:", (e as Error).stack || (e as Error).message);

@@ -68,7 +68,6 @@ survives server restarts. Sessions created with `projectId` inherit the project'
 | DELETE | `/api/memory/:id?projectId=<id>` | — | `{ ok }` |
 | POST | `/api/memory/search` | `{ query, projectId?, threshold?, topK?, folder?, scope?, category? }` | `{ results: MemoryView[] }` |
 | POST | `/api/memory/consolidate` | `{ projectId? }` | `{ removed, kept }` |
-| GET | `/api/memory/graph?projectId=<id>` | — | `{ global, project }` graph (`{nodes,edges}`) |
 
 `MemoryView = { id, memory, scope:"project"|"global", category?, folder?, score?, createdAt?, updatedAt? }`
 (`score` only on search/recall results). Memory is backed by **mem0** (self-hosted OSS, on-device):
@@ -190,7 +189,7 @@ cursor over it.
 - `step_added` — `{ type, step:WorkflowStep }`.
 - `step_state` — `{ type, stepId, status, output?, error?, usage?, sandboxRunId?, browserSessionId?, toolCallIds?, thinking? }`.
 
-`WorkflowStep = { id, agent, task, status:"pending"|"ready"|"running"|"done"|"error"|"skipped", parents, children, batch?, output?, error?, usage?, sandboxRunId?, browserSessionId?, toolCallIds?, thinking?, startedAt?, endedAt? }`.
+`WorkflowStep = { id, agent, task, status:"pending"|"ready"|"running"|"done"|"error"|"skipped", parents, children, output?, error?, usage?, sandboxRunId?, browserSessionId?, toolCallIds?, thinking?, startedAt?, endedAt? }`.
 
 ### Gate events (server ↔ client, human approval)
 

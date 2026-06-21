@@ -26,7 +26,6 @@ export interface MetricsBaseline {
   build: { ok: boolean; output: string } | null;
   tests: { ok: boolean; passed: number; failed: number; output: string } | null;
   fileCount: number;
-  loc: number;
   testFiles: number;
 }
 
@@ -37,7 +36,6 @@ export interface MetricsCompare {
   buildFixed: boolean;
   testsImproved: boolean;
   fileCountDelta: number;
-  locDelta: number;
   /** Anti-gaming: did the test count drop suspiciously? */
   testsDeleted: boolean;
   summary: string;
@@ -60,8 +58,8 @@ async function runCmd(cmd: string, cwd: string, timeoutMs = 60000): Promise<{ ok
   }
 }
 
-/** Count files (non-node_modules, non-dist, non-.git) + rough LOC. */
-async function countFiles(cwd: string): Promise<{ fileCount: number; loc: number; testFiles: number }> {
+/** Count files (non-node_modules, non-dist, non-.git) + test-file count. */
+async function countFiles(cwd: string): Promise<{ fileCount: number; testFiles: number }> {
   try {
     const { stdout } = await execAsync(
       `git ls-files --cached --others --exclude-standard | findstr /v /b "node_modules dist .git release" || echo ""`,
@@ -69,9 +67,9 @@ async function countFiles(cwd: string): Promise<{ fileCount: number; loc: number
     ).catch(() => ({ stdout: "" }));
     const files = stdout.split("\n").map((s) => s.trim()).filter(Boolean);
     const testFiles = files.filter((f) => /\.(test|spec)\.[cm]?[jt]sx?$/i.test(f) || /(^|\/)(?:tests?|__tests__)\//i.test(f)).length;
-    return { fileCount: files.length, loc: 0, testFiles }; // LOC is expensive; skip for now
+    return { fileCount: files.length, testFiles };
   } catch {
-    return { fileCount: 0, loc: 0, testFiles: 0 };
+    return { fileCount: 0, testFiles: 0 };
   }
 }
 
@@ -105,7 +103,6 @@ export async function captureBaseline(cwd: string, gateCommand?: string): Promis
     build,
     tests: tests ? { ok: tests.ok, ...parseTestCounts(tests.output), output: tests.output.slice(-1000) } : null,
     fileCount: files.fileCount,
-    loc: files.loc,
     testFiles: files.testFiles,
   };
   await ensureDir();
@@ -121,7 +118,6 @@ export async function compare(baseline: MetricsBaseline, afterCwd?: string, gate
   // Require a real prior failure so a null/absent baseline can't be reported as RED → GREEN.
   const testsImproved = !!after.tests && !!baseline.tests && !baseline.tests.ok && after.tests.ok;
   const fileCountDelta = after.fileCount - baseline.fileCount;
-  const locDelta = after.loc - baseline.loc;
   // anti-gaming: flag if the test-file count dropped >20%, or the passing-test count dropped >20%
   // from a previously-green suite (deleting/disabling tests to flip the suite GREEN must not slip).
   const testsDeleted =
@@ -137,7 +133,7 @@ export async function compare(baseline: MetricsBaseline, afterCwd?: string, gate
   if (testsDeleted) parts.push("⚠ tests removed/disabled (anti-gaming)");
   if (parts.length === 0) parts.push("no metric movement detected");
   const summary = parts.join("; ");
-  return { baseline, after, typecheckFixed, buildFixed, testsImproved, fileCountDelta, locDelta, testsDeleted, summary };
+  return { baseline, after, typecheckFixed, buildFixed, testsImproved, fileCountDelta, testsDeleted, summary };
 }
 
 /** Render a baseline for the agent's context. */

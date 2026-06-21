@@ -27,7 +27,6 @@ import os from "node:os";
 import type { Memory as Mem0, MemoryItem } from "mem0ai/oss";
 import type { MemoryView, MemoryScope } from "./types";
 import { localEmbedder, EMBED_DIM } from "./embedder";
-import { memoryGraph, type GraphView } from "./memory-graph";
 import { getConfig } from "./config";
 
 // ---- paths (respect DOTZ_CONFIG_DIR for relocation + test isolation, like config.ts) ----
@@ -200,7 +199,6 @@ export class MemoryStore {
       if (input.folder && !v.folder) v.folder = input.folder;
       return v;
     });
-    for (const v of views) if (v.id) memoryGraph.indexMemory(userId, v.id, v.memory);
     if (!opts.skipMirror) await this.writeMirror(scope, input.projectCwd);
     return views;
   }
@@ -247,38 +245,24 @@ export class MemoryStore {
         for (const it of r.results) collected.push(this.toView(it, sc));
       } catch { /* a scope with no rows can throw — ignore */ }
     }
-    // 1-hop graph expansion: entities in the query + their neighbors give a small recall boost.
-    const boost = new Set<string>();
-    for (const sc of scopes) for (const e of memoryGraph.expand(scopeUser(sc, opts.projectCwd), query)) boost.add(e);
-    return this.rerank(collected, opts.folder, boost).slice(0, topK);
+    return this.rerank(collected, opts.folder).slice(0, topK);
   }
 
-  /** Combine semantic score with recency decay, folder-match, and a graph-relationship boost. */
-  private rerank(items: MemoryView[], folder?: string, boost?: Set<string>): MemoryView[] {
+  /** Combine semantic score with recency decay and folder-match. */
+  private rerank(items: MemoryView[], folder?: string): MemoryView[] {
     const now = Date.now();
     const norm = (p: string) => p.replace(/\\/g, "/").replace(/^\.?\//, "").toLowerCase();
     const f = folder ? norm(folder) : null;
-    const boostList = boost && boost.size ? [...boost] : null;
     return items
       .map((it) => {
         const base = it.score ?? 0;
         const age = now - (it.createdAt ?? now);
         const recency = Math.exp(-Math.max(0, age) / RECENCY_HALFLIFE_MS); // 1 → 0
         const folderBoost = f && it.folder && (norm(it.folder) === f || f.startsWith(norm(it.folder)) || norm(it.folder).startsWith(f)) ? 0.1 : 0;
-        const text = (it.memory || "").toLowerCase();
-        const graphBoost = boostList && boostList.some((e) => text.includes(e)) ? 0.05 : 0;
-        return { it, rank: base * 0.8 + recency * 0.2 + folderBoost + graphBoost };
+        return { it, rank: base * 0.8 + recency * 0.2 + folderBoost };
       })
       .sort((a, b) => b.rank - a.rank)
       .map((x) => x.it);
-  }
-
-  /** Observable entity/relationship graph for the UI/REST (global + the current project). */
-  graphFor(projectCwd?: string | null): { global: GraphView; project: GraphView | null } {
-    return {
-      global: memoryGraph.graph(GLOBAL_USER),
-      project: projectCwd ? memoryGraph.graph(scopeUser("project", projectCwd)) : null,
-    };
   }
 
   /** Pre-task recall: search + emit observability event + render an injectable prompt block. */
@@ -304,7 +288,6 @@ export class MemoryStore {
       { userId, metadata: { scope, ts: Date.now() }, infer: true },
     );
     const views = (res.results || []).map((r) => this.toView(r, scope));
-    for (const v of views) if (v.id) memoryGraph.indexMemory(userId, v.id, v.memory);
     if (views.length) {
       await this.writeMirror(scope, projectCwd);
       // Count actual CAPTURES (facts stored), not exchanges — mem0 extracts nothing from trivial turns,
@@ -347,7 +330,7 @@ export class MemoryStore {
             }
           }
         }
-        for (const id of dropped) { try { await mem.delete(id); memoryGraph.removeMemory(id); removed++; } catch { /* ignore */ } }
+        for (const id of dropped) { try { await mem.delete(id); removed++; } catch { /* ignore */ } }
         kept += all.length - dropped.size;
       } else {
         kept += all.length;
@@ -361,13 +344,6 @@ export class MemoryStore {
     const mem = await this.engine();
     try { await mem.update(id, text); } catch { return null; }
     const it = await mem.get(id).catch(() => null);
-    // Re-sync the entity graph with the edited text (add()/remove() maintain it — update() must too,
-    // or the graph keeps the OLD text's entities and never gains the new ones).
-    memoryGraph.removeMemory(id);
-    if (it) {
-      const scope = (it.metadata?.scope as MemoryScope) || "global";
-      memoryGraph.indexMemory(scopeUser(scope, projectCwd), id, text);
-    }
     await this.writeMirrorAll(projectCwd);
     return it ? this.toView(it, (it.metadata?.scope as MemoryScope) || "global") : null;
   }
@@ -375,7 +351,6 @@ export class MemoryStore {
   async remove(id: string, projectCwd?: string | null): Promise<boolean> {
     const mem = await this.engine();
     try { await mem.delete(id); } catch { return false; }
-    memoryGraph.removeMemory(id);
     await this.writeMirrorAll(projectCwd);
     return true;
   }

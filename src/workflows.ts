@@ -50,7 +50,6 @@ export interface CreateStepInput {
   agent: string;
   task: string;
   parents?: string[];
-  batch?: string;
   sandboxRunId?: string | null;
   browserSessionId?: string | null;
   toolCallIds?: string[];
@@ -95,7 +94,6 @@ export class WorkflowStore {
       status: s.parents && s.parents.length > 0 ? "pending" : "ready",
       parents: [],
       children: [],
-      batch: s.batch,
       sandboxRunId: s.sandboxRunId,
       browserSessionId: s.browserSessionId,
       toolCallIds: s.toolCallIds,

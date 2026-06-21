@@ -13,7 +13,6 @@ import { createUserAgent, discoverAgents } from "../subagent/agents";
 import { memoryStore, readAgentsMd, writeAgentsMd, appendAgentsMdSection, isMemoryAutonomyEnabled } from "../../../src/memory";
 import { projectStore } from "../../../src/projects";
 import { captureBaseline, compare, renderBaseline, type MetricsBaseline } from "../../../src/metrics";
-import { getDesignSystem, getComponents, auditDesign, renderDesignSystem, renderComponents, renderAudit } from "../../../src/design";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "../../../src/browser";
 
 /** Flatten an AgentMessage's content (string or content-part array) to plain text. */
@@ -442,62 +441,6 @@ export default function (pi: ExtensionAPI) {
         ? `User feedback: ${result.feedback.trim()}`
         : "No reason given (or timed out after 5 min).";
       return { content: [{ type: "text", text: `✕ Plan not approved. Do NOT implement. ${reason} Incorporate this guidance and revise.` }], details: undefined };
-    },
-  });
-
-  // ---- design_system tool: get a design system (tokens, palette, typography, layout) ----
-  pi.registerTool({
-    name: "design_system",
-    label: "Design System",
-    description: [
-      "Get a complete design system (CSS tokens, color palette, typography pairing, layout pattern, platform guidelines) for a frontend task.",
-      "Pass a query describing the product type + intent (e.g. 'fintech dashboard dark', 'landing page hero', 'catppuccin mocha').",
-      "Returns ready-to-paste CSS custom properties + font imports + layout guidance.",
-    ].join(" "),
-    parameters: Type.Object({
-      query: Type.String({ description: "Product type + intent + style (e.g. 'saas analytics dashboard dark')" }),
-    }),
-    async execute(_id, params) {
-      const q = (params as { query: string }).query || "dashboard";
-      const ds = getDesignSystem(q);
-      return { content: [{ type: "text", text: renderDesignSystem(ds) }], details: undefined };
-    },
-  });
-
-  // ---- design_components tool: get icon + chart + framework guidance ----
-  pi.registerTool({
-    name: "design_components",
-    label: "Design Components",
-    description: [
-      "Get component guidance (Lucide icons, chart-type recommendations, framework rules) for a frontend task.",
-      "Pass a query describing what you're building (e.g. 'user profile settings', 'analytics chart').",
-    ].join(" "),
-    parameters: Type.Object({
-      query: Type.String({ description: "What you're building (e.g. 'notification dropdown', 'data table')" }),
-    }),
-    async execute(_id, params) {
-      const q = (params as { query: string }).query || "general";
-      const c = getComponents(q);
-      return { content: [{ type: "text", text: renderComponents(c) }], details: undefined };
-    },
-  });
-
-  // ---- design_audit tool: run a UX/accessibility audit against a target ----
-  pi.registerTool({
-    name: "design_audit",
-    label: "Design Audit",
-    description: [
-      "Run a UX + accessibility audit against a target description.",
-      "Returns findings (critical/warning/suggestion) with specific fixes + passed checks.",
-      "Use this as a verification gate before claiming a frontend task is complete.",
-    ].join(" "),
-    parameters: Type.Object({
-      target: Type.String({ description: "What to audit (e.g. 'dark theme login form', 'mobile dashboard layout')" }),
-    }),
-    async execute(_id, params) {
-      const t = (params as { target: string }).target || "general UI";
-      const a = auditDesign(t);
-      return { content: [{ type: "text", text: renderAudit(a) }], details: undefined };
     },
   });
 

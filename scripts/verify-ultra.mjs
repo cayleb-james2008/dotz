@@ -102,13 +102,10 @@ const memSearch = await (await fetch(base + "/api/memory/search", {
 })).json();
 ok(memSearch.results.some((r) => /4317/.test(r.memory)), `semantic recall surfaces the sentinel memory`);
 
-// [10] Phase 2 tools — rsi_baseline, rsi_compare, human_gate, design_system, design_components, design_audit
+// [10] Phase 2 tools — rsi_baseline, rsi_compare, human_gate
 ok(tools.all.includes("rsi_baseline"), `rsi_baseline tool registered`);
 ok(tools.all.includes("rsi_compare"), `rsi_compare tool registered`);
 ok(tools.all.includes("human_gate"), `human_gate tool registered`);
-ok(tools.all.includes("design_system"), `design_system tool registered`);
-ok(tools.all.includes("design_components"), `design_components tool registered`);
-ok(tools.all.includes("design_audit"), `design_audit tool registered`);
 
 // [11] commands — new workflow presets (ultra-code-review, e2e-test, self-improve)
 const cmds = await (await fetch(base + `/api/sessions/${sess.sessionId}/commands`)).json();

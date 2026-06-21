@@ -42,8 +42,8 @@ exists: drive the live app with **`browser_start`** (one isolated session per re
 the skill's contention rule, solved natively: regions run in parallel, each on its own session),
 **`browser_act`** (navigate/click/type/observe — force each empty/error/loading condition), and
 **`browser_stop`**. Capture a concrete repro + observation for every finding; never report a bug
-you did not trigger. Optionally run **`design_audit`** on each surface for the UX/accessibility
-half.
+you did not trigger. Cover the UX/accessibility half too (WCAG contrast, focus states, 44px touch
+targets, keyboard nav).
 
 ## Phase 3 — Verify (refute + dedup + confidence gate)
 Dedup findings across the whole matrix (merge same file/symbol/route + symptom). Then use the

@@ -6,10 +6,11 @@
  * the streamed output is the CLI's own device-code / URL prompt, which the user completes in a
  * normal browser tab.
  */
-import { spawn, execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { killTree } from "./kill-tree";
 
 export type ConnectionProviderId = "github" | "vercel" | "neon";
 
@@ -40,19 +41,6 @@ const LOGOUT_TIMEOUT_MS = 30_000;
 // neonctl has NO `logout` command and its `me`/`auth` aren't on PATH here, so Neon keys status + logout
 // off this file: present ⇒ connected; logout ⇒ delete it. `npx neonctl auth` writes this file on login.
 const NEON_CREDENTIALS = path.join(os.homedir(), ".config", "neonctl", "credentials.json");
-
-/** Kill a shell-spawned child AND its descendants. On Windows `{shell:true}` wraps the command in
- *  cmd.exe, so child.kill() only terminates that wrapper and leaks the real CLI tree (gh / vercel /
- *  npx→node→neonctl); taskkill /T /F kills the whole tree. */
-function killTree(child: ReturnType<typeof spawn> | undefined): void {
-  const pid = child?.pid;
-  if (!pid || child?.killed) return;
-  if (process.platform === "win32") {
-    try { execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () => { /* best-effort */ }); } catch { /* ignore */ }
-  } else {
-    try { child!.kill(); } catch { /* already gone */ }
-  }
-}
 
 /** Run a fixed first-party command (no user input) through the shell, capturing combined output. */
 function runCommand(command: string, timeoutMs = STATUS_TIMEOUT_MS): Promise<CmdResult> {
