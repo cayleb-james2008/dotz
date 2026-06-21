@@ -2172,8 +2172,14 @@ async function startConnectionLogin(provider) {
 }
 
 async function connectionLogout(provider) {
-  try { await post(`/api/connections/${provider}/logout`); refreshConnections(); }
-  catch (e) { pushError("connection logout: " + e.message); }
+  // The server replies HTTP 200 with {ok:false, output} when the CLI logout fails (e.g. gh errors,
+  // or neon's credentials file can't be removed), so post() won't throw — surface ok:false ourselves
+  // instead of silently leaving the row "connected" with no feedback.
+  try {
+    const r = await post(`/api/connections/${provider}/logout`);
+    if (r && r.ok === false) pushError("logout failed: " + (r.output || provider));
+    refreshConnections();
+  } catch (e) { pushError("connection logout: " + e.message); }
 }
 
 /* ---------- sandbox ---------- */

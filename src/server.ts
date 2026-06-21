@@ -284,6 +284,19 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       reply.code(400).send({ error: "steps (non-empty array) is required" });
       return;
     }
+    // Validate each step's SHAPE — the store later reads s.agent/s.task and iterates s.parents, so a
+    // null/number/string element or a non-array `parents` would throw an uncaught 500 (or persist a
+    // corrupt agent-less step) instead of a clean 400.
+    for (const s of body.steps) {
+      if (!s || typeof s !== "object" || typeof s.agent !== "string" || typeof s.task !== "string") {
+        reply.code(400).send({ error: "each step needs a string agent and task" });
+        return;
+      }
+      if (s.parents !== undefined && !Array.isArray(s.parents)) {
+        reply.code(400).send({ error: "step parents must be an array" });
+        return;
+      }
+    }
     let run;
     try {
       run = await workflowStore.create({

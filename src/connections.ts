@@ -152,13 +152,19 @@ export class ConnectionsController {
   /** All three providers' live auth status, checked in parallel. */
   async status(): Promise<ConnectionStatus[]> {
     return Promise.all(PROVIDERS.map(async (p) => {
-      const parsed = p.statusOverride ? p.statusOverride() : p.parse!(await runCommand(p.statusCommand!));
-      const login = this.logins.get(p.id);
-      return {
-        id: p.id, label: p.label, cli: p.cli,
-        installed: parsed.installed, loggedIn: parsed.loggedIn, account: parsed.account,
-        hint: login?.running ? "browser login in progress…" : parsed.hint,
-      };
+      try {
+        const parsed = p.statusOverride ? p.statusOverride() : p.parse!(await runCommand(p.statusCommand!));
+        const login = this.logins.get(p.id);
+        return {
+          id: p.id, label: p.label, cli: p.cli,
+          installed: parsed.installed, loggedIn: parsed.loggedIn, account: parsed.account,
+          hint: login?.running ? "browser login in progress…" : parsed.hint,
+        };
+      } catch {
+        // One provider's status check throwing must not reject the whole endpoint and blank ALL
+        // three providers in the panel — degrade just the failing one.
+        return { id: p.id, label: p.label, cli: p.cli, installed: false, loggedIn: false, hint: "status check failed" };
+      }
     }));
   }
 
@@ -175,7 +181,7 @@ export class ConnectionsController {
     const append = (chunk: Buffer) => { session.output = (session.output + chunk.toString()).slice(-OUTPUT_CAP); };
     child.stdout?.on("data", append);
     child.stderr?.on("data", append);
-    child.on("error", (err) => { session.output += `\n[error] ${err.message}`; session.running = false; });
+    child.on("error", (err) => { session.output += `\n[error] ${err.message}`; session.running = false; session.exitCode = session.exitCode ?? -1; clearTimeout(session.killTimer); });
     child.on("close", (code) => { session.running = false; session.exitCode = code; clearTimeout(session.killTimer); });
     // Advance the CLI's initial "press Enter to open the browser" prompt so the system browser opens.
     setTimeout(() => { try { child.stdin?.write("\n"); } catch { /* stdin may already be closed */ } }, 600);
