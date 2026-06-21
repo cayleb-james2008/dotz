@@ -588,7 +588,16 @@ function connectWS() {
     else if (m.kind === "browser") renderBrowserObservation(m.event);
     else if (m.kind === "gate") showGateCard(m.gateId, m.plan);
     else if (m.kind === "memory_recall") handleMemoryRecall(m);
-    else if (m.kind === "error") pushError(m.error);
+    else if (m.kind === "error") {
+      // A dead session (the server/exe restarted, so this sessionId no longer exists) will never
+      // come back by reconnecting — stop the exponential-reconnect loop and tell the user once,
+      // instead of spamming the transcript with "no such session" on every retry forever.
+      if (/no such session/i.test(m.error || "")) {
+        _wsIntentional = true;   // onclose checks this and skips the reconnect
+        state.sessionId = null;  // also fails onclose's state.sessionId guard
+        pushError("session ended (server restarted) — reopen the project to continue");
+      } else pushError(m.error);
+    }
   };
 }
 
@@ -1268,15 +1277,16 @@ async function refreshMemory() {
   try {
     const { entries } = await api("/api/memory" + (state.activeProjectId ? "?projectId=" + encodeURIComponent(state.activeProjectId) : ""));
     state.memory = entries || [];
+    state.memoryError = false;
     renderMemory();
-  } catch {}
+  } catch { state.memoryError = true; renderMemory(); }
 }
 
 function renderMemory() {
   const box = document.querySelector('.panel[data-panel="memory"] #memory-list') || $("memory-list");
   if (!box) return;
   box.innerHTML = "";
-  if (!state.memory.length) { box.appendChild(el("span", "dim mono", "no memories yet — they're captured automatically")); return; }
+  if (!state.memory.length) { box.appendChild(el("span", "dim mono", state.memoryError ? "⚠ couldn't load memory — check the server" : "no memories yet — they're captured automatically")); return; }
   state.memory.forEach((m) => {
     const entry = el("div", "mem-entry");
     const head = el("div", "mem-entry-head");

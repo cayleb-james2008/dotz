@@ -144,6 +144,22 @@ function snapshotElements(snapshot: string, observationSeq: number): BrowserObse
   return elements;
 }
 
+/** Extract console/error entries from an agent-browser command result. The `console`/`errors`
+ *  commands return STRUCTURED data — a wrapper object with an array field, a bare array, or
+ *  newline text. The old code JSON.stringify'd the wrapper, so an EMPTY result ("{\"errors\":[]}")
+ *  became one phantom non-empty line counted as a network error on every observation. */
+function resultLines(result: unknown): string[] {
+  const data = dataValue(result);
+  let arr: unknown[] | null = null;
+  if (Array.isArray(data)) arr = data;
+  else if (data && typeof data === "object") {
+    for (const v of Object.values(data as Record<string, unknown>)) { if (Array.isArray(v)) { arr = v; break; } }
+  }
+  if (arr) return arr.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).filter(Boolean);
+  if (typeof data === "string") return data.split(/\r?\n/).filter(Boolean);
+  return [];
+}
+
 export class BrowserController {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly events = new EventEmitter();
@@ -371,8 +387,8 @@ export class BrowserController {
     ]);
     const snapshot = stringValue(snapshotResult, "snapshot") ||
       (typeof dataValue(snapshotResult) === "string" ? String(dataValue(snapshotResult)) : JSON.stringify(dataValue(snapshotResult) ?? ""));
-    const consoleText = typeof dataValue(consoleResult) === "string" ? String(dataValue(consoleResult)) : JSON.stringify(dataValue(consoleResult) ?? "");
-    const errorText = typeof dataValue(errorResult) === "string" ? String(dataValue(errorResult)) : JSON.stringify(dataValue(errorResult) ?? "");
+    const consoleLines = resultLines(consoleResult);
+    const networkLines = resultLines(errorResult);
     const framePath = path.join(record.profileDir, "frame.jpg");
     await this.run(record, ["screenshot", framePath, "--screenshot-format", "jpeg", "--screenshot-quality", "72"]);
     const frame = await fs.readFile(framePath).catch(() => null);
@@ -385,8 +401,8 @@ export class BrowserController {
     record.observation.refs = [...new Set([...snapshot.matchAll(REF_PATTERN)].map((match) => match[1]))];
     record.observation.elements = snapshotElements(snapshot, record.observation.seq);
     record.observation.currentAction = action;
-    record.observation.consoleErrors = consoleText ? consoleText.split(/\r?\n/).filter((line) => /error|exception|failed/i.test(line)).slice(-50) : [];
-    record.observation.networkErrors = errorText ? errorText.split(/\r?\n/).filter(Boolean).slice(-50) : [];
+    record.observation.consoleErrors = consoleLines.filter((line) => /error|exception|failed/i.test(line)).slice(-50);
+    record.observation.networkErrors = networkLines.slice(-50);
     record.observation.counters.consoleErrors = record.observation.consoleErrors.length;
     record.observation.counters.networkErrors = record.observation.networkErrors.length;
     delete record.observation.error;
