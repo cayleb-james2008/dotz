@@ -338,7 +338,10 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     try { return await browserController.act((req.body ?? {}) as BrowserActInput); }
     catch (error) {
       const message = (error as Error).message;
-      reply.code(/stale browser (?:ref|action)/i.test(message) ? 409 : 400).send({ error: message });
+      // 409 (retryable conflict) for the staleness cases — a stale expectedSeq OR a ref from an
+      // older observation; the client refetches state and retries. Other errors (unknown action,
+      // bad coords, no session) are 400. The actual thrown text is "unknown browser ref:…".
+      reply.code(/stale browser action|unknown browser ref/i.test(message) ? 409 : 400).send({ error: message });
     }
   });
   app.post("/api/browser/stop", async (req, reply) => {

@@ -20,6 +20,14 @@ export type BrowserActionName =
   | "navigate" | "observe" | "back" | "forward" | "reload"
   | "click" | "clickAt" | "type" | "key" | "select" | "scroll" | "wait";
 
+// The closed set of valid actions. An unknown action string from an untrusted body would otherwise
+// fall through actionArgs() to undefined and be silently no-op'd while returning a 200 "ready"
+// observation (a typo'd action looking like success) — act() rejects it up front instead.
+const ACTION_NAMES = new Set<BrowserActionName>([
+  "navigate", "observe", "back", "forward", "reload",
+  "click", "clickAt", "type", "key", "select", "scroll", "wait",
+]);
+
 export interface BrowserOwner {
   app: "dotz";
   projectId: string;
@@ -217,6 +225,7 @@ export class BrowserController {
     const record = this.sessions.get(input.sessionId);
     if (!record) throw new Error("no such browser session");
     if (record.observation.status === "stopped") throw new Error("browser session is stopped");
+    if (!ACTION_NAMES.has(input.action)) throw new Error(`unknown browser action: ${input.action}`);
     const sequenceBound = Boolean(input.targetRef) || input.action === "clickAt" || (input.action === "type" && !input.targetRef);
     if (sequenceBound && input.expectedSeq !== record.observation.seq) {
       throw new Error(`stale browser action: expected observation seq ${record.observation.seq}`);

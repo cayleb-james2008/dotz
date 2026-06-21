@@ -243,10 +243,13 @@ function renderProjectDropdown() {
   const list = $("project-list");
   list.innerHTML = "";
   if (!state.projects.length) {
+    // Distinguish a FAILED load from a genuinely empty list — otherwise a server/fetch error reads
+    // as "you have no projects" and the user can't tell the difference.
+    const failed = state.projectsError;
     const empty = el("div", "dropdown-empty");
-    empty.appendChild(el("div", "de-glyph", "◆"));
-    empty.appendChild(el("div", "de-title", "No projects yet"));
-    empty.appendChild(el("div", "de-sub dim", "Create one below ↓"));
+    empty.appendChild(el("div", "de-glyph", failed ? "⚠" : "◆"));
+    empty.appendChild(el("div", "de-title", failed ? "Couldn't load projects" : "No projects yet"));
+    empty.appendChild(el("div", "de-sub dim", failed ? "Check the server, then reopen" : "Create one below ↓"));
     list.appendChild(empty);
   } else {
     state.projects.forEach((p) => {
@@ -505,8 +508,8 @@ async function persistConfig(patch) {
 }
 
 async function loadProjects() {
-  try { const { projects } = await api("/api/projects"); state.projects = projects || []; }
-  catch (e) { pushError("projects: " + e.message); }
+  try { const { projects } = await api("/api/projects"); state.projects = projects || []; state.projectsError = false; }
+  catch (e) { state.projectsError = true; pushError("projects: " + e.message); }
 }
 
 /* ---------- session lifecycle ---------- */
@@ -522,7 +525,9 @@ async function newSession() {
   setSession(s);
   clearTranscript();
   connectWS();
-  await Promise.all([loadModels(), loadCommands(), refreshMemory(), refreshSkills(), refreshWorkflows(), loadProjectFiles()]);
+  // allSettled, not all: a single loader failing (e.g. /models) must NOT reject the whole session
+  // bootstrap and strand the user in a half-open bento. Each loader surfaces its own error.
+  await Promise.allSettled([loadModels(), loadCommands(), refreshMemory(), refreshSkills(), refreshWorkflows(), loadProjectFiles()]);
   await refreshStats();
   refreshSandboxCount();
   refreshWfCount();
@@ -1088,17 +1093,19 @@ function primeTopbarFromConfig() {
 }
 
 async function loadModels() {
-  const m = await api(`/api/sessions/${state.sessionId}/models`);
-  state.modelCatalog = m.available || [];
-  populateProviderSelect(m.providerMeta);
-  const provSel = $("provider-select");
-  updateModelUI(m.current || state.summary.model);
-  state.activeProvider = (m.current && m.current.provider) || (state.config && state.config.provider) || "ollama";
-  provSel.value = state.activeProvider;
-  provSel.onchange = () => onProviderChange(provSel.value);
-  renderModelInput();
-  populateModelSuggestions();
-  syncSubagentInput();
+  try {
+    const m = await api(`/api/sessions/${state.sessionId}/models`);
+    state.modelCatalog = m.available || [];
+    populateProviderSelect(m.providerMeta);
+    const provSel = $("provider-select");
+    updateModelUI(m.current || state.summary.model);
+    state.activeProvider = (m.current && m.current.provider) || (state.config && state.config.provider) || "ollama";
+    provSel.value = state.activeProvider;
+    provSel.onchange = () => onProviderChange(provSel.value);
+    renderModelInput();
+    populateModelSuggestions();
+    syncSubagentInput();
+  } catch (e) { pushError("models: " + e.message); }
 }
 
 // Switching provider prefills both the executive + subagent model ids with that provider's
@@ -1249,7 +1256,7 @@ function wireMemoryPanel(node) {
   node.querySelector("#mem-consolidate").onclick = async () => {
     try {
       const r = await post("/api/memory/consolidate", { projectId: state.activeProjectId || "" });
-      pushError(`memory consolidated — removed ${r.removed}, kept ${r.kept}`);
+      showToast(`memory consolidated — removed ${r.removed}, kept ${r.kept}`);
       await refreshMemory();
     } catch (e) { pushError("consolidate: " + e.message); }
   };
