@@ -222,6 +222,10 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const rawText = body.text ?? body.value;
     if (typeof rawText !== "string" || !rawText.trim()) { reply.code(400).send({ error: "text (or value) is required" }); return; }
     const text = rawText.trim();
+    for (const k of ["category", "folder"]) {
+      const v = (body as Record<string, unknown>)[k];
+      if (v !== undefined && typeof v !== "string") { reply.code(400).send({ error: `${k} must be a string` }); return; }
+    }
     const cwd = await cwdForProject(body.projectId);
     const scope = body.scope ?? (body.projectId ? "project" : "global");
     return memoryStore.create({ text, category: body.category, folder: body.folder, scope, projectCwd: cwd });
@@ -513,7 +517,14 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const e = need((req.params as { id: string }).id, reply);
     if (!e) return;
     const s = e.session;
-    s.setActiveToolsByName(((req.body ?? {}) as { tools?: string[] }).tools ?? []);
+    // tools is fed to setActiveToolsByName which iterates it — a non-array (e.g. a number) would throw
+    // an uncaught 500; require an array of strings -> clean 400.
+    const tools = ((req.body ?? {}) as { tools?: unknown }).tools ?? [];
+    if (!Array.isArray(tools) || !tools.every((t) => typeof t === "string")) {
+      reply.code(400).send({ error: "tools must be an array of strings" });
+      return;
+    }
+    s.setActiveToolsByName(tools);
     return { active: s.getActiveToolNames(), all: s.getAllTools().map((t) => t.name) };
   });
 
