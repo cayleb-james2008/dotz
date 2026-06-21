@@ -168,9 +168,14 @@ export function resolveModel(session: AgentSession, ref: ModelRef): PiModel | un
   if (freeForm) {
     const tmpl = (reg.getAll() as Array<{ provider: string }>).find((m) => m.provider === ref.provider);
     if (tmpl) return { ...(tmpl as object), id: ref.modelId, name: ref.modelId } as PiModel;
-    // if no template from that provider, clone any free-form template (OpenRouter) and swap provider/id
-    const anyTmpl = (reg.getAll() as Array<{ provider: string }>).find((m) => m.provider === "openrouter");
-    if (anyTmpl) return { ...(anyTmpl as object), provider: ref.provider, id: ref.modelId, name: ref.modelId } as PiModel;
+    // Documented degraded fallback: OLLAMA (only) clones an OpenRouter template when no Ollama model
+    // is registered. Do NOT do this for "local" — it is not backed by any registered provider, so
+    // cloning an OpenRouter template would keep OpenRouter's baseUrl and silently route a "local"
+    // model to openrouter.ai. Return undefined → a clean "model not found" instead of a wrong endpoint.
+    if (ref.provider === "ollama") {
+      const orTmpl = (reg.getAll() as Array<{ provider: string }>).find((m) => m.provider === "openrouter");
+      if (orTmpl) return { ...(orTmpl as object), provider: ref.provider, id: ref.modelId, name: ref.modelId } as PiModel;
+    }
   }
   return undefined;
 }
