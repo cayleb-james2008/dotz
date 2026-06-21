@@ -46,6 +46,17 @@ export interface CreateProjectInput {
 }
 
 export class ProjectStore {
+  // Serialize read-modify-write ops: the store is ONE JSON file, so two concurrent create/update/
+  // remove requests can each readAll the same state and writeAll over each other, losing one update.
+  // ponytail: a single in-process chain (this store is per-process); a cross-process lock if dotz
+  // ever runs multiple server processes against the same file.
+  private writeChain: Promise<unknown> = Promise.resolve();
+  private serialize<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.writeChain.then(fn, fn);
+    this.writeChain = run.then(() => {}, () => {});
+    return run;
+  }
+
   async list(): Promise<Project[]> {
     return readAll();
   }
@@ -55,6 +66,7 @@ export class ProjectStore {
   }
 
   async create(input: CreateProjectInput): Promise<Project> {
+    return this.serialize(async () => {
     const now = Date.now();
     const project: Project = {
       id: randomUUID(),
@@ -72,23 +84,28 @@ export class ProjectStore {
     all.push(project);
     await writeAll(all);
     return project;
+    });
   }
 
   async update(id: string, patch: Partial<Omit<Project, "id" | "createdAt">>): Promise<Project | undefined> {
+    return this.serialize(async () => {
     const all = await readAll();
     const idx = all.findIndex((p) => p.id === id);
     if (idx === -1) return undefined;
     all[idx] = { ...all[idx], ...patch, id: all[idx].id, createdAt: all[idx].createdAt, updatedAt: Date.now() };
     await writeAll(all);
     return all[idx];
+    });
   }
 
   async remove(id: string): Promise<boolean> {
+    return this.serialize(async () => {
     const all = await readAll();
     const next = all.filter((p) => p.id !== id);
     if (next.length === all.length) return false;
     await writeAll(next);
     return true;
+    });
   }
 }
 
