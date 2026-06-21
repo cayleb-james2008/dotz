@@ -316,15 +316,27 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   app.post("/api/workflows/:id/step", async (req, reply) => {
     const run = workflowStore.get((req.params as { id: string }).id);
     if (!run) { reply.code(404).send({ error: "no such workflow run" }); return; }
+    // A finished run is immutable: a late step update would leave the run done/error/aborted while a
+    // step flips to running/error (a contradictory graph). Reject with 409 (the in-process workflow
+    // bridge calls stepState directly and is unaffected).
+    if (run.status === "done" || run.status === "error" || run.status === "aborted") {
+      reply.code(409).send({ error: `run is ${run.status} — its steps can no longer be updated` });
+      return;
+    }
     const body = (req.body ?? {}) as { stepId: string; status: WorkflowRun["steps"][number]["status"]; output?: string; error?: string; usage?: WorkflowRun["steps"][number]["usage"] };
+    if (typeof body.stepId !== "string" || !body.stepId) { reply.code(400).send({ error: "stepId is required" }); return; }
     if (!run.steps.some((s) => s.id === body.stepId)) { reply.code(404).send({ error: "no such step" }); return; }
     const ALLOWED = ["pending", "ready", "running", "done", "error", "skipped"];
     if (body.status !== undefined && !ALLOWED.includes(body.status)) { reply.code(400).send({ error: "invalid status" }); return; }
     await workflowStore.stepState(run.id, body.stepId, { status: body.status, output: body.output, error: body.error, usage: body.usage });
     return workflowStore.get(run.id);
   });
-  app.post("/api/workflows/:id/abort", async (req) => {
-    await workflowStore.abort((req.params as { id: string }).id);
+  app.post("/api/workflows/:id/abort", async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    // 404 for an unknown run, matching the GET/:id and /step routes — abort() is a silent no-op on a
+    // missing run, so without this the client gets a misleading {ok:true} for a run that never existed.
+    if (!workflowStore.get(id)) { reply.code(404).send({ error: "no such workflow run" }); return; }
+    await workflowStore.abort(id);
     return { ok: true };
   });
 
