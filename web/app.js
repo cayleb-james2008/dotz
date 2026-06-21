@@ -1530,11 +1530,6 @@ function handleWorkflowEvent(runId, event) {
       }
       break;
     }
-    case "step_added": {
-      const run = state.workflows.get(runId);
-      if (run) { run.steps.push(event.step); refreshWorkflowGraph(); }
-      break;
-    }
   }
 }
 

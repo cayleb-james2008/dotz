@@ -25,8 +25,7 @@ type WorkflowListener = (runId: string, event: WorkflowEvent) => void;
 export type WorkflowEvent =
   | { type: "workflow_start"; run: WorkflowRun }
   | { type: "workflow_end"; run: WorkflowRun }
-  | { type: "step_state"; stepId: string; status: WorkflowStep["status"]; output?: string; error?: string; usage?: WorkflowStep["usage"]; sandboxRunId?: string | null; browserSessionId?: string | null; toolCallIds?: string[]; thinking?: string }
-  | { type: "step_added"; step: WorkflowStep };
+  | { type: "step_state"; stepId: string; status: WorkflowStep["status"]; output?: string; error?: string; usage?: WorkflowStep["usage"]; sandboxRunId?: string | null; browserSessionId?: string | null; toolCallIds?: string[]; thinking?: string };
 
 async function ensureDir() {
   await fs.mkdir(DOTZ_DIR, { recursive: true });
@@ -62,6 +61,11 @@ export class WorkflowCycleError extends Error {}
 export class WorkflowStore {
   private active = new Map<string, WorkflowRun>();
   private listeners = new Set<WorkflowListener>();
+  // ponytail: bound the in-memory active map so /api/workflows/active + the live graph can't grow
+  // without limit over a long-lived server. Terminal runs persist to workflows.json (history) and the
+  // /:id route falls back to history, so evicting the oldest FINISHED runs only caps memory; in-flight
+  // runs are never evicted. Raise if a session legitimately tracks >100 concurrent workflows.
+  private static readonly ACTIVE_CAP = 100;
 
   onEvent(listener: WorkflowListener): () => void {
     this.listeners.add(listener);
@@ -159,8 +163,22 @@ export class WorkflowStore {
       updatedAt: now,
     };
     this.active.set(run.id, run);
+    this.pruneActive();
     await this.persist(run);
     return run;
+  }
+
+  /** Evict the oldest TERMINAL runs once the active map exceeds ACTIVE_CAP. They remain on disk
+   *  (history) + reachable via the /:id route's history fallback; in-flight runs are never evicted. */
+  private pruneActive(): void {
+    if (this.active.size <= WorkflowStore.ACTIVE_CAP) return;
+    const finished = [...this.active.values()]
+      .filter((r) => r.status === "done" || r.status === "error" || r.status === "aborted")
+      .sort((a, b) => a.updatedAt - b.updatedAt);
+    for (const r of finished) {
+      if (this.active.size <= WorkflowStore.ACTIVE_CAP) break;
+      this.active.delete(r.id);
+    }
   }
 
   get(id: string): WorkflowRun | undefined {
