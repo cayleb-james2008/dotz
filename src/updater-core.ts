@@ -72,10 +72,23 @@ export interface HelperOpts {
  */
 export function buildHelperScript(opts: HelperOpts): string {
   const { repo, pid, exePath, rebuildScript, isPackaged } = opts;
-  const relaunch = isPackaged ? `start "" "${exePath}"` : `start "" cmd /c "npm run electron"`;
+  // Packaged: relaunch the FRESHLY-REBUILT portable exe — the newest release\dotz*.exe — NOT
+  // process.execPath. A portable exe runs from a temp dir electron-builder RMDir's on exit (so
+  // process.execPath is already gone by relaunch time), and a version bump renames the artifact, so
+  // a hard-coded launched path also goes stale. Glob the newest build; fall back to the on-disk
+  // launched path (exePath) only if release\ has no exe (e.g. the repo dir vanished). Dev: npm run electron.
+  const relaunch = isPackaged
+    ? [
+        `set "DOTZ_EXE="`,
+        `for /f "delims=" %%F in ('dir /b /o-d "release\\dotz*.exe" 2^>nul') do if not defined DOTZ_EXE set "DOTZ_EXE=%CD%\\release\\%%F"`,
+        `if defined DOTZ_EXE ( start "" "%DOTZ_EXE%" ) else ( start "" "${exePath}" )`,
+      ]
+    : [`start "" cmd /c "npm run electron"`];
   return [
     `@echo off`,
-    `cd /d "${repo}"`,
+    // Guard the cd: a missing/unmounted repo dir must abort to :fail (relaunch current build), not
+    // run git pull + the rebuild in whatever directory the detached console happened to inherit.
+    `cd /d "${repo}" || goto fail`,
     `echo [dotz-update] waiting for dotz (pid ${pid}) to exit...`,
     `:waitloop`,
     `tasklist /FI "PID eq ${pid}" 2>nul | find "${pid}" >nul`,
@@ -85,11 +98,11 @@ export function buildHelperScript(opts: HelperOpts): string {
     `echo [dotz-update] rebuilding portable exe...`,
     `call npm run ${rebuildScript} || goto fail`,
     `echo [dotz-update] relaunching...`,
-    relaunch,
+    ...relaunch,
     `goto done`,
     `:fail`,
     `echo [dotz-update] update FAILED -- see above. Relaunching current build.`,
-    relaunch,
+    ...relaunch,
     `:done`,
   ].join("\r\n");
 }

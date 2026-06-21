@@ -80,7 +80,9 @@ async function buildFileTree(cwd: string, depth = 0): Promise<Array<{ path: stri
  *  value (number/array/object) reaches a string op and throws an uncaught 500 instead of a 400. */
 const isNonEmptyStr = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
 const isValidModel = (m: unknown): m is ModelRef =>
-  !!m && typeof m === "object" && typeof (m as ModelRef).provider === "string" && typeof (m as ModelRef).modelId === "string";
+  !!m && typeof m === "object" &&
+  typeof (m as ModelRef).provider === "string" && (m as ModelRef).provider.trim().length > 0 &&
+  typeof (m as ModelRef).modelId === "string" && (m as ModelRef).modelId.trim().length > 0;
 
 /** Public-facing snapshot of a session's control state. */
 function sessionSummary(id: string, s: AgentSession, profileId?: string | null, projectId?: string | null) {
@@ -424,8 +426,12 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   });
 
   // ---- sessions ----
-  app.post("/api/sessions", async (req) => {
+  app.post("/api/sessions", async (req, reply) => {
     const body = (req.body ?? {}) as CreateOpts;
+    // Validate the model shape like the project routes do — otherwise { provider } with no modelId
+    // flows into resolveModel and pins the session to a structurally broken provider/undefined model
+    // that setModel silently accepts (every later prompt then sends model=undefined upstream).
+    if (body.model !== undefined && !isValidModel(body.model)) { reply.code(400).send({ error: "model must be { provider, modelId }" }); return; }
     const entry = await pi.create(body);
     return sessionSummary(entry.id, entry.session, entry.profile.id, entry.projectId);
   });
@@ -476,7 +482,9 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     if (!e) return;
     const s = e.session;
     const ref = (req.body ?? {}) as Partial<ModelRef>;
-    if (!ref.provider || !ref.modelId) {
+    // trim-check: a whitespace-only modelId would pass a bare truthiness guard, then resolveModel
+    // clones a template with that garbage id and setModel accepts it (provider-only auth check).
+    if (!ref.provider?.trim() || !ref.modelId?.trim()) {
       reply.code(400).send({ error: "provider and modelId are required" });
       return;
     }

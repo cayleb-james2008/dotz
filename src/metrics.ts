@@ -75,9 +75,11 @@ async function countFiles(cwd: string): Promise<{ fileCount: number; testFiles: 
 
 /** Parse pass/fail counts from a test runner's output (vitest / jest / mocha / node:test TAP). */
 function parseTestCounts(output: string): { passed: number; failed: number } {
-  const num = (re: RegExp): number => { const m = output.match(re); return m ? Number(m[1]) : 0; };
-  const passed = num(/(\d+)\s+pass(?:ed|ing)\b/i) || num(/#\s*pass\s+(\d+)/i);
-  const failed = num(/(\d+)\s+fail(?:ed|ing)\b/i) || num(/#\s*fail\s+(\d+)/i);
+  // Use the LAST "(N) passed/failed" match, not the first: vitest prints "Test Files X passed"
+  // BEFORE the real "Tests Y passed", so the first match is the file count, not the test count.
+  const last = (re: RegExp): number => { const ms = [...output.matchAll(re)]; return ms.length ? Number(ms[ms.length - 1][1]) : 0; };
+  const passed = last(/(\d+)\s+pass(?:ed|ing)\b/gi) || last(/#\s*pass\s+(\d+)/gi);
+  const failed = last(/(\d+)\s+fail(?:ed|ing)\b/gi) || last(/#\s*fail\s+(\d+)/gi);
   return { passed, failed };
 }
 
@@ -118,11 +120,19 @@ export async function compare(baseline: MetricsBaseline, afterCwd?: string, gate
   // Require a real prior failure so a null/absent baseline can't be reported as RED → GREEN.
   const testsImproved = !!after.tests && !!baseline.tests && !baseline.tests.ok && after.tests.ok;
   const fileCountDelta = after.fileCount - baseline.fileCount;
-  // anti-gaming: flag if the test-file count dropped >20%, or the passing-test count dropped >20%
-  // from a previously-green suite (deleting/disabling tests to flip the suite GREEN must not slip).
+  // anti-gaming: detect tests deleted/gutted to flip the suite GREEN.
+  const baseParsed = (baseline.tests?.passed ?? 0) + (baseline.tests?.failed ?? 0) > 0;
+  const afterParsed = (after.tests?.passed ?? 0) + (after.tests?.failed ?? 0) > 0;
   const testsDeleted =
+    // (a) test FILES dropped >20% — the reliable signal that test files were removed.
     (baseline.testFiles > 0 && after.testFiles < baseline.testFiles * 0.8) ||
-    (!!baseline.tests?.ok && (after.tests?.passed ?? 0) < (baseline.tests.passed ?? 0) * 0.8);
+    // (b) passing count dropped >20% — applied whenever BOTH runs parsed a real count (so an
+    //     UNPARSEABLE after-run, passed=0, isn't mis-flagged as a deletion), regardless of whether
+    //     the baseline was green or red. Catches gutting most of a suite's passing assertions.
+    (baseParsed && afterParsed && (after.tests!.passed) < (baseline.tests!.passed) * 0.8) ||
+    // (c) the suite was gamed RED → GREEN while now reporting ZERO passing tests though the baseline
+    //     had test files — i.e. emptied to pass via --passWithNoTests.
+    (testsImproved && (after.tests?.passed ?? 0) === 0 && baseline.testFiles > 0);
   const parts: string[] = [];
   if (typecheckFixed) parts.push("typecheck: RED → GREEN");
   if (buildFixed) parts.push("build: RED → GREEN");

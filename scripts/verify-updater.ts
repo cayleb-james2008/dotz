@@ -109,7 +109,9 @@ test("buildHelperScript (packaged): waits for pid, ff-pulls, rebuilds, relaunche
   assert.match(bat, /PID eq 4242/, "waits on the parent pid");
   assert.match(bat, /git pull --ff-only/, "ff-only pull");
   assert.match(bat, /npm run dist:portable/, "uses the portable rebuild script");
-  assert.match(bat, /start "" "C:\\repo\\dotz\\release\\dotz 0\.2\.0\.exe"/, "relaunches the rebuilt exe");
+  assert.match(bat, /cd \/d "C:\\repo\\dotz" \|\| goto fail/, "cd is guarded so a missing repo aborts to :fail");
+  assert.match(bat, /dir \/b \/o-d "release\\dotz\*\.exe"/, "relaunches the NEWEST freshly-built release exe, not process.execPath");
+  assert.match(bat, /else \( start "" "C:\\repo\\dotz\\release\\dotz 0\.2\.0\.exe" \)/, "falls back to the on-disk launched exe");
   assert.ok(bat.includes("\r\n"), "CRLF line endings for a .bat");
 });
 
