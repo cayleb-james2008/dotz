@@ -28,7 +28,15 @@ process.on("unhandledRejection", (reason) => {
 async function startServer() {
   // In the packaged app, run agent sessions against the user's real cwd; default to home.
   runtime = await buildServer();
-  await runtime.app.listen({ host: HOST, port: PORT });
+  try {
+    await runtime.app.listen({ host: HOST, port: PORT });
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === "EADDRINUSE") {
+      console.error(`dotz: port ${PORT} is already in use — another dotz instance may be running. Set DOTZ_PORT to use a different port.`);
+    }
+    throw err;
+  }
 }
 
 function createWindow() {
@@ -99,19 +107,24 @@ if (gotTheLock) app.whenReady().then(async () => {
   });
   // Start the server before opening the window so the renderer has a live backend.
   let serverOk = true;
+  let serverErr: unknown = null;
   try {
     await startServer();
   } catch (e) {
     serverOk = false;
+    serverErr = e;
     console.error("dotz: server failed to start", e);
   }
   const win = createWindow();
   if (!serverOk) {
+    const isPortInUse = serverErr && (serverErr as { code?: string }).code === "EADDRINUSE";
+    const portMsg = isPortInUse
+      ? `Port ${PORT} is already in use by another process (likely another dotz instance). Close it, or set DOTZ_PORT to use a different port.`
+      : `The local agent server could not start (port ${PORT} may be in use by another process).`;
     win.loadURL("data:text/html," + encodeURIComponent(
       `<body style="background:#1e1e2e;color:#f38ba8;font-family:monospace;padding:40px">` +
       `<h2>dotz failed to start its backend</h2>` +
-      `<p>The local agent server could not start (port ${PORT} may be in use by another process). ` +
-      `Close any other instance using that port and relaunch dotz.</p></body>`));
+      `<p>${portMsg} Close any other instance using that port and relaunch dotz.</p>`));
   }
   // Background git check after the window is ready. If the local checkout is behind
   // origin, the renderer shows the UPDATE AVAILABLE card; the user chooses UPDATE & RESTART
