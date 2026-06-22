@@ -8,5 +8,6 @@ pub mod profiles;
 pub mod projects;
 pub mod sandbox;
 pub mod server;
+pub mod skills;
 pub mod types;
 pub mod workflows;
