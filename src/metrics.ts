@@ -41,11 +41,11 @@ export interface MetricsCompare {
   summary: string;
 }
 
-const RSI_DIR = path.join(os.homedir(), ".dotz", "ai-agents", "rsi");
-
-async function ensureDir() {
-  await fs.mkdir(RSI_DIR, { recursive: true });
-}
+// Respect DOTZ_CONFIG_DIR for operator relocation + test isolation (same as config.ts/memory.ts).
+const rsiDir = () => {
+  const base = process.env.DOTZ_CONFIG_DIR || path.join(os.homedir(), ".dotz");
+  return path.join(base, "ai-agents", "rsi");
+};
 
 /** Run a command in a cwd with a timeout; returns {ok, output}. */
 async function runCmd(cmd: string, cwd: string, timeoutMs = 60000): Promise<{ ok: boolean; output: string }> {
@@ -107,8 +107,8 @@ export async function captureBaseline(cwd: string, gateCommand?: string): Promis
     fileCount: files.fileCount,
     testFiles: files.testFiles,
   };
-  await ensureDir();
-  await fs.writeFile(path.join(RSI_DIR, `baseline-${baseline.id}.json`), JSON.stringify(baseline, null, 2), "utf-8");
+  await fs.mkdir(rsiDir(), { recursive: true });
+  await fs.writeFile(path.join(rsiDir(), `baseline-${baseline.id}.json`), JSON.stringify(baseline, null, 2), "utf-8");
   return baseline;
 }
 
