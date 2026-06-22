@@ -17,8 +17,9 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import type { WorkflowRun, WorkflowStep } from "./types";
 
-const DOTZ_DIR = path.join(os.homedir(), ".dotz", "ai-agents");
-const WORKFLOWS_FILE = path.join(DOTZ_DIR, "workflows.json");
+// Respect DOTZ_CONFIG_DIR for operator relocation + test isolation (same as config.ts/memory.ts).
+const dotzDir = () => process.env.DOTZ_CONFIG_DIR || path.join(os.homedir(), ".dotz");
+const workflowsFile = () => path.join(dotzDir(), "ai-agents", "workflows.json");
 
 type WorkflowListener = (runId: string, event: WorkflowEvent) => void;
 
@@ -28,12 +29,12 @@ export type WorkflowEvent =
   | { type: "step_state"; stepId: string; status: WorkflowStep["status"]; output?: string; error?: string; usage?: WorkflowStep["usage"]; sandboxRunId?: string | null; browserSessionId?: string | null; toolCallIds?: string[]; thinking?: string };
 
 async function ensureDir() {
-  await fs.mkdir(DOTZ_DIR, { recursive: true });
+  await fs.mkdir(path.dirname(workflowsFile()), { recursive: true });
 }
 
 async function readAll(): Promise<WorkflowRun[]> {
   try {
-    const raw = await fs.readFile(WORKFLOWS_FILE, "utf-8");
+    const raw = await fs.readFile(workflowsFile(), "utf-8");
     return JSON.parse(raw) as WorkflowRun[];
   } catch {
     return [];
@@ -42,7 +43,7 @@ async function readAll(): Promise<WorkflowRun[]> {
 
 async function writeAll(runs: WorkflowRun[]): Promise<void> {
   await ensureDir();
-  await fs.writeFile(WORKFLOWS_FILE, JSON.stringify(runs, null, 2), "utf-8");
+  await fs.writeFile(workflowsFile(), JSON.stringify(runs, null, 2), "utf-8");
 }
 
 export interface CreateStepInput {

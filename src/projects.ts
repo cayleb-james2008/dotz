@@ -11,16 +11,17 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { DEFAULT_MODEL, type Project, type ModelRef, type ThinkingLevel } from "./types";
 
-const DOTZ_DIR = path.join(os.homedir(), ".dotz");
-const PROJECTS_FILE = path.join(DOTZ_DIR, "projects.json");
+// Respect DOTZ_CONFIG_DIR for operator relocation + test isolation (same as config.ts/memory.ts).
+const dotzDir = () => process.env.DOTZ_CONFIG_DIR || path.join(os.homedir(), ".dotz");
+const projectsFile = () => path.join(dotzDir(), "projects.json");
 
 async function ensureDir() {
-  await fs.mkdir(DOTZ_DIR, { recursive: true });
+  await fs.mkdir(dotzDir(), { recursive: true });
 }
 
 async function readAll(): Promise<Project[]> {
   try {
-    const raw = await fs.readFile(PROJECTS_FILE, "utf-8");
+    const raw = await fs.readFile(projectsFile(), "utf-8");
     const parsed = JSON.parse(raw);
     // Guard a hand-edited non-array store ({}, null, 42, …) — without this the array consumers
     // (push/findIndex/filter/find) throw TypeError and every project op 500s until the file is fixed.
@@ -32,7 +33,7 @@ async function readAll(): Promise<Project[]> {
 
 async function writeAll(projects: Project[]): Promise<void> {
   await ensureDir();
-  await fs.writeFile(PROJECTS_FILE, JSON.stringify(projects, null, 2), "utf-8");
+  await fs.writeFile(projectsFile(), JSON.stringify(projects, null, 2), "utf-8");
 }
 
 export interface CreateProjectInput {
