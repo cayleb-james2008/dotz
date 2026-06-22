@@ -41,6 +41,14 @@ const SELF = fileURLToPath(import.meta.url);
 const WEB_DIR = path.resolve(path.dirname(SELF), "../web");
 const FILE_TREE_MAX_DEPTH = 3;
 
+/** Send to a single WebSocket, swallowing the synchronous throw that happens when the socket
+ *  enters CLOSING/CLOSED between the readyState check and the send() call. A broadcast must not
+ *  abort the whole fan-out because one socket died. */
+export function safeSend(socket: { readyState: number; send: (data: string) => void; OPEN: number }, data: string): void {
+  if (socket.readyState !== socket.OPEN) return;
+  try { socket.send(data); } catch { /* socket died mid-send — drop the message */ }
+}
+
 /** Validate a project cwd before it is persisted: it must be an ABSOLUTE path that EXISTS and is a
  *  DIRECTORY. Returns an error string for the caller to 400 on, or null when valid. Closes the gap
  *  where a relative ("relative/path") or nonexistent ("C:\\no\\such\\dir") cwd was accepted by the
@@ -139,14 +147,12 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     }
   }, HEARTBEAT_MS);
   onGateRequest((gateId, plan) => {
-    for (const s of wsSockets) {
-      if (s.readyState === s.OPEN) s.send(JSON.stringify({ kind: "gate", gateId, plan }));
-    }
+    const msg = JSON.stringify({ kind: "gate", gateId, plan });
+    for (const s of wsSockets) safeSend(s, msg);
   });
   const offBrowserBroadcast = browserController.subscribe((observation) => {
-    for (const s of wsSockets) {
-      if (s.readyState === s.OPEN) s.send(JSON.stringify({ kind: "browser", event: observation }));
-    }
+    const msg = JSON.stringify({ kind: "browser", event: observation });
+    for (const s of wsSockets) safeSend(s, msg);
   });
   // Enable autonomous memory (capture / recall / consolidation) — ONLY in this main server
   // process. Spawned subagents never call buildServer, so they never enable autonomy and never
@@ -156,9 +162,8 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   // re-enter importLegacy before the marker is written and double-import every legacy entry.
   // Forward pre-task memory recall to the UI so the operator can see which memories were injected.
   const offMemoryRecall = onMemoryRecall((e) => {
-    for (const s of wsSockets) {
-      if (s.readyState === s.OPEN) s.send(JSON.stringify({ kind: "memory_recall", cwd: e.cwd, query: e.query, items: e.items }));
-    }
+    const msg = JSON.stringify({ kind: "memory_recall", cwd: e.cwd, query: e.query, items: e.items });
+    for (const s of wsSockets) safeSend(s, msg);
   });
   app.addHook("onClose", async () => {
     clearInterval(heartbeat);
