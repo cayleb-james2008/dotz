@@ -55,6 +55,14 @@ fn store() -> &'static Mutex<Vec<Project>> {
     STORE.get_or_init(|| Mutex::new(read_all_from_disk()))
 }
 
+/// Resolve a project's cwd by id (for memory scoping; mirrors server.ts cwdForProject).
+/// None id or unknown id => None (global scope).
+pub fn cwd_for_project(id: Option<&str>) -> Option<String> {
+    let id = id?;
+    let g = store().lock().unwrap();
+    g.iter().find(|p| p.id == id).map(|p| p.cwd.clone())
+}
+
 fn projects_file() -> std::path::PathBuf {
     crate::config::dotz_dir().join("projects.json")
 }
