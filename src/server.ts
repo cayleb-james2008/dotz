@@ -688,7 +688,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const sessionId = new URL(req.url, `http://${HOST}`).searchParams.get("sessionId") ?? "";
     const entry = pi.get(sessionId);
     if (!entry) {
-      socket.send(JSON.stringify({ kind: "error", error: "no such session" }));
+      safeSend(socket, JSON.stringify({ kind: "error", error: "no such session" }));
       socket.close();
       return;
     }
@@ -697,12 +697,12 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const offAgent = pi.subscribe(sessionId, (event) => {
       // Bridge: synthesize workflow runs from subagent tool calls so the graph auto-populates.
       try { workflowBridge.handleEvent(sessionId, entry.projectId, event); } catch { /* best-effort */ }
-      if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ kind: "event", sessionId, event }));
+      safeSend(socket, JSON.stringify({ kind: "event", sessionId, event }));
     });
     // Fan sandbox events to the same socket so the UI can render live sandbox output inline.
     // Any sandbox run started from this session's context (projectId match) broadcasts here.
     const sandboxSub = (e: SandboxEvent) => {
-      if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ kind: "sandbox", sessionId, event: e }));
+      safeSend(socket, JSON.stringify({ kind: "sandbox", sessionId, event: e }));
     };
     // Unsubscribe handles for every run this socket attaches to — runs are kept in `active` after
     // they finish (by design, for REST inspection), so without this the closed socket's listener
@@ -712,9 +712,9 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     // can render the live workflow graph. All active workflow runs broadcast here; the UI filters
     // by sessionId/projectId as needed.
     const offWorkflow = workflowStore.onEvent((runId, event) => {
-      if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ kind: "workflow", sessionId, runId, event }));
+      safeSend(socket, JSON.stringify({ kind: "workflow", sessionId, runId, event }));
     });
-    socket.send(JSON.stringify({ kind: "ready", sessionId }));
+    safeSend(socket, JSON.stringify({ kind: "ready", sessionId }));
     wsSockets.add(socket);
     // Heartbeat: mark alive on pong so the interval knows this socket is responsive.
     wsAlive.add(socket);
@@ -749,13 +749,11 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
           const wsLang = typeof msg.language === "string" ? msg.language : "bash";
           const wsCode = typeof msg.code === "string" ? msg.code : "";
           if (!SANDBOX_LANGUAGES.includes(wsLang)) {
-            if (socket.readyState === socket.OPEN)
-              socket.send(JSON.stringify({ kind: "error", sessionId, error: `unsupported language: ${wsLang}. Available: ${SANDBOX_LANGUAGES.join(", ")}` }));
+            safeSend(socket, JSON.stringify({ kind: "error", sessionId, error: `unsupported language: ${wsLang}. Available: ${SANDBOX_LANGUAGES.join(", ")}` }));
             return;
           }
           if (msg.mode !== undefined && msg.mode !== "terminal" && msg.mode !== "web") {
-            if (socket.readyState === socket.OPEN)
-              socket.send(JSON.stringify({ kind: "error", sessionId, error: 'mode must be "terminal" or "web"' }));
+            safeSend(socket, JSON.stringify({ kind: "error", sessionId, error: 'mode must be "terminal" or "web"' }));
             return;
           }
           const run = await sandbox.start(msg.projectId || entry.projectId || null, wsLang, wsCode, {
@@ -765,7 +763,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
           // Subscribe AFTER start (not via onEvent) so we get an unsubscribe handle to clean up on
           // close; the single sandbox_start is sent explicitly below (avoids a duplicate emit).
           sandboxOffs.add(sandbox.subscribe(run.id, sandboxSub));
-          if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ kind: "sandbox", sessionId, event: { type: "sandbox_start", runId: run.id, run } }));
+          safeSend(socket, JSON.stringify({ kind: "sandbox", sessionId, event: { type: "sandbox_start", runId: run.id, run } }));
         } else if (msg.kind === "sandbox.kill") {
           await sandbox.kill(msg.runId || "");
         }         else if (msg.kind === "sandbox.cursor") {
@@ -779,11 +777,9 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
         }
       } catch (e) {
         // Guard: the socket may have closed while the async handler was running (e.g. a long
-        // s.prompt() that threw after the client disconnected). send() on a non-OPEN socket
-        // throws, which would be an unhandled rejection.
-        if (socket.readyState === socket.OPEN) {
-          try { socket.send(JSON.stringify({ kind: "error", error: (e as Error).message })); } catch { /* socket closed */ }
-        }
+        // s.prompt() that threw after the client disconnected). safeSend drops the message if the
+        // socket is no longer OPEN and swallows the synchronous throw from a close race.
+        safeSend(socket, JSON.stringify({ kind: "error", error: (e as Error).message }));
       }
     });
 
