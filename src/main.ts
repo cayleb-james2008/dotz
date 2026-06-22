@@ -51,6 +51,7 @@ function createWindow() {
     height: 920,
     minWidth: 1024,
     minHeight: 640,
+    icon: path.join(app.getAppPath(), "assets", "dotz.png"),
     backgroundColor: "#1e1e2e",
     title: "dotz",
     autoHideMenuBar: true,

@@ -21,28 +21,10 @@
     "test:sandbox": "node --test --import tsx scripts/verify-sandbox.mjs",
     "test:hardening": "node --test --import tsx scripts/verify-server-hardening.ts",
     "electron": "npm run build && electron .",
-    "dist": "npm run check && npm run fetch-model && npm run build && electron-builder --win nsis portable",
-    "dist:portable": "npm run check && npm run fetch-model && npm run build && electron-builder --win portable",
-    "dist:publish": "npm run fetch-model && npm run build && electron-builder --win nsis portable --publish always"
-  },
-  "build": {
-    "appId": "dev.dotz.app",
-    "productName": "dotz",
-    "directories": {
-      "output": "release"
-    },
-    "asar": false,
-    "win": {
-      "target": [
-        "nsis",
-        "portable"
-      ]
-    },
-    "publish": {
-      "provider": "github",
-      "owner": "cayleb-james2008",
-      "repo": "dotz"
-    }
+    "clean:release": "node -e \"require('node:fs').rmSync('release',{recursive:true,force:true})\"",
+    "dist": "npm run clean:release && npm run check && npm run fetch-model && npm run build && electron-builder --win portable",
+    "dist:portable": "npm run dist",
+    "dist:publish": "npm run clean:release && npm run fetch-model && npm run build && electron-builder --win portable --publish always"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.79.6",
