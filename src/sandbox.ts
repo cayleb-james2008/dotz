@@ -239,6 +239,12 @@ export class Sandbox {
         ar.killedByUs = true;
         killTree(ar.proc, "group");
         run.output += `\n[timeout] killed after ${timeoutMs}ms\n`;
+        // Backstop: if killTree fails or the process is a zombie that never emits 'exit',
+        // finish() would never be called and the run would stay "running" forever — the UI
+        // and REST would show a permanently active sandbox with no recourse short of a server
+        // restart. Force-finish after a 2s grace period so the run always terminates. The
+        // `finished` flag makes this a no-op if exit already fired.
+        setTimeout(() => finish("killed", null), 2_000);
       }, timeoutMs);
     }
 

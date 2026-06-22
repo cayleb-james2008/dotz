@@ -24,6 +24,12 @@ let runtime: Awaited<ReturnType<typeof buildServer>> | null = null;
 process.on("unhandledRejection", (reason) => {
   console.error("dotz: unhandled rejection:", reason);
 });
+// Same for synchronous uncaught exceptions — a throw in any callback (EventEmitter, child_process,
+// IPC handler) would crash the app. Log but don't exit so a single bad callback doesn't take down
+// the entire desktop app.
+process.on("uncaughtException", (err) => {
+  console.error("dotz: uncaught exception:", err);
+});
 
 async function startServer() {
   // In the packaged app, run agent sessions against the user's real cwd; default to home.
