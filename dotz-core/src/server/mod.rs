@@ -40,12 +40,13 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
         .merge(crate::workflows::router())
         .merge(crate::skills::router())
         .merge(crate::memory::router())
+        .merge(crate::agent::router())
         .fallback_service(ServeDir::new(web_dir).append_index_html_on_directories(true))
 }
 
 async fn health(State(_s): State<Shared>) -> Json<Value> {
     // ponytail: sessions/sandboxRuns are 0 until those stores land (Phase 3/4).
-    Json(json!({ "ok": true, "sessions": 0, "sandboxRuns": 0 }))
+    Json(json!({ "ok": true, "sessions": crate::agent::session_count(), "sandboxRuns": 0 }))
 }
 
 async fn providers() -> Json<Value> {
