@@ -14,12 +14,8 @@ import { memoryStore, readAgentsMd, writeAgentsMd, appendAgentsMdSection, isMemo
 import { projectStore } from "../../../src/projects";
 import { captureBaseline, compare, renderBaseline, type MetricsBaseline } from "../../../src/metrics";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "../../../src/browser";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { DESIGN_DOMAIN_DOCTRINE, DESIGN_DOMAIN_MARKER } from "../../../src/profiles";
 
-/** Vendored Open Design systems dir (.pi/design-systems), resolved from this extension's location. */
-const DESIGN_SYSTEMS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "design-systems");
-/** Heuristic: does a prompt look like graphic/visual design work? Drives auto-routing to DESIGN mode. */
 // Graphic/visual-design intent. Deliberately omits high-collision bare tokens (css, ui, ux, theme,
 // deck, icon, palette, bare "brand") that fire on backend/test/infra work; design-context phrases kept.
 const DESIGN_INTENT = /\b(?:design|mock-?up|wireframe|logo|poster|flyer|banner|branding|graphic|illustration|landing[- ]?page|infographic|favicon|typograph(?:y|ic)|tailwind|figma|moodboard|slides?|presentation)\b|\b(?:colou?r) (?:palette|scheme)\b|\bbrand (?:identity|guidelines|kit|system)\b/i;
@@ -480,14 +476,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event) => {
     if (!DESIGN_INTENT.test(event.prompt || "")) return;
     requestPanelOpen("design");
-    const block =
-      `\n\n# DESIGN MODE (auto-activated — this request looks design-related)\n` +
-      `dotz ships Open Design natively; treat this as a design task:\n` +
-      `- 150+ design systems at ${DESIGN_SYSTEMS_DIR}/<slug>/ — READ DESIGN.md + tokens.css for the chosen system and honor its tokens.\n` +
-      `- 150+ design skills in the skill pool (source: design) — load with the \`skill\` tool.\n` +
-      `- The DESIGN panel (now opening) previews systems and renders/exports your HTML/CSS artifact (HTML + PDF).\n` +
-      `Produce a real, on-brand, self-contained HTML/CSS artifact; avoid AI-slop; meet WCAG contrast and focus states.`;
-    return { systemPrompt: (event.systemPrompt || "") + block };
+    // Skip the doctrine injection when it's already present (e.g. the DESIGN profile carries it) — no
+    // duplicate copy. The panel-open above is idempotent, so it's fine to always fire it.
+    const sys = event.systemPrompt || "";
+    if (sys.includes(DESIGN_DOMAIN_MARKER)) return;
+    return { systemPrompt: sys + "\n\n# DESIGN MODE (auto-activated — this request looks design-related)" + DESIGN_DOMAIN_DOCTRINE };
   });
 
   // Post-task capture: after each task completes, extract durable facts from the exchange (mem0's
