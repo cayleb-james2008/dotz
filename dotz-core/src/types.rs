@@ -70,6 +70,30 @@ pub fn provider_defaults_json() -> Value {
     })
 }
 
+/// Suggested low-cost worker model ids — ONLY configured/available models (port of LOW_COST_MODELS).
+pub fn low_cost_models() -> Vec<ModelRef> {
+    vec![
+        ModelRef { provider: "ollama".into(), model_id: "minimax-m3".into() },
+        ModelRef { provider: "ollama".into(), model_id: "kimi-k2.7-code".into() },
+    ]
+}
+
+/// Render the subagent-model directive for system-prompt injection (port of renderLowCostModels).
+pub fn render_low_cost_models() -> String {
+    let sub = std::env::var("DOTZ_SUBAGENT_MODEL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        let (_, s) = provider_default(DEFAULT_PROVIDER).unwrap();
+        format!("{DEFAULT_PROVIDER}/{s}")
+    });
+    let list = low_cost_models()
+        .iter()
+        .map(|m| format!("{}/{}", m.provider, m.model_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\n# dotz subagent model\nEvery subagent you disperse via the `subagent` tool runs on `{sub}` by default (the configured, known-working low-cost worker). You (the lead) keep the high-quality executive model.\n\nDo NOT pass a `model` override unless a task genuinely needs a different model — omitting `model` uses `{sub}`, which always works. If you must override, choose ONLY from this exact list of configured low-cost models: {list}. NEVER invent a model id (e.g. `openai/*`, `anthropic/*`, `google/*`, or any OpenRouter id) — unconfigured ids fail with auth/credit errors and silently break the fan-out.\n"
+    )
+}
+
 /// (executive, subagent) defaults for a provider, if known.
 pub fn provider_default(id: &str) -> Option<(&'static str, &'static str)> {
     match id {

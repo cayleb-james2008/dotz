@@ -63,6 +63,12 @@ pub fn cwd_for_project(id: Option<&str>) -> Option<String> {
     g.iter().find(|p| p.id == id).map(|p| p.cwd.clone())
 }
 
+/// Fetch a full project by id (clone), for the agent session binder. None => unknown id.
+/// (Named `find`, not `get`, to avoid clashing with the `axum::routing::get` import.)
+pub fn find(id: &str) -> Option<Project> {
+    store().lock().unwrap().iter().find(|p| p.id == id).cloned()
+}
+
 fn projects_file() -> std::path::PathBuf {
     crate::config::dotz_dir().join("projects.json")
 }

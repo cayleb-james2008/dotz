@@ -438,6 +438,42 @@ fn render_mirror_file(file: &std::path::Path, title: &str, items: &[MemoryView])
     let _ = std::fs::write(file, out);
 }
 
+// ---- public surface for the agent runtime (pre-turn recall + the memory_* tools) ----
+
+/// Query-relevant recall for pre-turn system-prompt injection. Searches project+global scope
+/// (or global-only when no cwd), best-effort: any embedder/db error yields an empty list rather
+/// than failing the turn. Mirrors the dotz-tools before_agent_start recall hook.
+pub fn recall(query: &str, cwd: Option<&str>) -> Vec<MemoryView> {
+    search(query, cwd, None, None, Some(6), None, None).unwrap_or_default()
+}
+
+/// Render a recalled-memory block for the system prompt (empty string when no hits).
+pub fn render_recall(items: &[MemoryView]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("# Relevant memory (recalled for this turn)\n");
+    for it in items {
+        out.push_str(&format!("- {}\n", it.memory));
+    }
+    out
+}
+
+/// Public list (global + project) for the memory_list tool.
+pub fn list_public(cwd: Option<&str>) -> Vec<MemoryView> {
+    list(cwd)
+}
+
+/// Public search for the memory_search tool (defaulted threshold/topK).
+pub fn search_public(query: &str, cwd: Option<&str>) -> Vec<MemoryView> {
+    search(query, cwd, None, None, Some(8), None, None).unwrap_or_default()
+}
+
+/// Public verbatim add for the memory_add tool.
+pub fn add_public(text: &str, scope: &str, cwd: Option<&str>) -> Result<MemoryView, String> {
+    add(text, scope, None, None, cwd)
+}
+
 // ---- handlers ----
 fn cwd_of(q: &HashMap<String, String>) -> Option<String> {
     crate::projects::cwd_for_project(q.get("projectId").map(|s| s.as_str()))
