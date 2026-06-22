@@ -7,7 +7,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { PROVIDER_DEFAULTS, DEFAULT_PROVIDER, VALID_THINKING_LEVELS, type ModelRef, type ThinkingLevel } from "./types";
+import { PROVIDERS, PROVIDER_DEFAULTS, DEFAULT_PROVIDER, VALID_THINKING_LEVELS, type ModelRef, type ThinkingLevel } from "./types";
+
+const KNOWN_PROVIDER_IDS = new Set(PROVIDERS.map((p) => p.id));
 
 // DOTZ_CONFIG_DIR overrides the config location (operator relocation + test isolation so verify
 // scripts never read or mutate the operator's real ~/.dotz/config.json). Resolved lazily so a
@@ -39,8 +41,18 @@ export async function loadConfig(): Promise<DotzConfig> {
   try {
     const raw = await fs.readFile(configFile(), "utf-8");
     const parsed = JSON.parse(raw) as Partial<DotzConfig>;
-    // Guard a hand-edited or corrupt config.json so an invalid thinkingLevel doesn't propagate
-    // to session.setThinkingLevel() and cause every new session to fail.
+    // Guard a hand-edited or corrupt config.json: invalid provider/model values would otherwise
+    // flow into executiveModelRef() / DOTZ_SUBAGENT_MODEL and break every new session with a
+    // structurally invalid model or a provider the SDK doesn't recognize.
+    if (parsed.provider !== undefined && (typeof parsed.provider !== "string" || !KNOWN_PROVIDER_IDS.has(parsed.provider))) {
+      parsed.provider = defaults().provider;
+    }
+    if (parsed.executiveModel !== undefined && (typeof parsed.executiveModel !== "string" || !parsed.executiveModel.trim())) {
+      parsed.executiveModel = defaults().executiveModel;
+    }
+    if (parsed.subagentModel !== undefined && (typeof parsed.subagentModel !== "string" || !parsed.subagentModel.trim())) {
+      parsed.subagentModel = defaults().subagentModel;
+    }
     if (parsed.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(parsed.thinkingLevel)) {
       parsed.thinkingLevel = defaults().thinkingLevel;
     }
@@ -64,9 +76,12 @@ export async function updateConfig(patch: Partial<DotzConfig>): Promise<DotzConf
   // Allow-list known string fields so a junk key or a non-string value (e.g. an array `provider`)
   // can't be persisted and then corrupt DOTZ_SUBAGENT_MODEL via applyEnv.
   const clean: Partial<DotzConfig> = {};
-  if (typeof patch.provider === "string") clean.provider = patch.provider;
-  if (typeof patch.executiveModel === "string") clean.executiveModel = patch.executiveModel;
-  if (typeof patch.subagentModel === "string") clean.subagentModel = patch.subagentModel;
+  const p = typeof patch.provider === "string" ? patch.provider.trim().toLowerCase() : "";
+  if (KNOWN_PROVIDER_IDS.has(p)) clean.provider = p;
+  const exec = typeof patch.executiveModel === "string" ? patch.executiveModel.trim() : "";
+  if (exec) clean.executiveModel = exec;
+  const sub = typeof patch.subagentModel === "string" ? patch.subagentModel.trim() : "";
+  if (sub) clean.subagentModel = sub;
   if (typeof patch.thinkingLevel === "string" && VALID_THINKING_LEVELS.has(patch.thinkingLevel)) {
     clean.thinkingLevel = patch.thinkingLevel;
   }

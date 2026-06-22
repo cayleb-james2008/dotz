@@ -213,6 +213,34 @@ test("POST /api/config accepts valid thinkingLevel", async () => {
   assert.equal(body.config.thinkingLevel, "high", "thinkingLevel persisted");
 });
 
+test("POST /api/config rejects unknown provider with 400", async () => {
+  const res = await postRaw("/api/config", { provider: "banana" });
+  assert.equal(res.status, 400, `expected 400 for unknown provider, got ${res.status}`);
+  const body = await res.json() as { error: string };
+  assert.match(body.error, /provider/i, "error mentions provider");
+});
+
+test("POST /api/config rejects non-string provider with 400", async () => {
+  const res = await postRaw("/api/config", { provider: 123 });
+  assert.equal(res.status, 400, `expected 400 for non-string provider, got ${res.status}`);
+});
+
+test("POST /api/config rejects empty executiveModel with 400", async () => {
+  const res = await postRaw("/api/config", { executiveModel: "   " });
+  assert.equal(res.status, 400, `expected 400 for empty executiveModel, got ${res.status}`);
+  const body = await res.json() as { error: string };
+  assert.match(body.error, /executiveModel/i, "error mentions executiveModel");
+});
+
+test("POST /api/config persists valid provider and model ids", async () => {
+  const res = await postRaw("/api/config", { provider: "openrouter", executiveModel: "a/b", subagentModel: "c/d" });
+  assert.equal(res.status, 200, `expected 200 for valid config, got ${res.status}`);
+  const body = await res.json() as { config: { provider: string; executiveModel: string; subagentModel: string } };
+  assert.equal(body.config.provider, "openrouter");
+  assert.equal(body.config.executiveModel, "a/b");
+  assert.equal(body.config.subagentModel, "c/d");
+});
+
 // ---- WebSocket sandbox.start input validation ----
 
 test("WebSocket sandbox.start rejects invalid language with error message", async () => {
