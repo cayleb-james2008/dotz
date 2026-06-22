@@ -356,11 +356,13 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   // ---- design (native Open Design): vendored design systems for the DESIGN panel ----
   // ponytail: re-reads ~150 manifests per call; fine for a local single-user app, cache if it ever lags.
   app.get("/api/design/systems", async () => {
-    let entries: string[] = [];
-    try { entries = await fs.readdir(DESIGN_SYSTEMS_DIR); } catch { return { systems: [] }; }
+    let dirents: import("node:fs").Dirent[] = [];
+    try { dirents = await fs.readdir(DESIGN_SYSTEMS_DIR, { withFileTypes: true }); } catch { return { systems: [] }; }
     const systems: Array<{ id: string; name: string; category: string; description: string }> = [];
-    for (const id of entries.sort()) {
-      if (!/^[a-z0-9][a-z0-9-]*$/i.test(id)) continue; // skip LICENSE, NOTICE, dotfiles
+    for (const ent of dirents.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!ent.isDirectory()) continue;               // skip the LICENSE / NOTICE files (and any stray file)
+      const id = ent.name;
+      if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) continue; // skip _schema, dotfiles (slugs are lowercase ASCII)
       try {
         const raw = await fs.readFile(path.join(DESIGN_SYSTEMS_DIR, id, "manifest.json"), "utf-8");
         const m = JSON.parse(raw) as { name?: string; category?: string; description?: string };
@@ -372,7 +374,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   // The chosen system's reference components page — same-origin srcdoc preview in the DESIGN panel.
   app.get("/api/design/systems/:id/components", async (req, reply) => {
     const id = (req.params as { id: string }).id;
-    if (!/^[a-z0-9][a-z0-9-]*$/i.test(id)) { reply.code(400).send({ error: "bad id" }); return; }
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) { reply.code(400).send({ error: "bad id" }); return; }
     try {
       const html = await fs.readFile(path.join(DESIGN_SYSTEMS_DIR, id, "components.html"), "utf-8");
       reply.type("text/html").send(html);
