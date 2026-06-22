@@ -18,6 +18,13 @@ const DIR = path.dirname(fileURLToPath(import.meta.url));
 
 let runtime: Awaited<ReturnType<typeof buildServer>> | null = null;
 
+// Harden: an unhandled promise rejection in the Electron main process (e.g. from the pi SDK,
+// sandbox, or browser controller) would crash the app by default (Node v15+). Log prominently so
+// bugs are visible but don't take down the desktop app.
+process.on("unhandledRejection", (reason) => {
+  console.error("dotz: unhandled rejection:", reason);
+});
+
 async function startServer() {
   // In the packaged app, run agent sessions against the user's real cwd; default to home.
   runtime = await buildServer();
