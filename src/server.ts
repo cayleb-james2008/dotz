@@ -32,7 +32,7 @@ import { workflowBridge } from "./workflow-bridge";
 import { resolveHumanGate, onGateRequest } from "../.pi/extensions/dotz-tools/index";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "./browser";
 import { connectionsController } from "./connections";
-import { PROVIDERS, PROVIDER_DEFAULTS, type Project, type WorkflowRun } from "./types";
+import { PROVIDERS, PROVIDER_DEFAULTS, type Project, type WorkflowRun, VALID_THINKING_LEVELS } from "./types";
 import { loadConfig, getConfig, updateConfig, type DotzConfig } from "./config";
 
 const HOST = "127.0.0.1";
@@ -83,11 +83,6 @@ const isValidModel = (m: unknown): m is ModelRef =>
   !!m && typeof m === "object" &&
   typeof (m as ModelRef).provider === "string" && (m as ModelRef).provider.trim().length > 0 &&
   typeof (m as ModelRef).modelId === "string" && (m as ModelRef).modelId.trim().length > 0;
-
-/** Valid thinking levels — the closed set from types.ts (ThinkingLevel). Used to validate untrusted
- *  request bodies before they reach session.setThinkingLevel(), which may throw or silently accept
- *  garbage for unknown values. Mirrors THINK_LEVELS in web/app.js. */
-const VALID_THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
 /** Public-facing snapshot of a session's control state. */
 function sessionSummary(id: string, s: AgentSession, profileId?: string | null, projectId?: string | null) {

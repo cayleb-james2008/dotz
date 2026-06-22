@@ -3,6 +3,9 @@ import process from "node:process";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
+/** Closed set of valid thinking levels — shared by config loading and REST validation. */
+export const VALID_THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
+
 export interface ModelRef {
   provider: string;
   modelId: string;
