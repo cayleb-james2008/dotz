@@ -7,7 +7,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { PROVIDER_DEFAULTS, DEFAULT_PROVIDER, type ModelRef, type ThinkingLevel } from "./types";
+import { PROVIDER_DEFAULTS, DEFAULT_PROVIDER, VALID_THINKING_LEVELS, type ModelRef, type ThinkingLevel } from "./types";
 
 // DOTZ_CONFIG_DIR overrides the config location (operator relocation + test isolation so verify
 // scripts never read or mutate the operator's real ~/.dotz/config.json). Resolved lazily so a
@@ -38,7 +38,13 @@ function applyEnv(c: DotzConfig): void {
 export async function loadConfig(): Promise<DotzConfig> {
   try {
     const raw = await fs.readFile(configFile(), "utf-8");
-    cache = { ...defaults(), ...(JSON.parse(raw) as Partial<DotzConfig>) };
+    const parsed = JSON.parse(raw) as Partial<DotzConfig>;
+    // Guard a hand-edited or corrupt config.json so an invalid thinkingLevel doesn't propagate
+    // to session.setThinkingLevel() and cause every new session to fail.
+    if (parsed.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(parsed.thinkingLevel)) {
+      parsed.thinkingLevel = defaults().thinkingLevel;
+    }
+    cache = { ...defaults(), ...parsed };
   } catch {
     cache = defaults();
   }
@@ -61,7 +67,9 @@ export async function updateConfig(patch: Partial<DotzConfig>): Promise<DotzConf
   if (typeof patch.provider === "string") clean.provider = patch.provider;
   if (typeof patch.executiveModel === "string") clean.executiveModel = patch.executiveModel;
   if (typeof patch.subagentModel === "string") clean.subagentModel = patch.subagentModel;
-  if (typeof patch.thinkingLevel === "string") clean.thinkingLevel = patch.thinkingLevel;
+  if (typeof patch.thinkingLevel === "string" && VALID_THINKING_LEVELS.has(patch.thinkingLevel)) {
+    clean.thinkingLevel = patch.thinkingLevel;
+  }
   const next = { ...getConfig(), ...clean };
   cache = next;
   applyEnv(next);
