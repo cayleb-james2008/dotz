@@ -179,7 +179,14 @@ export class Sandbox {
       emit({ type: "sandbox_output", runId: run.id, stream, line: rest });
     };
 
+    // Guard against a double finish: on some platforms the 'error' event (e.g. kill failed) fires
+    // BEFORE 'exit', so both handlers call finish(). Without this guard, sandbox_end is emitted
+    // TWICE (the UI renders a duplicate end card) and the tempDir rm + proc cleanup runs twice.
+    // The flag is set on the first call; the second is a no-op.
+    let finished = false;
     const finish = (status: "done" | "error" | "killed", exitCode: number | null) => {
+      if (finished) return;
+      finished = true;
       if (ar.timeout) { clearTimeout(ar.timeout); ar.timeout = null; }
       flushLine("stdout"); flushLine("stderr");
       if (portDetector) portDetector.dispose();

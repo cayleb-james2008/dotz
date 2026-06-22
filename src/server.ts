@@ -166,8 +166,14 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
 
   // ---- global config: provider + executive/subagent model + reasoning defaults ----
   app.get("/api/config", async () => ({ config: getConfig(), providerDefaults: PROVIDER_DEFAULTS, providers: PROVIDERS }));
-  app.post("/api/config", async (req) => {
+  app.post("/api/config", async (req, reply) => {
     const patch = (req.body ?? {}) as Partial<DotzConfig>;
+    // Validate thinkingLevel against the known set — an invalid value (e.g. "banana", 123) would
+    // be persisted by updateConfig (which only checks typeof string) and then used as the default
+    // for every new session, silently corrupting the reasoning state of all future sessions.
+    if (patch.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(patch.thinkingLevel)) {
+      reply.code(400).send({ error: `thinkingLevel must be one of: ${[...VALID_THINKING_LEVELS].join(", ")}` }); return;
+    }
     const config = await updateConfig(patch);
     return { config };
   });
@@ -450,6 +456,14 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       reply.code(400).send({ error: `unsupported language: ${body.language}. Available: ${SANDBOX_LANGUAGES.join(", ")}` });
       return;
     }
+    // Validate mode — a non-string truthy value (number, object) would pass through to
+    // sandbox.start() where `opts.mode || "terminal"` would keep it, and `mode === "web"` would
+    // be false (so a web run is silently treated as terminal). A typo'd string ("webserver")
+    // would also silently fall through to terminal. Reject both with a clean 400.
+    if (body.mode !== undefined && body.mode !== "terminal" && body.mode !== "web") {
+      reply.code(400).send({ error: 'mode must be "terminal" or "web"' });
+      return;
+    }
     const run = await sandbox.start(body.projectId || null, body.language, body.code, { timeoutMs: body.timeoutMs, mode: body.mode });
     return run;
   });
@@ -503,8 +517,13 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     return { ...sessionSummary(e.session.sessionId, e.session, e.profile.id, e.projectId), stats: e.session.getSessionStats() };
   });
 
-  app.delete("/api/sessions/:id", async (req) => {
-    pi.dispose((req.params as { id: string }).id);
+  app.delete("/api/sessions/:id", async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    // Match the 404 pattern used by every other :id route (projects, workflows, sandbox).
+    // A bare { ok: true } for a non-existent session was misleading — the UI thought it
+    // disposed a session that never existed, silently swallowing a stale sessionId.
+    if (!pi.get(id)) { reply.code(404).send({ error: "no such session" }); return; }
+    pi.dispose(id);
     return { ok: true };
   });
 
