@@ -390,7 +390,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       if (err instanceof WorkflowCycleError) { reply.code(400).send({ error: err.message }); return; }
       throw err;
     }
-    workflowStore.start(run.id);
+    await workflowStore.start(run.id);
     return run;
   });
   app.post("/api/workflows/:id/step", async (req, reply) => {

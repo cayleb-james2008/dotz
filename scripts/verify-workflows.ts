@@ -137,7 +137,7 @@ test("stepState: all steps done finishes the run", async () => {
       { agent: "b", task: "tb" },
     ],
   });
-  store.start(run.id);
+  await store.start(run.id);
   assert.equal(run.status, "running");
   await store.stepState(run.id, run.steps[0].id, { status: "done" });
   assert.equal(run.status, "running");
@@ -155,7 +155,7 @@ test("stepState: error on one step sweeps remaining runnable steps to skipped", 
       { agent: "b", task: "tb" },
     ],
   });
-  store.start(run.id);
+  await store.start(run.id);
   await store.stepState(run.id, run.steps[0].id, { status: "error", error: "boom" });
   assert.equal(run.status, "error");
   // step 1 was ready/running — should be swept to skipped
@@ -172,7 +172,7 @@ test("abort: sweeps all non-terminal steps to skipped and marks run aborted", as
       { agent: "b", task: "tb", parents: ["0"] },
     ],
   });
-  store.start(run.id);
+  await store.start(run.id);
   await store.abort(run.id);
   assert.equal(run.status, "aborted");
   assert.equal(run.steps[0].status, "skipped");
@@ -185,13 +185,29 @@ test("persist: run is retrievable from history after persist", async () => {
     label: "persist-test",
     steps: [{ agent: "a", task: "ta" }],
   });
-  store.start(run.id);
+  await store.start(run.id);
   await store.stepState(run.id, run.steps[0].id, { status: "done" });
   // The run should have been persisted to the (temp) workflows.json.
   const history = await store.listHistory();
   const found = history.find((r) => r.id === run.id);
   assert.ok(found, "run should be in history after persist");
   assert.equal(found!.status, "done");
+});
+
+test("persist: start is persisted before any step state changes", async () => {
+  const store = new WorkflowStore();
+  const run = await store.create({
+    label: "start-persist-test",
+    steps: [{ agent: "a", task: "ta" }],
+  });
+  await store.start(run.id);
+  // Simulate a server restart: a fresh store reading from disk must see the run as running.
+  const restarted = new WorkflowStore();
+  const history = await restarted.listHistory();
+  const found = history.find((r) => r.id === run.id);
+  assert.ok(found, "run should be in history immediately after start");
+  assert.equal(found!.status, "running", "history must reflect running status after start");
+  assert.ok(found!.startedAt, "startedAt must be set after start");
 });
 
 test("workflow-bridge: stepState rejection during start is caught, not unhandled", async () => {
