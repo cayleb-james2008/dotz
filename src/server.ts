@@ -110,7 +110,21 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
 
   // Human-gate: when the agent calls the `human_gate` tool, forward the gate request to all
   // open WS sockets so the UI can render an approval card. The UI replies via gate.approve/reject.
-  const wsSockets = new Set<{ readyState: number; send: (data: string) => void; OPEN: number }>();
+  const wsSockets = new Set<{ readyState: number; send: (data: string) => void; OPEN: number; ping: () => void; terminate: () => void }>();
+
+  // WebSocket heartbeat: ping every 30s and terminate sockets that don't pong back within one
+  // interval. Without this, a half-open connection (laptop sleep, network change, crashed client)
+  // lingers forever in wsSockets — leaking memory, sending broadcasts into the void, and never
+  // firing the socket's `close` handler (so sandboxOffs/gate listeners for that socket leak too).
+  const HEARTBEAT_MS = 30_000;
+  const wsAlive = new Set<typeof wsSockets extends Set<infer T> ? T : never>();
+  const heartbeat = setInterval(() => {
+    for (const s of wsSockets) {
+      if (!wsAlive.has(s)) { s.terminate(); wsSockets.delete(s); wsAlive.delete(s); continue; }
+      wsAlive.delete(s);
+      try { s.ping(); } catch { /* socket may have closed between checks */ }
+    }
+  }, HEARTBEAT_MS);
   onGateRequest((gateId, plan) => {
     for (const s of wsSockets) {
       if (s.readyState === s.OPEN) s.send(JSON.stringify({ kind: "gate", gateId, plan }));
@@ -134,6 +148,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     }
   });
   app.addHook("onClose", async () => {
+    clearInterval(heartbeat);
     offBrowserBroadcast();
     offMemoryRecall();
     await browserController.disposeAll();
@@ -607,6 +622,9 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     });
     socket.send(JSON.stringify({ kind: "ready", sessionId }));
     wsSockets.add(socket);
+    // Heartbeat: mark alive on pong so the interval knows this socket is responsive.
+    wsAlive.add(socket);
+    (socket as { on?: (ev: string, cb: () => void) => void }).on?.("pong", () => { wsAlive.add(socket); });
 
     socket.on("message", async (raw: Buffer) => {
       let msg: { kind?: string; text?: string; projectId?: string | null; language?: string; code?: string; mode?: "terminal" | "web"; timeoutMs?: number; runId?: string; x?: number; y?: number; action?: "move" | "click" | "type"; cursorText?: string; gateId?: string; feedback?: string };
@@ -642,11 +660,16 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
           resolveHumanGate(msg.gateId || "", false, msg.feedback);
         }
       } catch (e) {
-        socket.send(JSON.stringify({ kind: "error", error: (e as Error).message }));
+        // Guard: the socket may have closed while the async handler was running (e.g. a long
+        // s.prompt() that threw after the client disconnected). send() on a non-OPEN socket
+        // throws, which would be an unhandled rejection.
+        if (socket.readyState === socket.OPEN) {
+          try { socket.send(JSON.stringify({ kind: "error", error: (e as Error).message })); } catch { /* socket closed */ }
+        }
       }
     });
 
-    socket.on("close", () => { offAgent(); offWorkflow(); for (const off of sandboxOffs) off(); sandboxOffs.clear(); wsSockets.delete(socket); });
+    socket.on("close", () => { offAgent(); offWorkflow(); for (const off of sandboxOffs) off(); sandboxOffs.clear(); wsSockets.delete(socket); wsAlive.delete(socket); });
   });
 
   // Static chat UI last, so explicit /api and /ws routes win.
@@ -657,7 +680,16 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
 
 export async function start(): Promise<void> {
   const { app, pi } = await buildServer();
-  await app.listen({ host: HOST, port: PORT });
+  try {
+    await app.listen({ host: HOST, port: PORT });
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === "EADDRINUSE") {
+      console.error(`dotz: port ${PORT} is already in use — another dotz instance may be running. Set DOTZ_PORT to use a different port.`);
+      process.exit(1);
+    }
+    throw err;
+  }
   console.log(`dotz server → http://${HOST}:${PORT}`);
   const shutdown = async () => {
     sandbox.disposeAll();

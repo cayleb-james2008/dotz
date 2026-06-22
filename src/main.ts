@@ -125,6 +125,12 @@ app.on("before-quit", (e) => {
   quitting = true;
   sandbox.disposeAll();
   if (runtime) runtime.pi.disposeAll();
-  browserController.disposeAll().catch(() => undefined).finally(() => app.exit(0));
+  // Close the Fastify server so its onClose hook runs — that disposes connectionsController
+  // (active CLI login subprocesses: gh/vercel/neonctl) AND browserController (browser sessions
+  // + stray-process reaping) AND unsubscribes memory/browser broadcast listeners. Without
+  // app.close(), connectionsController.disposeAll() was NEVER called, leaking login processes.
+  // browserController.disposeAll() is idempotent (second call is a no-op after sessions map empties).
+  const serverClosed = runtime ? runtime.app.close().catch(() => undefined) : Promise.resolve();
+  serverClosed.finally(() => app.exit(0));
 });
 app.on("window-all-closed", () => app.quit());
