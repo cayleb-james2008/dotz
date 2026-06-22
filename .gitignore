@@ -11,3 +11,6 @@ data/
 
 # Solomon RSI host venv (interpreter only, created to satisfy run_improver launcher)
 .venv/
+
+# Rust build output
+/target/
