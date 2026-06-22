@@ -9,7 +9,8 @@ the agent — no subprocess, nothing to version separately. A lean Fastify backe
 REST + WebSocket surface; a single self-contained cyberbrutalist UI binds to it; Electron wraps
 it into a native window / portable `.exe`. dotz is **multi-provider** (not just OpenRouter),
 keeps **persistent projects** + a **memory store** injected into the agent's system prompt, and
-ships a **sandbox** with a live web preview the agent can drive an on-screen cursor over.
+ships a **sandbox** with a live web preview the agent can drive an on-screen cursor over, plus a
+native **Open Design** workspace (150+ design systems, live preview, HTML/PDF export).
 
 ## Architecture
 
@@ -17,7 +18,7 @@ ships a **sandbox** with a live web preview the agent can drive an on-screen cur
 dotz.exe  (Electron)
  ├─ main process (Node): boots the embedded pi SDK + Fastify on 127.0.0.1:4317
  │    src/pi.ts       — PiSessions: owns AgentSession lifecycle, fans events to WS subscribers
- │    src/profiles.ts — 5 operating profiles + bundled .pi loader (injects doctrine + project memory)
+ │    src/profiles.ts — 6 operating profiles + bundled .pi loader (injects doctrine + project memory)
  │    src/projects.ts — persistent named workspaces (cwd + profile + model + thinking defaults)
  │    src/memory.ts   — mem0-backed autonomous memory (on-device; capture/recall/consolidate)
  │    src/embedder.ts — bundled local transformers.js embedder (all-MiniLM-L6-v2, 384-dim)
@@ -25,7 +26,8 @@ dotz.exe  (Electron)
  │    src/types.ts    — shared types (ModelRef, ProviderMeta, Project, MemoryView, SandboxRun)
  │    src/server.ts   — Fastify: REST controls + WS event stream + static UI
  │    src/main.ts     — Electron: start server, open BrowserWindow → localhost
- │    .pi/            — bundled agent resources: subagent extension, 4 agents, 3 workflow prompts
+ │    .pi/            — bundled agent resources: extensions, agents, workflow prompts, + vendored
+ │                    Open Design content (150+ design-systems + design-skills) for DESIGN mode
  └─ renderer: web/   — the cyberbrutalist chat UI (vanilla HTML/CSS/JS), same in browser + app
 ```
 
@@ -44,6 +46,7 @@ the full UI↔backend contract, and [docs/design-prompt.md](docs/design-prompt.m
     - **PLAN** — read-only research + planning (`read, grep, find, ls, subagent`; no edits).
     - **FRONTEND** — workflow mode tuned for UI/design work (WCAG, real focus states, no AI-slop).
     - **BACKEND** — workflow mode tuned for APIs/data/infra (TDD, boring tech, honest errors).
+    - **DESIGN** — graphic/visual design backed by native Open Design (gallery, preview, export — see below).
 - **Model** — dotz is **multi-provider**, not just OpenRouter. Each provider declares its own UI
   mode via `ProviderMeta.freeForm`: OpenRouter is a **free-form model-id input** (not a giant
   dropdown), defaulting to `nex-agi/nex-n2-pro:free`; other providers may expose a fixed model list.
@@ -75,6 +78,28 @@ the full UI↔backend contract, and [docs/design-prompt.md](docs/design-prompt.m
   inline web preview iframe at that port; the agent drives an **agent cursor** over the live
   preview (`move` / `click` / `type` at `(x, y)`) and both the agent and the user see the same
   pointer state via `sandbox_cursor` events. Run lifecycle: `pending → running → done|error|killed`.
+
+## Design mode (Open Design, native)
+
+dotz ships a native port of [Open Design](https://github.com/nexu-io/open-design) — its content,
+in dotz's own shell. Open the **DESIGN panel** from the `+ PANELS` palette: a design workspace with
+a searchable gallery of **150+ bundled design systems** (Stripe, Linear, Apple, Notion, Vercel,
+Figma, …), a live same-origin preview iframe, and one-click **HTML / PDF export** of the rendered
+artifact.
+
+- **Design systems** live at `.pi/design-systems/<slug>/` (each a `DESIGN.md` + `tokens.css` +
+  `components.html`), served read-only via `GET /api/design/systems`. Apache-2.0 — see the bundled
+  `LICENSE` + `NOTICE`.
+- **Design skills** (150+) are vendored into the unified skill pool tagged `source: design` at
+  *lowest* priority (they never shadow your own same-named skills) and kept out of the always-on
+  prompt index — load any by name with the `skill` tool.
+- **DESIGN profile** makes design the operating mode for a session; **`/design <brief>`** kicks off
+  a design workflow; and an **auto-route** opens the panel + injects the Open Design doctrine
+  whenever a request looks graphic/design-related, so design work lands in the native workspace even
+  from another profile.
+
+The preview iframe is sandboxed (`allow-same-origin allow-modals allow-popups`, **no** `allow-scripts`)
+since the bundled systems are static HTML/CSS — a hardened default that still supports print-to-PDF.
 
 ## Setup
 
