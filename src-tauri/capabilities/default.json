@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "dotz main window — local server UI + updater + dialog",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:4317", "http://localhost:4317"]
+  },
+  "permissions": ["core:default", "updater:default", "dialog:default"]
+}

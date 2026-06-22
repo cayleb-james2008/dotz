@@ -3,7 +3,7 @@
 # src-tauri (added Phase 1b): the thin WebView2 shell that runs dotz-core + opens the window.
 [workspace]
 resolver = "2"
-members = ["dotz-core"]
+members = ["dotz-core", "src-tauri"]
 
 [workspace.package]
 version = "0.2.0"
