@@ -6,6 +6,7 @@
  */
 import { spawn, execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { killTree } from "./kill-tree";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -454,7 +455,9 @@ export class BrowserController {
       });
       const code = await new Promise<number | null>((resolve, reject) => {
         const timeout = setTimeout(() => {
-          child?.kill();
+          // Use killTree (not bare child.kill) so a grandchild headless Chrome is reaped too —
+          // child.kill only sends SIGTERM to the direct child, leaving Chrome orphaned.
+          killTree(child, "single");
           reject(new Error("agent-browser command timed out"));
         }, 35_000);
         child!.once("error", (error) => { clearTimeout(timeout); reject(error); });
@@ -469,6 +472,10 @@ export class BrowserController {
       if (code !== 0) throw new Error((stderr || stdout || `agent-browser exited ${code}`).trim().slice(0, 1000));
       return parseJsonOutput(stdout);
     } finally {
+      // Ensure the child is dead even on a timeout/error path — without this, a timed-out
+      // agent-browser command leaks its process (and its Chrome grandchild) because the
+      // timeout handler only rejects the Promise; it doesn't guarantee the child exited.
+      if (child) killTree(child, "single");
       if (stdoutFile) await stdoutFile.close().catch(() => undefined);
       if (stderrFile) await stderrFile.close().catch(() => undefined);
       await Promise.all([fs.rm(stdoutPath, { force: true }), fs.rm(stderrPath, { force: true })]).catch(() => undefined);
