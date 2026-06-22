@@ -107,14 +107,13 @@ export class WorkflowBridge {
     const label = `subagent: ${steps.length} step${steps.length > 1 ? "s" : ""} (${steps.map((s) => s.agent).join("→")})`;
     workflowStore
       .create({ sessionId, projectId, label, origin: "subagent-bridge", steps })
-      .then((run) => {
+      .then(async (run) => {
         this.runsByToolCall.set(toolCallId, run.id);
-        workflowStore.start(run.id);
+        await workflowStore.start(run.id);
         // Mark all ready steps as running (the subagent extension runs them immediately).
         // Each stepState is fire-and-forget but its rejection is caught — a persist failure
         // (disk, permissions) must not become an unhandled promise rejection that crashes the
-        // server process. The pending-end replay below stays synchronous so a fast subagent end
-        // event is not delayed waiting for disk writes.
+        // server process.
         const runningPromises: Promise<void>[] = [];
         for (const step of run.steps) {
           if (step.status === "ready") {
@@ -125,7 +124,7 @@ export class WorkflowBridge {
         // sweep + cleanup run (otherwise the steps stay "running" and the maps leak).
         const pe = this.pendingEnds.get(toolCallId);
         if (pe) { this.pendingEnds.delete(toolCallId); this.onEnd(toolCallId, pe.result, pe.isError); }
-        return Promise.all(runningPromises).then(() => undefined);
+        await Promise.all(runningPromises);
       })
       .catch(() => {
         // Bridge is best-effort — but a create() failure (e.g. cycle) must not leave the buffered
