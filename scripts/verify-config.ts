@@ -11,8 +11,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { loadConfig, getConfig, updateConfig } from "../src/config";
-import { VALID_THINKING_LEVELS } from "../src/types";
+import { loadConfig, getConfig, updateConfig, executiveModelRef } from "../src/config";
+import { PROVIDERS, PROVIDER_DEFAULTS, VALID_THINKING_LEVELS } from "../src/types";
 
 let tmpDir: string;
 
@@ -62,6 +62,44 @@ test("updateConfig persists valid thinkingLevel", async () => {
   assert.equal(cfg.thinkingLevel, "medium", "valid thinkingLevel is applied in memory");
   const raw = JSON.parse(await fs.readFile(configPath(), "utf-8"));
   assert.equal(raw.thinkingLevel, "medium", "valid thinkingLevel is persisted to disk");
+});
+
+test("loadConfig clamps unknown provider to default", async () => {
+  await fs.writeFile(configPath(), JSON.stringify({ provider: "banana", executiveModel: "glm-5.2", subagentModel: "minimax-m3", thinkingLevel: "low" }));
+  const cfg = await loadConfig();
+  assert.equal(cfg.provider, "ollama", "unknown provider should fall back to default");
+});
+
+test("loadConfig clamps empty/whitespace model ids to defaults", async () => {
+  await fs.writeFile(configPath(), JSON.stringify({ provider: "openrouter", executiveModel: "   ", subagentModel: "", thinkingLevel: "low" }));
+  const cfg = await loadConfig();
+  assert.equal(cfg.provider, "openrouter", "valid provider is kept");
+  assert.equal(cfg.executiveModel, PROVIDER_DEFAULTS.ollama.executive, "empty executiveModel falls back");
+  assert.equal(cfg.subagentModel, PROVIDER_DEFAULTS.ollama.subagent, "empty subagentModel falls back");
+});
+
+test("updateConfig ignores unknown provider", async () => {
+  const before = getConfig();
+  const cfg = await updateConfig({ provider: "not-a-provider" as any });
+  assert.equal(cfg.provider, before.provider, "unknown provider must not change current provider");
+});
+
+test("updateConfig trims and lowercases provider, trims model ids", async () => {
+  const cfg = await updateConfig({ provider: "  OpenRouter  ", executiveModel: "  some/model  ", subagentModel: " other " });
+  assert.equal(cfg.provider, "openrouter", "provider is trimmed and lowercased");
+  assert.equal(cfg.executiveModel, "some/model", "executiveModel is trimmed");
+  assert.equal(cfg.subagentModel, "other", "subagentModel is trimmed");
+  const raw = JSON.parse(await fs.readFile(configPath(), "utf-8"));
+  assert.equal(raw.provider, "openrouter");
+  assert.equal(raw.executiveModel, "some/model");
+});
+
+test("executiveModelRef returns a valid model ref after sanitization", async () => {
+  await fs.writeFile(configPath(), JSON.stringify({ provider: "bad-provider", executiveModel: "", subagentModel: "  ", thinkingLevel: "medium" }));
+  await loadConfig();
+  const ref = executiveModelRef();
+  assert.ok(ref.provider && PROVIDERS.some((p) => p.id === ref.provider), "ref provider is known");
+  assert.ok(ref.modelId, "ref modelId is non-empty");
 });
 
 test("loadConfig reads a valid config unchanged", async () => {

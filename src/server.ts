@@ -182,7 +182,27 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     if (patch.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(patch.thinkingLevel)) {
       reply.code(400).send({ error: `thinkingLevel must be one of: ${[...VALID_THINKING_LEVELS].join(", ")}` }); return;
     }
-    const config = await updateConfig(patch);
+    // Validate provider/model fields so an unknown provider or empty model string can't be saved
+    // as the operator's default. A bad provider would break DOTZ_SUBAGENT_MODEL; an empty model id
+    // would cause session creation to fail downstream with a confusing SDK error.
+    const cleanPatch: Partial<DotzConfig> = {};
+    if (patch.provider !== undefined) {
+      const p = typeof patch.provider === "string" ? patch.provider.trim().toLowerCase() : "";
+      if (!PROVIDERS.some((pr) => pr.id === p)) {
+        reply.code(400).send({ error: `provider must be one of: ${PROVIDERS.map((pr) => pr.id).join(", ")}` }); return;
+      }
+      cleanPatch.provider = p;
+    }
+    for (const k of ["executiveModel", "subagentModel"] as const) {
+      const v = patch[k];
+      if (v !== undefined) {
+        const trimmed = typeof v === "string" ? v.trim() : "";
+        if (!trimmed) { reply.code(400).send({ error: `${k} must be a non-empty string` }); return; }
+        cleanPatch[k] = trimmed;
+      }
+    }
+    if (patch.thinkingLevel !== undefined) cleanPatch.thinkingLevel = patch.thinkingLevel;
+    const config = await updateConfig(cleanPatch);
     return { config };
   });
 
