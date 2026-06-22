@@ -249,8 +249,10 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       const v = (body as Record<string, unknown>)[k];
       if (v !== undefined && typeof v !== "string") { reply.code(400).send({ error: `${k} must be a string` }); return; }
     }
+    if (body.scope !== undefined && body.scope !== "project" && body.scope !== "global") { reply.code(400).send({ error: "scope must be 'project' or 'global'" }); return; }
     const cwd = await cwdForProject(body.projectId);
     const scope = body.scope ?? (body.projectId ? "project" : "global");
+    if (scope !== "project" && scope !== "global") { reply.code(400).send({ error: "scope must be 'project' or 'global'" }); return; }
     return memoryStore.create({ text, category: body.category, folder: body.folder, scope, projectCwd: cwd });
   });
   app.patch("/api/memory/:id", async (req, reply) => {
@@ -270,8 +272,20 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   app.post("/api/memory/search", async (req, reply) => {
     const body = (req.body ?? {}) as { query?: string; projectId?: string; threshold?: number; topK?: number; folder?: string; scope?: "project" | "global"; category?: string };
     if (body.query !== undefined && typeof body.query !== "string") { reply.code(400).send({ error: "query must be a string" }); return; }
+    // Coerce threshold/topK to safe numbers — a non-number (string, null, array) would pass through
+    // as NaN into cosine/scoring math, silently returning wrong/empty results instead of a 400.
+    const numOrUndef = (v: unknown, field: string): number | undefined => {
+      if (v === undefined) return undefined;
+      if (typeof v !== "number" || !Number.isFinite(v)) { reply.code(400).send({ error: `${field} must be a finite number` }); return undefined; }
+      return v;
+    };
+    const threshold = numOrUndef(body.threshold, "threshold");
+    if (threshold === undefined && body.threshold !== undefined) return; // 400 already sent
+    const topK = numOrUndef(body.topK, "topK");
+    if (topK === undefined && body.topK !== undefined) return;
+    if (body.scope !== undefined && body.scope !== "project" && body.scope !== "global") { reply.code(400).send({ error: "scope must be 'project' or 'global'" }); return; }
     const results = await memoryStore.search(body.query ?? "", {
-      projectCwd: await cwdForProject(body.projectId), threshold: body.threshold, topK: body.topK, folder: body.folder, scope: body.scope, category: body.category,
+      projectCwd: await cwdForProject(body.projectId), threshold, topK, folder: body.folder, scope: body.scope, category: body.category,
     });
     return { results };
   });
@@ -516,9 +530,11 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     if (!e) return;
     const s = e.session;
     const ref = (req.body ?? {}) as Partial<ModelRef>;
-    // trim-check: a whitespace-only modelId would pass a bare truthiness guard, then resolveModel
-    // clones a template with that garbage id and setModel accepts it (provider-only auth check).
-    if (!ref.provider?.trim() || !ref.modelId?.trim()) {
+    // Type-check provider/modelId from the untrusted body before calling .trim() — a non-string
+    // value (number, array, object) would throw TypeError (non-string has no .trim()), causing an
+    // uncaught 500 instead of a clean 400.
+    if (typeof ref.provider !== "string" || typeof ref.modelId !== "string" ||
+        !ref.provider.trim() || !ref.modelId.trim()) {
       reply.code(400).send({ error: "provider and modelId are required" });
       return;
     }
@@ -585,7 +601,8 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   app.post("/api/sessions/:id/abort", async (req, reply) => {
     const e = need((req.params as { id: string }).id, reply);
     if (!e) return;
-    await e.session.abort();
+    try { await e.session.abort(); }
+    catch (err) { reply.code(500).send({ error: "abort failed", detail: (err as Error).message }); return; }
     return { ok: true };
   });
 
@@ -703,6 +720,10 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       }
     });
 
+    // An unhandled 'error' event on a WebSocket (ECONNRESET, EPIPE, etc.) is an uncaught exception
+    // that crashes the process. The 'close' handler already tears down listeners, so 'error' just
+    // needs a no-op sink — the socket is already dead by the time 'error' fires.
+    socket.on("error", () => { /* closed/errored — close handler already runs cleanup */ });
     socket.on("close", () => { offAgent(); offWorkflow(); for (const off of sandboxOffs) off(); sandboxOffs.clear(); wsSockets.delete(socket); wsAlive.delete(socket); });
   });
 
@@ -713,6 +734,12 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
 }
 
 export async function start(): Promise<void> {
+  // Harden: an unhandled promise rejection (a stray async error in a WS handler, a sandbox timer
+  // callback, or a pi SDK internal) would otherwise crash the entire server by default (Node v15+).
+  // Log it prominently so bugs are visible but don't take down a long-running server.
+  process.on("unhandledRejection", (reason) => {
+    console.error("dotz: unhandled rejection:", reason);
+  });
   const { app, pi } = await buildServer();
   try {
     await app.listen({ host: HOST, port: PORT });
