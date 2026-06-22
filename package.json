@@ -17,6 +17,7 @@
     "fetch-model": "node scripts/fetch-embed-model.mjs",
     "verify-memory": "tsx scripts/verify-memory.ts",
     "test:updater": "node --test --import tsx scripts/verify-updater.ts",
+    "test:config": "node --test --import tsx scripts/verify-config.ts",
     "test:workflows": "node --test --import tsx scripts/verify-workflows.ts",
     "test:sandbox": "node --test --import tsx scripts/verify-sandbox.mjs",
     "test:metrics": "node --test --import tsx scripts/verify-metrics.ts",
