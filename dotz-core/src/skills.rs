@@ -383,6 +383,34 @@ fn not_found() -> Response {
         .into_response()
 }
 
+/// Render the skill index (names + one-line descriptions) for system-prompt injection. Mirrors
+/// skillLoader.renderIndex(): a header + one bullet per skill. Empty string when no skills.
+pub fn render_index() -> String {
+    let guard = index().lock().unwrap();
+    if guard.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# Available skills\nLoad a skill body on demand with the `skill` tool (name = the id below).\n",
+    );
+    for s in guard.values() {
+        out.push_str(&format!("- {}: {}\n", s.name, s.description));
+    }
+    out
+}
+
+/// Load a skill's SKILL.md body (frontmatter stripped) by name — backs the `skill` tool's execute.
+/// None when the skill is unknown or the file can't be read. Mirrors skillLoader.loadBody().
+pub fn load_body(name: &str) -> Option<String> {
+    let path = {
+        let guard = index().lock().unwrap();
+        guard.get(name).map(|s| s.path.clone())
+    }?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let (_, body) = split_frontmatter(&raw);
+    Some(body.to_string())
+}
+
 /// Stateless router for the unified skills endpoints.
 pub fn router() -> Router<()> {
     Router::new()
