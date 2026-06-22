@@ -20,7 +20,9 @@ import { fileURLToPath } from "node:url";
 /** Vendored Open Design systems dir (.pi/design-systems), resolved from this extension's location. */
 const DESIGN_SYSTEMS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "design-systems");
 /** Heuristic: does a prompt look like graphic/visual design work? Drives auto-routing to DESIGN mode. */
-const DESIGN_INTENT = /\b(?:design|ui|ux|mock-?up|wireframe|logo|poster|flyer|banner|brand(?:ing)?|graphic|illustration|landing[- ]?page|deck|slides?|presentation|infographic|icon|favicon|palette|typograph(?:y|ic)|css|tailwind|theme|figma)\b/i;
+// Graphic/visual-design intent. Deliberately omits high-collision bare tokens (css, ui, ux, theme,
+// deck, icon, palette, bare "brand") that fire on backend/test/infra work; design-context phrases kept.
+const DESIGN_INTENT = /\b(?:design|mock-?up|wireframe|logo|poster|flyer|banner|branding|graphic|illustration|landing[- ]?page|infographic|favicon|typograph(?:y|ic)|tailwind|figma|moodboard|slides?|presentation)\b|\b(?:colou?r) (?:palette|scheme)\b|\bbrand (?:identity|guidelines|kit|system)\b/i;
 
 /** Flatten an AgentMessage's content (string or content-part array) to plain text. */
 function textOf(content: unknown): string {

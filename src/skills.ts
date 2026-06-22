@@ -74,6 +74,11 @@ const INDEX_CAP = 80;
  *  Computed per load() so the DOTZ_SKILLS_PATHS override is read fresh from the environment. */
 function scanRoots(): Array<{ dir: string; source: Skill["source"] }> {
   const roots: Array<{ dir: string; source: Skill["source"] }> = [
+    // Vendored Open Design skills (Apache-2.0) — LOWEST priority (first in the array; load() lets later
+    // roots overwrite earlier same-named skills), so they only fill NEW names and never shadow the
+    // operator's own same-named skills (e.g. brainstorming, design-md, imagegen). Tagged "design" so
+    // renderIndex() keeps them OUT of the 80-cap prompt index; still loadable via the `skill` tool.
+    { dir: path.join(DOTZ_PI, "design-skills"), source: "design" },
     { dir: path.join(os.homedir(), ".hermes", "skills"), source: "hermes" },
     {
       dir: path.join(os.homedir(), ".codex", "plugins", "cache", "openai-curated", "superpowers"),
@@ -83,9 +88,6 @@ function scanRoots(): Array<{ dir: string; source: Skill["source"] }> {
     { dir: path.join(os.homedir(), ".codex", "skills"), source: "codex" },
     { dir: path.join(os.homedir(), ".claude", "skills"), source: "claude" },
     { dir: path.join(os.homedir(), ".config", "opencode", "skills"), source: "opencode" },
-    // Vendored Open Design skills (Apache-2.0). Tagged "design" so renderIndex() keeps them OUT of the
-    // always-on prompt index (150+ would evict dotz's own past INDEX_CAP); still loadable via `skill`.
-    { dir: path.join(DOTZ_PI, "design-skills"), source: "design" },
     { dir: path.join(DOTZ_PI, "skills"), source: "dotz" },
     { dir: userSkillsDir(), source: "dotz" },
   ];
