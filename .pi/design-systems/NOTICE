@@ -1,0 +1,17 @@
+dotz DESIGN mode — vendored Open Design content
+================================================
+
+The design systems in this directory are vendored from:
+
+  Open Design — https://github.com/nexu-io/open-design
+  Copyright the Open Design authors. Licensed under the Apache License, Version 2.0.
+
+The full Apache-2.0 license text is in the adjacent LICENSE file.
+
+Modifications by dotz: per-language DESIGN-<lang>.md translations and the preview/
+and source/ subdirectories were removed to reduce size. The English DESIGN.md,
+tokens (tokens.css / design-tokens.json / tailwind-v4.css), and the components
+fixtures (components.html / components.manifest.json) are retained verbatim.
+
+Some bundled presentation components upstream (e.g. guizang-ppt, html-ppt) carry
+their own MIT license; see the upstream repository for those notices.

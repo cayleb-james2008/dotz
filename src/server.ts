@@ -29,7 +29,7 @@ import { sandbox, SANDBOX_LANGUAGES, type SandboxEvent } from "./sandbox";
 import { skillLoader } from "./skills";
 import { workflowStore, WorkflowCycleError } from "./workflows";
 import { workflowBridge } from "./workflow-bridge";
-import { resolveHumanGate, onGateRequest } from "../.pi/extensions/dotz-tools/index";
+import { resolveHumanGate, onGateRequest, onPanelOpenRequest } from "../.pi/extensions/dotz-tools/index";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "./browser";
 import { connectionsController } from "./connections";
 import { PROVIDERS, PROVIDER_DEFAULTS, type Project, type WorkflowRun, VALID_THINKING_LEVELS } from "./types";
@@ -39,6 +39,8 @@ const HOST = "127.0.0.1";
 const PORT = Number(process.env.DOTZ_PORT || 4317);
 const SELF = fileURLToPath(import.meta.url);
 const WEB_DIR = path.resolve(path.dirname(SELF), "../web");
+/** Vendored Open Design systems (Apache-2.0) — served read-only to the DESIGN panel. */
+const DESIGN_SYSTEMS_DIR = path.resolve(path.dirname(SELF), "../.pi/design-systems");
 const FILE_TREE_MAX_DEPTH = 3;
 
 /** Send to a single WebSocket, swallowing the synchronous throw that happens when the socket
@@ -148,6 +150,11 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
   }, HEARTBEAT_MS);
   onGateRequest((gateId, plan) => {
     const msg = JSON.stringify({ kind: "gate", gateId, plan });
+    for (const s of wsSockets) safeSend(s, msg);
+  });
+  // The dotz-tools design auto-route asks the UI to open the DESIGN panel; fan it out to every socket.
+  onPanelOpenRequest((panel) => {
+    const msg = JSON.stringify({ kind: "panel_open", panelName: panel });
     for (const s of wsSockets) safeSend(s, msg);
   });
   const offBrowserBroadcast = browserController.subscribe((observation) => {
@@ -344,6 +351,32 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const body = await skillLoader.loadBody(name);
     if (!body) { reply.code(404).send({ error: "no such skill" }); return; }
     return { name, body };
+  });
+
+  // ---- design (native Open Design): vendored design systems for the DESIGN panel ----
+  // ponytail: re-reads ~150 manifests per call; fine for a local single-user app, cache if it ever lags.
+  app.get("/api/design/systems", async () => {
+    let entries: string[] = [];
+    try { entries = await fs.readdir(DESIGN_SYSTEMS_DIR); } catch { return { systems: [] }; }
+    const systems: Array<{ id: string; name: string; category: string; description: string }> = [];
+    for (const id of entries.sort()) {
+      if (!/^[a-z0-9][a-z0-9-]*$/i.test(id)) continue; // skip LICENSE, NOTICE, dotfiles
+      try {
+        const raw = await fs.readFile(path.join(DESIGN_SYSTEMS_DIR, id, "manifest.json"), "utf-8");
+        const m = JSON.parse(raw) as { name?: string; category?: string; description?: string };
+        systems.push({ id, name: m.name || id, category: m.category || "", description: m.description || "" });
+      } catch { systems.push({ id, name: id, category: "", description: "" }); }
+    }
+    return { systems };
+  });
+  // The chosen system's reference components page — same-origin srcdoc preview in the DESIGN panel.
+  app.get("/api/design/systems/:id/components", async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    if (!/^[a-z0-9][a-z0-9-]*$/i.test(id)) { reply.code(400).send({ error: "bad id" }); return; }
+    try {
+      const html = await fs.readFile(path.join(DESIGN_SYSTEMS_DIR, id, "components.html"), "utf-8");
+      reply.type("text/html").send(html);
+    } catch { reply.code(404).send({ error: "no components for this system" }); }
   });
 
   // ---- workflows ----
