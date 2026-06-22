@@ -383,6 +383,15 @@ code { font-family: var(--mono); color: var(--peach); }
 .panel[data-panel="sandbox"] { grid-column: span 6; grid-row: span 4; }
 .panel[data-panel="skills"] { grid-column: span 4; grid-row: span 4; }
 .panel[data-panel="connections"] { grid-column: span 4; grid-row: span 3; }
+.panel[data-panel="design"] { grid-column: span 6; grid-row: span 6; }
+.design-body { padding: 10px; overflow: hidden; display: flex; flex-direction: column; gap: 6px; }
+.design-toolbar { display: flex; gap: 6px; align-items: center; }
+.design-toolbar .pf-input { flex: 1; }
+.design-content { display: flex; gap: 8px; flex: 1; min-height: 0; }
+.design-list { width: 38%; min-width: 150px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+.design-preview-wrap { flex: 1; display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+.design-iframe { flex: 1; width: 100%; border: none; background: #fff; }
+.skill-source.design { background: var(--lav); color: #1e1e2e; }
 
 /* ---- CHAT PANEL ---- */
 .chat-body { display: flex; flex-direction: column; overflow: hidden; }

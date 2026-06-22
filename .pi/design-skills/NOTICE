@@ -1,0 +1,10 @@
+dotz DESIGN mode — vendored Open Design content
+================================================
+
+The design skills in this directory are vendored, unmodified, from:
+
+  Open Design — https://github.com/nexu-io/open-design
+  Copyright the Open Design authors. Licensed under the Apache License, Version 2.0.
+
+The full Apache-2.0 license text is in the adjacent LICENSE file. Individual skills
+may credit their own upstream sources in their SKILL.md frontmatter (`od.upstream`).

@@ -14,6 +14,13 @@ import { memoryStore, readAgentsMd, writeAgentsMd, appendAgentsMdSection, isMemo
 import { projectStore } from "../../../src/projects";
 import { captureBaseline, compare, renderBaseline, type MetricsBaseline } from "../../../src/metrics";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "../../../src/browser";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** Vendored Open Design systems dir (.pi/design-systems), resolved from this extension's location. */
+const DESIGN_SYSTEMS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "design-systems");
+/** Heuristic: does a prompt look like graphic/visual design work? Drives auto-routing to DESIGN mode. */
+const DESIGN_INTENT = /\b(?:design|ui|ux|mock-?up|wireframe|logo|poster|flyer|banner|brand(?:ing)?|graphic|illustration|landing[- ]?page|deck|slides?|presentation|infographic|icon|favicon|palette|typograph(?:y|ic)|css|tailwind|theme|figma)\b/i;
 
 /** Flatten an AgentMessage's content (string or content-part array) to plain text. */
 function textOf(content: unknown): string {
@@ -51,6 +58,14 @@ export function resolveHumanGate(gateId: string, approved: boolean, feedback?: s
 export function registerGateListener(gateId: string, fn: GateResolver): void {
   gateListeners.set(gateId, fn);
 }
+
+/** Panel-open listeners — the server registers one to forward UI panel-open requests to the WS UI. */
+type PanelNotify = (panel: string) => void;
+let panelNotify: PanelNotify | null = null;
+/** Register a panel-open listener (called by the server to forward to the WS UI). */
+export function onPanelOpenRequest(fn: PanelNotify): void { panelNotify = fn; }
+/** Ask the UI to open a bento panel (best-effort; no-op when no server is listening, e.g. subagents). */
+function requestPanelOpen(panel: string): void { try { if (panelNotify) panelNotify(panel); } catch { /* best-effort */ } }
 
 export default function (pi: ExtensionAPI) {
   // The SELECTED PROJECT's working dir. dotz's project tools (agents_md, rsi_baseline, memory_*,
@@ -455,6 +470,22 @@ export default function (pi: ExtensionAPI) {
       const { block } = await memoryStore.recall(event.prompt || "", ctx.cwd);
       if (block) return { systemPrompt: (event.systemPrompt || "") + block };
     } catch { /* recall is best-effort, never blocks the turn */ }
+  });
+
+  // Auto-route design requests: when a prompt looks graphic/design-related, open the DESIGN panel and
+  // inject Open Design doctrine for THIS turn — so design work happens in the native design workspace
+  // even from a non-DESIGN profile. (profiles.ts DESIGN profile holds the full doctrine.)
+  pi.on("before_agent_start", async (event) => {
+    if (!DESIGN_INTENT.test(event.prompt || "")) return;
+    requestPanelOpen("design");
+    const block =
+      `\n\n# DESIGN MODE (auto-activated — this request looks design-related)\n` +
+      `dotz ships Open Design natively; treat this as a design task:\n` +
+      `- 150+ design systems at ${DESIGN_SYSTEMS_DIR}/<slug>/ — READ DESIGN.md + tokens.css for the chosen system and honor its tokens.\n` +
+      `- 150+ design skills in the skill pool (source: design) — load with the \`skill\` tool.\n` +
+      `- The DESIGN panel (now opening) previews systems and renders/exports your HTML/CSS artifact (HTML + PDF).\n` +
+      `Produce a real, on-brand, self-contained HTML/CSS artifact; avoid AI-slop; meet WCAG contrast and focus states.`;
+    return { systemPrompt: (event.systemPrompt || "") + block };
   });
 
   // Post-task capture: after each task completes, extract durable facts from the exchange (mem0's
