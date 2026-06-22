@@ -58,15 +58,22 @@ async function runCmd(cmd: string, cwd: string, timeoutMs = 60000): Promise<{ ok
   }
 }
 
-/** Count files (non-node_modules, non-dist, non-.git) + test-file count. */
-async function countFiles(cwd: string): Promise<{ fileCount: number; testFiles: number }> {
+/** Count tracked files (non-node_modules, non-dist, non-.git) + test-file count.
+ *  Runs `git ls-files` and filters in JS so it works on Linux/macOS CI (no `findstr`). */
+export async function countFiles(cwd: string): Promise<{ fileCount: number; testFiles: number }> {
   try {
     const { stdout } = await execAsync(
-      `git ls-files --cached --others --exclude-standard | findstr /v /b "node_modules dist .git release" || echo ""`,
+      "git ls-files --cached --others --exclude-standard",
       { cwd, timeout: 15000, maxBuffer: 1024 * 1024, windowsHide: true }
-    ).catch(() => ({ stdout: "" }));
-    const files = stdout.split("\n").map((s) => s.trim()).filter(Boolean);
-    const testFiles = files.filter((f) => /\.(test|spec)\.[cm]?[jt]sx?$/i.test(f) || /(^|\/)(?:tests?|__tests__)\//i.test(f)).length;
+    );
+    const ignored = /^(node_modules|dist|release|\.git)(\/|$)/;
+    const files = stdout.split("\n").map((s) => s.trim()).filter(Boolean).filter((f) => !ignored.test(f));
+    const testFiles = files.filter((f) =>
+      /\.(test|spec)\.[cm]?[jt]sx?$/i.test(f) ||
+      /(^|\/)(?:tests?|__tests__)\//i.test(f) ||
+      /(^|\/)verify-[^/]+\.[cm]?[jt]sx?$/i.test(f) ||
+      /(^|\/)check-[^/]+\.[cm]?[jt]sx?$/i.test(f)
+    ).length;
     return { fileCount: files.length, testFiles };
   } catch {
     return { fileCount: 0, testFiles: 0 };
@@ -74,7 +81,7 @@ async function countFiles(cwd: string): Promise<{ fileCount: number; testFiles: 
 }
 
 /** Parse pass/fail counts from a test runner's output (vitest / jest / mocha / node:test TAP). */
-function parseTestCounts(output: string): { passed: number; failed: number } {
+export function parseTestCounts(output: string): { passed: number; failed: number } {
   // Use the LAST "(N) passed/failed" match, not the first: vitest prints "Test Files X passed"
   // BEFORE the real "Tests Y passed", so the first match is the file count, not the test count.
   const last = (re: RegExp): number => { const ms = [...output.matchAll(re)]; return ms.length ? Number(ms[ms.length - 1][1]) : 0; };
