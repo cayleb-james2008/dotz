@@ -196,14 +196,15 @@ export class WorkflowStore {
     return all;
   }
 
-  /** Mark a run as started. */
-  start(id: string): void {
+  /** Mark a run as started and persist the transition so a restart doesn't lose it. */
+  async start(id: string): Promise<void> {
     const run = this.active.get(id);
     if (!run) return;
     run.status = "running";
     run.startedAt = Date.now();
     run.updatedAt = Date.now();
     this.emit(id, { type: "workflow_start", run });
+    await this.persist(run);
   }
 
   /** Update a step's state and propagate readiness to children. */
