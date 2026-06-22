@@ -14,12 +14,12 @@ files:
   - package.json
   - node_modules/**/*
 win:
+  icon: assets/dotz.ico
+  artifactName: dotz.exe
   target:
-    - nsis
     - portable
-# NSIS updates through GitHub Releases; portable builds remain manual-download artifacts.
+# Source-rebuild updates keep the portable exe as the only Windows release artifact.
 publish:
   provider: github
   owner: cayleb-james2008
   repo: dotz
-# icon: assets/dotz.ico

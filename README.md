@@ -106,7 +106,7 @@ npm run electron
 ## Build the single exe
 
 ```bash
-npm run dist        # → release/dotz <version>.exe  (Windows portable)
+npm run dist        # → release/dotz.exe  (the one Windows launcher)
 ```
 
 `npm run build` bundles `src/` into `dist/` with esbuild (node_modules left external so pi's
