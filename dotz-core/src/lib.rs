@@ -3,6 +3,8 @@
 //! (see docs/api-contract.md). The vanilla `web/` UI is served unchanged.
 pub mod config;
 pub mod connections;
+pub mod embed;
+pub mod memory;
 pub mod design;
 pub mod profiles;
 pub mod projects;
