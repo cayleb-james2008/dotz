@@ -7,7 +7,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyError } from "fastify";
 import fastifyWebsocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
 import {
@@ -107,6 +107,19 @@ function sessionSummary(id: string, s: AgentSession, profileId?: string | null, 
 export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessions }> {
   const app = Fastify({ logger: false });
   const pi = new PiSessions();
+
+  // Sanitize unhandled errors: Fastify's default error handler includes the full stack trace in
+  // the response body, which leaks internals to the UI (and to any HTTP client). Return a clean
+  // message for 4xx (validation) errors and a generic message for 5xx (server) errors. Explicit
+  // reply.code(N).send({...}) calls (the validation guards throughout this file) bypass this
+  // handler entirely — it only fires for truly unhandled exceptions.
+  app.setErrorHandler((error: FastifyError, _request, reply) => {
+    const status = error.statusCode || 500;
+    console.error("dotz: unhandled request error:", error.message);
+    reply.code(status).send({
+      error: status < 500 ? error.message : "internal server error",
+    });
+  });
 
   // Load the operator's persisted provider/model/reasoning defaults (sets DOTZ_SUBAGENT_MODEL).
   await loadConfig();
@@ -710,7 +723,22 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
         }
         else if (msg.kind === "abort") await s.abort();
         else if (msg.kind === "sandbox.start") {
-          const run = await sandbox.start(msg.projectId || entry.projectId || null, msg.language || "bash", msg.code || "", {
+          // Validate language + code from the untrusted WS message — a non-string value (number,
+          // object, null) would pass through to sandbox.start() where fs.writeFile(code) throws an
+          // uncaught error or persists garbage. Same validation the REST POST /api/sandbox/runs does.
+          const wsLang = typeof msg.language === "string" ? msg.language : "bash";
+          const wsCode = typeof msg.code === "string" ? msg.code : "";
+          if (!SANDBOX_LANGUAGES.includes(wsLang)) {
+            if (socket.readyState === socket.OPEN)
+              socket.send(JSON.stringify({ kind: "error", sessionId, error: `unsupported language: ${wsLang}. Available: ${SANDBOX_LANGUAGES.join(", ")}` }));
+            return;
+          }
+          if (msg.mode !== undefined && msg.mode !== "terminal" && msg.mode !== "web") {
+            if (socket.readyState === socket.OPEN)
+              socket.send(JSON.stringify({ kind: "error", sessionId, error: 'mode must be "terminal" or "web"' }));
+            return;
+          }
+          const run = await sandbox.start(msg.projectId || entry.projectId || null, wsLang, wsCode, {
             timeoutMs: msg.timeoutMs,
             mode: msg.mode,
           });
@@ -758,6 +786,12 @@ export async function start(): Promise<void> {
   // Log it prominently so bugs are visible but don't take down a long-running server.
   process.on("unhandledRejection", (reason) => {
     console.error("dotz: unhandled rejection:", reason);
+  });
+  // Same for synchronous uncaught exceptions — a throw inside a .on() callback (socket, child
+  // process, EventEmitter) is an uncaughtException that would crash the process by default. Log
+  // but don't exit so a single bad callback doesn't take down the entire server.
+  process.on("uncaughtException", (err) => {
+    console.error("dotz: uncaught exception:", err);
   });
   const { app, pi } = await buildServer();
   try {
