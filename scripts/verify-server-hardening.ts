@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { buildServer } from "../src/server";
+import { buildServer, safeSend } from "../src/server";
 import type { FastifyInstance } from "fastify";
 import type { PiSessions } from "../src/pi";
 
@@ -109,6 +109,26 @@ test("DELETE /api/sessions/:id returns 404 for unknown session (not 200 ok:true)
 });
 
 // ---- WebSocket: error events do not crash the process ----
+
+test("safeSend swallows synchronous send errors from dying sockets", () => {
+  const socket = {
+    readyState: 1,
+    OPEN: 1,
+    send: () => { throw new Error("WebSocket send failed — socket is CLOSING"); },
+  };
+  assert.doesNotThrow(() => safeSend(socket as never, "{}"), "a send-throwing socket must not break the broadcast");
+});
+
+test("safeSend skips sockets that are not OPEN", () => {
+  let called = false;
+  const socket = {
+    readyState: 2, // CLOSING
+    OPEN: 1,
+    send: () => { called = true; },
+  };
+  safeSend(socket as never, "{}");
+  assert.equal(called, false, "send must not be called on a non-OPEN socket");
+});
 
 test("WebSocket to non-existent session closes cleanly without crashing server", async () => {
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?sessionId=does-not-exist`);
