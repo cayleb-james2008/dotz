@@ -130,7 +130,10 @@ app.on("before-quit", (e) => {
   // + stray-process reaping) AND unsubscribes memory/browser broadcast listeners. Without
   // app.close(), connectionsController.disposeAll() was NEVER called, leaking login processes.
   // browserController.disposeAll() is idempotent (second call is a no-op after sessions map empties).
+  // Timeout backstop: if app.close() hangs (e.g. an agent-browser `close` command stalls), force
+  // exit after 8s so the app never wedges in a non-quit state — the OS reaps any orphaned children.
   const serverClosed = runtime ? runtime.app.close().catch(() => undefined) : Promise.resolve();
-  serverClosed.finally(() => app.exit(0));
+  const forceExit = setTimeout(() => app.exit(0), 8_000);
+  serverClosed.finally(() => { clearTimeout(forceExit); app.exit(0); });
 });
 app.on("window-all-closed", () => app.quit());

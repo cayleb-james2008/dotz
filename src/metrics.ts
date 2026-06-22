@@ -50,7 +50,7 @@ const rsiDir = () => {
 /** Run a command in a cwd with a timeout; returns {ok, output}. */
 async function runCmd(cmd: string, cwd: string, timeoutMs = 60000): Promise<{ ok: boolean; output: string }> {
   try {
-    const { stdout, stderr } = await execAsync(cmd, { cwd, timeout: timeoutMs, maxBuffer: 1024 * 1024 });
+    const { stdout, stderr } = await execAsync(cmd, { cwd, timeout: timeoutMs, maxBuffer: 1024 * 1024, windowsHide: true });
     return { ok: true, output: (stdout + stderr).slice(-2000) };
   } catch (e) {
     const err = e as { stdout?: string; stderr?: string; message: string };
@@ -63,7 +63,7 @@ async function countFiles(cwd: string): Promise<{ fileCount: number; testFiles: 
   try {
     const { stdout } = await execAsync(
       `git ls-files --cached --others --exclude-standard | findstr /v /b "node_modules dist .git release" || echo ""`,
-      { cwd, timeout: 15000, maxBuffer: 1024 * 1024 }
+      { cwd, timeout: 15000, maxBuffer: 1024 * 1024, windowsHide: true }
     ).catch(() => ({ stdout: "" }));
     const files = stdout.split("\n").map((s) => s.trim()).filter(Boolean);
     const testFiles = files.filter((f) => /\.(test|spec)\.[cm]?[jt]sx?$/i.test(f) || /(^|\/)(?:tests?|__tests__)\//i.test(f)).length;

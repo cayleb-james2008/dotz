@@ -84,6 +84,11 @@ const isValidModel = (m: unknown): m is ModelRef =>
   typeof (m as ModelRef).provider === "string" && (m as ModelRef).provider.trim().length > 0 &&
   typeof (m as ModelRef).modelId === "string" && (m as ModelRef).modelId.trim().length > 0;
 
+/** Valid thinking levels — the closed set from types.ts (ThinkingLevel). Used to validate untrusted
+ *  request bodies before they reach session.setThinkingLevel(), which may throw or silently accept
+ *  garbage for unknown values. Mirrors THINK_LEVELS in web/app.js. */
+const VALID_THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
+
 /** Public-facing snapshot of a session's control state. */
 function sessionSummary(id: string, s: AgentSession, profileId?: string | null, projectId?: string | null) {
   const m = s.model as (typeof s.model & { provider?: string; reasoning?: boolean }) | undefined;
@@ -186,6 +191,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     for (const k of ["profileId", "thinkingLevel", "appUrl", "gateCommand"]) {
       if (b[k] !== undefined && typeof b[k] !== "string") { reply.code(400).send({ error: `${k} must be a string` }); return; }
     }
+    if (body.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(body.thinkingLevel)) { reply.code(400).send({ error: `thinkingLevel must be one of: ${[...VALID_THINKING_LEVELS].join(", ")}` }); return; }
     const cwdErr = await validateCwd(body.cwd);
     if (cwdErr) { reply.code(400).send({ error: cwdErr }); return; }
     return projectStore.create({ name: body.name, cwd: body.cwd, profileId: body.profileId, model: body.model, thinkingLevel: body.thinkingLevel, appUrl: body.appUrl, gateCommand: body.gateCommand });
@@ -210,7 +216,7 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     }
     if (raw.profileId !== undefined) { if (typeof raw.profileId !== "string") { reply.code(400).send({ error: "profileId must be a string" }); return; } patch.profileId = raw.profileId; }
     if (raw.model !== undefined) { if (!isValidModel(raw.model)) { reply.code(400).send({ error: "model must be { provider, modelId }" }); return; } patch.model = raw.model; }
-    if (raw.thinkingLevel !== undefined) { if (typeof raw.thinkingLevel !== "string") { reply.code(400).send({ error: "thinkingLevel must be a string" }); return; } patch.thinkingLevel = raw.thinkingLevel as ThinkingLevel; }
+    if (raw.thinkingLevel !== undefined) { if (typeof raw.thinkingLevel !== "string") { reply.code(400).send({ error: "thinkingLevel must be a string" }); return; } if (!VALID_THINKING_LEVELS.has(raw.thinkingLevel as ThinkingLevel)) { reply.code(400).send({ error: `thinkingLevel must be one of: ${[...VALID_THINKING_LEVELS].join(", ")}` }); return; } patch.thinkingLevel = raw.thinkingLevel as ThinkingLevel; }
     if (raw.appUrl !== undefined) { if (typeof raw.appUrl !== "string") { reply.code(400).send({ error: "appUrl must be a string" }); return; } patch.appUrl = raw.appUrl; }
     if (raw.gateCommand !== undefined) { if (typeof raw.gateCommand !== "string") { reply.code(400).send({ error: "gateCommand must be a string" }); return; } patch.gateCommand = raw.gateCommand; }
     const p = await projectStore.update((req.params as { id: string }).id, patch);
@@ -447,8 +453,21 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     // flows into resolveModel and pins the session to a structurally broken provider/undefined model
     // that setModel silently accepts (every later prompt then sends model=undefined upstream).
     if (body.model !== undefined && !isValidModel(body.model)) { reply.code(400).send({ error: "model must be { provider, modelId }" }); return; }
-    const entry = await pi.create(body);
-    return sessionSummary(entry.id, entry.session, entry.profile.id, entry.projectId);
+    // Validate thinkingLevel against the known set — an invalid value (e.g. 123, "banana") would
+    // pass through to session.setThinkingLevel(), which may throw or silently corrupt the session's
+    // reasoning state. Same allow-list the UI uses (THINK_LEVELS in app.js).
+    if (body.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(body.thinkingLevel)) {
+      reply.code(400).send({ error: `thinkingLevel must be one of: ${[...VALID_THINKING_LEVELS].join(", ")}` }); return;
+    }
+    try {
+      const entry = await pi.create(body);
+      return sessionSummary(entry.id, entry.session, entry.profile.id, entry.projectId);
+    } catch (err) {
+      // pi.create() can throw for auth failures (no provider key), bad model resolution, or SDK
+      // init errors — surface these as a clean 503 instead of Fastify's generic 500 so the UI can
+      // show a helpful message (e.g. "configure your Ollama API key") instead of a stack trace.
+      reply.code(503).send({ error: "session creation failed", detail: (err as Error).message });
+    }
   });
 
   app.get("/api/sessions", async () => pi.list().map((e) => sessionSummary(e.id, e.session, e.profile.id, e.projectId)));
@@ -521,7 +540,13 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const e = need((req.params as { id: string }).id, reply);
     if (!e) return;
     const s = e.session;
-    s.setThinkingLevel(((req.body ?? {}) as { level: ThinkingLevel }).level);
+    const level = ((req.body ?? {}) as { level: ThinkingLevel }).level;
+    // Validate against the known set — an invalid level (number, typo, null) reaches setThinkingLevel
+    // which may throw or silently accept garbage, corrupting the session's reasoning state.
+    if (typeof level !== "string" || !VALID_THINKING_LEVELS.has(level as ThinkingLevel)) {
+      reply.code(400).send({ error: `level must be one of: ${[...VALID_THINKING_LEVELS].join(", ")}` }); return;
+    }
+    s.setThinkingLevel(level as ThinkingLevel);
     return {
       thinkingLevel: s.thinkingLevel,
       supportsThinking: s.supportsThinking(),
@@ -635,9 +660,18 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
       }
       const s = entry.session;
       try {
-        if (msg.kind === "prompt") await s.prompt(msg.text ?? "", s.isStreaming ? { streamingBehavior: "followUp" } : undefined);
-        else if (msg.kind === "steer") await s.steer(msg.text ?? "");
-        else if (msg.kind === "followUp") await s.followUp(msg.text ?? "");
+        if (msg.kind === "prompt") {
+          if (typeof msg.text !== "string" || !msg.text.trim()) return;
+          await s.prompt(msg.text, s.isStreaming ? { streamingBehavior: "followUp" } : undefined);
+        }
+        else if (msg.kind === "steer") {
+          if (typeof msg.text !== "string" || !msg.text.trim()) return;
+          await s.steer(msg.text);
+        }
+        else if (msg.kind === "followUp") {
+          if (typeof msg.text !== "string" || !msg.text.trim()) return;
+          await s.followUp(msg.text);
+        }
         else if (msg.kind === "abort") await s.abort();
         else if (msg.kind === "sandbox.start") {
           const run = await sandbox.start(msg.projectId || entry.projectId || null, msg.language || "bash", msg.code || "", {
@@ -694,7 +728,11 @@ export async function start(): Promise<void> {
   const shutdown = async () => {
     sandbox.disposeAll();
     pi.disposeAll();
-    await app.close();
+    // Timeout backstop: app.close() runs async onClose hooks (browserController.disposeAll, etc).
+    // If one stalls, force exit after 8s so Ctrl+C always terminates the server.
+    const forceExit = setTimeout(() => process.exit(0), 8_000);
+    try { await app.close(); } catch { /* best-effort */ }
+    clearTimeout(forceExit);
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
