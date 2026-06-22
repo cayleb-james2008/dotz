@@ -15,7 +15,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { WorkflowStore, WorkflowCycleError } from "../src/workflows";
+import { WorkflowStore, WorkflowCycleError, workflowStore } from "../src/workflows";
+import { WorkflowBridge } from "../src/workflow-bridge";
 
 let tmpDir: string;
 
@@ -191,4 +192,37 @@ test("persist: run is retrievable from history after persist", async () => {
   const found = history.find((r) => r.id === run.id);
   assert.ok(found, "run should be in history after persist");
   assert.equal(found!.status, "done");
+});
+
+test("workflow-bridge: stepState rejection during start is caught, not unhandled", async () => {
+  const bridge = new WorkflowBridge();
+  const originalStepState = workflowStore.stepState.bind(workflowStore);
+  let unhandled = 0;
+  const onUnhandled = () => { unhandled++; };
+  process.on("unhandledRejection", onUnhandled);
+
+  // Force every stepState call to reject so the bridge must swallow the rejection rather than
+  // leave it as an unhandled promise (which crashes Node v15+ by default).
+  workflowStore.stepState = async () => { throw new Error("forced stepState failure"); };
+
+  try {
+    bridge.handleEvent("bridge-test-session", null, {
+      type: "tool_execution_start",
+      toolName: "subagent",
+      toolCallId: "bridge-stepstate-fail",
+      args: { agent: "worker", task: "do something" },
+    });
+    // Let the create() + start() + stepState promises settle.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(unhandled, 0, "stepState rejection must not surface as an unhandled rejection");
+
+    const runs = workflowStore.list();
+    const run = runs.find((r) => r.sessionId === "bridge-test-session");
+    assert.ok(run, "bridge should still have created the run");
+    assert.equal(run!.status, "running", "run should be started even though stepState failed");
+    assert.equal(run!.steps[0].status, "ready", "step status should remain ready because stepState rejected");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    workflowStore.stepState = originalStepState;
+  }
 });
