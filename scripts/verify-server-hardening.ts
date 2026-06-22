@@ -17,7 +17,8 @@ import path from "node:path";
 import os from "node:os";
 import { buildServer, safeSend } from "../src/server";
 import type { FastifyInstance } from "fastify";
-import type { PiSessions } from "../src/pi";
+import type { PiSessions, AgentSession, SessionEntry } from "../src/pi";
+import { fileURLToPath } from "node:url";
 
 let tmpDir: string;
 let app: FastifyInstance;
@@ -163,6 +164,79 @@ test("WebSocket abrupt termination does not crash the server", async () => {
   // If the 'error' event had no handler, the process would have crashed.
   const health = await (await fetch(`${base}/api/health`)).json() as { ok: boolean };
   assert.equal(health.ok, true, "server survived the WebSocket abrupt termination");
+});
+
+// ---- WebSocket per-session fan-outs must use safeSend ----
+
+test("WebSocket per-session fan-outs use safeSend (source contract)", async () => {
+  const serverPath = fileURLToPath(new URL("../src/server.ts", import.meta.url));
+  const src = await fs.readFile(serverPath, "utf-8");
+  const wsRouteStart = src.indexOf('app.get("/ws"');
+  const wsRouteEnd = src.indexOf("await app.register(fastifyStatic", wsRouteStart);
+  assert.ok(wsRouteStart > 0, "found /ws route in server.ts");
+  assert.ok(wsRouteEnd > wsRouteStart, "found end of /ws route");
+  const wsRoute = src.slice(wsRouteStart, wsRouteEnd);
+  const rawSends = [...wsRoute.matchAll(/\bsocket\.send\s*\(/g)];
+  assert.equal(rawSends.length, 0, "per-session WebSocket handler must use safeSend, not raw socket.send");
+});
+
+test("WebSocket to a real session survives graceful close without crashing server", async () => {
+  const sessionId = "fake-session-close-test";
+  const fakeSession = {
+    sessionId,
+    isStreaming: false,
+    supportsThinking: () => true,
+    getAvailableThinkingLevels: () => ["off", "minimal", "low", "medium", "high", "xhigh"],
+    getActiveToolNames: () => [],
+    getAllTools: () => [],
+    getSessionStats: () => ({}),
+    subscribe: () => () => {},
+    dispose: () => {},
+    prompt: () => Promise.resolve(),
+    steer: () => Promise.resolve(),
+    followUp: () => Promise.resolve(),
+    abort: () => Promise.resolve(),
+    setModel: () => Promise.resolve(),
+    setThinkingLevel: () => {},
+    setActiveToolsByName: () => {},
+  } as unknown as AgentSession;
+
+  const fakeEntry = {
+    id: sessionId,
+    session: fakeSession,
+    profile: { id: "solo", name: "Solo", description: "", tools: [], thinkingLevel: "high", promptAppend: "" },
+    projectId: null,
+    listeners: new Set<(event: unknown) => void>(),
+    unsubscribe: () => {},
+  } as unknown as SessionEntry;
+
+  const originalGet = pi.get.bind(pi);
+  const originalSubscribe = pi.subscribe.bind(pi);
+  pi.get = (id: string) => (id === sessionId ? fakeEntry : originalGet(id));
+  pi.subscribe = (id: string, listener: (event: unknown) => void) => {
+    if (id === sessionId) {
+      fakeEntry.listeners.add(listener);
+      return () => fakeEntry.listeners.delete(listener);
+    }
+    return originalSubscribe(id, listener);
+  };
+  try {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?sessionId=${sessionId}`);
+    const msg = await new Promise<unknown>((resolve) => {
+      ws.addEventListener("message", (e) => resolve(JSON.parse((e as MessageEvent).data)), { once: true });
+      ws.addEventListener("error", () => resolve(null), { once: true });
+    });
+    assert.equal((msg as { kind: string }).kind, "ready", "server sends ready message for a valid session");
+
+    ws.close();
+    await new Promise((r) => setTimeout(r, 200));
+
+    const health = await (await fetch(`${base}/api/health`)).json() as { ok: boolean };
+    assert.equal(health.ok, true, "server survived graceful close of a session WebSocket");
+  } finally {
+    pi.get = originalGet;
+    pi.subscribe = originalSubscribe;
+  }
 });
 
 // ---- session creation: invalid model shape returns 400 (not 500) ----
