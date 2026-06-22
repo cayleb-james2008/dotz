@@ -439,10 +439,14 @@ export class BrowserController {
     const nonce = randomUUID();
     const stdoutPath = path.join(record.profileDir, `command-${nonce}.out`);
     const stderrPath = path.join(record.profileDir, `command-${nonce}.err`);
-    const stdoutFile = await fs.open(stdoutPath, "w+");
-    const stderrFile = await fs.open(stderrPath, "w+");
+    // Open both file handles INSIDE the try block so the finally can close them on any failure
+    // path — if stderrFile open fails, stdoutFile was already opened and would leak without this.
+    let stdoutFile: import("node:fs/promises").FileHandle | undefined;
+    let stderrFile: import("node:fs/promises").FileHandle | undefined;
     let child: ReturnType<typeof spawn> | undefined;
     try {
+      stdoutFile = await fs.open(stdoutPath, "w+");
+      stderrFile = await fs.open(stderrPath, "w+");
       child = spawn(executable, args, {
         windowsHide: true,
         stdio: ["ignore", stdoutFile.fd, stderrFile.fd],
@@ -465,8 +469,8 @@ export class BrowserController {
       if (code !== 0) throw new Error((stderr || stdout || `agent-browser exited ${code}`).trim().slice(0, 1000));
       return parseJsonOutput(stdout);
     } finally {
-      await stdoutFile.close().catch(() => undefined);
-      await stderrFile.close().catch(() => undefined);
+      if (stdoutFile) await stdoutFile.close().catch(() => undefined);
+      if (stderrFile) await stderrFile.close().catch(() => undefined);
       await Promise.all([fs.rm(stdoutPath, { force: true }), fs.rm(stderrPath, { force: true })]).catch(() => undefined);
     }
   }

@@ -6,6 +6,10 @@
 // Portable: scans from the repo root (parent of this script's dir), skipping
 // vendored/build trees. Precise child_process binding detection avoids false
 // positives like `regex.exec(...)`.
+//
+// Also tracks `promisify(child_process.fn)` aliases (e.g. `execAsync = promisify(exec)`)
+// so calls through the promisified wrapper are guarded too — the wrapper spawns the
+// same underlying process but its call site uses a different name.
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -46,6 +50,18 @@ function boundNames(src) {
     ns.add(m[1]);
   for (const m of src.matchAll(new RegExp(`(?:const|let|var)\\s+(\\w+)\\s*=\\s*require\\(\\s*${cp}\\s*\\)`, "g")))
     ns.add(m[1]);
+
+  // Track promisify aliases of child_process functions: `promisify(exec)` → execAsync.
+  // Without this, a promisified call (e.g. `execAsync(cmd, { cwd })`) bypasses the guard even
+  // though it spawns the same underlying process — the bare-name pattern only matches `exec(`.
+  if (/promisify/.test(src)) {
+    for (const fn of SPAWN) {
+      if (!bare.has(fn)) continue;
+      const re = new RegExp(`(?:const|let|var)\\s+(\\w+)\\s*=\\s*promisify\\(\\s*${fn}\\s*\\)`, "g");
+      for (const m of src.matchAll(re)) bare.add(m[1]);
+    }
+  }
+
   return { bare, ns };
 }
 
@@ -64,8 +80,11 @@ for (const file of walk(ROOT)) {
   if (!src.includes("child_process")) continue;
   const { bare, ns } = boundNames(src);
   const patterns = [];
+  // Create a bare-name pattern for EVERY name in `bare` — not just SPAWN names.
+  // `bare` includes child_process function names (exec, spawn, …) AND their promisify aliases
+  // (execAsync = promisify(exec)). Without this, promisified call sites bypass the guard.
+  for (const name of bare) patterns.push(new RegExp(`(?<![.\\w])${name}\\s*\\(`, "g"));
   for (const fn of SPAWN) {
-    if (bare.has(fn)) patterns.push(new RegExp(`(?<![.\\w])${fn}\\s*\\(`, "g"));
     for (const alias of ns) patterns.push(new RegExp(`\\b${alias}\\.${fn}\\s*\\(`, "g"));
   }
   for (const pat of patterns)
