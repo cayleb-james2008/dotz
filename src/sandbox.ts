@@ -126,6 +126,10 @@ function isPortOpen(port: number): Promise<boolean> {
 
 export class Sandbox {
   private active = new Map<string, ActiveRun>();
+  /** Cap on the in-memory run map. Terminal runs (done/error/killed) are evicted oldest-first once
+   *  the cap is exceeded; in-flight runs are never evicted. This prevents unbounded memory growth
+   *  over a long-lived server (every sandbox run ever started stayed in `active` forever). */
+  private static readonly ACTIVE_CAP = 100;
 
   private async spawnRun(
     run: SandboxRun,
@@ -260,8 +264,23 @@ export class Sandbox {
     const timeoutMs = typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
     const ar = await this.spawnRun(run, code, language, timeoutMs, listeners, mode);
     this.active.set(run.id, ar);
+    this.pruneActive();
     for (const l of [...ar.listeners]) l({ type: "sandbox_start", runId: run.id, run });
     return run;
+  }
+
+  /** Evict the oldest TERMINAL runs once the active map exceeds ACTIVE_CAP. The process handle
+   *  is already dead by the time a run is terminal (finish() nulls ar.proc), so eviction just drops
+   *  the stale run record from memory — no child-process cleanup needed. */
+  private pruneActive(): void {
+    if (this.active.size <= Sandbox.ACTIVE_CAP) return;
+    const terminal = [...this.active.values()]
+      .filter((ar) => ar.run.status === "done" || ar.run.status === "error" || ar.run.status === "killed")
+      .sort((a, b) => (a.run.endedAt ?? 0) - (b.run.endedAt ?? 0));
+    for (const ar of terminal) {
+      if (this.active.size <= Sandbox.ACTIVE_CAP) break;
+      this.active.delete(ar.run.id);
+    }
   }
 
   /** Subscribe to a run's live events (output, port detection, cursor, end). */
