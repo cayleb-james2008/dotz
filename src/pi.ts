@@ -189,13 +189,16 @@ export interface SlashCommand {
 /** Aggregate invocable commands exactly like pi's RPC get_commands: extensions, prompt templates, skills. */
 export function listCommands(session: AgentSession): SlashCommand[] {
   const s = session as unknown as {
-    extensionRunner: { getRegisteredCommands(): Array<{ invocationName: string; description: string }> };
-    promptTemplates: ReadonlyArray<{ name: string; description: string }>;
-    resourceLoader: { getSkills(): { skills: Array<{ name: string; description: string }> } };
+    extensionRunner?: { getRegisteredCommands?: () => Array<{ invocationName: string; description: string } > };
+    promptTemplates?: ReadonlyArray<{ name: string; description: string }>;
+    resourceLoader?: { getSkills?: () => { skills: Array<{ name: string; description: string }> } };
   };
   const out: SlashCommand[] = [];
-  for (const c of s.extensionRunner.getRegisteredCommands()) out.push({ name: c.invocationName, description: c.description, source: "extension" });
-  for (const t of s.promptTemplates) out.push({ name: t.name, description: t.description, source: "prompt" });
-  for (const sk of s.resourceLoader.getSkills().skills) out.push({ name: `skill:${sk.name}`, description: sk.description, source: "skill" });
+  // Defensive: the SDK's internal shape (extensionRunner / promptTemplates / resourceLoader) can
+  // change across pi versions. A missing or differently-shaped field would throw TypeError (an
+  // uncaught 500 on GET /api/sessions/:id/commands) — degrade to an empty list instead.
+  for (const c of s.extensionRunner?.getRegisteredCommands?.() ?? []) out.push({ name: c.invocationName, description: c.description, source: "extension" });
+  for (const t of s.promptTemplates ?? []) out.push({ name: t.name, description: t.description, source: "prompt" });
+  for (const sk of s.resourceLoader?.getSkills?.()?.skills ?? []) out.push({ name: `skill:${sk.name}`, description: sk.description, source: "skill" });
   return out;
 }

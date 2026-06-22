@@ -152,3 +152,21 @@ test("pruneActive: kills and errors are both terminal (evictable)", () => {
   assert.equal(s.has("k"), false, "killed run evicted as terminal");
   assert.equal(s.has("e"), false, "error run evicted as terminal");
 });
+
+// ---- finish() guard: exactly one sandbox_end per run ----
+// The finish() closure inside spawnRun has a `finished` flag that prevents a double
+// sandbox_end emission when both 'error' and 'exit' fire on the child process (which can
+// happen when killTree fails and the process then exits). This test starts a REAL run and
+// verifies exactly one sandbox_end event is received — the minimum guarantee of the guard.
+test("finish guard: a real run emits exactly one sandbox_end event", async () => {
+  const s = new Sandbox();
+  const ends = [];
+  const run = await s.start(null, "bash", "echo hello-world", { timeoutMs: 5000 });
+  s.subscribe(run.id, (e) => { if (e.type === "sandbox_end") ends.push(e); });
+  // Wait for the run to complete (bash echo exits in <1s).
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+  assert.equal(ends.length, 1, `expected exactly 1 sandbox_end, got ${ends.length}`);
+  assert.equal(ends[0].run.status, "done", "run completed successfully");
+  assert.equal(ends[0].run.exitCode, 0, "exit code 0");
+  s.disposeAll();
+});
