@@ -103,6 +103,11 @@ test("POST /api/sessions/:id/model returns 404 for unknown session (not 500)", a
   assert.equal(res.status, 404, `expected 404 for model on unknown session, got ${res.status}`);
 });
 
+test("DELETE /api/sessions/:id returns 404 for unknown session (not 200 ok:true)", async () => {
+  const res = await fetch(base + "/api/sessions/nonexistent-id", { method: "DELETE" });
+  assert.equal(res.status, 404, `expected 404 for delete on unknown session, got ${res.status}`);
+});
+
 // ---- WebSocket: error events do not crash the process ----
 
 test("WebSocket to non-existent session closes cleanly without crashing server", async () => {
@@ -166,6 +171,46 @@ test("POST /api/sessions rejects invalid thinkingLevel with 400", async () => {
     thinkingLevel: "banana",
   });
   assert.equal(res.status, 400, `expected 400 for invalid thinkingLevel, got ${res.status}`);
+});
+
+// ---- sandbox run validation (no session required) ----
+
+test("POST /api/sandbox/runs rejects non-string language with 400", async () => {
+  const res = await postRaw("/api/sandbox/runs", { language: 123, code: "console.log(1)" });
+  assert.equal(res.status, 400, `expected 400 for non-string language, got ${res.status}`);
+});
+
+test("POST /api/sandbox/runs rejects invalid mode with 400", async () => {
+  const res = await postRaw("/api/sandbox/runs", { language: "bash", code: "echo hi", mode: "webserver" });
+  assert.equal(res.status, 400, `expected 400 for invalid mode, got ${res.status}`);
+  const body = await res.json() as { error: string };
+  assert.match(body.error, /mode/i, "error mentions mode");
+});
+
+test("POST /api/sandbox/runs rejects non-string mode (number) with 400", async () => {
+  const res = await postRaw("/api/sandbox/runs", { language: "bash", code: "echo hi", mode: 42 });
+  assert.equal(res.status, 400, `expected 400 for non-string mode, got ${res.status}`);
+});
+
+// ---- global config validation ----
+
+test("POST /api/config rejects invalid thinkingLevel with 400", async () => {
+  const res = await postRaw("/api/config", { thinkingLevel: "banana" });
+  assert.equal(res.status, 400, `expected 400 for invalid thinkingLevel, got ${res.status}`);
+  const body = await res.json() as { error: string };
+  assert.match(body.error, /thinkingLevel/i, "error mentions thinkingLevel");
+});
+
+test("POST /api/config rejects non-string thinkingLevel (number) with 400", async () => {
+  const res = await postRaw("/api/config", { thinkingLevel: 42 });
+  assert.equal(res.status, 400, `expected 400 for non-string thinkingLevel, got ${res.status}`);
+});
+
+test("POST /api/config accepts valid thinkingLevel", async () => {
+  const res = await postRaw("/api/config", { thinkingLevel: "high" });
+  assert.equal(res.status, 200, `expected 200 for valid thinkingLevel, got ${res.status}`);
+  const body = await res.json() as { config: { thinkingLevel: string } };
+  assert.equal(body.config.thinkingLevel, "high", "thinkingLevel persisted");
 });
 
 // ---- server health after all tests ----

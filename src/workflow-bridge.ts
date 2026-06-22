@@ -121,7 +121,12 @@ export class WorkflowBridge {
         const pe = this.pendingEnds.get(toolCallId);
         if (pe) { this.pendingEnds.delete(toolCallId); this.onEnd(toolCallId, pe.result, pe.isError); }
       })
-      .catch(() => { /* bridge is best-effort */ });
+      .catch(() => {
+        // Bridge is best-effort — but a create() failure (e.g. cycle) must not leave the buffered
+        // end in pendingEnds forever (it would leak memory AND the toolCallId is never cleaned
+        // up, so the entry grows the map over a long-lived session with many failed dispersals).
+        this.pendingEnds.delete(toolCallId);
+      });
   }
 
   private onUpdate(toolCallId: string, partialResult: unknown): void {
