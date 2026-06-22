@@ -32,6 +32,12 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
         .route("/api/profiles", get(profiles_list))
         .route("/api/config", get(get_config).post(post_config))
         .with_state(state)
+        // Phase 2 cold modules — self-contained, stateless Router<()> merged after with_state.
+        .merge(crate::sandbox::router())
+        .merge(crate::design::router())
+        .merge(crate::projects::router())
+        .merge(crate::connections::router())
+        .merge(crate::workflows::router())
         .fallback_service(ServeDir::new(web_dir).append_index_html_on_directories(true))
 }
 
