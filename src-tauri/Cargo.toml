@@ -1,9 +1,9 @@
 [package]
 name = "dotz-tauri"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "dotz — ultra code (Rust/Tauri shell)"
-default-run = "dotz-tauri"
+default-run = "dotz"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -17,5 +17,5 @@ dotz-core = { path = "../dotz-core" }
 serde_json = "1"
 
 [[bin]]
-name = "dotz-tauri"
+name = "dotz"
 path = "src/main.rs"
