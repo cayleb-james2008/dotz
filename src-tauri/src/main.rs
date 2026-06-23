@@ -121,6 +121,13 @@ fn main() {
             if std::env::var("DOTZ_ASSETS").is_err() {
                 std::env::set_var("DOTZ_ASSETS", res.join("assets"));
             }
+            // In-app browser binary (bundled as a resource).
+            if std::env::var("DOTZ_BROWSER_BIN").is_err() {
+                std::env::set_var(
+                    "DOTZ_BROWSER_BIN",
+                    res.join("agent-browser").join("agent-browser-win32-x64.exe"),
+                );
+            }
             let addr = SocketAddr::from(([127, 0, 0, 1], PORT));
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = dotz_core::server::serve(addr, web_dir).await {

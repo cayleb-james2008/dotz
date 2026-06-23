@@ -41,6 +41,7 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
         .merge(crate::skills::router())
         .merge(crate::memory::router())
         .merge(crate::agent::router())
+        .merge(crate::browser::router())
         .fallback_service(ServeDir::new(web_dir).append_index_html_on_directories(true))
 }
 
