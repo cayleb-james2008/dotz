@@ -1,7 +1,8 @@
 //! LLM provider layer. The primary (and only fully-wired) adapter is the OpenAI Chat-Completions
 //! streaming client, which covers the 9 OpenAI-compatible providers dotz uses
 //! (openrouter, ollama, openai, groq, mistral, xai, deepseek, cohere, local) — they differ only by
-//! baseURL + auth. Anthropic + Google are stubbed (Phase 3b) returning a clear error.
+//! baseURL + auth. Anthropic (Messages API) and Google (Gemini API) have native adapters of their
+//! own (see provider_anthropic.rs / provider_google.rs), selected by `adapter_for`.
 //!
 //! Auth mirrors the .pi extensions: an `apiKey` value of the form `$VAR` (or `${VAR}`) is resolved
 //! from the environment at request time; a bare literal is sent verbatim. The Ollama Cloud key MUST
@@ -122,7 +123,8 @@ fn context_window_for(provider: &str, model_id: &str) -> u64 {
 
 /// Resolve a provider/model into endpoint + metadata. free-form providers (ollama/openrouter/local)
 /// accept ANY model id; OpenAI-compatible catalog providers also accept any id (the upstream API
-/// validates). Anthropic/Google return None here (handled by the stub adapter). Default: ollama/glm-5.2.
+/// validates). Anthropic/Google return None here (their native adapters resolve endpoints themselves).
+/// Default: ollama/glm-5.2.
 pub fn resolve(provider: &str, model_id: &str) -> Option<ResolvedModel> {
     let (base_url, api_key_ref) = provider_endpoint(provider)?;
     Some(ResolvedModel {
@@ -333,23 +335,8 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-// ---- Anthropic + Google stubs (Phase 3b) ----
-
-pub struct UnimplementedProvider {
-    pub name: &'static str,
-}
-
-#[async_trait]
-impl Provider for UnimplementedProvider {
-    async fn stream(&self, _req: ChatRequest, _tx: mpsc::Sender<StreamDelta>) -> Result<(), String> {
-        Err(format!(
-            "provider '{}' is not yet implemented (Phase 3b: native {} adapter). Use an OpenAI-compatible provider (ollama, openrouter, openai, groq, mistral, xai, deepseek, cohere, local).",
-            self.name, self.name
-        ))
-    }
-}
-
-/// Pick the adapter for a provider id. OpenAI-compatible → OpenAiChat; anthropic/google → stub.
+/// Pick the adapter for a provider id. anthropic → native Messages API, google → native Gemini API,
+/// everything else (ollama/openrouter/openai/groq/mistral/xai/deepseek/cohere/local) → OpenAI-compatible.
 pub fn adapter_for(provider: &str) -> Box<dyn Provider> {
     match provider {
         "anthropic" => Box::new(super::provider_anthropic::AnthropicMessages::new()),

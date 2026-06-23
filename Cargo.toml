@@ -11,4 +11,6 @@ edition = "2021"
 
 [profile.release]
 strip = true
-lto = "thin"
+lto = "fat"          # whole-program inlining across crates (was "thin"); shipping binary, slow compile is fine
+codegen-units = 1    # one codegen unit → the optimizer sees the whole crate, smaller+faster binary
+# ponytail: left panic="unwind" (the default) — panic="abort" shaves a little more but Tauri/wry want unwinding.

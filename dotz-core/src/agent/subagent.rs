@@ -190,7 +190,7 @@ fn discover_agents(cwd: &str, scope: &str) -> Discovery {
     // Map by name, applying precedence.
     let mut map: HashMap<String, AgentConfig> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    let mut put = |a: AgentConfig, map: &mut HashMap<String, AgentConfig>, order: &mut Vec<String>| {
+    let put = |a: AgentConfig, map: &mut HashMap<String, AgentConfig>, order: &mut Vec<String>| {
         if !map.contains_key(&a.name) {
             order.push(a.name.clone());
         }

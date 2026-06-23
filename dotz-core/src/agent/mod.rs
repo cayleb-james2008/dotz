@@ -3,7 +3,7 @@
 //! A WORKING single-agent chat turn streamed over WebSocket, emitting the EXACT event shapes the
 //! unchanged `web/app.js` consumes. Ollama Cloud (OpenAI-compatible) is the primary provider and
 //! works end-to-end. Other OpenAI-compatible providers (openrouter/openai/groq/mistral/xai/deepseek/
-//! cohere/local) share the same adapter; anthropic + google are stubbed (Phase 3b).
+//! cohere/local) share the same adapter; anthropic + google have their own native adapters.
 //!
 //! Wiring: `agent::router()` returns a `Router<()>` with the `/api/sessions*` REST endpoints AND the
 //! `GET /ws` upgrade. Merge it into `server::app()` like the other Phase-2 cold modules.
