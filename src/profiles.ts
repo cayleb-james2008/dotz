@@ -15,6 +15,8 @@ import { skillLoader } from "./skills";
 /** Bundled .pi (skills / extensions / prompts) — resolved relative to this module so it works
  *  both in dev (src/) and in the packaged app (dist/, with .pi shipped alongside). */
 const DOTZ_PI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".pi");
+/** Vendored Open Design systems (DESIGN.md + tokens.css per slug) — referenced by the DESIGN doctrine. */
+const DESIGN_SYSTEMS_DIR = path.join(DOTZ_PI, "design-systems");
 
 export interface Profile {
   id: string;
@@ -72,6 +74,22 @@ Planning mode. Investigate read-only and produce a concrete, step-by-step plan. 
 subagents (\`subagent\` / /scout-and-plan) to map the codebase in PARALLEL, then synthesize a
 plan with named files and a verification section. Do NOT edit files in this mode.`;
 
+/** The graphic/visual-design domain doctrine — single source of truth, shared by the DESIGN profile
+ *  (below) and the dotz-tools design auto-route, so the path / skill names / steps never drift.
+ *  DESIGN_DOMAIN_MARKER is a stable substring the auto-route uses to detect when this doctrine is
+ *  already present (e.g. under the DESIGN profile) and skip a duplicate injection. */
+export const DESIGN_DOMAIN_MARKER = "## Domain: graphic & visual design";
+export const DESIGN_DOMAIN_DOCTRINE =
+  `\n\n${DESIGN_DOMAIN_MARKER} — Open Design (native to dotz)
+dotz ships Open Design natively. For ANY graphic/design artifact (UI, landing page, poster, logo, brand, deck, social card, illustration):
+
+1. PICK a design system. 150+ are bundled at ${DESIGN_SYSTEMS_DIR}/<slug>/ (e.g. stripe, linear, apple, notion, vercel, figma). READ that system's DESIGN.md and tokens.css FIRST and honor its tokens — never invent off-brand colors/spacing. Browse them in the DESIGN panel or via GET /api/design/systems.
+2. USE design skills. 150+ Open Design skills are in the skill pool (source: design) — load the relevant one with the \`skill\` tool (e.g. canvas-design, brand-guidelines, ad-creative, article-magazine, algorithmic-art).
+3. AUTHOR a real, self-contained HTML/CSS artifact: paste the chosen system's :root tokens FIRST, then build everything with var(...). Avoid AI-slop (no purple gradients, fake glassmorphism, generic SaaS cards); meet WCAG contrast, real focus states, 44px touch targets.
+4. PREVIEW & EXPORT in the DESIGN panel — render the artifact, then export HTML or PDF.`;
+
+const DESIGN_DOCTRINE = WORKFLOW_DOCTRINE + DESIGN_DOMAIN_DOCTRINE;
+
 export const PROFILES: Profile[] = [
   {
     id: "workflow",
@@ -126,6 +144,16 @@ export const PROFILES: Profile[] = [
     appendSystemPrompt:
       WORKFLOW_DOCTRINE +
       `\n\n## Domain: back-end, data & infra\nPrefer boring, well-tested technology. Write tests first (TDD) for core logic. Validate inputs at boundaries, surface errors honestly, and never log secrets.`,
+  },
+  {
+    id: "design",
+    name: "DESIGN",
+    tagline: "Graphic & visual design · Open Design (native)",
+    model: DEFAULT_MODEL,
+    thinkingLevel: "high",
+    tools: undefined,
+    workflow: true,
+    appendSystemPrompt: DESIGN_DOCTRINE,
   },
 ];
 

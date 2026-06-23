@@ -407,6 +407,27 @@
       </div>
     </template>
 
+    <template id="tpl-design">
+      <div class="panel" data-panel="design" role="region" aria-label="Design">
+        <div class="panel-head" draggable="true"><span class="panel-icon">❖</span> DESIGN <button class="panel-close">×</button></div>
+        <div class="panel-body design-body">
+          <div class="design-toolbar">
+            <input id="design-search" class="pf-input" placeholder="search 150+ design systems…" />
+            <button id="design-export-html" class="btn-mini" title="download preview as HTML">⭳ HTML</button>
+            <button id="design-export-pdf" class="btn-mini" title="print preview to PDF">⭳ PDF</button>
+          </div>
+          <div id="design-count" class="skills-count dim mono">loading…</div>
+          <div class="design-content">
+            <div id="design-list" class="design-list"></div>
+            <div class="design-preview-wrap">
+              <div class="sb-pane-head">PREVIEW <span id="design-preview-label" class="dim mono"></span></div>
+              <iframe id="design-iframe" class="design-iframe" sandbox="allow-same-origin allow-modals allow-popups" referrerpolicy="no-referrer"></iframe>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
     <script src="/app.js"></script>
   </body>
 </html>
