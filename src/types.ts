@@ -140,7 +140,7 @@ export interface Skill {
   /** Absolute path to the SKILL.md body. */
   path: string;
   /** Which pool this skill was discovered in. */
-  source: "opencode" | "claude" | "codex" | "ecc" | "superpowers" | "hermes" | "dotz";
+  source: "opencode" | "claude" | "codex" | "ecc" | "superpowers" | "hermes" | "dotz" | "design";
   /** Raw body (loaded lazily — only present after loadBody() is called). */
   body?: string;
   /** Optional tags from frontmatter. */
