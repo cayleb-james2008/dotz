@@ -384,6 +384,22 @@ impl Tool for StubTool {
     }
 }
 
+/// The real subagent tool (text path; the DAG-populating `details` are attached in session.rs).
+struct SubagentTool;
+#[async_trait]
+impl Tool for SubagentTool {
+    fn name(&self) -> &'static str { "subagent" }
+    fn description(&self) -> &'static str {
+        "Delegate tasks to specialized subagents with isolated context. Modes: single (agent+task), parallel (tasks[], max 8, concurrency 4), chain (chain[] sequential with {previous} feed-forward, max 16). Omit `model` to use the configured low-cost worker."
+    }
+    fn parameters(&self) -> Value { crate::agent::subagent::parameters_schema() }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        let cwd = ctx.cwd.to_string_lossy().to_string();
+        let d = crate::agent::subagent::dispatch(args, &cwd).await;
+        if d.is_error { Err(d.text) } else { Ok(d.text) }
+    }
+}
+
 /// The tool registry. Holds every tool; `active` is the subset the model sees.
 pub struct ToolRegistry {
     tools: BTreeMap<&'static str, Box<dyn Tool>>,
@@ -409,9 +425,9 @@ impl ToolRegistry {
         add(Box::new(MemorySearchTool));
         add(Box::new(MemoryAddTool));
         add(Box::new(MemoryListTool));
+        add(Box::new(SubagentTool));
         // Phase-4 stubs — present in the list so the tool surface matches pi.
         for (n, d) in [
-            ("subagent", "Disperse work to subagents (Phase 4)."),
             ("agents_md", "Read/write AGENTS.md doctrine (Phase 4)."),
             ("human_gate", "Request human approval before proceeding (Phase 4)."),
             ("browser_start", "Start an in-app browser session (Phase 4)."),
@@ -426,7 +442,7 @@ impl ToolRegistry {
 
         let active = vec![
             "read", "write", "edit", "bash", "ls", "grep", "find", "skill", "memory_search",
-            "memory_add", "memory_list",
+            "memory_add", "memory_list", "subagent",
         ]
         .into_iter()
         .map(String::from)
