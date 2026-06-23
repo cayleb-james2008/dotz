@@ -400,6 +400,56 @@ impl Tool for SubagentTool {
     }
 }
 
+// ---- in-app browser tools (drive the agent-browser controller) ----
+struct BrowserStartTool;
+#[async_trait]
+impl Tool for BrowserStartTool {
+    fn name(&self) -> &'static str { "browser_start" }
+    fn description(&self) -> &'static str {
+        "Start an isolated in-app browser at a URL (origin-allowlisted, disposable profile). Returns the page observation with interactive refs. Args: {url, allowedOrigins?:[string]}."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": { "url": { "type": "string" }, "allowedOrigins": { "type": "array", "items": { "type": "string" } } }, "required": ["url"] })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        let url = args.get("url").and_then(|v| v.as_str()).ok_or("url is required")?;
+        let origins = args.get("allowedOrigins").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+        let cwd = ctx.cwd.to_string_lossy().to_string();
+        let obs = crate::browser::start(&cwd, url, origins, None, None, None).await?;
+        Ok(serde_json::to_string(&obs).unwrap_or_default())
+    }
+}
+struct BrowserActTool;
+#[async_trait]
+impl Tool for BrowserActTool {
+    fn name(&self) -> &'static str { "browser_act" }
+    fn description(&self) -> &'static str {
+        "Drive the in-app browser. Args: {sessionId, action, targetRef?, text?, x?, y?, key?, url?, values?, expectedSeq?}. Actions: navigate, observe, back, forward, reload, click, clickAt, type, key, select, scroll, wait."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": { "sessionId": { "type": "string" }, "action": { "type": "string" } }, "required": ["sessionId", "action"] })
+    }
+    async fn execute(&self, args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
+        let obs = crate::browser::act(args).await?;
+        Ok(serde_json::to_string(&obs).unwrap_or_default())
+    }
+}
+struct BrowserStopTool;
+#[async_trait]
+impl Tool for BrowserStopTool {
+    fn name(&self) -> &'static str { "browser_stop" }
+    fn description(&self) -> &'static str { "Stop an in-app browser session and dispose its profile. Args: {sessionId}." }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": { "sessionId": { "type": "string" } }, "required": ["sessionId"] })
+    }
+    async fn execute(&self, args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
+        let sid = args.get("sessionId").and_then(|v| v.as_str()).ok_or("sessionId is required")?;
+        let obs = crate::browser::stop(sid).await?;
+        Ok(serde_json::to_string(&obs).unwrap_or_default())
+    }
+}
+
 /// The tool registry. Holds every tool; `active` is the subset the model sees.
 pub struct ToolRegistry {
     tools: BTreeMap<&'static str, Box<dyn Tool>>,
@@ -426,12 +476,13 @@ impl ToolRegistry {
         add(Box::new(MemoryAddTool));
         add(Box::new(MemoryListTool));
         add(Box::new(SubagentTool));
+        add(Box::new(BrowserStartTool));
+        add(Box::new(BrowserActTool));
+        add(Box::new(BrowserStopTool));
         // Phase-4 stubs — present in the list so the tool surface matches pi.
         for (n, d) in [
             ("agents_md", "Read/write AGENTS.md doctrine (Phase 4)."),
             ("human_gate", "Request human approval before proceeding (Phase 4)."),
-            ("browser_start", "Start an in-app browser session (Phase 4)."),
-            ("browser_act", "Drive the in-app browser (Phase 4)."),
             ("create_agent", "Create a persistent subagent (Phase 4)."),
             ("create_skill", "Create a persistent skill (Phase 4)."),
             ("rsi_baseline", "Capture the gate baseline (Phase 4)."),
@@ -442,7 +493,7 @@ impl ToolRegistry {
 
         let active = vec![
             "read", "write", "edit", "bash", "ls", "grep", "find", "skill", "memory_search",
-            "memory_add", "memory_list", "subagent",
+            "memory_add", "memory_list", "subagent", "browser_start", "browser_act", "browser_stop",
         ]
         .into_iter()
         .map(String::from)
