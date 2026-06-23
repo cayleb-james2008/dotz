@@ -453,9 +453,21 @@ pub async fn run_turn(session: std::sync::Arc<Mutex<AgentSession>>, prompt: Stri
                 });
             }
             // Execute without holding the session lock (the registry is stateless).
-            let (result_value, is_error, result_text) = match run_tool(&session, &name, &args, &ctx).await {
-                Ok(text) => (json!({ "content": [{ "type": "text", "text": text }] }), false, text),
-                Err(e) => (json!({ "content": [{ "type": "text", "text": e.clone() }], "isError": true }), true, e),
+            // subagent is special-cased so its SubagentDetails reach result.details (the workflow bridge reads it).
+            let (result_value, is_error, result_text) = if name == "subagent" {
+                let cwd = ctx.cwd.to_string_lossy().to_string();
+                let d = super::subagent::dispatch(&args, &cwd).await;
+                let rv = json!({
+                    "content": [{ "type": "text", "text": d.text.clone() }],
+                    "details": d.details_json(),
+                    "isError": d.is_error,
+                });
+                (rv, d.is_error, d.text)
+            } else {
+                match run_tool(&session, &name, &args, &ctx).await {
+                    Ok(text) => (json!({ "content": [{ "type": "text", "text": text }] }), false, text),
+                    Err(e) => (json!({ "content": [{ "type": "text", "text": e.clone() }], "isError": true }), true, e),
+                }
             };
             {
                 let mut s = session.lock().unwrap();
@@ -591,11 +603,34 @@ fn apply_delta(session: &std::sync::Arc<Mutex<AgentSession>>, sess_id: &str, acc
     }
 }
 
-/// Emit turn_end + agent_end and clear the cancel state.
+/// Emit turn_end + agent_end, then (main session only) fire-and-forget autonomous memory capture.
 fn finish_turn(session: &std::sync::Arc<Mutex<AgentSession>>, final_msg: Message, tool_results: Vec<ToolResult>) {
-    let s = session.lock().unwrap();
-    emit(&s, &AgentEvent::TurnEnd { message: final_msg, tool_results });
-    emit(&s, &AgentEvent::AgentEnd { messages: s.history.clone(), will_retry: false });
+    let join_text = |m: &Message| {
+        m.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let (cwd, user_text, assistant_text) = {
+        let s = session.lock().unwrap();
+        let user_text = s.history.iter().rev().find(|m| m.role == "user").map(&join_text).unwrap_or_default();
+        let assistant_text = join_text(&final_msg);
+        emit(&s, &AgentEvent::TurnEnd { message: final_msg.clone(), tool_results });
+        emit(&s, &AgentEvent::AgentEnd { messages: s.history.clone(), will_retry: false });
+        // Capture to PROJECT scope only when the session is project-bound; otherwise global (matches Node).
+        let cwd = if s.project_id.is_some() { s.cwd.to_string_lossy().to_string() } else { String::new() };
+        (cwd, user_text, assistant_text)
+    };
+    if crate::memory::is_autonomy_enabled() {
+        tokio::spawn(async move {
+            let cwd_opt = if cwd.is_empty() { None } else { Some(cwd.as_str()) };
+            crate::memory::capture_exchange(&user_text, &assistant_text, cwd_opt).await;
+        });
+    }
 }
 
 /// Finish the turn with an error assistant message (stopReason "error").

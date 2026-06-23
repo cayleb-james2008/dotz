@@ -16,11 +16,19 @@ use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GLOBAL_USER: &str = "__global__";
 const RECENCY_HALFLIFE_MS: f64 = 1000.0 * 60.0 * 60.0 * 24.0 * 30.0; // 30 days
+const AUTO_CONSOLIDATE_EVERY: i64 = 25; // captures between automatic consolidation passes
+const CAPTURE_DEDUP_THRESHOLD: f64 = 0.95; // a new fact >= this cosine to a same-scope neighbor is a near-dup
+
+/// Coding-tuned fact extraction instruction — ported verbatim from memory.ts CODING_INSTRUCTIONS.
+/// Keeps durable engineering facts, drops transient task chatter; this is what makes auto-capture
+/// useful instead of noisy.
+const CODING_INSTRUCTIONS: &str = "You are the durable memory of a coding agent working on software projects. Extract ONLY durable, reusable facts worth remembering across future sessions: - project conventions & code style, architecture/design decisions and their rationale, - build / test / lint / deploy commands, important file or module locations, - gotchas, workarounds, and non-obvious constraints, tooling/library choices, - explicit, stable USER preferences and standing instructions. IGNORE transient task state, one-off answers, ephemeral file contents, and pleasantries. Write each memory as a single concise, self-contained fact. If nothing is durable, extract nothing.";
 
 /// A memory as surfaced to REST/UI (mirrors types.ts MemoryView). camelCase; optionals omitted.
 #[derive(Clone, Serialize)]
@@ -436,6 +444,176 @@ fn render_mirror_file(file: &std::path::Path, title: &str, items: &[MemoryView])
         }
     }
     let _ = std::fs::write(file, out);
+}
+
+// ---- LLM autonomy: capture (infer:true) + auto-consolidation ----
+// Mirrors memory.ts captureExchange / maybeAutoConsolidate. The Node version delegated the fact
+// extraction + dedup to mem0 (infer:true); this port does it explicitly: one LLM chat completion to
+// extract durable facts, then per-fact cosine dedup vs same-scope neighbors before a verbatim add().
+
+/// ONLY the main server process enables capture — spawned subagents (separate processes) must never
+/// capture. Mirrors memory.ts autonomyEnabled / isMemoryAutonomyEnabled.
+static AUTONOMY: AtomicBool = AtomicBool::new(false);
+/// Facts captured since the last consolidation pass (counts stored facts, not exchanges).
+static CAPTURES_SINCE_CONSOLIDATE: AtomicI64 = AtomicI64::new(0);
+
+/// Enable autonomous memory capture for this process. Call once at server startup.
+pub fn enable_autonomy() {
+    AUTONOMY.store(true, Ordering::Relaxed);
+}
+
+/// True when this process is the main session and should auto-capture memory.
+pub fn is_autonomy_enabled() -> bool {
+    AUTONOMY.load(Ordering::Relaxed)
+}
+
+/// Resolve the memory-LLM endpoint (Ollama OpenAI-compatible) + model + key. Mirrors memory.ts
+/// engine(): DOTZ_MEMORY_BASE_URL || https://ollama.com/v1, DOTZ_MEMORY_MODEL || executiveModel ||
+/// glm-5.2, and OLLAMA_API_KEY via the $-env indirection the providers use.
+fn memory_llm() -> (String, String, String) {
+    let base_url = std::env::var("DOTZ_MEMORY_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://ollama.com/v1".to_string());
+    let model = std::env::var("DOTZ_MEMORY_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let exec = crate::config::load().executive_model;
+            if exec.trim().is_empty() {
+                "glm-5.2".to_string()
+            } else {
+                exec
+            }
+        });
+    // Same auth rule as the providers: prefer DOTZ_MEMORY_API_KEY, else OLLAMA_API_KEY (the $-form is
+    // what triggers env indirection — we resolve it directly here).
+    let key = std::env::var("DOTZ_MEMORY_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::agent::provider::resolve_api_key("$OLLAMA_API_KEY"));
+    (base_url, model, key)
+}
+
+/// Ask the configured LLM to extract durable facts from one user↔assistant exchange. Returns a list
+/// of self-contained fact strings (possibly empty). Best-effort: any transport/parse error → empty.
+async fn extract_facts(user_text: &str, assistant_text: &str) -> Vec<String> {
+    let (base_url, model, key) = memory_llm();
+    if key.is_empty() {
+        return Vec::new(); // no key → silent no-op (mirrors the provider's empty-reply 401 behavior)
+    }
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let system = format!(
+        "{CODING_INSTRUCTIONS}\n\n\
+         OUTPUT FORMAT — CRITICAL: respond with ONLY a raw JSON array of strings and NOTHING else. \
+         No prose, no greeting, no acknowledgement, no markdown code fences. Each array element is one \
+         durable, self-contained fact in the third person. If nothing is durable, output exactly [].\n\
+         Example of a valid response: [\"The deploy command is `make ship-prod`, run from the repo root on the release branch.\"]"
+    );
+    let exchange = format!(
+        "User:\n{user_text}\n\nAssistant:\n{assistant_text}\n\n\
+         Now output the durable facts from this exchange as a raw JSON array of strings (just the array)."
+    );
+    let body = json!({
+        "model": model,
+        "temperature": 0.1,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": exchange },
+        ],
+    });
+    let resp = match reqwest::Client::new().post(&url).bearer_auth(&key).json(&body).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    let v: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let content = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    parse_facts(content)
+}
+
+/// Parse the LLM reply into a fact list. Accepts a bare JSON array, or one fenced/embedded in prose
+/// (we slice the outermost [...]); falls back to non-empty trimmed lines. Always returns clean facts.
+fn parse_facts(content: &str) -> Vec<String> {
+    let slice = match (content.find('['), content.rfind(']')) {
+        (Some(a), Some(b)) if b > a => &content[a..=b],
+        _ => content.trim(),
+    };
+    if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(slice) {
+        return arr
+            .into_iter()
+            .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Auto-capture a completed user↔assistant exchange. LLM-extracts durable facts, dedups each against
+/// same-scope neighbors (cosine >= CAPTURE_DEDUP_THRESHOLD → skip), verbatim-adds the rest (which
+/// writes the mirror), bumps the capture counter, and consolidates every AUTO_CONSOLIDATE_EVERY.
+/// Best-effort throughout — never panics, mirrors memory.ts captureExchange. Returns the kept facts.
+pub async fn capture_exchange(user_text: &str, assistant_text: &str, cwd: Option<&str>) -> Vec<MemoryView> {
+    let u = user_text.trim();
+    let a = assistant_text.trim();
+    if u.len() < 8 && a.len() < 40 {
+        return Vec::new(); // skip trivial exchanges
+    }
+    let scope = if cwd.is_some() { "project" } else { "global" };
+    let facts = extract_facts(u, a).await;
+    if facts.is_empty() {
+        return Vec::new();
+    }
+
+    // Same-scope neighbors for dedup (embeddings already in the row).
+    let user_id = scope_user(scope, cwd);
+    let neighbors: Vec<Row> = {
+        let conn = db().lock().unwrap();
+        rows_for_user(&conn, &user_id, None)
+    };
+
+    let mut kept: Vec<MemoryView> = Vec::new();
+    let mut added_embs: Vec<Vec<f32>> = Vec::new();
+    for fact in facts {
+        let emb = match embed_text(&fact) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        // Near-dup vs existing neighbors OR vs a fact we just added this turn → skip.
+        let dup = neighbors.iter().any(|r| cosine(&emb, &r.embedding) >= CAPTURE_DEDUP_THRESHOLD)
+            || added_embs.iter().any(|e| cosine(&emb, e) >= CAPTURE_DEDUP_THRESHOLD);
+        if dup {
+            continue;
+        }
+        if let Ok(v) = add(&fact, scope, None, None, cwd) {
+            kept.push(v);
+            added_embs.push(emb);
+        }
+    }
+
+    if !kept.is_empty() {
+        CAPTURES_SINCE_CONSOLIDATE.fetch_add(kept.len() as i64, Ordering::Relaxed);
+        maybe_auto_consolidate(cwd);
+    }
+    kept
+}
+
+/// Run consolidation if enough new captures have accumulated since the last pass. Resets the counter
+/// when it fires. Mirrors memory.ts maybeAutoConsolidate.
+pub fn maybe_auto_consolidate(cwd: Option<&str>) {
+    if CAPTURES_SINCE_CONSOLIDATE.load(Ordering::Relaxed) < AUTO_CONSOLIDATE_EVERY {
+        return;
+    }
+    CAPTURES_SINCE_CONSOLIDATE.store(0, Ordering::Relaxed);
+    let _ = consolidate(cwd);
 }
 
 // ---- public surface for the agent runtime (pre-turn recall + the memory_* tools) ----
