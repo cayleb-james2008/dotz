@@ -8,6 +8,7 @@
 //! Wiring: `agent::router()` returns a `Router<()>` with the `/api/sessions*` REST endpoints AND the
 //! `GET /ws` upgrade. Merge it into `server::app()` like the other Phase-2 cold modules.
 pub mod event;
+pub mod extra_tools;
 pub mod provider;
 pub mod provider_anthropic;
 pub mod provider_google;
@@ -249,6 +250,13 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
             }
             "abort" => {
                 session::abort(&session_id);
+            }
+            // Resolve a pending human_gate (app.js sends {kind:"gate.approve"|"gate.reject", gateId, feedback?}).
+            "gate.approve" | "gate.reject" => {
+                if let Some(gid) = v.get("gateId").and_then(|g| g.as_str()) {
+                    let fb = v.get("feedback").and_then(|f| f.as_str()).map(|s| s.to_string());
+                    extra_tools::resolve_gate(gid, kind == "gate.approve", fb);
+                }
             }
             _ => {}
         }

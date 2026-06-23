@@ -410,7 +410,7 @@ async fn run_single_agent(
         agent.system_prompt.clone()
     };
 
-    let ctx = ToolCtx { cwd: PathBuf::from(cwd) };
+    let ctx = ToolCtx { cwd: PathBuf::from(cwd), tx: None };
 
     // Conversation history (rich Messages, like the executive session).
     let mut history: Vec<Message> = vec![Message::user(&format!("Task: {task}"), now_ms())];
