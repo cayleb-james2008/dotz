@@ -74,6 +74,11 @@ const INDEX_CAP = 80;
  *  Computed per load() so the DOTZ_SKILLS_PATHS override is read fresh from the environment. */
 function scanRoots(): Array<{ dir: string; source: Skill["source"] }> {
   const roots: Array<{ dir: string; source: Skill["source"] }> = [
+    // Vendored Open Design skills (Apache-2.0) — LOWEST priority (first in the array; load() lets later
+    // roots overwrite earlier same-named skills), so they only fill NEW names and never shadow the
+    // operator's own same-named skills (e.g. brainstorming, design-md, imagegen). Tagged "design" so
+    // renderIndex() keeps them OUT of the 80-cap prompt index; still loadable via the `skill` tool.
+    { dir: path.join(DOTZ_PI, "design-skills"), source: "design" },
     { dir: path.join(os.homedir(), ".hermes", "skills"), source: "hermes" },
     {
       dir: path.join(os.homedir(), ".codex", "plugins", "cache", "openai-curated", "superpowers"),
@@ -222,7 +227,10 @@ export class SkillLoader {
    *  entries so a large skill pool doesn't bloat the system prompt; the overflow is summarized in
    *  a footer (the agent can still load any skill by name via the `skill` tool). */
   renderIndex(): string {
-    const skills = this.list();
+    // Vendored Open Design skills (source: "design") are EXCLUDED from the always-on prompt index —
+    // 150+ of them would evict dotz's own skills past INDEX_CAP. They stay loadable via the `skill`
+    // tool and /api/skills, and are surfaced in the DESIGN panel + the DESIGN profile doctrine.
+    const skills = this.list().filter((s) => s.source !== "design");
     if (skills.length === 0) return "";
     const shown = skills.slice(0, INDEX_CAP);
     const lines = shown.map((s) => `- ${s.name}: ${s.description.slice(0, 160)}`);

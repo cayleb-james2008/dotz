@@ -1,0 +1,16 @@
+# dotz Rust rewrite — workspace.
+# dotz-core: the backend (axum server + agent/memory/... modules), plus a headless `serve` bin.
+# src-tauri (added Phase 1b): the thin WebView2 shell that runs dotz-core + opens the window.
+[workspace]
+resolver = "2"
+members = ["dotz-core", "src-tauri"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+
+[profile.release]
+strip = true
+lto = "fat"          # whole-program inlining across crates (was "thin"); shipping binary, slow compile is fine
+codegen-units = 1    # one codegen unit → the optimizer sees the whole crate, smaller+faster binary
+# ponytail: left panic="unwind" (the default) — panic="abort" shaves a little more but Tauri/wry want unwinding.

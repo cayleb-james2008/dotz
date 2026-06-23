@@ -1,0 +1,42 @@
+name: release
+
+# Cut a draft GitHub Release with the NSIS installer + the signed latest.json (the in-app updater
+# feed) whenever a v* tag is pushed. The source repo can stay PRIVATE — release assets are public,
+# so tauri-plugin-updater fetches latest.json with no auth.
+#
+# Required repo secrets (Settings → Secrets → Actions):
+#   TAURI_SIGNING_PRIVATE_KEY           contents of ~/.claude/dotz-rust/dotz-updater.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the key password (see dotz-updater.key.password)
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # Fetch the embedding model into assets/models (gitignored, needed by the bundled resources).
+      - name: fetch embed model
+        run: |
+          npm ci || npm install
+          npm run fetch-model
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: src-tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
+          releaseDraft: true
+          prerelease: false

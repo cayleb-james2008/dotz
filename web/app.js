@@ -11,7 +11,7 @@
 const THINK_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const LAYOUT_KEY = "dotz.layout.v1";
 const BRAIN_FLOAT_KEY = "dotz.brainFloat.v1";
-const PANEL_NAMES = ["chat", "graph", "brain", "browser", "memory", "files", "sandbox", "skills", "connections"];
+const PANEL_NAMES = ["chat", "graph", "brain", "browser", "memory", "files", "sandbox", "skills", "design", "connections"];
 const PANEL_META = {
   chat: { icon: "▓", label: "CHAT" },
   graph: { icon: "◐", label: "WORKFLOW GRAPH" },
@@ -21,6 +21,7 @@ const PANEL_META = {
   files: { icon: "▥", label: "FILES" },
   sandbox: { icon: "▩", label: "SANDBOX" },
   skills: { icon: "✦", label: "SKILLS" },
+  design: { icon: "❖", label: "DESIGN" },
   connections: { icon: "⊕", label: "CONNECTIONS" },
 };
 
@@ -59,6 +60,7 @@ const state = {
   connectionsPollTimer: null,
   connectionsLoginProvider: null,
   chatAutoScroll: true,
+  designSystems: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -304,6 +306,7 @@ function mountPanel(name) {
   else if (name === "memory") wireMemoryPanel(node);
   else if (name === "sandbox") wireSandboxPanel(node);
   else if (name === "skills") wireSkillsPanel(node);
+  else if (name === "design") wireDesignPanel(node);
   else if (name === "browser") wireBrowserPanel(node);
   else if (name === "files") wireFilesPanel(node);
   else if (name === "connections") wireConnectionsPanel(node);
@@ -591,6 +594,7 @@ function connectWS() {
     else if (m.kind === "browser") renderBrowserObservation(m.event);
     else if (m.kind === "gate") showGateCard(m.gateId, m.plan);
     else if (m.kind === "memory_recall") handleMemoryRecall(m);
+    else if (m.kind === "panel_open") { if (m.panelName) openPanel(m.panelName); }
     else if (m.kind === "error") {
       // A dead session (the server/exe restarted, so this sessionId no longer exists) will never
       // come back by reconnecting — stop the exponential-reconnect loop and tell the user once,
@@ -1405,6 +1409,86 @@ async function showSkillDetail(skill) {
     const { body: full } = await api(`/api/skills/${encodeURIComponent(skill.name)}`);
     body.textContent = full;
   } catch (e) { body.textContent = "error: " + e.message; }
+}
+
+/* ---------- design (native Open Design) ---------- */
+function wireDesignPanel(node) {
+  const search = node.querySelector("#design-search");
+  if (search) search.addEventListener("input", () => renderDesignList(search.value.toLowerCase()));
+  const eh = node.querySelector("#design-export-html");
+  const ep = node.querySelector("#design-export-pdf");
+  if (eh) eh.onclick = exportDesignHtml;
+  if (ep) ep.onclick = exportDesignPdf;
+  refreshDesignSystems();
+}
+
+async function refreshDesignSystems() {
+  try {
+    const { systems } = await api("/api/design/systems");
+    state.designSystems = systems || [];
+    renderDesignList("");
+  } catch (e) { pushError("design systems load: " + e.message); }
+}
+
+function renderDesignList(filter) {
+  const panel = document.querySelector('.panel[data-panel="design"]');
+  const list = panel ? panel.querySelector("#design-list") : null;
+  const count = panel ? panel.querySelector("#design-count") : null;
+  if (!list || !count) return;
+  const all = state.designSystems || [];
+  const f = filter
+    ? all.filter((s) => (s.name || "").toLowerCase().includes(filter) || (s.category || "").toLowerCase().includes(filter) || (s.id || "").toLowerCase().includes(filter))
+    : all;
+  count.textContent = `${f.length} of ${all.length} design systems`;
+  list.innerHTML = "";
+  f.forEach((s) => {
+    const item = el("div", "skill-item");
+    const head = el("div", "skill-item-head");
+    head.appendChild(el("span", "skill-name", s.name || s.id));
+    if (s.category) head.appendChild(el("span", "skill-source design", s.category));
+    item.appendChild(head);
+    if (s.description) item.appendChild(el("div", "skill-desc", truncate(s.description, 100)));
+    item.onclick = () => loadDesignPreview(s.id, s.name || s.id);
+    list.appendChild(item);
+  });
+}
+
+async function loadDesignPreview(id, label) {
+  const panel = document.querySelector('.panel[data-panel="design"]');
+  const iframe = panel ? panel.querySelector("#design-iframe") : null;
+  const lbl = panel ? panel.querySelector("#design-preview-label") : null;
+  if (!iframe) return;
+  if (lbl) lbl.textContent = label || id;
+  try {
+    const r = await fetch(`/api/design/systems/${encodeURIComponent(id)}/components`);
+    if (!r.ok) throw new Error("preview unavailable");
+    iframe.srcdoc = await r.text();
+  } catch (e) {
+    iframe.srcdoc = `<p style="font-family:monospace;color:#888;padding:1rem">no preview: ${esc(e.message)}</p>`;
+  }
+}
+
+// Export the current preview. HTML = a Blob download; PDF = native print of the same-origin srcdoc
+// iframe (zero deps). PNG export is deferred to Stage 2 (needs rasterization / Chromium).
+function exportDesignHtml() {
+  const panel = document.querySelector('.panel[data-panel="design"]');
+  const iframe = panel ? panel.querySelector("#design-iframe") : null;
+  const html = iframe && iframe.srcdoc;
+  if (!html) { pushError("open a design preview first"); return; }
+  const blob = new Blob([html], { type: "text/html" });
+  const a = el("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "design-artifact.html";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+function exportDesignPdf() {
+  const panel = document.querySelector('.panel[data-panel="design"]');
+  const iframe = panel ? panel.querySelector("#design-iframe") : null;
+  if (!iframe || !iframe.srcdoc) { pushError("open a design preview first"); return; }
+  try { iframe.contentWindow.focus(); iframe.contentWindow.print(); }
+  catch (e) { pushError("print failed: " + e.message); }
 }
 
 /* ---------- files ---------- */
