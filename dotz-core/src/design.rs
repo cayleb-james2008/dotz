@@ -92,41 +92,47 @@ async fn list_systems() -> Json<serde_json::Value> {
     }
     slugs.sort();
 
-    let mut systems: Vec<SystemEntry> = Vec::with_capacity(slugs.len());
-    for id in slugs {
-        let manifest_path = dir.join(&id).join("manifest.json");
-        let entry = match std::fs::read_to_string(&manifest_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        {
-            Some(m) => {
-                let name = m
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(id.as_str())
-                    .to_string();
-                let category = m
-                    .get("category")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let description = m
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                SystemEntry { id: id.clone(), name, category, description }
+    // Read every slug's manifest.json CONCURRENTLY instead of one-at-a-time. This handler is uncached
+    // and re-runs on every design-panel open, so 150+ sequential small-file reads were the cost.
+    // `join_all` yields results in input order, so the output stays byte-identical to the sorted scan.
+    let systems: Vec<SystemEntry> = futures_util::future::join_all(slugs.into_iter().map(|id| {
+        let dir = dir.clone();
+        async move {
+            let manifest_path = dir.join(&id).join("manifest.json");
+            match tokio::fs::read_to_string(&manifest_path)
+                .await
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            {
+                Some(m) => {
+                    let name = m
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(id.as_str())
+                        .to_string();
+                    let category = m
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let description = m
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    SystemEntry { id: id.clone(), name, category, description }
+                }
+                None => SystemEntry {
+                    id: id.clone(),
+                    name: id.clone(),
+                    category: String::new(),
+                    description: String::new(),
+                },
             }
-            None => SystemEntry {
-                id: id.clone(),
-                name: id.clone(),
-                category: String::new(),
-                description: String::new(),
-            },
-        };
-        systems.push(entry);
-    }
+        }
+    }))
+    .await;
 
     Json(json!({ "systems": systems }))
 }

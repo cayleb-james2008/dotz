@@ -27,7 +27,6 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
 
 const VERSION: u32 = 1;
 const MAX_OUTPUT: i64 = 50_000;
@@ -465,9 +464,8 @@ async fn run(session_id: &str, profile_dir: &PathBuf, allowed_origins: &[String]
         .env("AGENT_BROWSER_HEADED", "false");
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.creation_flags(CREATE_NO_WINDOW); // inherent on tokio::process::Command (no CommandExt import needed)
     }
 
     let mut child = cmd.spawn().map_err(|e| format!("agent-browser spawn failed: {e}"))?;

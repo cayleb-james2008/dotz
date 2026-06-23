@@ -1,5 +1,11 @@
 # dotz
 
+> **Rust rewrite (this branch).** The backend is now native Rust — an **axum** server + a **Tauri**
+> (WebView2) desktop shell + **`ort`** ONNX embeddings — with dotz's own agent runtime replacing the
+> third-party pi SDK. It serves the **same `web/` UI** and the same REST + WebSocket contract, so the
+> feature prose below still applies; only the stack names (Electron→Tauri, Fastify→axum,
+> transformers.js→`ort`, pi-SDK→native runtime) have changed. See `DEPLOY.md` for the Rust build/ship flow.
+
 A **pi.dev-based, Claude-Desktop-style coding-agent dashboard** — a clean chat interface for
 the [pi](https://pi.dev) coding agent, with live controls for **model, reasoning effort, tools,
 skills, and subagent orchestration**, packaged as its own desktop app.

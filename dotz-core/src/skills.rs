@@ -315,16 +315,45 @@ fn platforms_ok(s: &Skill) -> bool {
 
 /// Build the deduped, platform-filtered, name-sorted index. Scan roots low→high so a later root
 /// overwrites an earlier same-named skill (BTreeMap insert replaces the value, keeping sorted order).
+///
+/// The walk (directory listing) is sequential and cheap; the per-file cost is read-to-string + YAML
+/// parse, which is embarrassingly parallel. We collect every (file, source) in priority order, parse
+/// them across the available cores with `std::thread::scope` (stdlib — no rayon dep), then insert in
+/// the original order so the dedupe priority is byte-identical to the sequential version.
 fn build_index() -> BTreeMap<String, Skill> {
-    let mut map: BTreeMap<String, Skill> = BTreeMap::new();
+    // 1. Collect candidate files in priority order (low→high). The walk is fast; parsing isn't.
+    let mut files: Vec<(PathBuf, &'static str)> = Vec::new();
     for (dir, source) in scan_roots() {
         for file in find_skill_files(&dir) {
-            if let Some(skill) = parse_skill_file(&file, source) {
-                if platforms_ok(&skill) {
-                    map.insert(skill.name.clone(), skill);
-                }
-            }
+            files.push((file, source));
         }
+    }
+    let n = files.len();
+    let mut parsed: Vec<Option<Skill>> = (0..n).map(|_| None).collect();
+
+    // 2. Parse in parallel, each thread owning a disjoint slice of inputs+outputs (no locking).
+    let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(8);
+    let chunk = n.div_ceil(threads.max(1)).max(1);
+    if n > 0 {
+        std::thread::scope(|s| {
+            for (in_c, out_c) in files.chunks(chunk).zip(parsed.chunks_mut(chunk)) {
+                s.spawn(move || {
+                    for (i, (file, source)) in in_c.iter().enumerate() {
+                        if let Some(skill) = parse_skill_file(file, source) {
+                            if platforms_ok(&skill) {
+                                out_c[i] = Some(skill);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    // 3. Insert in priority order — later (higher-priority) roots overwrite earlier same-named skills.
+    let mut map: BTreeMap<String, Skill> = BTreeMap::new();
+    for skill in parsed.into_iter().flatten() {
+        map.insert(skill.name.clone(), skill);
     }
     map
 }
@@ -383,20 +412,43 @@ fn not_found() -> Response {
         .into_response()
 }
 
-/// Render the skill index (names + one-line descriptions) for system-prompt injection. Mirrors
-/// skillLoader.renderIndex(): a header + one bullet per skill. Empty string when no skills.
+/// Max skills listed in the system-prompt index. Mirrors `INDEX_CAP` in skills.ts — a large pool
+/// (96+ skills here) must NOT dump every full description into every turn's prompt; the overflow is
+/// summarized and any skill is still loadable by name via the `skill` tool.
+const INDEX_CAP: usize = 80;
+
+/// Render the skill index (names + truncated descriptions) for system-prompt injection. Byte-faithful
+/// to skillLoader.renderIndex(): capped at `INDEX_CAP` rows, each description clipped to 160 chars,
+/// with an overflow footer + count in the heading. Empty string when no skills.
 pub fn render_index() -> String {
     let guard = index().lock().unwrap();
-    if guard.is_empty() {
+    let total = guard.len();
+    if total == 0 {
         return String::new();
     }
-    let mut out = String::from(
-        "# Available skills\nLoad a skill body on demand with the `skill` tool (name = the id below).\n",
-    );
-    for s in guard.values() {
-        out.push_str(&format!("- {}: {}\n", s.name, s.description));
+    let mut lines: Vec<String> = guard
+        .values()
+        .take(INDEX_CAP)
+        .map(|s| {
+            let desc: String = s.description.chars().take(160).collect();
+            format!("- {}: {}", s.name, desc)
+        })
+        .collect();
+    if total > INDEX_CAP {
+        lines.push(format!(
+            "- …and {} more — call the `skill` tool by name, or GET /api/skills to browse/filter the full pool.",
+            total - INDEX_CAP
+        ));
     }
-    out
+    let heading = if total > INDEX_CAP {
+        format!("{total} skills, showing first {INDEX_CAP}")
+    } else {
+        format!("{total} skills")
+    };
+    format!(
+        "\n# dotz unified skill index ({heading})\nInvoke a skill's full instructions by calling the `skill` tool with its name. Skills are auto-discovered from opencode, claude, codex, ecc, superpowers, hermes, and bundled .pi pools.\n{}\n",
+        lines.join("\n")
+    )
 }
 
 /// Load a skill's SKILL.md body (frontmatter stripped) by name — backs the `skill` tool's execute.
@@ -416,4 +468,43 @@ pub fn router() -> Router<()> {
     Router::new()
         .route("/api/skills", get(list_skills))
         .route("/api/skills/{name}", get(get_skill))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// The parallel `build_index()` MUST produce the exact same deduped (name → path) mapping a plain
+    /// sequential parse of the same roots produces — same priority order, same platform filter. This
+    /// is the runnable guard for the `std::thread::scope` parallelization. Run with `--nocapture` to
+    /// also see the sequential-vs-parallel timing over the real on-disk skill pool.
+    #[test]
+    fn parallel_index_matches_sequential() {
+        let t0 = Instant::now();
+        let mut seq: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for (dir, source) in scan_roots() {
+            for file in find_skill_files(&dir) {
+                if let Some(s) = parse_skill_file(&file, source) {
+                    if platforms_ok(&s) {
+                        seq.insert(s.name.clone(), s.path.clone());
+                    }
+                }
+            }
+        }
+        let seq_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        let par = build_index();
+        let par_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        let par_paths: BTreeMap<String, PathBuf> =
+            par.iter().map(|(k, v)| (k.clone(), v.path.clone())).collect();
+        assert_eq!(seq, par_paths, "parallel build_index diverged from the sequential reference");
+
+        eprintln!(
+            "skills index over {} skills: sequential {seq_ms:.1}ms, parallel {par_ms:.1}ms",
+            par.len()
+        );
+    }
 }
