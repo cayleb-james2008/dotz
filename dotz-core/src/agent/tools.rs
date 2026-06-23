@@ -369,23 +369,6 @@ fn render_mem(items: &[crate::memory::MemoryView]) -> String {
     items.iter().map(|m| format!("- {}", m.memory)).collect::<Vec<_>>().join("\n")
 }
 
-// ---- Phase 4 stub tools (registered so the tool list matches the pi surface) ----
-struct StubTool {
-    name: &'static str,
-    description: &'static str,
-}
-#[async_trait]
-impl Tool for StubTool {
-    fn name(&self) -> &'static str { self.name }
-    fn description(&self) -> &'static str { self.description }
-    fn parameters(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
-    }
-    async fn execute(&self, _args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
-        Err(format!("tool '{}' is not yet implemented (Phase 4)", self.name))
-    }
-}
-
 /// The real subagent tool (text path; the DAG-populating `details` are attached in session.rs).
 struct SubagentTool;
 #[async_trait]

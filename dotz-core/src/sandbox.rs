@@ -200,9 +200,8 @@ async fn execute_run(id: String, language: String, code: String, timeout_ms: i64
         .stderr(Stdio::piped());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
+        command.creation_flags(CREATE_NO_WINDOW); // inherent on tokio::process::Command (no CommandExt import needed)
     }
 
     let mut child = match command.spawn() {

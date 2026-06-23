@@ -6,7 +6,7 @@
 //!   agent_start → turn_start → (message_start → message_update×N → message_end)×rounds → turn_end → agent_end
 //! with `message_update.assistantMessageEvent.partial` carrying the full assistant snapshot each tick.
 use super::event::*;
-use super::provider::{self, ChatRequest, Provider, StreamDelta};
+use super::provider::{self, ChatRequest, StreamDelta};
 use super::tools::{ToolCtx, ToolRegistry};
 use crate::{config, memory, profiles, projects, skills, types};
 use serde_json::{json, Value};
