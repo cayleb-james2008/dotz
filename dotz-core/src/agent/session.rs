@@ -343,7 +343,7 @@ pub async fn run_turn(session: std::sync::Arc<Mutex<AgentSession>>, prompt: Stri
         format!("{system_prompt}\n\n{recall_block}")
     };
 
-    let ctx = ToolCtx { cwd: cwd.clone() };
+    let ctx = ToolCtx { cwd: cwd.clone(), tx: Some(session.lock().unwrap().tx.clone()) };
     let cancel = session.lock().unwrap().cancel.clone();
 
     // The agent loop: up to a bounded number of tool-rounds.

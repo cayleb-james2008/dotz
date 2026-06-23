@@ -65,7 +65,7 @@ pub fn provider_ids() -> Vec<&'static str> {
 pub fn provider_defaults_json() -> Value {
     json!({
         "ollama": { "executive": "glm-5.2", "subagent": "minimax-m3" },
-        "openrouter": { "executive": "nex-agi/nex-n2-pro:free", "subagent": "nex-agi/nex-n2-pro:free" },
+        "openrouter": { "executive": "nex-agi/nex-n2-pro", "subagent": "nex-agi/nex-n2-pro" },
         "local": { "executive": "qwen2.5-coder", "subagent": "qwen2.5-coder" },
     })
 }
@@ -98,7 +98,7 @@ pub fn render_low_cost_models() -> String {
 pub fn provider_default(id: &str) -> Option<(&'static str, &'static str)> {
     match id {
         "ollama" => Some(("glm-5.2", "minimax-m3")),
-        "openrouter" => Some(("nex-agi/nex-n2-pro:free", "nex-agi/nex-n2-pro:free")),
+        "openrouter" => Some(("nex-agi/nex-n2-pro", "nex-agi/nex-n2-pro")),
         "local" => Some(("qwen2.5-coder", "qwen2.5-coder")),
         _ => None,
     }
