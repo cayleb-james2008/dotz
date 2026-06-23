@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 /// Context a tool executes in (the session's cwd, for relative-path resolution + memory scoping).
 pub struct ToolCtx {
     pub cwd: PathBuf,
+    /// Session WS broadcast sender (for human_gate to emit a gate frame). None in subagent contexts.
+    pub tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 }
 
 impl ToolCtx {
@@ -479,21 +481,13 @@ impl ToolRegistry {
         add(Box::new(BrowserStartTool));
         add(Box::new(BrowserActTool));
         add(Box::new(BrowserStopTool));
-        // Phase-4 stubs — present in the list so the tool surface matches pi.
-        for (n, d) in [
-            ("agents_md", "Read/write AGENTS.md doctrine (Phase 4)."),
-            ("human_gate", "Request human approval before proceeding (Phase 4)."),
-            ("create_agent", "Create a persistent subagent (Phase 4)."),
-            ("create_skill", "Create a persistent skill (Phase 4)."),
-            ("rsi_baseline", "Capture the gate baseline (Phase 4)."),
-            ("rsi_compare", "Compare against the gate baseline (Phase 4)."),
-        ] {
-            add(Box::new(StubTool { name: n, description: d }));
-        }
+        // The remaining pi tools: agents_md, create_agent/skill, rsi_baseline/compare, human_gate.
+        super::extra_tools::register(&mut add);
 
         let active = vec![
             "read", "write", "edit", "bash", "ls", "grep", "find", "skill", "memory_search",
             "memory_add", "memory_list", "subagent", "browser_start", "browser_act", "browser_stop",
+            "agents_md", "create_agent", "create_skill", "rsi_baseline", "rsi_compare", "human_gate",
         ]
         .into_iter()
         .map(String::from)
