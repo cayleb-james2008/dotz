@@ -102,6 +102,8 @@ fn provider_endpoint(provider: &str) -> Option<(String, String)> {
             };
             Some((base, key))
         }
+        "anthropic" => pair("https://api.anthropic.com/v1", "$ANTHROPIC_API_KEY"),
+        "google" => pair("https://generativelanguage.googleapis.com/v1beta", "$GEMINI_API_KEY"),
         _ => None,
     }
 }
@@ -350,8 +352,8 @@ impl Provider for UnimplementedProvider {
 /// Pick the adapter for a provider id. OpenAI-compatible → OpenAiChat; anthropic/google → stub.
 pub fn adapter_for(provider: &str) -> Box<dyn Provider> {
     match provider {
-        "anthropic" => Box::new(UnimplementedProvider { name: "anthropic" }),
-        "google" => Box::new(UnimplementedProvider { name: "google" }),
+        "anthropic" => Box::new(super::provider_anthropic::AnthropicMessages::new()),
+        "google" => Box::new(super::provider_google::GoogleGemini::new()),
         _ => Box::new(OpenAiChat::new()),
     }
 }

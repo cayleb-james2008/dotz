@@ -9,7 +9,10 @@
 //! `GET /ws` upgrade. Merge it into `server::app()` like the other Phase-2 cold modules.
 pub mod event;
 pub mod provider;
+pub mod provider_anthropic;
+pub mod provider_google;
 pub mod session;
+pub mod subagent;
 pub mod tools;
 
 use axum::{

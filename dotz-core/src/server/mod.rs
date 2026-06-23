@@ -123,6 +123,8 @@ fn bad(msg: String) -> (StatusCode, Json<Value>) {
 
 pub async fn serve(addr: SocketAddr, web_dir: PathBuf) -> std::io::Result<()> {
     let state = Arc::new(AppState { config: Mutex::new(config::load()) });
+    // Only the main server process captures memory autonomously (subagents never do).
+    crate::memory::enable_autonomy();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("dotz-core listening on http://{addr}  (web: {})", web_dir.display());
     axum::serve(listener, app(web_dir, state)).await
