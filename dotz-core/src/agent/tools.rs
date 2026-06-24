@@ -98,6 +98,11 @@ fn obj_param(props: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": props, "required": required })
 }
 
+/// Cap for the `read` tool output. Reading arbitrarily large files (logs, binaries, dumps)
+/// into the agent context would blow up the context window and block the tokio runtime; we
+/// return the leading chunk and tell the agent how to proceed.
+const READ_CAP: usize = 200 * 1024;
+
 // ---- read ----
 struct ReadTool;
 #[async_trait]
@@ -106,7 +111,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &'static str {
-        "Read a file's contents (UTF-8). Returns the full text."
+        "Read a file's contents (UTF-8). Returns the full text, or the first ~200 KB with a truncation marker for larger files."
     }
     fn parameters(&self) -> Value {
         obj_param(
@@ -117,7 +122,24 @@ impl Tool for ReadTool {
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let p = str_arg(args, "file_path").ok_or("file_path is required")?;
         let path = ctx.resolve_in_cwd(p)?;
-        std::fs::read_to_string(path).map_err(|e| format!("read {p}: {e}"))
+        // Offload the blocking filesystem read to tokio's blocking pool so a slow/bursty read
+        // does not stall the agent loop.
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| format!("read {p}: {e}"))?;
+        if content.len() <= READ_CAP {
+            return Ok(content);
+        }
+        // Truncate on a char boundary so the returned string is always valid UTF-8.
+        let mut end = READ_CAP;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        let omitted = content.len() - end;
+        Ok(format!(
+            "{}\n\n[read truncated: {omitted} bytes omitted; use grep, head/tail, or read a smaller range]",
+            &content[..end]
+        ))
     }
 }
 
@@ -995,6 +1017,99 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&sibling);
+    }
+
+    /// The `read` tool must return small files unchanged.
+    #[tokio::test]
+    async fn read_tool_returns_small_file_unchanged() {
+        let base =
+            std::env::temp_dir().join(format!("dotz-read-small-{}" , uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("note.txt"), "hello world").unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["read".to_string()]);
+        let ctx = ToolCtx {
+            cwd: base.clone(),
+            tx: None,
+        };
+        let out = registry
+            .run("read", &json!({"file_path": "note.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out, "hello world");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The `read` tool must cap huge files so they do not explode the context window or block
+    /// the runtime, returning a leading chunk plus a clear truncation marker.
+    #[tokio::test]
+    async fn read_tool_truncates_oversized_file() {
+        let base =
+            std::env::temp_dir().join(format!("dotz-read-large-{}" , uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        // Build a file larger than READ_CAP (200 KiB). The leading bytes are ASCII so the
+        // char-boundary truncation is deterministic; the trailing multi-byte char tests boundary
+        // correctness.
+        let mut content = "A".repeat(READ_CAP + 500);
+        content.push('é'); // 2-byte UTF-8 char at the end
+        std::fs::write(base.join("big.txt"), &content).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["read".to_string()]);
+        let ctx = ToolCtx {
+            cwd: base.clone(),
+            tx: None,
+        };
+        let out = registry
+            .run("read", &json!({"file_path": "big.txt"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            out.contains("[read truncated:"),
+            "oversized read must include a truncation marker, got: {out}"
+        );
+        assert!(
+            out.contains("bytes omitted"),
+            "truncation marker must mention omitted bytes, got: {out}"
+        );
+        assert!(
+            out.starts_with("AAAA"),
+            "truncated read must start with the original leading content"
+        );
+        assert!(
+            out.len() <= READ_CAP + 300,
+            "truncated read should be close to READ_CAP plus the marker, got {} bytes",
+            out.len()
+        );
+        // The returned string must be valid UTF-8 (no panic on .chars()).
+        let _ = out.chars().count();
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The `read` tool must still reject paths that escape the project directory.
+    #[tokio::test]
+    async fn read_tool_rejects_escaping_paths() {
+        let base =
+            std::env::temp_dir().join(format!("dotz-read-escape-{}" , uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["read".to_string()]);
+        let ctx = ToolCtx {
+            cwd: base.clone(),
+            tx: None,
+        };
+        let err = registry
+            .run("read", &json!({"file_path": "../secret.txt"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.contains("escapes"), "escaping path should be rejected, got: {err}");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A path inside the cwd, including via an absolute path that points back at the cwd, is
