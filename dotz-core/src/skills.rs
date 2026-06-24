@@ -134,21 +134,21 @@ fn scan_roots() -> Vec<(PathBuf, &'static str)> {
         (pi.join("skills"), "dotz"),
         (user_skills_dir(), "dotz"),
     ];
-    // Operator override: DOTZ_SKILLS_PATHS=dir1<sep>dir2 (path.delimiter — ';' on Windows). Each
-    // existing dir is appended at the end (highest priority).
+    // Operator override: DOTZ_SKILLS_PATHS=dir1<sep>dir2 (path.delimiter — ';' on Windows,
+    // ':' on Unix). Each existing dir is appended at the end (highest priority).
     if let Ok(extra) = std::env::var("DOTZ_SKILLS_PATHS") {
-        for d in extra.split(';') {
-            let d = d.trim();
-            if d.is_empty() {
-                continue;
-            }
-            let p = PathBuf::from(d);
-            if p.exists() {
-                roots.push((p, "dotz"));
-            }
-        }
+        roots.extend(extra_skills_roots(&extra));
     }
     roots
+}
+
+/// Parse a DOTZ_SKILLS_PATHS value into existing (dir, "dotz") pairs. Uses the OS path-list
+/// separator so the same env value works on Windows and Unix CI.
+fn extra_skills_roots(raw: &str) -> Vec<(PathBuf, &'static str)> {
+    std::env::split_paths(raw)
+        .filter(|p| !p.as_os_str().is_empty() && p.exists())
+        .map(|p| (p, "dotz"))
+        .collect()
 }
 
 /// Recursively collect files named (case-insensitively) `skill.md` under `root`. Unreadable dirs
@@ -509,6 +509,29 @@ pub fn router() -> Router<()> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// DOTZ_SKILLS_PATHS must be parsed with the OS path-list separator so a multi-dir override
+    /// works on both Windows (`;`) and Unix (`:`) without hand-rolling the delimiter.
+    #[test]
+    fn extra_skills_paths_uses_os_path_delimiter() {
+        let dir1 = std::env::temp_dir().join(format!("dotz-skills-a-{}", uuid::Uuid::new_v4()));
+        let dir2 = std::env::temp_dir().join(format!("dotz-skills-b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir1).unwrap();
+        std::fs::create_dir_all(&dir2).unwrap();
+
+        let joined = std::env::join_paths([&dir1 as &std::path::Path, &dir2]).unwrap();
+        let raw = joined.to_string_lossy().to_string();
+
+        let extra = extra_skills_roots(&raw);
+
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+
+        assert_eq!(extra.len(), 2, "both existing override dirs should be parsed");
+        assert_eq!(extra[0].0, dir1);
+        assert_eq!(extra[1].0, dir2);
+        assert!(extra.iter().all(|(_, source)| *source == "dotz"));
+    }
 
     /// The parallel `build_index()` MUST produce the exact same deduped (name → path) mapping a plain
     /// sequential parse of the same roots produces — same priority order, same platform filter. This
