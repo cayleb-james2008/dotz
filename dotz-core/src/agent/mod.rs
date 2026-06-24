@@ -374,10 +374,16 @@ async fn recv_broadcast(rx: &mut broadcast::Receiver<Value>) -> Option<Value> {
 /// Configurable WebSocket keep-alive interval. Browsers and most clients auto-respond to ping
 /// frames with pong, which keeps idle connections alive through proxies/firewalls. Defaults to
 /// 30s; override with `DOTZ_WS_PING_INTERVAL_MS` (e.g. for fast tests).
+///
+/// Clamped to [100ms, 1h]: a zero or missing value would panic `tokio::time::interval`, and a
+/// sub-millisecond interval would spam pings; an enormous interval defeats the keep-alive purpose.
 fn ws_ping_interval() -> Duration {
+    const MIN_MS: u64 = 100;
+    const MAX_MS: u64 = 3_600_000; // 1 hour
     std::env::var("DOTZ_WS_PING_INTERVAL_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
+        .map(|ms| ms.clamp(MIN_MS, MAX_MS))
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_secs(30))
 }
@@ -877,5 +883,45 @@ mod tests {
             found_ping,
             "expected a WebSocket ping frame from the server"
         );
+    }
+
+    /// `ws_ping_interval` must reject values that would break tokio (zero) or defeat keep-alive
+    /// (extreme values), falling back to the default when the env var is missing/invalid.
+    #[tokio::test]
+    async fn ws_ping_interval_clamps_invalid_values_and_honors_valid_override() {
+        let _guard = WS_TEST_LOCK.lock().await;
+        let prev = std::env::var("DOTZ_WS_PING_INTERVAL_MS").ok();
+
+        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "0");
+        assert_eq!(ws_ping_interval().as_millis(), 100, "zero must clamp to min");
+
+        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "50");
+        assert_eq!(
+            ws_ping_interval().as_millis(),
+            100,
+            "below-minimum must clamp to min"
+        );
+
+        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "250");
+        assert_eq!(ws_ping_interval().as_millis(), 250, "valid value preserved");
+
+        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "10000000");
+        assert_eq!(
+            ws_ping_interval().as_millis(),
+            3_600_000,
+            "above-maximum must clamp to max"
+        );
+
+        std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS");
+        assert_eq!(
+            ws_ping_interval().as_secs(),
+            30,
+            "missing env var falls back to 30s"
+        );
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p),
+            None => std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS"),
+        }
     }
 }
