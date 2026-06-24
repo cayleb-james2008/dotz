@@ -1,0 +1,28 @@
+dotz — License (source-available, all rights reserved)
+
+Copyright (c) 2026 Cayleb James. All rights reserved.
+
+This repository is SOURCE-AVAILABLE, not open source. The source is published so you
+can read it and so the desktop app can self-update — it is not licensed for reuse.
+
+You MAY:
+  - Download and run the official dotz binary releases, free of charge, for personal
+    or commercial use.
+  - View and read the source code in this repository.
+
+You MAY NOT, without prior written permission from the copyright holder:
+  - Copy, modify, fork, or create derivative works from the source code.
+  - Redistribute, sublicense, sell, mirror, or re-publish the source code or the binaries.
+  - Use the source code, in whole or in part, in any other project or product.
+
+Third-party content bundled in this repository retains its own license(s) — in
+particular the vendored Open Design systems and skills under `.pi/` are Apache-2.0
+(see the LICENSE/NOTICE shipped alongside that content). This file governs only the
+original dotz source and binaries.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE
+LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
