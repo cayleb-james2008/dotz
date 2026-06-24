@@ -812,6 +812,14 @@ fn finish_error(session: &std::sync::Arc<Mutex<AgentSession>>, detail: &str) {
     let mut msg = Message::assistant_shell(&s.provider, &s.model_id, now_ms());
     msg.stop_reason = Some("error".into());
     msg.error_message = Some(detail.to_string());
+    // The UI contract expects a message_start before every message_end; the error path was
+    // skipping it and leaving the bubble renderer with no shell to attach the error to.
+    emit(
+        &s,
+        &AgentEvent::MessageStart {
+            message: Message::assistant_shell(&s.provider, &s.model_id, msg.timestamp),
+        },
+    );
     emit(
         &s,
         &AgentEvent::MessageEnd {
@@ -903,4 +911,47 @@ pub fn models(id: &str) -> Option<Value> {
         "available": [],
         "providerMeta": types::providers(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_error_emits_message_start_before_message_end() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        finish_error(&sess, "provider unreachable");
+
+        let mut kinds: Vec<String> = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            if let Some(kind) = frame
+                .get("event")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str())
+            {
+                kinds.push(kind.to_string());
+            }
+        }
+
+        dispose(&sid);
+
+        let start_pos = kinds.iter().position(|k| k == "message_start");
+        let end_pos = kinds.iter().position(|k| k == "message_end");
+        assert!(
+            start_pos.is_some(),
+            "message_start missing in error events: {kinds:?}"
+        );
+        assert!(
+            end_pos.is_some(),
+            "message_end missing in error events: {kinds:?}"
+        );
+        assert!(
+            start_pos.unwrap() < end_pos.unwrap(),
+            "message_start must precede message_end in error path: {kinds:?}"
+        );
+    }
 }
