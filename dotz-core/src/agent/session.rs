@@ -10,7 +10,7 @@ use super::provider::{self, ChatRequest, StreamDelta};
 use super::tools::{ToolCtx, ToolRegistry};
 use crate::{config, memory, profiles, projects, skills, types};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -378,6 +378,10 @@ struct Accumulator {
     text_idx: Option<usize>,
     /// Streamed tool calls by provider index → (block index in content, id, name, args-json-buffer).
     tool_calls: HashMap<usize, (usize, String, String, String)>,
+    /// Indices for which a ToolCallStart has already been processed. Some providers stream the
+    /// name/id across multiple chunks; without this guard a duplicate start would create phantom
+    /// tool-call content blocks and break tool_call_id matching.
+    tool_call_started: HashSet<usize>,
 }
 
 impl Accumulator {
@@ -387,6 +391,7 @@ impl Accumulator {
             thinking_idx: None,
             text_idx: None,
             tool_calls: HashMap::new(),
+            tool_call_started: HashSet::new(),
         }
     }
 }
@@ -817,6 +822,12 @@ fn apply_delta(
             delta_text = Some(t);
         }
         StreamDelta::ToolCallStart { index, id, name } => {
+            // Only create a content block the first time we see a given provider index.
+            // Provider adapters normally dedupe repeated starts, but the session accumulator is
+            // the last line of defense against phantom duplicate tool calls.
+            if !acc.tool_call_started.insert(index) {
+                return;
+            }
             acc.msg.content.push(ContentBlock::ToolCall {
                 id: id.clone(),
                 name: name.clone(),
@@ -1078,6 +1089,7 @@ pub(crate) static SSE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::provider::StreamDelta;
     use crate::agent::tools;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1105,6 +1117,73 @@ mod tests {
             "TurnGuard must clear turn_active on drop"
         );
         dispose(&sid);
+    }
+
+    #[test]
+    fn session_accumulator_dedupes_repeated_tool_call_start() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut acc = Accumulator::new("ollama", "glm-5.2", 0);
+        let mut stop = String::new();
+
+        apply_delta(
+            &sess,
+            &sid,
+            &mut acc,
+            StreamDelta::ToolCallStart {
+                index: 0,
+                id: "call_1".into(),
+                name: "bash".into(),
+            },
+            &mut stop,
+        );
+        // A misbehaving provider might re-emit the same index; the accumulator must not create a
+        // duplicate content block.
+        apply_delta(
+            &sess,
+            &sid,
+            &mut acc,
+            StreamDelta::ToolCallStart {
+                index: 0,
+                id: "call_1".into(),
+                name: "bash".into(),
+            },
+            &mut stop,
+        );
+        apply_delta(
+            &sess,
+            &sid,
+            &mut acc,
+            StreamDelta::ToolCallArgs {
+                index: 0,
+                json: "{\"command\":\"echo hi\"}".into(),
+            },
+            &mut stop,
+        );
+
+        let tool_blocks: Vec<_> = acc
+            .msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolCall { id, name, arguments } => {
+                    Some((id.clone(), name.clone(), arguments.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        dispose(&sid);
+
+        assert_eq!(
+            tool_blocks.len(),
+            1,
+            "duplicate ToolCallStart for the same index must not create extra tool-call blocks"
+        );
+        assert_eq!(tool_blocks[0].0, "call_1");
+        assert_eq!(tool_blocks[0].1, "bash");
+        assert_eq!(tool_blocks[0].2["command"], "echo hi");
     }
 
     /// A panic while holding the session mutex (e.g. inside a tool callback) poisons the mutex.
