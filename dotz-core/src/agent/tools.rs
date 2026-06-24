@@ -191,6 +191,8 @@ impl Tool for BashTool {
         }
         if !out.status.success() {
             s.push_str(&format!("\n[exit {}]", out.status.code().unwrap_or(-1)));
+            // A non-zero exit is an error so the agent loop marks the tool result as failed.
+            return Err(s);
         }
         Ok(s)
     }
@@ -709,6 +711,24 @@ mod tests {
         assert!(
             out.contains("hello"),
             "active bash should execute, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_reports_bash_failure_as_error() {
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["bash".to_string()]);
+        let ctx = ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: None,
+        };
+        let err = registry
+            .run("bash", &json!({"command": "exit 1"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("[exit 1]"),
+            "a failing bash command must return an error containing the exit code, got: {err}"
         );
     }
 }
