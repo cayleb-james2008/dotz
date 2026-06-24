@@ -38,9 +38,12 @@ const MAX_ROUNDS: usize = 12;
 const DEFAULT_SUBAGENT_TIMEOUT_MS: u64 = 1000 * 60 * 5; // 5 minutes
 
 fn subagent_timeout() -> Duration {
+    const MIN_MS: u64 = 1_000;     // 1 second — zero would time out before any stream arrives.
+    const MAX_MS: u64 = 3_600_000; // 1 hour — anything larger defeats the purpose of the cap.
     std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
+        .map(|ms| ms.clamp(MIN_MS, MAX_MS))
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis(DEFAULT_SUBAGENT_TIMEOUT_MS))
 }
@@ -1155,6 +1158,49 @@ mod tests {
             names.contains(&"bash".to_string()),
             "explicit agent.tools listing bash should be honored"
         );
+    }
+
+    /// The configurable subagent timeout must clamp to sane bounds. A zero or extremely small
+    /// value would time out before the provider stream starts; an enormous value defeats the
+    /// purpose of the wall-clock cap.
+    #[tokio::test]
+    async fn subagent_timeout_is_configurable_and_clamped() {
+        // Serialize with other subagent tests that mutate this process-global env var.
+        let _guard = crate::agent::session::SSE_TEST_LOCK.lock().await;
+        let prev = std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS").ok();
+
+        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+        assert_eq!(
+            subagent_timeout().as_secs(),
+            300,
+            "default subagent timeout is 5 minutes"
+        );
+
+        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "5000");
+        assert_eq!(
+            subagent_timeout().as_millis(),
+            5000,
+            "valid override is preserved"
+        );
+
+        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "50");
+        assert_eq!(
+            subagent_timeout().as_millis(),
+            1000,
+            "below-minimum value clamps to 1 second"
+        );
+
+        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "100000000");
+        assert_eq!(
+            subagent_timeout().as_millis(),
+            3_600_000,
+            "above-maximum value clamps to 1 hour"
+        );
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS"),
+        }
     }
 
     /// A subagent whose provider stream hangs must not stall the executive turn forever, and the
