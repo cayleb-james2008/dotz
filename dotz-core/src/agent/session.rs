@@ -557,7 +557,18 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         }
 
         acc.msg.stop_reason = Some(stop_reason.clone());
-        let assistant_msg = acc.msg.clone();
+        let assistant_msg = if stop_reason == "aborted" {
+            // An aborted turn never executes its pending tool calls. Strip any partially-streamed
+            // tool-call blocks from the assistant message before it is committed to history; leaving
+            // them would confuse the next turn with calls that were never run.
+            let mut sanitized = acc.msg.clone();
+            sanitized
+                .content
+                .retain(|b| !matches!(b, ContentBlock::ToolCall { .. }));
+            sanitized
+        } else {
+            acc.msg.clone()
+        };
 
         // message_end for the assistant message.
         {
@@ -1375,6 +1386,140 @@ mod tests {
             last.and_then(|m| m.stop_reason).as_deref(),
             Some("aborted"),
             "aborted turn should produce an assistant message with stopReason aborted"
+        );
+        drop(g);
+        dispose(&sid);
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
+            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+        }
+        let _ = server_tx.send(()).await;
+    }
+
+    /// An abort that arrives after the assistant message has started streaming a tool_call must
+    /// not leave that partial, unexecuted tool_call in the conversation history. Before the
+    /// sanitization fix, the aborted message_end retained the ToolCall block, which the next turn
+    /// then saw as a completed call.
+    #[tokio::test]
+    async fn aborted_turn_strips_partial_tool_calls_from_history() {
+        let _guard = SSE_TEST_LOCK.lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel::<()>();
+        let (tc_tx, tc_rx) = tokio::sync::oneshot::channel::<()>();
+        let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::with_capacity(8192);
+            loop {
+                let mut tmp = [0u8; 1024];
+                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+            let _ = stream.write_all(response).await;
+            let _ = headers_tx.send(());
+            // Stream the assistant role so the accumulator has a message shell.
+            let _ = stream.write_all(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n").await;
+            // Stream a tool_call start — this is the partial call we want removed on abort.
+            let _ = stream.write_all(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n").await;
+            let _ = tc_tx.send(());
+            let _ = server_rx.recv().await;
+        });
+
+        let prev = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
+        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+
+        let opts = CreateOpts {
+            model: Some(types::ModelRef {
+                provider: "local".into(),
+                model_id: "test".into(),
+            }),
+            tools: Some(vec!["bash".into()]),
+            ..Default::default()
+        };
+        let summary = create(opts).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        let mut turn = tokio::spawn(run_turn(sess.clone(), "run a command".into()));
+
+        tokio::select! {
+            _ = headers_rx => {}
+            r = &mut turn => panic!("turn finished before provider stream started: {r:?}"),
+        }
+
+        // Wait until the partial tool_call has been streamed AND processed by the client. We know
+        // it was processed once the corresponding message_update appears on the broadcast.
+        let mut saw_toolcall = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && !saw_toolcall {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    if frame
+                        .get("event")
+                        .and_then(|e| e.get("type"))
+                        .and_then(|t| t.as_str())
+                        == Some("message_update")
+                    {
+                        if let Some(ame) = frame
+                            .get("event")
+                            .and_then(|e| e.get("assistantMessageEvent"))
+                        {
+                            if ame.get("type").and_then(|t| t.as_str())
+                                == Some("toolcall_start")
+                            {
+                                saw_toolcall = true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_toolcall,
+            "the partial tool_call should have been streamed before abort"
+        );
+        // Also wait for the server to have sent the delta so it isn't racing the abort.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tc_rx)
+            .await
+            .unwrap();
+
+        assert!(abort(&sid), "abort should find the active session");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), turn).await;
+        assert!(result.is_ok(), "run_turn must finish promptly after abort");
+
+        let g = sess.lock().unwrap();
+        let last = g
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .cloned();
+        let msg = last.expect("aborted turn should produce an assistant message");
+        assert_eq!(
+            msg.stop_reason.as_deref(),
+            Some("aborted"),
+            "aborted turn should produce an assistant message with stopReason aborted"
+        );
+        assert!(
+            msg.content
+                .iter()
+                .all(|b| !matches!(b, ContentBlock::ToolCall { .. })),
+            "aborted assistant message must not contain partial tool calls: {:?}",
+            msg.content
         );
         drop(g);
         dispose(&sid);
