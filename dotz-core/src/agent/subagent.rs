@@ -354,6 +354,23 @@ fn unknown_agent_result(
 
 // ---- the in-process child agent loop ----
 
+/// Build the tool registry for a subagent: honor the agent's declared tool list, otherwise use the
+/// full registry minus the `subagent` tool so a subagent does not recurse by default.
+fn build_subagent_registry(agent: &AgentConfig) -> ToolRegistry {
+    let mut r = ToolRegistry::new();
+    if let Some(t) = &agent.tools {
+        r.set_active(t);
+    } else {
+        let default: Vec<String> = r
+            .all_names()
+            .into_iter()
+            .filter(|n| n != "subagent")
+            .collect();
+        r.set_active(&default);
+    }
+    r
+}
+
 /// Run one subagent to completion: a fresh agent loop with the agent's system prompt + the resolved
 /// model, NO memory autonomy (the agent's own prompt only), and the agent's tool set (or the default
 /// active set). Captures the message list + usage as a SingleResult.
@@ -399,17 +416,9 @@ async fn run_single_agent(
     };
 
     // Restricted tool set: the agent's declared tools (validated against the registry) or the default
-    // active set. A subagent never recurses into `subagent` (kept out of the default set; an explicit
-    // agent.tools listing it is honored — the oracle places no special guard, and depth is bounded by
-    // the bounded round/task/chain caps).
-    let registry = ToolRegistry::new();
-    let registry = {
-        let mut r = registry;
-        if let Some(t) = &agent.tools {
-            r.set_active(t);
-        }
-        r
-    };
+    // active set with subagent recursion removed. An explicit agent.tools listing `subagent` is
+    // still honored — the oracle places no special guard beyond the bounded round/task/chain caps.
+    let registry = build_subagent_registry(agent);
     let tool_specs = registry.active_specs();
 
     let resolved = match provider::resolve(&provider_id, &model_id) {
@@ -975,5 +984,61 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
         text,
         is_error: false,
         details: make_details("single", vec![r]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subagent_registry_excludes_recursion_by_default() {
+        let agent = AgentConfig {
+            name: "test".into(),
+            description: "test".into(),
+            tools: None,
+            model: None,
+            system_prompt: "sys".into(),
+            source: "user",
+        };
+        // The baseline executive registry includes subagent; the subagent default must not.
+        let full = ToolRegistry::new();
+        assert!(
+            full.active_names().contains(&"subagent".to_string()),
+            "the full registry default should include subagent for executive sessions"
+        );
+
+        let r = build_subagent_registry(&agent);
+        let names = r.active_names();
+        assert!(
+            !names.contains(&"subagent".to_string()),
+            "default subagent tool set must not include subagent recursion"
+        );
+        assert!(
+            names.contains(&"bash".to_string()),
+            "default subagent tool set should still include bash"
+        );
+    }
+
+    #[test]
+    fn subagent_registry_honors_explicit_tools_including_subagent() {
+        let agent = AgentConfig {
+            name: "test".into(),
+            description: "test".into(),
+            tools: Some(vec!["subagent".to_string(), "bash".to_string()]),
+            model: None,
+            system_prompt: "sys".into(),
+            source: "user",
+        };
+        let r = build_subagent_registry(&agent);
+        let names = r.active_names();
+        assert!(
+            names.contains(&"subagent".to_string()),
+            "explicit agent.tools listing subagent should be honored"
+        );
+        assert!(
+            names.contains(&"bash".to_string()),
+            "explicit agent.tools listing bash should be honored"
+        );
     }
 }
