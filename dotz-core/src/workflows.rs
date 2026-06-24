@@ -254,9 +254,11 @@ fn create(
                     let is_index =
                         !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
                     if is_index {
+                        // Numeric strings are positional refs just like Number values;
+                        // out-of-range positional refs are skipped, not treated as literal ids.
                         match trimmed.parse::<usize>() {
                             Ok(n) if n < len => ids[n].clone(),
-                            _ => s.clone(),
+                            _ => continue,
                         }
                     } else {
                         s.clone()
@@ -820,6 +822,41 @@ mod tests {
             let run = create(None, None, "test".into(), None, &inputs).unwrap();
             assert!(run.steps[1].parents.is_empty());
             assert_eq!(run.steps[1].status, "ready");
+        });
+    }
+
+    /// Numeric strings in parent refs must behave like Number refs: an out-of-range index is
+    /// skipped, not silently treated as a literal step id. Before this fix, "99" would fall through
+    /// to the literal-id path and rely on the outer `ids.contains` check to discard it; that path
+    /// would have accepted a step id that happened to be all digits.
+    #[test]
+    fn out_of_range_numeric_string_parent_is_skipped() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!("99")]))];
+            let run = create(None, None, "test".into(), None, &inputs).unwrap();
+            assert!(run.steps[1].parents.is_empty());
+            assert_eq!(run.steps[1].status, "ready");
+        });
+    }
+
+    /// A mix of valid string positional refs, out-of-range numeric strings, and unknown literal ids
+    /// must resolve correctly and dedupe.
+    #[test]
+    fn mixed_string_parent_refs_resolve_and_dedupe() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", None),
+                step(
+                    "c",
+                    "C",
+                    Some(vec![json!("0"), json!("no-such"), json!("0"), json!("99")]),
+                ),
+            ];
+            let run = create(None, None, "test".into(), None, &inputs).unwrap();
+            let ids: Vec<_> = run.steps.iter().map(|s| s.id.clone()).collect();
+            assert_eq!(run.steps[2].parents, vec![ids[0].clone()]);
+            assert_eq!(run.steps[2].status, "pending");
         });
     }
 
