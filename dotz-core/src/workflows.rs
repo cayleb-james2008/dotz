@@ -256,8 +256,10 @@ fn create(
     }
 
     // Resolve children from parents.
-    let parent_map: Vec<(String, Vec<String>)> =
-        steps.iter().map(|s| (s.id.clone(), s.parents.clone())).collect();
+    let parent_map: Vec<(String, Vec<String>)> = steps
+        .iter()
+        .map(|s| (s.id.clone(), s.parents.clone()))
+        .collect();
     for (child_id, parents) in &parent_map {
         for pid in parents {
             if let Some(parent) = steps.iter_mut().find(|s| &s.id == pid) {
@@ -269,10 +271,15 @@ fn create(
     // Reject cyclic graphs (Kahn's algorithm): if a topological order can't cover every step, a
     // cycle exists.
     {
-        let mut indeg: HashMap<String, isize> =
-            steps.iter().map(|s| (s.id.clone(), s.parents.len() as isize)).collect();
-        let mut queue: Vec<String> =
-            steps.iter().filter(|s| s.parents.is_empty()).map(|s| s.id.clone()).collect();
+        let mut indeg: HashMap<String, isize> = steps
+            .iter()
+            .map(|s| (s.id.clone(), s.parents.len() as isize))
+            .collect();
+        let mut queue: Vec<String> = steps
+            .iter()
+            .filter(|s| s.parents.is_empty())
+            .map(|s| s.id.clone())
+            .collect();
         let mut ordered = 0usize;
         let mut q = 0usize;
         while q < queue.len() {
@@ -499,7 +506,9 @@ async fn list_active_handler() -> Json<Value> {
 }
 
 /// GET /api/workflows/:id → run (active, else history fallback) or 404.
-async fn get_handler(Path(id): Path<String>) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+async fn get_handler(
+    Path(id): Path<String>,
+) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
     if let Some(run) = get_active(&id) {
         return Ok(Json(run));
     }
@@ -655,7 +664,10 @@ fn not_found(msg: &str) -> (StatusCode, Json<Value>) {
 /// Register the /api/workflows routes with stateless handlers.
 pub fn router() -> Router<()> {
     Router::new()
-        .route("/api/workflows", get(list_history_handler).post(create_handler))
+        .route(
+            "/api/workflows",
+            get(list_history_handler).post(create_handler),
+        )
         .route("/api/workflows/active", get(list_active_handler))
         .route("/api/workflows/{id}", get(get_handler))
         .route("/api/workflows/{id}/step", post(step_handler))

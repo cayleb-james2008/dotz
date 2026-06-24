@@ -19,7 +19,8 @@ fn valid_name(name: &str) -> bool {
     if !bytes[0].is_ascii_lowercase() {
         return false;
     }
-    n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    n.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 // (RESOURCE_NAME kept as documentation of the regex valid_name enforces.)
 const _: &str = RESOURCE_NAME;
@@ -28,7 +29,9 @@ const _: &str = RESOURCE_NAME;
 struct AgentsMdTool;
 #[async_trait]
 impl Tool for AgentsMdTool {
-    fn name(&self) -> &'static str { "agents_md" }
+    fn name(&self) -> &'static str {
+        "agents_md"
+    }
     fn description(&self) -> &'static str {
         "Read or write the project's AGENTS.md doctrine. Args: {action:\"read\"|\"write\", content?}. read returns the file; write replaces it."
     }
@@ -37,12 +40,23 @@ impl Tool for AgentsMdTool {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let file = ctx.cwd.join("AGENTS.md");
-        match args.get("action").and_then(|v| v.as_str()).unwrap_or("read") {
+        match args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("read")
+        {
             "read" => Ok(std::fs::read_to_string(&file).unwrap_or_default()),
             "write" => {
-                let content = args.get("content").and_then(|v| v.as_str()).ok_or("content is required for write")?;
+                let content = args
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or("content is required for write")?;
                 std::fs::write(&file, content).map_err(|e| e.to_string())?;
-                Ok(format!("wrote {} ({} bytes)", file.display(), content.len()))
+                Ok(format!(
+                    "wrote {} ({} bytes)",
+                    file.display(),
+                    content.len()
+                ))
             }
             other => Err(format!("unknown action: {other}")),
         }
@@ -53,7 +67,9 @@ impl Tool for AgentsMdTool {
 struct CreateAgentTool;
 #[async_trait]
 impl Tool for CreateAgentTool {
-    fn name(&self) -> &'static str { "create_agent" }
+    fn name(&self) -> &'static str {
+        "create_agent"
+    }
     fn description(&self) -> &'static str {
         "Create a persistent subagent. Args: {name (lowercase-hyphen), description, systemPrompt}. Written to ~/.pi/agent/agents/<name>.md; never overwrites an existing agent."
     }
@@ -61,19 +77,40 @@ impl Tool for CreateAgentTool {
         json!({ "type": "object", "properties": { "name": { "type": "string" }, "description": { "type": "string" }, "systemPrompt": { "type": "string" } }, "required": ["name", "systemPrompt"] })
     }
     async fn execute(&self, args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
-        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if !valid_name(name) {
-            return Err("name must be lowercase letters/digits/hyphens, 2-64 chars, starting with a letter".into());
+            return Err(
+                "name must be lowercase letters/digits/hyphens, 2-64 chars, starting with a letter"
+                    .into(),
+            );
         }
-        let prompt = args.get("systemPrompt").and_then(|v| v.as_str()).ok_or("systemPrompt is required")?;
-        let desc = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
-        let dir = dirs::home_dir().ok_or("no home dir")?.join(".pi").join("agent").join("agents");
+        let prompt = args
+            .get("systemPrompt")
+            .and_then(|v| v.as_str())
+            .ok_or("systemPrompt is required")?;
+        let desc = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let dir = dirs::home_dir()
+            .ok_or("no home dir")?
+            .join(".pi")
+            .join("agent")
+            .join("agents");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let file = dir.join(format!("{name}.md"));
         if file.exists() {
             return Err(format!("agent \"{name}\" already exists"));
         }
-        let body = if desc.is_empty() { format!("# {name}\n\n{prompt}\n") } else { format!("# {name}\n\n> {desc}\n\n{prompt}\n") };
+        let body = if desc.is_empty() {
+            format!("# {name}\n\n{prompt}\n")
+        } else {
+            format!("# {name}\n\n> {desc}\n\n{prompt}\n")
+        };
         std::fs::write(&file, body).map_err(|e| e.to_string())?;
         Ok(format!("created agent \"{name}\" at {}", file.display()))
     }
@@ -83,7 +120,9 @@ impl Tool for CreateAgentTool {
 struct CreateSkillTool;
 #[async_trait]
 impl Tool for CreateSkillTool {
-    fn name(&self) -> &'static str { "create_skill" }
+    fn name(&self) -> &'static str {
+        "create_skill"
+    }
     fn description(&self) -> &'static str {
         "Create a persistent skill. Args: {name (lowercase-hyphen), description, body}. Written to ~/.dotz/ai-agents/skills/<name>/SKILL.md; never overwrites an existing skill."
     }
@@ -91,19 +130,38 @@ impl Tool for CreateSkillTool {
         json!({ "type": "object", "properties": { "name": { "type": "string" }, "description": { "type": "string" }, "body": { "type": "string" } }, "required": ["name", "description", "body"] })
     }
     async fn execute(&self, args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
-        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if !valid_name(name) {
-            return Err("name must be lowercase letters/digits/hyphens, 2-64 chars, starting with a letter".into());
+            return Err(
+                "name must be lowercase letters/digits/hyphens, 2-64 chars, starting with a letter"
+                    .into(),
+            );
         }
-        let description = args.get("description").and_then(|v| v.as_str()).map(|s| s.replace(['\r', '\n'], " ").trim().to_string()).unwrap_or_default();
-        let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.replace(['\r', '\n'], " ").trim().to_string())
+            .unwrap_or_default();
+        let body = args
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if description.is_empty() {
             return Err("description is required".into());
         }
         if body.is_empty() {
             return Err("body is required".into());
         }
-        let dir = crate::config::dotz_dir().join("ai-agents").join("skills").join(name);
+        let dir = crate::config::dotz_dir()
+            .join("ai-agents")
+            .join("skills")
+            .join(name);
         let file = dir.join("SKILL.md");
         if file.exists() {
             return Err(format!("skill \"{name}\" already exists"));
@@ -117,7 +175,10 @@ impl Tool for CreateSkillTool {
             body
         );
         std::fs::write(&file, content).map_err(|e| e.to_string())?;
-        Ok(format!("created skill \"{name}\" at {} (available on next index reload)", file.display()))
+        Ok(format!(
+            "created skill \"{name}\" at {} (available on next index reload)",
+            file.display()
+        ))
     }
 }
 
@@ -176,7 +237,12 @@ fn parse_counts(text: &str) -> (i64, i64) {
             if let Some(idx) = l.find(kw) {
                 // take the last number appearing before the keyword on this line
                 let prefix = &l[..idx];
-                let n: String = prefix.chars().rev().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+                let n: String = prefix
+                    .chars()
+                    .rev()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
                 if let Ok(v) = n.chars().rev().collect::<String>().parse::<i64>() {
                     return v;
                 }
@@ -193,7 +259,9 @@ fn parse_counts(text: &str) -> (i64, i64) {
 struct RsiBaselineTool;
 #[async_trait]
 impl Tool for RsiBaselineTool {
-    fn name(&self) -> &'static str { "rsi_baseline" }
+    fn name(&self) -> &'static str {
+        "rsi_baseline"
+    }
     fn description(&self) -> &'static str {
         "Capture the project's test-gate baseline (run the gate, record pass/fail). Args: {command?}. Stores the baseline for a later rsi_compare."
     }
@@ -212,7 +280,9 @@ impl Tool for RsiBaselineTool {
 struct RsiCompareTool;
 #[async_trait]
 impl Tool for RsiCompareTool {
-    fn name(&self) -> &'static str { "rsi_compare" }
+    fn name(&self) -> &'static str {
+        "rsi_compare"
+    }
     fn description(&self) -> &'static str {
         "Re-run the gate and compare against the rsi_baseline (regression/improvement). Args: {command?}."
     }
@@ -243,7 +313,8 @@ impl Tool for RsiCompareTool {
 }
 
 // ---- human_gate: emit a {kind:"gate"} frame over the session WS, block until approve/reject ----
-static GATES: OnceLock<Mutex<HashMap<String, oneshot::Sender<(bool, Option<String>)>>>> = OnceLock::new();
+static GATES: OnceLock<Mutex<HashMap<String, oneshot::Sender<(bool, Option<String>)>>>> =
+    OnceLock::new();
 fn gates() -> &'static Mutex<HashMap<String, oneshot::Sender<(bool, Option<String>)>>> {
     GATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -258,7 +329,9 @@ pub fn resolve_gate(gate_id: &str, approved: bool, feedback: Option<String>) {
 struct HumanGateTool;
 #[async_trait]
 impl Tool for HumanGateTool {
-    fn name(&self) -> &'static str { "human_gate" }
+    fn name(&self) -> &'static str {
+        "human_gate"
+    }
     fn description(&self) -> &'static str {
         "Request human approval before proceeding. Args: {plan}. Shows the plan to the operator and BLOCKS until they approve or reject (5-min timeout)."
     }
@@ -266,9 +339,14 @@ impl Tool for HumanGateTool {
         json!({ "type": "object", "properties": { "plan": { "type": "string" } }, "required": ["plan"] })
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let plan = args.get("plan").and_then(|v| v.as_str()).unwrap_or("(no plan provided)");
+        let plan = args
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no plan provided)");
         let Some(ws_tx) = ctx.tx.as_ref() else {
-            return Err("human_gate is only available in an interactive session (not a subagent)".into());
+            return Err(
+                "human_gate is only available in an interactive session (not a subagent)".into(),
+            );
         };
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
@@ -278,8 +356,14 @@ impl Tool for HumanGateTool {
         let result = tokio::time::timeout(Duration::from_secs(300), rx).await;
         gates().lock().unwrap().remove(&id);
         match result {
-            Ok(Ok((true, feedback))) => Ok(format!("APPROVED{}", feedback.map(|f| format!(": {f}")).unwrap_or_default())),
-            Ok(Ok((false, feedback))) => Err(format!("REJECTED{}", feedback.map(|f| format!(": {f}")).unwrap_or_default())),
+            Ok(Ok((true, feedback))) => Ok(format!(
+                "APPROVED{}",
+                feedback.map(|f| format!(": {f}")).unwrap_or_default()
+            )),
+            Ok(Ok((false, feedback))) => Err(format!(
+                "REJECTED{}",
+                feedback.map(|f| format!(": {f}")).unwrap_or_default()
+            )),
             _ => Err("human gate timed out (no operator response in 5 minutes)".into()),
         }
     }

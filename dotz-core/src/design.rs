@@ -121,7 +121,12 @@ async fn list_systems() -> Json<serde_json::Value> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    SystemEntry { id: id.clone(), name, category, description }
+                    SystemEntry {
+                        id: id.clone(),
+                        name,
+                        category,
+                        description,
+                    }
                 }
                 None => SystemEntry {
                     id: id.clone(),
@@ -146,12 +151,7 @@ async fn system_components(Path(id): Path<String>) -> Response {
     }
     let html_path = design_systems_dir().join(&id).join("components.html");
     match std::fs::read_to_string(&html_path) {
-        Ok(html) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/html")],
-            html,
-        )
-            .into_response(),
+        Ok(html) => (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], html).into_response(),
         Err(_) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no components for this system" })),
@@ -164,5 +164,8 @@ async fn system_components(Path(id): Path<String>) -> Response {
 pub fn router() -> Router<()> {
     Router::new()
         .route("/api/design/systems", get(list_systems))
-        .route("/api/design/systems/{id}/components", get(system_components))
+        .route(
+            "/api/design/systems/{id}/components",
+            get(system_components),
+        )
 }

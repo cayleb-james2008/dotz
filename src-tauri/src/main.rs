@@ -97,6 +97,13 @@ async fn apply_update(app: &tauri::AppHandle) -> Value {
 }
 
 fn main() {
+    if let Err(e) = run() {
+        eprintln!("dotz fatal: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tauri::Builder::default()
         // single-instance first (Tauri 2 requirement): relaunching focuses the running window.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -111,7 +118,10 @@ fn main() {
         .setup(|app| {
             // Resolve bundled resources (web/, .pi/, assets/) so the embedded server can serve them.
             // Dev override: DOTZ_WEB_DIR / DOTZ_PI / DOTZ_ASSETS point at the worktree.
-            let res = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let res = app
+                .path()
+                .resource_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."));
             let web_dir = std::env::var("DOTZ_WEB_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| res.join("web"));
@@ -125,7 +135,8 @@ fn main() {
             if std::env::var("DOTZ_BROWSER_BIN").is_err() {
                 std::env::set_var(
                     "DOTZ_BROWSER_BIN",
-                    res.join("agent-browser").join("agent-browser-win32-x64.exe"),
+                    res.join("agent-browser")
+                        .join("agent-browser-win32-x64.exe"),
                 );
             }
             let addr = SocketAddr::from(([127, 0, 0, 1], PORT));
@@ -135,25 +146,35 @@ fn main() {
                 }
             });
             // Wait until the server accepts connections, then open the window on it.
+            let mut ready = false;
             for _ in 0..100 {
                 if std::net::TcpStream::connect(addr).is_ok() {
+                    ready = true;
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
+            if !ready {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "dotz-core server failed to start in time",
+                )) as Box<dyn std::error::Error>);
+            }
             let url = format!("http://127.0.0.1:{PORT}");
-            tauri::WebviewWindowBuilder::new(
-                app,
-                "main",
-                tauri::WebviewUrl::External(url.parse().unwrap()),
-            )
-            .title("dotz · ultra code")
-            .inner_size(1480.0, 920.0)
-            .min_inner_size(1000.0, 700.0)
-            .initialization_script(SHIM)
-            .build()?;
+            let parsed = url.parse().map_err(|e| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid URL {url}: {e}"),
+                )) as Box<dyn std::error::Error>
+            })?;
+            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(parsed))
+                .title("dotz · ultra code")
+                .inner_size(1480.0, 920.0)
+                .min_inner_size(1000.0, 700.0)
+                .initialization_script(SHIM)
+                .build()?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running dotz");
+        .run(tauri::generate_context!())?;
+    Ok(())
 }

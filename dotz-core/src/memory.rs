@@ -49,7 +49,10 @@ pub struct MemoryView {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 /// Scope → mem0 userId. global / no-cwd → "__global__"; project → "proj:<norm cwd>"
@@ -59,7 +62,11 @@ fn scope_user(scope: &str, cwd: Option<&str>) -> String {
         ("global", _) | (_, None) => GLOBAL_USER.to_string(),
         (_, Some(c)) => {
             let norm = c.replace('\\', "/");
-            let norm = if cfg!(windows) { norm.to_lowercase() } else { norm };
+            let norm = if cfg!(windows) {
+                norm.to_lowercase()
+            } else {
+                norm
+            };
             format!("proj:{norm}")
         }
     }
@@ -117,14 +124,19 @@ fn embed_text(text: &str) -> Result<Vec<f32>, String> {
     if g.is_none() {
         *g = Some(Embedder::load().map_err(|e| format!("embedder load: {e}"))?);
     }
-    g.as_mut().unwrap().embed(text).map_err(|e| format!("embed: {e}"))
+    g.as_mut()
+        .unwrap()
+        .embed(text)
+        .map_err(|e| format!("embed: {e}"))
 }
 
 fn enc_emb(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 fn dec_emb(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 struct Row {
@@ -186,7 +198,13 @@ fn row_to_view(r: &Row, score: Option<f64>) -> MemoryView {
 }
 
 /// Add a memory verbatim (manual add — infer:false). Returns the created view; writes the mirror.
-fn add(text: &str, scope: &str, category: Option<&str>, folder: Option<&str>, cwd: Option<&str>) -> Result<MemoryView, String> {
+fn add(
+    text: &str,
+    scope: &str,
+    category: Option<&str>,
+    folder: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<MemoryView, String> {
     let user_id = scope_user(scope, cwd);
     let emb = embed_text(text)?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -214,7 +232,10 @@ fn add(text: &str, scope: &str, category: Option<&str>, folder: Option<&str>, cw
 
 fn list(cwd: Option<&str>) -> Vec<MemoryView> {
     let conn = db().lock().unwrap();
-    let mut out: Vec<MemoryView> = rows_for_user(&conn, GLOBAL_USER, None).iter().map(|r| row_to_view(r, None)).collect();
+    let mut out: Vec<MemoryView> = rows_for_user(&conn, GLOBAL_USER, None)
+        .iter()
+        .map(|r| row_to_view(r, None))
+        .collect();
     if let Some(c) = cwd {
         let u = scope_user("project", Some(c));
         for r in rows_for_user(&conn, &u, None) {
@@ -224,7 +245,15 @@ fn list(cwd: Option<&str>) -> Vec<MemoryView> {
     out
 }
 
-fn search(query: &str, cwd: Option<&str>, scope: Option<&str>, threshold: Option<f64>, top_k: Option<usize>, folder: Option<&str>, category: Option<&str>) -> Result<Vec<MemoryView>, String> {
+fn search(
+    query: &str,
+    cwd: Option<&str>,
+    scope: Option<&str>,
+    threshold: Option<f64>,
+    top_k: Option<usize>,
+    folder: Option<&str>,
+    category: Option<&str>,
+) -> Result<Vec<MemoryView>, String> {
     if query.trim().is_empty() {
         return Ok(vec![]);
     }
@@ -294,7 +323,10 @@ fn rerank(items: Vec<MemoryView>, folder: Option<&str>) -> Vec<MemoryView> {
 /// Merge/prune near-duplicate memories per scope (keep newest of each >0.97 cluster). Returns (removed, kept).
 fn consolidate(cwd: Option<&str>) -> (i64, i64) {
     let scopes: Vec<(&str, String)> = match cwd {
-        Some(c) => vec![("project", scope_user("project", Some(c))), ("global", GLOBAL_USER.to_string())],
+        Some(c) => vec![
+            ("project", scope_user("project", Some(c))),
+            ("global", GLOBAL_USER.to_string()),
+        ],
         None => vec![("global", GLOBAL_USER.to_string())],
     };
     let (mut removed, mut kept) = (0i64, 0i64);
@@ -316,7 +348,11 @@ fn consolidate(cwd: Option<&str>) -> (i64, i64) {
                     if cosine(&rows[i].embedding, &rows[j].embedding) > 0.97 {
                         // keep the newer; if all[i] (anchor) is dropped, stop using it as anchor.
                         let drop_i = rows[j].created_at >= rows[i].created_at;
-                        dropped.insert(if drop_i { rows[i].id.clone() } else { rows[j].id.clone() });
+                        dropped.insert(if drop_i {
+                            rows[i].id.clone()
+                        } else {
+                            rows[j].id.clone()
+                        });
                         if drop_i {
                             break;
                         }
@@ -326,7 +362,10 @@ fn consolidate(cwd: Option<&str>) -> (i64, i64) {
             {
                 let conn = db().lock().unwrap();
                 for id in &dropped {
-                    if conn.execute("DELETE FROM memories WHERE id=?1", rusqlite::params![id]).is_ok() {
+                    if conn
+                        .execute("DELETE FROM memories WHERE id=?1", rusqlite::params![id])
+                        .is_ok()
+                    {
                         removed += 1;
                     }
                 }
@@ -386,7 +425,8 @@ fn remove(id: &str, cwd: Option<&str>) -> bool {
     // Mirror memory.ts: delete is best-effort; success unless the statement errors (missing id => still ok).
     let ok = {
         let conn = db().lock().unwrap();
-        conn.execute("DELETE FROM memories WHERE id=?1", rusqlite::params![id]).is_ok()
+        conn.execute("DELETE FROM memories WHERE id=?1", rusqlite::params![id])
+            .is_ok()
     };
     if ok {
         write_mirror_all(cwd);
@@ -397,13 +437,18 @@ fn remove(id: &str, cwd: Option<&str>) -> bool {
 // ---- MEMORY.md mirror (git-committable source of truth) ----
 fn mirror_items(user_id: &str) -> Vec<MemoryView> {
     let conn = db().lock().unwrap();
-    rows_for_user(&conn, user_id, None).iter().map(|r| row_to_view(r, None)).collect()
+    rows_for_user(&conn, user_id, None)
+        .iter()
+        .map(|r| row_to_view(r, None))
+        .collect()
 }
 
 fn write_mirror(scope: &str, cwd: Option<&str>) {
     if scope == "global" {
         let items = mirror_items(GLOBAL_USER);
-        let file = crate::config::dotz_dir().join("ai-agents").join("MEMORY.md");
+        let file = crate::config::dotz_dir()
+            .join("ai-agents")
+            .join("MEMORY.md");
         render_mirror_file(&file, "dotz global memory", &items);
     } else if let Some(c) = cwd {
         let items = mirror_items(&scope_user("project", Some(c)));
@@ -439,7 +484,11 @@ fn render_mirror_file(file: &std::path::Path, title: &str, items: &[MemoryView])
     for (cat, list) in &by_cat {
         out.push_str(&format!("\n## {cat}\n"));
         for it in list {
-            let folder = it.folder.as_ref().map(|f| format!("  _(folder: {f})_")).unwrap_or_default();
+            let folder = it
+                .folder
+                .as_ref()
+                .map(|f| format!("  _(folder: {f})_"))
+                .unwrap_or_default();
             out.push_str(&format!("- {}{}\n", it.memory, folder));
         }
     }
@@ -522,7 +571,13 @@ async fn extract_facts(user_text: &str, assistant_text: &str) -> Vec<String> {
             { "role": "user", "content": exchange },
         ],
     });
-    let resp = match reqwest::Client::new().post(&url).bearer_auth(&key).json(&body).send().await {
+    let resp = match reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&key)
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => r,
         _ => return Vec::new(),
     };
@@ -561,7 +616,11 @@ fn parse_facts(content: &str) -> Vec<String> {
 /// same-scope neighbors (cosine >= CAPTURE_DEDUP_THRESHOLD → skip), verbatim-adds the rest (which
 /// writes the mirror), bumps the capture counter, and consolidates every AUTO_CONSOLIDATE_EVERY.
 /// Best-effort throughout — never panics, mirrors memory.ts captureExchange. Returns the kept facts.
-pub async fn capture_exchange(user_text: &str, assistant_text: &str, cwd: Option<&str>) -> Vec<MemoryView> {
+pub async fn capture_exchange(
+    user_text: &str,
+    assistant_text: &str,
+    cwd: Option<&str>,
+) -> Vec<MemoryView> {
     let u = user_text.trim();
     let a = assistant_text.trim();
     if u.len() < 8 && a.len() < 40 {
@@ -588,8 +647,12 @@ pub async fn capture_exchange(user_text: &str, assistant_text: &str, cwd: Option
             Err(_) => continue,
         };
         // Near-dup vs existing neighbors OR vs a fact we just added this turn → skip.
-        let dup = neighbors.iter().any(|r| cosine(&emb, &r.embedding) >= CAPTURE_DEDUP_THRESHOLD)
-            || added_embs.iter().any(|e| cosine(&emb, e) >= CAPTURE_DEDUP_THRESHOLD);
+        let dup = neighbors
+            .iter()
+            .any(|r| cosine(&emb, &r.embedding) >= CAPTURE_DEDUP_THRESHOLD)
+            || added_embs
+                .iter()
+                .any(|e| cosine(&emb, e) >= CAPTURE_DEDUP_THRESHOLD);
         if dup {
             continue;
         }
@@ -665,7 +728,9 @@ async fn get_memory(Query(q): Query<HashMap<String, String>>) -> Json<Value> {
     Json(json!({ "entries": list(cwd.as_deref()) }))
 }
 
-async fn post_memory(body: Option<Json<Value>>) -> Result<Json<MemoryView>, (StatusCode, Json<Value>)> {
+async fn post_memory(
+    body: Option<Json<Value>>,
+) -> Result<Json<MemoryView>, (StatusCode, Json<Value>)> {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let raw = b.get("text").or_else(|| b.get("value"));
     let text = match raw.and_then(|v| v.as_str()) {
@@ -691,16 +756,28 @@ async fn post_memory(body: Option<Json<Value>>) -> Result<Json<MemoryView>, (Sta
         .get("scope")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| if project_id.is_some() { "project".into() } else { "global".into() });
+        .unwrap_or_else(|| {
+            if project_id.is_some() {
+                "project".into()
+            } else {
+                "global".into()
+            }
+        });
     let category = b.get("category").and_then(|v| v.as_str());
     let folder = b.get("folder").and_then(|v| v.as_str());
     match add(&text, &scope, category, folder, cwd.as_deref()) {
         Ok(v) => Ok(Json(v)),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e })))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )),
     }
 }
 
-async fn patch_memory(Path(id): Path<String>, body: Option<Json<Value>>) -> Result<Json<MemoryView>, (StatusCode, Json<Value>)> {
+async fn patch_memory(
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Result<Json<MemoryView>, (StatusCode, Json<Value>)> {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let raw = b.get("text").or_else(|| b.get("value"));
     let text = match raw.and_then(|v| v.as_str()) {
@@ -710,16 +787,24 @@ async fn patch_memory(Path(id): Path<String>, body: Option<Json<Value>>) -> Resu
     let cwd = crate::projects::cwd_for_project(b.get("projectId").and_then(|v| v.as_str()));
     match update(&id, &text, cwd.as_deref()) {
         Some(v) => Ok(Json(v)),
-        None => Err((StatusCode::NOT_FOUND, Json(json!({ "error": "no such memory entry" })))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such memory entry" })),
+        )),
     }
 }
 
-async fn delete_memory(Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
+async fn delete_memory(
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Value> {
     let cwd = cwd_of(&q);
     Json(json!({ "ok": remove(&id, cwd.as_deref()) }))
 }
 
-async fn search_memory(body: Option<Json<Value>>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn search_memory(
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     if let Some(qv) = b.get("query") {
         if !qv.is_null() && !qv.is_string() {
@@ -754,9 +839,20 @@ async fn search_memory(body: Option<Json<Value>>) -> Result<Json<Value>, (Status
     let scope = b.get("scope").and_then(|v| v.as_str());
     let folder = b.get("folder").and_then(|v| v.as_str());
     let category = b.get("category").and_then(|v| v.as_str());
-    match search(query, cwd.as_deref(), scope, threshold, top_k, folder, category) {
+    match search(
+        query,
+        cwd.as_deref(),
+        scope,
+        threshold,
+        top_k,
+        folder,
+        category,
+    ) {
         Ok(results) => Ok(Json(json!({ "results": results }))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e })))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )),
     }
 }
 
@@ -770,7 +866,10 @@ async fn consolidate_memory(body: Option<Json<Value>>) -> Json<Value> {
 pub fn router() -> Router<()> {
     Router::new()
         .route("/api/memory", get(get_memory).post(post_memory))
-        .route("/api/memory/{id}", patch(patch_memory).delete(delete_memory))
+        .route(
+            "/api/memory/{id}",
+            patch(patch_memory).delete(delete_memory),
+        )
         .route("/api/memory/search", post(search_memory))
         .route("/api/memory/consolidate", post(consolidate_memory))
 }

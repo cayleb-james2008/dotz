@@ -17,7 +17,10 @@ pub struct ModelRef {
 }
 
 pub fn default_model() -> ModelRef {
-    ModelRef { provider: "ollama".into(), model_id: "glm-5.2".into() }
+    ModelRef {
+        provider: "ollama".into(),
+        model_id: "glm-5.2".into(),
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -33,7 +36,11 @@ fn is_false(b: &bool) -> bool {
 }
 
 const fn pm(id: &'static str, label: &'static str, free_form: bool) -> ProviderMeta {
-    ProviderMeta { id, label, free_form }
+    ProviderMeta {
+        id,
+        label,
+        free_form,
+    }
 }
 
 /// The 11 known providers, in UI order.
@@ -73,8 +80,14 @@ pub fn provider_defaults_json() -> Value {
 /// Suggested low-cost worker model ids — ONLY configured/available models (port of LOW_COST_MODELS).
 pub fn low_cost_models() -> Vec<ModelRef> {
     vec![
-        ModelRef { provider: "ollama".into(), model_id: "minimax-m3".into() },
-        ModelRef { provider: "ollama".into(), model_id: "kimi-k2.7-code".into() },
+        ModelRef {
+            provider: "ollama".into(),
+            model_id: "minimax-m3".into(),
+        },
+        ModelRef {
+            provider: "ollama".into(),
+            model_id: "kimi-k2.7-code".into(),
+        },
     ]
 }
 
@@ -156,8 +169,14 @@ mod tests {
     #[test]
     fn provider_default_returns_expected_pairs() {
         assert_eq!(provider_default("ollama"), Some(("glm-5.2", "minimax-m3")));
-        assert_eq!(provider_default("openrouter"), Some(("nex-agi/nex-n2-pro", "nex-agi/nex-n2-pro")));
-        assert_eq!(provider_default("local"), Some(("qwen2.5-coder", "qwen2.5-coder")));
+        assert_eq!(
+            provider_default("openrouter"),
+            Some(("nex-agi/nex-n2-pro", "nex-agi/nex-n2-pro"))
+        );
+        assert_eq!(
+            provider_default("local"),
+            Some(("qwen2.5-coder", "qwen2.5-coder"))
+        );
         assert_eq!(provider_default("unknown"), None);
     }
 
