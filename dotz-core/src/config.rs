@@ -45,18 +45,29 @@ fn config_file() -> PathBuf {
 /// The bundled subagent extension reads DOTZ_SUBAGENT_MODEL to pin every dispersed subagent's model.
 /// Normalizes the subagent model so a persisted value that already includes the provider prefix
 /// (e.g. "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free") does not produce a doubled prefix
-/// like "openrouter/openrouter/...". If no subagent model is configured, derives the provider's
-/// default so the env var is always valid.
+/// like "openrouter/openrouter/...". Also strips a *mismatched* provider prefix so switching
+/// executive provider (e.g. openrouter -> ollama) does not leave a stale prefix in the env var.
+/// If no subagent model is configured, derives the provider's default so the env var is always valid.
 pub fn apply_env(c: &DotzConfig) {
-    let prefix = format!("{}/", c.provider);
-    let model = if let Some(rest) = c.subagent_model.strip_prefix(&prefix) {
-        rest.to_string()
-    } else if c.subagent_model.trim().is_empty() {
+    let model = strip_any_provider_prefix(&c.subagent_model);
+    let model = if model.trim().is_empty() {
         default_subagent_model(&c.provider)
     } else {
-        c.subagent_model.clone()
+        model
     };
     std::env::set_var("DOTZ_SUBAGENT_MODEL", format!("{}/{}", c.provider, model));
+}
+
+/// Strip any leading "<provider>/" prefix from a model string. This prevents stale prefixes from
+/// surviving a provider change and then being re-prepended by apply_env.
+fn strip_any_provider_prefix(model: &str) -> String {
+    let trimmed = model.trim();
+    for pid in types::provider_ids() {
+        if let Some(rest) = trimmed.strip_prefix(&format!("{pid}/")) {
+            return rest.to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 /// Default subagent model id for a provider. Falls back to the global default provider's subagent
@@ -273,6 +284,26 @@ mod tests {
             assert_eq!(
                 std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
                 "ollama/minimax-m3"
+            );
+        });
+    }
+
+    /// Switching executive provider must not leave a stale provider prefix in DOTZ_SUBAGENT_MODEL.
+    /// Without this normalization, a subagent_model of "openrouter/..." under provider "ollama"
+    /// would become the invalid "ollama/openrouter/...".
+    #[test]
+    fn apply_env_strips_mismatched_provider_prefix() {
+        with_tmp_dir(|_| {
+            let cfg = DotzConfig {
+                provider: "ollama".into(),
+                executive_model: "glm-5.2".into(),
+                subagent_model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free".into(),
+                thinking_level: "medium".into(),
+            };
+            apply_env(&cfg);
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "ollama/nvidia/nemotron-3-ultra-550b-a55b:free"
             );
         });
     }
