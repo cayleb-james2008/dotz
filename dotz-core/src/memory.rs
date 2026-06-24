@@ -225,6 +225,11 @@ fn add(
     folder: Option<&str>,
     cwd: Option<&str>,
 ) -> Result<MemoryView, String> {
+    if scope != "project" && scope != "global" {
+        return Err(format!(
+            "memory scope must be 'project' or 'global', got '{scope}'"
+        ));
+    }
     let user_id = scope_user(scope, cwd);
     let emb = embed_text(text)?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -1094,6 +1099,33 @@ mod tests {
             assert!(raw.contains("- Alpha fact."));
             assert!(raw.contains("- Zebra convention."));
             assert!(raw.contains("- General note."));
+        });
+    }
+
+    /// add() must reject scope values other than 'project' or 'global'. The memory_add tool's
+    /// JSON schema declares the enum, but without this guard a malformed/imagined scope like
+    /// 'workspace' would be accepted and stored under the project userId while advertising the
+    /// wrong scope label.
+    #[test]
+    fn add_rejects_invalid_scope() {
+        with_tmp_dir(|dir| {
+            let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+            std::env::set_var("DOTZ_CONFIG_DIR", dir);
+            // Force DB init in the isolated dir.
+            drop(db().lock().unwrap());
+
+            let err = add_public("a fact", "workspace", Some(dir.to_str().unwrap()))
+                .err()
+                .expect("invalid scope should fail");
+            assert!(
+                err.contains("scope must be 'project' or 'global'"),
+                "invalid scope should return a clear error, got: {err}"
+            );
+
+            match prev {
+                Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+                None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            }
         });
     }
 
