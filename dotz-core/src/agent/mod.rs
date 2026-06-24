@@ -29,6 +29,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use tokio::sync::broadcast;
 
 use crate::types;
 
@@ -209,6 +210,18 @@ async fn ws_handler(ws: WebSocketUpgrade, Query(q): Query<HashMap<String, String
     }
 }
 
+/// Receive the next broadcast frame, treating a lagged receiver as a recoverable skip instead
+/// of a connection-fatal error. A slow WebSocket client will resume from the newest message.
+async fn recv_broadcast(rx: &mut broadcast::Receiver<Value>) -> Option<Value> {
+    loop {
+        match rx.recv().await {
+            Ok(frame) => return Some(frame),
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
 async fn ws_loop(socket: WebSocket, session_id: String) {
     let (mut sink, mut stream) = socket.split();
 
@@ -220,7 +233,7 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
 
     // Fan agent events (broadcast) → socket.
     let fan = tokio::spawn(async move {
-        while let Ok(frame) = rx.recv().await {
+        while let Some(frame) = recv_broadcast(&mut rx).await {
             if sink.send(WsMessage::Text(frame.to_string().into())).await.is_err() {
                 break;
             }
@@ -295,6 +308,40 @@ pub fn session_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recv_broadcast_returns_none_when_closed() {
+        let (tx, mut rx) = broadcast::channel::<Value>(2);
+        drop(tx);
+        assert!(recv_broadcast(&mut rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn recv_broadcast_resumes_after_lag() {
+        let (tx, mut rx) = broadcast::channel::<Value>(2);
+        // Overflow the buffer so the receiver lags.
+        for i in 0..5 {
+            let _ = tx.send(json!({ "n": i }));
+        }
+        // The fan must stay alive across the lag error.
+        let first = recv_broadcast(&mut rx).await;
+        assert!(first.is_some(), "recv_broadcast should resume after lag, not close the connection");
+
+        // Drain whatever buffered tail remains so the receiver is caught up.
+        let mut seen_last = false;
+        while let Some(v) = recv_broadcast(&mut rx).await {
+            if v.get("n").and_then(|n| n.as_i64()) == Some(4) {
+                seen_last = true;
+                break;
+            }
+        }
+        assert!(seen_last, "receiver should catch up to the buffered tail");
+
+        // After recovery, new messages are delivered normally.
+        let _ = tx.send(json!({ "n": 99 }));
+        let next = recv_broadcast(&mut rx).await;
+        assert_eq!(next.and_then(|v| v.get("n").and_then(|n| n.as_i64())), Some(99));
+    }
 
     #[test]
     fn ws_validation_rejects_missing_session_id() {
