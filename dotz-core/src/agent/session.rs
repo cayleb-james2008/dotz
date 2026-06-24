@@ -113,6 +113,14 @@ fn store_guard() -> std::sync::MutexGuard<'static, Store> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Lock a single session, recovering from a poisoned mutex. A panic while holding a session lock
+/// (e.g. inside a tool or provider callback) must not permanently brick that session.
+fn session_guard(
+    s: &std::sync::Arc<std::sync::Mutex<AgentSession>>,
+) -> std::sync::MutexGuard<'_, AgentSession> {
+    s.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Options for creating a session (mirrors CreateOpts).
 #[derive(Default)]
 pub struct CreateOpts {
@@ -259,7 +267,7 @@ pub fn get(id: &str) -> Option<std::sync::Arc<Mutex<AgentSession>>> {
 pub fn list_summaries() -> Vec<Value> {
     store_guard()
         .values()
-        .map(|s| s.lock().unwrap().summary())
+        .map(|s| session_guard(&s).summary())
         .collect()
 }
 
@@ -269,7 +277,7 @@ pub fn count() -> usize {
 
 pub fn dispose(id: &str) -> bool {
     if let Some(s) = store_guard().remove(id) {
-        s.lock().unwrap().cancel.cancel();
+        session_guard(&s).cancel.cancel();
         true
     } else {
         false
@@ -278,7 +286,7 @@ pub fn dispose(id: &str) -> bool {
 
 /// Subscribe to a session's event stream (broadcast). The WS handler relays each Value frame.
 pub fn subscribe(id: &str) -> Option<broadcast::Receiver<Value>> {
-    get(id).map(|s| s.lock().unwrap().tx.subscribe())
+    get(id).map(|s| session_guard(&s).tx.subscribe())
 }
 
 fn emit(sess: &AgentSession, ev: &AgentEvent) {
@@ -397,7 +405,7 @@ impl Drop for TurnGuard {
 pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     // Reject concurrent turns on the same session to keep history and the cancellation token sane.
     let _guard = {
-        let s = session.lock().unwrap();
+        let s = session_guard(&session);
         if s.turn_active.swap(true, Ordering::SeqCst) {
             // Tell the operator (and any UI subscriber) why the prompt vanished instead of
             // silently dropping it. A busy session means an earlier turn is still streaming.
@@ -415,7 +423,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
 
     // Snapshot the immutable bits + append the user message under the lock; release before awaiting.
     let (sess_id, system_prompt, provider_id, model_id, thinking, cwd, tools_specs) = {
-        let mut s = session.lock().unwrap();
+        let mut s = session_guard(&session);
         s.cancel = CancellationToken::new();
         let ts = now_ms();
         let user_msg = Message::user(&prompt, ts);
@@ -456,7 +464,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
 
     // Notify the UI of the recalled memories for this turn (contract: {kind:"memory_recall", items}).
     {
-        let s = session.lock().unwrap();
+        let s = session_guard(&session);
         let _ = s.tx.send(serde_json::json!({
             "kind": "memory_recall",
             "sessionId": s.id,
@@ -466,9 +474,9 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
 
     let ctx = ToolCtx {
         cwd: cwd.clone(),
-        tx: Some(session.lock().unwrap().tx.clone()),
+        tx: Some(session_guard(&session).tx.clone()),
     };
-    let cancel = session.lock().unwrap().cancel.clone();
+    let cancel = session_guard(&session).cancel.clone();
 
     // Accumulate every tool result from this turn so the final turn_end event can surface them
     // to the UI (workflow step links, error markers, etc.).
@@ -479,7 +487,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     for _round in 0..MAX_ROUNDS {
         // Build the request from current history.
         let messages = {
-            let s = session.lock().unwrap();
+            let s = session_guard(&session);
             to_openai_messages(&effective_system, &s.history)
         };
         let resolved = match provider::resolve(&provider_id, &model_id) {
@@ -509,7 +517,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         // message_start (assistant shell).
         let start_ts = now_ms();
         {
-            let s = session.lock().unwrap();
+            let s = session_guard(&session);
             emit(
                 &s,
                 &AgentEvent::MessageStart {
@@ -582,7 +590,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
 
         // message_end for the assistant message.
         {
-            let mut s = session.lock().unwrap();
+            let mut s = session_guard(&session);
             emit(
                 &s,
                 &AgentEvent::MessageEnd {
@@ -615,7 +623,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         // Run each tool, emit tool_execution_start/end, append a tool-result message to history.
         for (call_id, name, args) in calls {
             {
-                let s = session.lock().unwrap();
+                let s = session_guard(&session);
                 emit(
                     &s,
                     &AgentEvent::ToolExecutionStart {
@@ -630,7 +638,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             let (result_value, is_error, result_text) =
                 execute_tool(&session, &name, &args, &ctx).await;
             {
-                let mut s = session.lock().unwrap();
+                let mut s = session_guard(&session);
                 emit(
                     &s,
                     &AgentEvent::ToolExecutionEnd {
@@ -690,7 +698,7 @@ async fn execute_tool(
 ) -> (Value, bool, String) {
     if name == "subagent" {
         let active = {
-            let s = session.lock().unwrap();
+            let s = session_guard(&session);
             s.tools.active_names()
         };
         if !active.iter().any(|n| n == "subagent") {
@@ -734,7 +742,7 @@ async fn run_tool(
 ) -> Result<String, String> {
     // Snapshot the session's active tool set so execution respects set_tools restrictions.
     let active = {
-        let s = session.lock().unwrap();
+        let s = session_guard(&session);
         s.tools.active_names()
     };
     let registry = {
@@ -839,7 +847,7 @@ fn apply_delta(
     }
 
     if let Some(kind) = ame_kind {
-        let s = session.lock().unwrap();
+        let s = session_guard(&session);
         let ame = AssistantMessageEvent {
             kind: kind.to_string(),
             content_index,
@@ -874,7 +882,7 @@ fn finish_turn(
             .join("")
     };
     let (cwd, user_text, assistant_text) = {
-        let s = session.lock().unwrap();
+        let s = session_guard(&session);
         let user_text = s
             .history
             .iter()
@@ -925,7 +933,7 @@ fn finish_error(
     detail: &str,
     tool_results: Vec<ToolResult>,
 ) {
-    let mut s = session.lock().unwrap();
+    let mut s = session_guard(&session);
     let mut msg = Message::assistant_shell(&s.provider, &s.model_id, now_ms());
     msg.stop_reason = Some("error".into());
     msg.error_message = Some(detail.to_string());
@@ -963,7 +971,7 @@ fn finish_error(
 /// Abort the running turn (CancellationToken). The select! in run_turn observes it.
 pub fn abort(id: &str) -> bool {
     if let Some(s) = get(id) {
-        s.lock().unwrap().cancel.cancel();
+        session_guard(&s).cancel.cancel();
         true
     } else {
         false
@@ -976,7 +984,7 @@ pub fn abort(id: &str) -> bool {
 /// subscribers stay connected. Returns 409-style "session is busy" if a turn is in flight.
 pub fn reload(id: &str) -> Result<Value, String> {
     let s = get(id).ok_or("no such session")?;
-    let mut g = s.lock().unwrap();
+    let mut g = session_guard(&s);
     if g.turn_active.load(Ordering::SeqCst) {
         return Err("session is busy".into());
     }
@@ -999,7 +1007,7 @@ pub fn reload(id: &str) -> Result<Value, String> {
 
 pub fn set_model(id: &str, provider_id: &str, model_id: &str) -> Result<Value, String> {
     let s = get(id).ok_or("no such session")?;
-    let mut g = s.lock().unwrap();
+    let mut g = session_guard(&s);
     g.provider = provider_id.to_string();
     g.model_id = model_id.to_string();
     Ok(g.summary())
@@ -1007,7 +1015,7 @@ pub fn set_model(id: &str, provider_id: &str, model_id: &str) -> Result<Value, S
 
 pub fn set_thinking(id: &str, level: &str) -> Result<Value, String> {
     let s = get(id).ok_or("no such session")?;
-    let mut g = s.lock().unwrap();
+    let mut g = session_guard(&s);
     g.thinking_level = level.to_string();
     Ok(json!({
         "thinkingLevel": g.thinking_level,
@@ -1018,33 +1026,33 @@ pub fn set_thinking(id: &str, level: &str) -> Result<Value, String> {
 
 pub fn set_tools(id: &str, names: &[String]) -> Result<Value, String> {
     let s = get(id).ok_or("no such session")?;
-    let mut g = s.lock().unwrap();
+    let mut g = session_guard(&s);
     g.tools.set_active(names);
     Ok(json!({ "active": g.tools.active_names(), "all": g.tools.all_names() }))
 }
 
 pub fn get_tools(id: &str) -> Option<Value> {
     let s = get(id)?;
-    let g = s.lock().unwrap();
+    let g = session_guard(&s);
     Some(json!({ "active": g.tools.active_names(), "all": g.tools.all_names() }))
 }
 
 pub fn summary_with_stats(id: &str) -> Option<Value> {
     let s = get(id)?;
-    let g = s.lock().unwrap();
+    let g = session_guard(&s);
     let mut sum = g.summary();
     sum["stats"] = g.stats();
     Some(sum)
 }
 
 pub fn summary(id: &str) -> Option<Value> {
-    get(id).map(|s| s.lock().unwrap().summary())
+    get(id).map(|s| session_guard(&s).summary())
 }
 
 /// Models list for GET /api/sessions/:id/models — current + default + providers + providerMeta.
 pub fn models(id: &str) -> Option<Value> {
     let s = get(id)?;
-    let g = s.lock().unwrap();
+    let g = session_guard(&s);
     let default = types::default_model();
     Some(json!({
         "current": { "provider": g.provider, "modelId": g.model_id, "name": g.model_id, "reasoning": true },
@@ -1738,6 +1746,52 @@ mod tests {
             None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
         }
         let _ = server_tx.send(()).await;
+    }
+
+    /// A panic while holding an individual session mutex must not permanently brick that
+    /// session. With per-session poison recovery, control operations (abort, set_thinking, reload)
+    /// keep working even after a previous lock owner panicked mid-turn.
+    #[test]
+    fn session_mutex_recovers_from_poisoned_lock() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+
+        // Poison the session mutex by panicking while holding the lock.
+        let poison_thread = std::thread::spawn({
+            let sess = sess.clone();
+            move || {
+                let _guard = sess.lock().unwrap();
+                panic!("intentional session poison");
+            }
+        });
+        assert!(
+            poison_thread.join().is_err(),
+            "panic must leave the session mutex poisoned"
+        );
+
+        // Control operations on the poisoned session must recover and succeed.
+        assert!(
+            abort(&sid),
+            "abort must succeed after session lock poison"
+        );
+        assert!(
+            set_thinking(&sid, "xhigh").is_ok(),
+            "set_thinking must succeed after session lock poison"
+        );
+        let reloaded = reload(&sid);
+        assert!(
+            reloaded.is_ok(),
+            "reload must succeed after session lock poison: {:?}",
+            reloaded.err()
+        );
+        assert_eq!(
+            reloaded.unwrap()["sessionId"],
+            sid,
+            "reload must preserve the same session id"
+        );
+
+        dispose(&sid);
     }
 
     /// A panic while holding the session-store mutex must not permanently kill the agent runtime.
