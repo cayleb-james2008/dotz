@@ -72,7 +72,9 @@ impl AgentSession {
     /// getSessionStats shape: {tokens, cost, contextUsage:{percent, contextWindow}}.
     pub fn stats(&self) -> Value {
         // app.js refreshStats reads tokens.input/output → tokens MUST be an object, not a scalar.
-        let last = self.history.iter().filter_map(|m| m.usage.as_ref()).last();
+        // FilterMap over a double-ended iterator: .last() walks the whole history; .next_back()
+        // is O(1) and gives the same final element.
+        let last = self.history.iter().filter_map(|m| m.usage.as_ref()).next_back();
         let (input, output, total) = last
             .map(|u| (u.input, u.output, u.total_tokens))
             .unwrap_or((0, 0, 0));
@@ -1123,6 +1125,70 @@ mod tests {
             !sess.lock().unwrap().turn_active.load(Ordering::SeqCst),
             "TurnGuard must clear turn_active on drop"
         );
+        dispose(&sid);
+    }
+
+    #[test]
+    fn stats_returns_last_usage_and_sums_cost() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        {
+            let mut s = sess.lock().unwrap();
+            s.history.push(Message::user("hello", 1));
+            s.history.push(Message {
+                role: "assistant".into(),
+                content: Vec::new(),
+                api: None,
+                provider: None,
+                model: None,
+                usage: Some(Usage {
+                    input: 10,
+                    output: 5,
+                    total_tokens: 15,
+                    cost: Cost {
+                        input: 0.1,
+                        output: 0.05,
+                        total: 0.15,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                stop_reason: None,
+                error_message: None,
+                timestamp: 2,
+                response_id: None,
+            });
+            s.history.push(Message {
+                role: "assistant".into(),
+                content: Vec::new(),
+                api: None,
+                provider: None,
+                model: None,
+                usage: Some(Usage {
+                    input: 30,
+                    output: 20,
+                    total_tokens: 50,
+                    cost: Cost {
+                        input: 0.3,
+                        output: 0.2,
+                        total: 0.5,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                stop_reason: None,
+                error_message: None,
+                timestamp: 3,
+                response_id: None,
+            });
+        }
+        let stats = session_guard(&sess).stats();
+        let tokens = stats["tokens"].clone();
+        assert_eq!(tokens["input"].as_u64().unwrap(), 30);
+        assert_eq!(tokens["output"].as_u64().unwrap(), 20);
+        assert_eq!(tokens["totalTokens"].as_u64().unwrap(), 50);
+        assert!((stats["cost"].as_f64().unwrap() - 0.65).abs() < f64::EPSILON);
         dispose(&sid);
     }
 
