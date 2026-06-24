@@ -96,37 +96,55 @@ fn normalize_origin(value: &str) -> Result<String, String> {
     if authority.is_empty() {
         return Err(format!("invalid browser URL: {value}"));
     }
-    // Strip default ports so http://host and http://host:80 compare equal; keeps
-    // non-default ports intact. Matches the host-only --allowed-domains flag in spirit
-    // while keeping the explicit-port form in the allowlist consistent.
-    let authority = strip_default_port(&scheme, authority);
+
+    let default_port: u16 = if scheme == "http" { 80 } else { 443 };
+
+    // IPv6 literal: [host]:port or [host]. Brackets are part of the host syntax and must be
+    // preserved in the normalized origin so the allowlist compares equal to user-supplied URLs.
+    if authority.starts_with('[') {
+        let Some(close) = authority.find(']') else {
+            return Err(format!("invalid browser URL: {value}"));
+        };
+        let host = &authority[1..close];
+        if host.is_empty() {
+            return Err(format!("invalid browser URL: {value}"));
+        }
+        let after = &authority[close + 1..];
+        if after.is_empty() {
+            return Ok(format!("{scheme}://[{host}]"));
+        }
+        let Some(port_str) = after.strip_prefix(':') else {
+            return Ok(format!("{scheme}://{authority}"));
+        };
+        let Ok(port) = port_str.parse::<u16>() else {
+            return Ok(format!("{scheme}://{authority}"));
+        };
+        if port == default_port {
+            return Ok(format!("{scheme}://[{host}]"));
+        }
+        return Ok(format!("{scheme}://[{host}]:{port}"));
+    }
+
+    // Hostname/IPv4 with optional port.
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if let Ok(p) = port.parse::<u16>() {
+            if p == default_port {
+                return Ok(format!("{scheme}://{host}"));
+            }
+            return Ok(format!("{scheme}://{host}:{p}"));
+        }
+    }
     Ok(format!("{scheme}://{authority}"))
 }
 
-/// Remove the default port for http/https so origins that differ only by an explicit default
-/// port compare equal. Non-default ports and non-http(s) schemes are left unchanged.
-/// # ponytail: IPv6 literals are not handled here; the rest of the controller already splits on
-/// the last ':' for host extraction, so this keeps the same ceiling.
-fn strip_default_port(scheme: &str, authority: &str) -> String {
-    let default = match scheme {
-        "http" => Some(80u16),
-        "https" => Some(443u16),
-        _ => None,
-    };
-    let Some(default) = default else {
-        return authority.to_string();
-    };
-    if let Some((host, port)) = authority.rsplit_once(':') {
-        if port.parse::<u16>().ok() == Some(default) {
-            return host.to_string();
-        }
-    }
-    authority.to_string()
-}
-
 /// The host portion of a normalized origin (for the `--allowed-domains` flag).
+/// IPv6 brackets are stripped so the allowlist receives the bare host.
 fn origin_host(origin: &str) -> String {
     let host = origin.split_once("://").map(|(_, h)| h).unwrap_or(origin);
+    if host.starts_with('[') {
+        let end = host.find(']').unwrap_or(host.len());
+        return host[1..end].to_string();
+    }
     host.rsplit_once(':')
         .map(|(h, _)| h)
         .unwrap_or(host)
@@ -1475,24 +1493,51 @@ mod tests {
         assert_eq!(origin_host("http://example.com"), "example.com");
     }
 
+    /// IPv6 hosts are bracketed in origins; `origin_host` must return the bare host so the
+    /// agent-browser `--allowed-domains` flag receives a conventional unbracketed host value.
     #[test]
-    fn strip_default_port_only_affects_http_and_https_defaults() {
+    fn origin_host_strips_ipv6_brackets_and_port() {
+        assert_eq!(origin_host("http://[::1]:8080"), "::1");
+        assert_eq!(origin_host("https://[::1]"), "::1");
+        assert_eq!(origin_host("http://[2001:db8::1]:443"), "2001:db8::1");
+    }
+
+    /// IPv6 origins must normalize while preserving brackets and stripping default ports,
+    /// so the same origin expressed with or without an explicit port compares equal.
+    #[test]
+    fn normalize_origin_handles_ipv6_default_ports() {
         assert_eq!(
-            strip_default_port("http", "example.com:80".into()),
-            "example.com"
+            normalize_origin("http://[::1]").unwrap(),
+            normalize_origin("http://[::1]:80").unwrap()
         );
         assert_eq!(
-            strip_default_port("https", "example.com:443".into()),
-            "example.com"
+            normalize_origin("https://[::1]").unwrap(),
+            normalize_origin("https://[::1]:443").unwrap()
         );
         assert_eq!(
-            strip_default_port("http", "example.com:8080".into()),
-            "example.com:8080"
+            normalize_origin("http://[::1]:8080").unwrap(),
+            "http://[::1]:8080"
+        );
+    }
+
+    /// IPv6 URLs with userinfo, paths, and non-default ports must normalize correctly.
+    #[test]
+    fn normalize_origin_handles_ipv6_urls() {
+        assert_eq!(
+            normalize_origin("http://user:pass@[::1]:8080/path").unwrap(),
+            "http://[::1]:8080"
         );
         assert_eq!(
-            strip_default_port("other", "example.com:80".into()),
-            "example.com:80"
+            normalize_origin("https://[2001:db8::1]/foo").unwrap(),
+            "https://[2001:db8::1]"
         );
+    }
+
+    /// A malformed IPv6 literal (missing closing bracket) must be rejected rather than
+    /// producing a truncated origin that could slip into the allowlist.
+    #[test]
+    fn normalize_origin_rejects_ipv6_without_closing_bracket() {
+        assert!(normalize_origin("http://[::1").is_err());
     }
 
     /// A snapshot line may contain an `@` that is not a valid element ref (e.g. an email
