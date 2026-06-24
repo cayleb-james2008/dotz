@@ -320,8 +320,14 @@ fn all_status() -> Vec<ConnectionStatus> {
 // ---- handlers ----
 
 /// GET /api/connections -> { connections: [ConnectionStatus...] }
+///
+/// Status checks shell out to first-party CLIs with a 12s timeout, so we run the collection
+/// off the async runtime thread. A slow or hanging `gh auth status` call must not delay other
+/// REST handlers or the WebSocket event fan-out.
 async fn get_connections() -> Json<Value> {
-    let connections = all_status();
+    let connections = tokio::task::spawn_blocking(|| all_status())
+        .await
+        .unwrap_or_else(|_| Vec::new());
     Json(json!({ "connections": connections }))
 }
 
@@ -349,4 +355,85 @@ pub fn router() -> Router<()> {
             "/api/connections/{provider}/logout",
             axum::routing::post(disabled),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_installed_detects_missing_command() {
+        let r = CmdResult {
+            code: Some(127),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert!(not_installed(&r));
+    }
+
+    #[test]
+    fn not_installed_detects_command_not_found_message() {
+        let r = CmdResult {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "gh: command not found".into(),
+        };
+        assert!(not_installed(&r));
+    }
+
+    #[test]
+    fn extract_account_reads_gh_auth_status_output() {
+        let out = "Logged in to github.com as cayleb-james2008 (account cayleb-james2008)";
+        assert_eq!(extract_account(out), Some("cayleb-james2008".into()));
+    }
+
+    #[test]
+    fn extract_account_skips_when_no_whitespace_after_keyword() {
+        // "accountable" should not match because there's no whitespace after "account".
+        let out = "Accountable behavior is required";
+        assert_eq!(extract_account(out), None);
+    }
+
+    #[test]
+    fn parse_vercel_uses_last_non_tag_line_when_success() {
+        let r = CmdResult {
+            code: Some(0),
+            stdout: "vercel\nsomeuser".into(),
+            stderr: String::new(),
+        };
+        let p = parse_vercel(&r);
+        assert!(p.installed);
+        assert!(p.logged_in);
+        assert_eq!(p.account, Some("someuser".into()));
+    }
+
+    #[test]
+    fn parse_vercel_not_logged_in_when_exit_nonzero() {
+        let r = CmdResult {
+            code: Some(1),
+            stdout: "Error: not logged in".into(),
+            stderr: String::new(),
+        };
+        let p = parse_vercel(&r);
+        assert!(p.installed);
+        assert!(!p.logged_in);
+        assert_eq!(p.account, None);
+    }
+
+    #[tokio::test]
+    async fn get_connections_returns_all_three_providers() {
+        let resp = get_connections().await;
+        let arr = resp
+            .0
+            .get("connections")
+            .and_then(|v| v.as_array())
+            .expect("connections array");
+        let ids: Vec<&str> = arr
+            .iter()
+            .filter_map(|v| v.get("id").and_then(|x| x.as_str()))
+            .collect();
+        assert!(ids.contains(&"github"), "github missing: {ids:?}");
+        assert!(ids.contains(&"vercel"), "vercel missing: {ids:?}");
+        assert!(ids.contains(&"neon"), "neon missing: {ids:?}");
+    }
 }
