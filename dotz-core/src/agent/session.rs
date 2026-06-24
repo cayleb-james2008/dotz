@@ -47,6 +47,10 @@ pub struct AgentSession {
     /// `TurnGuard` clears it when the turn finishes or panics, preventing interleaved history
     /// and cancellation-token replacement.
     pub turn_active: AtomicBool,
+    /// Set when the session is removed from the live store. Any caller still holding an Arc to the
+    /// session (e.g. a prompt task spawned just before disposal) must bail out instead of starting
+    /// a new turn against a disposed session.
+    pub disposed: AtomicBool,
 }
 
 impl AgentSession {
@@ -266,6 +270,7 @@ pub fn create(opts: CreateOpts) -> Result<Value, String> {
         tx,
         cancel: CancellationToken::new(),
         turn_active: AtomicBool::new(false),
+        disposed: AtomicBool::new(false),
     };
     let summary = session.summary();
     store_guard().insert(id.clone(), std::sync::Arc::new(Mutex::new(session)));
@@ -289,7 +294,9 @@ pub fn count() -> usize {
 
 pub fn dispose(id: &str) -> bool {
     if let Some(s) = store_guard().remove(id) {
-        session_guard(&s).cancel.cancel();
+        let g = session_guard(&s);
+        g.disposed.store(true, Ordering::SeqCst);
+        g.cancel.cancel();
         true
     } else {
         false
@@ -421,9 +428,19 @@ impl Drop for TurnGuard {
 /// Run one prompt to completion: assemble, append user msg, loop (stream → maybe tools → repeat).
 /// This is the public entry the WS `prompt` handler calls. It blocks until the turn finishes.
 pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
-    // Reject concurrent turns on the same session to keep history and the cancellation token sane.
+    // Reject turns against a session that has been disposed from the live store. A prompt task
+    // spawned just before disposal may still hold an Arc and would otherwise start a new turn
+    // (and replace the cancelled cancellation token) after the session is gone.
     let _guard = {
         let s = session_guard(&session);
+        if s.disposed.load(Ordering::SeqCst) {
+            let _ = s.tx.send(serde_json::json!({
+                "kind": "error",
+                "sessionId": s.id,
+                "error": "Session has been disposed."
+            }));
+            return;
+        }
         if s.turn_active.swap(true, Ordering::SeqCst) {
             // Tell the operator (and any UI subscriber) why the prompt vanished instead of
             // silently dropping it. A busy session means an earlier turn is still streaming.
@@ -1420,6 +1437,57 @@ mod tests {
             .turn_active
             .store(false, Ordering::SeqCst);
         dispose(&sid);
+    }
+
+    /// A prompt task spawned just before the session is disposed must not start a real turn once
+    /// the session is gone. Before the disposed flag, `run_turn` replaced the cancelled token and
+    /// ran against a session no longer in the store. Now it emits a clear error frame and leaves
+    /// history untouched.
+    #[tokio::test]
+    async fn run_turn_rejects_disposed_session() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        assert!(dispose(&sid), "dispose should remove the session");
+
+        run_turn(sess.clone(), "prompt after dispose".into()).await;
+
+        let g = sess.lock().unwrap();
+        assert!(
+            g.history.is_empty(),
+            "run_turn against a disposed session must not append to history"
+        );
+        assert!(
+            !g.turn_active.load(Ordering::SeqCst),
+            "turn_active must stay false for a disposed session"
+        );
+        assert!(
+            g.disposed.load(Ordering::SeqCst),
+            "disposed flag must be set on the held Arc"
+        );
+        drop(g);
+
+        let mut found = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.get("kind").and_then(|k| k.as_str()) == Some("error") {
+                assert_eq!(
+                    frame.get("sessionId").and_then(|s| s.as_str()),
+                    Some(sid.as_str())
+                );
+                let err = frame.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                assert!(
+                    err.contains("disposed"),
+                    "error should explain the session is disposed: {err}"
+                );
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "run_turn should emit a disposed-session error frame"
+        );
     }
 
     #[test]
