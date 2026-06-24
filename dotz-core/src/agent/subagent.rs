@@ -1355,6 +1355,8 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let (mut read_half, mut write_half) = stream.into_split();
             let mut buf = Vec::with_capacity(8192);
+            // Read the full HTTP request (headers + small JSON body) before responding so the
+            // client can finish sending and later close cleanly when the subagent aborts.
             loop {
                 let mut tmp = [0u8; 1024];
                 let n = read_half.read(&mut tmp).await.unwrap_or(0);
@@ -1366,6 +1368,17 @@ mod tests {
                     break;
                 }
             }
+            // Drain the rest of the request body (small JSON); stop if the client has nothing
+            // more to send within a short window.
+            let body_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+            while tokio::time::Instant::now() < body_deadline {
+                let mut tmp = [0u8; 1024];
+                match tokio::time::timeout(Duration::from_millis(50), read_half.read(&mut tmp)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) => break,
+                    Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break,
+                }
+            }
             let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
             let _ = write_half.write_all(response).await;
             let _ = headers_tx.send(());
@@ -1375,7 +1388,9 @@ mod tests {
                 match tokio::time::timeout(Duration::from_secs(3), read_half.read(&mut after)).await
                 {
                     Ok(Ok(0)) | Ok(Err(_)) => {
-                        let _ = closed_tx.send(());
+                        // `closed_tx` is a bounded mpsc sender; `send` is async and must be
+                        // awaited or the message is dropped without being delivered.
+                        let _ = closed_tx.send(()).await;
                     }
                     _ => {}
                 }
@@ -1424,10 +1439,9 @@ mod tests {
             None => std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS"),
         }
 
-        assert!(
-            tokio::time::timeout(Duration::from_secs(3), closed_rx.recv())
-                .await
-                .is_ok(),
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), closed_rx.recv()).await,
+            Ok(Some(())),
             "timed-out subagent must abort the provider stream task and close the connection"
         );
         let _ = done_tx.send(()).await;
