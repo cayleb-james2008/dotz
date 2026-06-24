@@ -21,7 +21,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Semaphore};
 
 const MAX_PARALLEL_TASKS: usize = 8;
@@ -32,6 +32,36 @@ const MAX_CONCURRENCY: usize = 4;
 const CHAIN_PREVIOUS_CAP: usize = 24 * 1024;
 /// Bound a subagent's own tool-rounds (matches the executive loop's MAX_ROUNDS in session.rs).
 const MAX_ROUNDS: usize = 12;
+/// Default wall-clock timeout for one subagent run. Long enough for real work, short enough that
+/// a hung provider/tool cannot stall the executive turn forever. Override with
+/// `DOTZ_SUBAGENT_TIMEOUT_MS` (e.g. for fast tests).
+const DEFAULT_SUBAGENT_TIMEOUT_MS: u64 = 1000 * 60 * 5; // 5 minutes
+
+fn subagent_timeout() -> Duration {
+    std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_SUBAGENT_TIMEOUT_MS))
+}
+
+fn timeout_result(agent_name: &str, task: &str, step: Option<usize>) -> SingleResult {
+    SingleResult {
+        agent: agent_name.to_string(),
+        agent_source: "timeout".into(),
+        task: task.to_string(),
+        exit_code: 1,
+        messages: Vec::new(),
+        usage: SubUsage::default(),
+        model: None,
+        stop_reason: Some("timeout".into()),
+        error_message: Some(format!(
+            "subagent '{agent_name}' timed out after {:?}",
+            subagent_timeout()
+        )),
+        step,
+    }
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -277,6 +307,7 @@ impl SingleResult {
         self.exit_code != 0
             || self.stop_reason.as_deref() == Some("error")
             || self.stop_reason.as_deref() == Some("aborted")
+            || self.stop_reason.as_deref() == Some("timeout")
     }
 
     /// The final assistant text output (last assistant message's text blocks).
@@ -373,8 +404,29 @@ fn build_subagent_registry(agent: &AgentConfig) -> ToolRegistry {
 
 /// Run one subagent to completion: a fresh agent loop with the agent's system prompt + the resolved
 /// model, NO memory autonomy (the agent's own prompt only), and the agent's tool set (or the default
-/// active set). Captures the message list + usage as a SingleResult.
+/// active set). Captures the message list + usage as a SingleResult. A wall-clock timeout prevents a
+/// hung provider or long tool chain from stalling the executive turn indefinitely.
 async fn run_single_agent(
+    agents: &[AgentConfig],
+    agent_name: &str,
+    task: &str,
+    model_override: Option<&str>,
+    cwd: &str,
+    step: Option<usize>,
+) -> SingleResult {
+    match tokio::time::timeout(
+        subagent_timeout(),
+        run_single_agent_inner(agents, agent_name, task, model_override, cwd, step),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => timeout_result(agent_name, task, step),
+    }
+}
+
+/// The actual subagent loop — kept separate so `run_single_agent` can wrap it in a timeout.
+async fn run_single_agent_inner(
     agents: &[AgentConfig],
     agent_name: &str,
     task: &str,
@@ -1039,6 +1091,110 @@ mod tests {
         assert!(
             names.contains(&"bash".to_string()),
             "explicit agent.tools listing bash should be honored"
+        );
+    }
+
+    /// A subagent whose provider stream hangs must not stall the executive turn forever.
+    /// Before the timeout fix, `run_single_agent` would await the stream indefinitely.
+    #[tokio::test]
+    async fn run_single_agent_times_out_on_hung_provider() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Serialize with other tests that mutate the process-global local-provider URL.
+        let _guard = crate::agent::session::SSE_TEST_LOCK.lock().await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel::<()>();
+        let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::with_capacity(8192);
+            loop {
+                let mut tmp = [0u8; 1024];
+                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+            let _ = stream.write_all(response).await;
+            let _ = headers_tx.send(());
+            let _ = server_rx.recv().await;
+        });
+
+        let prev_url = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
+        let prev_timeout = std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS").ok();
+        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "500");
+
+        let agent = AgentConfig {
+            name: "test".into(),
+            description: "test".into(),
+            tools: None,
+            model: None,
+            system_prompt: "sys".into(),
+            source: "test",
+        };
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+
+        // Start the subagent first so the fake server gets a connection; once headers are on the
+        // wire we know the provider stream is hung and the timeout is actually being exercised.
+        let mut run = tokio::spawn(async move {
+            let agents = [agent];
+            run_single_agent(
+                &agents,
+                "test",
+                "task",
+                Some("local/test"),
+                &cwd,
+                None,
+            )
+            .await
+        });
+
+        tokio::select! {
+            _ = headers_rx => {}
+            r = &mut run => panic!("run_single_agent finished before provider stream started: {r:?}"),
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+
+        match prev_url {
+            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
+            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+        }
+        match prev_timeout {
+            Some(p) => std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS"),
+        }
+        let _ = server_tx.send(()).await;
+
+        assert_eq!(result.exit_code, 1, "timed-out subagent must report failure");
+        assert_eq!(
+            result.stop_reason.as_deref(),
+            Some("timeout"),
+            "stop_reason must be 'timeout', got {:?}",
+            result.stop_reason
+        );
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("timed out"),
+            "error message should mention timeout: {:?}",
+            result.error_message
         );
     }
 }

@@ -1022,15 +1022,20 @@ pub fn models(id: &str) -> Option<Value> {
 }
 
 #[cfg(test)]
+/// Lock shared by any test that mutates the process-global `DOTZ_LOCAL_BASE_URL` env var so
+/// concurrent fake-provider tests do not race each other.
+pub(crate) static SSE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::tools;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    /// Serializes the two hung-SSE tests below so they don't race on the
+    /// Serializes the hung-SSE tests below so they don't race on the
     /// process-global `DOTZ_LOCAL_BASE_URL` env var.
-    static SSE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    use super::SSE_TEST_LOCK;
 
     #[test]
     fn turn_guard_clears_flag_on_drop() {
