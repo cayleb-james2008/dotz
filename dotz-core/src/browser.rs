@@ -96,7 +96,32 @@ fn normalize_origin(value: &str) -> Result<String, String> {
     if authority.is_empty() {
         return Err(format!("invalid browser URL: {value}"));
     }
+    // Strip default ports so http://host and http://host:80 compare equal; keeps
+    // non-default ports intact. Matches the host-only --allowed-domains flag in spirit
+    // while keeping the explicit-port form in the allowlist consistent.
+    let authority = strip_default_port(&scheme, authority);
     Ok(format!("{scheme}://{authority}"))
+}
+
+/// Remove the default port for http/https so origins that differ only by an explicit default
+/// port compare equal. Non-default ports and non-http(s) schemes are left unchanged.
+/// # ponytail: IPv6 literals are not handled here; the rest of the controller already splits on
+/// the last ':' for host extraction, so this keeps the same ceiling.
+fn strip_default_port(scheme: &str, authority: &str) -> String {
+    let default = match scheme {
+        "http" => Some(80u16),
+        "https" => Some(443u16),
+        _ => None,
+    };
+    let Some(default) = default else {
+        return authority.to_string();
+    };
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if port.parse::<u16>().ok() == Some(default) {
+            return host.to_string();
+        }
+    }
+    authority.to_string()
 }
 
 /// The host portion of a normalized origin (for the `--allowed-domains` flag).
@@ -1389,4 +1414,183 @@ pub fn router() -> Router<()> {
         .route("/api/browser/start", post(post_start))
         .route("/api/browser/act", post(post_act))
         .route("/api/browser/stop", post(post_stop))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_origin_lowercases_and_strips_path() {
+        assert_eq!(
+            normalize_origin("https://Example.COM/path?x=1#frag").unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_origin_strips_userinfo() {
+        assert_eq!(
+            normalize_origin("http://user:pass@example.com/page").unwrap(),
+            "http://example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_origin_rejects_non_http() {
+        assert!(normalize_origin("ftp://example.com").is_err());
+        assert!(normalize_origin("not-a-url").is_err());
+    }
+
+    #[test]
+    fn normalize_origin_treats_default_ports_as_equal() {
+        assert_eq!(
+            normalize_origin("http://example.com").unwrap(),
+            normalize_origin("http://example.com:80").unwrap()
+        );
+        assert_eq!(
+            normalize_origin("https://example.com").unwrap(),
+            normalize_origin("https://example.com:443").unwrap()
+        );
+    }
+
+    #[test]
+    fn normalize_origin_preserves_non_default_ports() {
+        assert_eq!(
+            normalize_origin("http://example.com:8080").unwrap(),
+            "http://example.com:8080"
+        );
+        assert_eq!(
+            normalize_origin("https://example.com:8443/foo").unwrap(),
+            "https://example.com:8443"
+        );
+    }
+
+    #[test]
+    fn origin_host_strips_scheme_and_port() {
+        assert_eq!(origin_host("https://example.com:8080"), "example.com");
+        assert_eq!(origin_host("http://example.com"), "example.com");
+    }
+
+    #[test]
+    fn strip_default_port_only_affects_http_and_https_defaults() {
+        assert_eq!(
+            strip_default_port("http", "example.com:80".into()),
+            "example.com"
+        );
+        assert_eq!(
+            strip_default_port("https", "example.com:443".into()),
+            "example.com"
+        );
+        assert_eq!(
+            strip_default_port("http", "example.com:8080".into()),
+            "example.com:8080"
+        );
+        assert_eq!(
+            strip_default_port("other", "example.com:80".into()),
+            "example.com:80"
+        );
+    }
+
+    #[test]
+    fn act_status_maps_stale_and_unknown_ref_to_conflict() {
+        assert_eq!(
+            act_status("stale browser action: expected observation seq 3"),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            act_status("unknown browser ref: @e99"),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(act_status("some other error"), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn action_args_navigate_requires_allowed_origin() {
+        let allowed = vec!["https://example.com".into()];
+        let args = action_args(
+            "navigate",
+            &allowed,
+            &Some("https://example.com/page".into()),
+            &None,
+            &None,
+            &None,
+            &[],
+            "down",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            Some(vec!["open".into(), "https://example.com/page".into()])
+        );
+
+        let err = action_args(
+            "navigate",
+            &allowed,
+            &Some("https://evil.com".into()),
+            &None,
+            &None,
+            &None,
+            &[],
+            "down",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("not in the allowlist"));
+    }
+
+    #[test]
+    fn action_args_type_requires_text() {
+        let err = action_args(
+            "type",
+            &[],
+            &None,
+            &None,
+            &None,
+            &None,
+            &[],
+            "down",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("type requires text"));
+    }
+
+    #[test]
+    fn action_args_scroll_clamps_pixels_and_wait_clamps_ms() {
+        let allowed = vec![];
+        let scroll = action_args(
+            "scroll",
+            &allowed,
+            &None,
+            &None,
+            &None,
+            &None,
+            &[],
+            "up",
+            Some(-100.0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(scroll, Some(vec!["scroll".into(), "up".into(), "1".into()]));
+
+        let wait = action_args(
+            "wait",
+            &allowed,
+            &None,
+            &None,
+            &None,
+            &None,
+            &[],
+            "down",
+            None,
+            Some(100_000.0),
+        )
+        .unwrap();
+        assert_eq!(wait, Some(vec!["wait".into(), "30000".into()]));
+    }
 }
