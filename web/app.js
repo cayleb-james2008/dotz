@@ -11,7 +11,7 @@
 const THINK_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const LAYOUT_KEY = "dotz.layout.v1";
 const BRAIN_FLOAT_KEY = "dotz.brainFloat.v1";
-const PANEL_NAMES = ["chat", "graph", "brain", "browser", "memory", "files", "sandbox", "skills", "design", "connections"];
+const PANEL_NAMES = ["chat", "graph", "brain", "browser", "memory", "files", "sandbox", "skills", "design", "connections", "doctrine"];
 const PANEL_META = {
   chat: { icon: "▓", label: "CHAT" },
   graph: { icon: "◐", label: "WORKFLOW GRAPH" },
@@ -23,6 +23,7 @@ const PANEL_META = {
   skills: { icon: "✦", label: "SKILLS" },
   design: { icon: "❖", label: "DESIGN" },
   connections: { icon: "⊕", label: "CONNECTIONS" },
+  doctrine: { icon: "◈", label: "DOCTRINE" },
 };
 
 const state = {
@@ -310,6 +311,7 @@ function mountPanel(name) {
   else if (name === "browser") wireBrowserPanel(node);
   else if (name === "files") wireFilesPanel(node);
   else if (name === "connections") wireConnectionsPanel(node);
+  else if (name === "doctrine") wireDoctrinePanel(node);
 }
 
 function unmountPanel(name) {
@@ -2271,6 +2273,64 @@ async function connectionLogout(provider) {
     if (r && r.ok === false) pushError("logout failed: " + (r.output || provider));
     refreshConnections();
   } catch (e) { pushError("connection logout: " + e.message); }
+}
+
+/* ---------- doctrine (AGENTS.md editor) ---------- */
+function wireDoctrinePanel(node) {
+  const editor = node.querySelector("#doctrine-editor");
+  const preview = node.querySelector("#doctrine-preview");
+  const status = node.querySelector("#doctrine-status");
+  const saveBtn = node.querySelector("#doctrine-save");
+  const reloadBtn = node.querySelector("#doctrine-reload");
+  if (!editor || !preview || !status || !saveBtn || !reloadBtn) return;
+
+  editor.addEventListener("input", () => {
+    preview.innerHTML = renderMarkdown(editor.value);
+    status.textContent = "unsaved";
+    status.classList.remove("dim");
+    status.classList.add("yellow");
+  });
+
+  saveBtn.onclick = async () => {
+    if (!state.activeProjectId) { pushError("open a project first"); return; }
+    status.textContent = "saving…";
+    status.classList.remove("yellow");
+    try {
+      await patch("/api/agents_md?projectId=" + encodeURIComponent(state.activeProjectId), { content: editor.value });
+      status.textContent = "saved";
+      status.classList.add("dim");
+      showToast("AGENTS.md saved");
+    } catch (e) {
+      status.textContent = "save failed";
+      status.classList.add("red");
+      pushError("doctrine save: " + e.message);
+    }
+  };
+
+  reloadBtn.onclick = () => loadDoctrine(editor, preview, status);
+  loadDoctrine(editor, preview, status);
+}
+
+async function loadDoctrine(editor, preview, status) {
+  if (!state.activeProjectId) {
+    status.textContent = "no project";
+    editor.value = "";
+    preview.innerHTML = "";
+    return;
+  }
+  status.textContent = "loading…";
+  status.classList.remove("red", "yellow");
+  try {
+    const { content } = await api("/api/agents_md?projectId=" + encodeURIComponent(state.activeProjectId));
+    editor.value = content || "";
+    preview.innerHTML = renderMarkdown(content || "");
+    status.textContent = "loaded";
+    status.classList.add("dim");
+  } catch (e) {
+    status.textContent = "load failed";
+    status.classList.add("red");
+    pushError("doctrine load: " + e.message);
+  }
 }
 
 /* ---------- sandbox ---------- */
