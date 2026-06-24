@@ -9,6 +9,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 /// Context a tool executes in (the session's cwd, for relative-path resolution + memory scoping).
 pub struct ToolCtx {
@@ -148,6 +151,21 @@ impl Tool for EditTool {
     }
 }
 
+/// Configurable wall-clock timeout for `bash` tool executions. A hung command (interactive prompt,
+/// infinite loop, long sleep) otherwise blocks the agent turn forever. Defaults to 5 minutes;
+/// override with `DOTZ_BASH_TIMEOUT_MS` (clamped to [1s, 1h]).
+fn bash_timeout() -> Duration {
+    const DEFAULT_MS: u64 = 300_000; // 5 minutes
+    const MIN_MS: u64 = 1_000;       // 1 second
+    const MAX_MS: u64 = 3_600_000;   // 1 hour
+    std::env::var("DOTZ_BASH_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|ms| ms.clamp(MIN_MS, MAX_MS))
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_MS))
+}
+
 // ---- bash ----
 struct BashTool;
 #[async_trait]
@@ -166,31 +184,71 @@ impl Tool for BashTool {
             .ok_or("command is required")?
             .to_string();
         let cwd = ctx.cwd.clone();
-        // Block on the OS process off the async runtime worker.
-        let out = tokio::task::spawn_blocking(move || {
-            // Windows: cmd /C; otherwise sh -c. (The host here is Windows; keep both for portability.)
-            let mut c = if cfg!(windows) {
-                let mut c = std::process::Command::new("cmd");
-                c.arg("/C").arg(&cmd);
-                c
-            } else {
-                let mut c = std::process::Command::new("sh");
-                c.arg("-c").arg(&cmd);
-                c
-            };
-            c.current_dir(&cwd).output()
-        })
-        .await
-        .map_err(|e| format!("spawn: {e}"))?
-        .map_err(|e| format!("exec: {e}"))?;
-        let mut s = String::from_utf8_lossy(&out.stdout).to_string();
-        let err = String::from_utf8_lossy(&out.stderr);
+        let timeout = bash_timeout();
+
+        let mut c = if cfg!(windows) {
+            let mut c = tokio::process::Command::new("cmd");
+            c.arg("/C").arg(&cmd);
+            c
+        } else {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c").arg(&cmd);
+            c
+        };
+        c.current_dir(&cwd);
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            c.creation_flags(CREATE_NO_WINDOW); // avoid console pop-ups in the packaged app
+        }
+
+        let mut child = c
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("exec: {e}"))?;
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+
+        let run_fut = async {
+            let (status, _, _) = tokio::join!(
+                child.wait(),
+                async {
+                    if let Some(s) = stdout.as_mut() {
+                        let _ = s.read_to_end(&mut stdout_buf).await;
+                    }
+                },
+                async {
+                    if let Some(s) = stderr.as_mut() {
+                        let _ = s.read_to_end(&mut stderr_buf).await;
+                    }
+                },
+            );
+            status
+        };
+
+        let status = match tokio::time::timeout(timeout, run_fut).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(format!("exec: {e}")),
+            Err(_) => {
+                let _ = child.start_kill();
+                return Err(format!(
+                    "[timeout] killed after {}ms",
+                    timeout.as_millis()
+                ));
+            }
+        };
+
+        let mut s = String::from_utf8_lossy(&stdout_buf).to_string();
+        let err = String::from_utf8_lossy(&stderr_buf);
         if !err.trim().is_empty() {
             s.push_str("\n[stderr]\n");
             s.push_str(&err);
         }
-        if !out.status.success() {
-            s.push_str(&format!("\n[exit {}]", out.status.code().unwrap_or(-1)));
+        if !status.success() {
+            s.push_str(&format!("\n[exit {}]", status.code().unwrap_or(-1)));
             // A non-zero exit is an error so the agent loop marks the tool result as failed.
             return Err(s);
         }
@@ -677,6 +735,10 @@ impl Default for ToolRegistry {
 mod tests {
     use super::*;
 
+    /// Serialize tests that mutate the process-global `DOTZ_BASH_TIMEOUT_MS` env var so
+    /// concurrent bash tests do not race on timeout configuration.
+    static BASH_TIMEOUT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn run_rejects_inactive_tool() {
         // bash exists in the registry but is not in the active set after we restrict it.
@@ -729,6 +791,84 @@ mod tests {
         assert!(
             err.contains("[exit 1]"),
             "a failing bash command must return an error containing the exit code, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_is_configurable_and_clamped() {
+        let _guard = BASH_TIMEOUT_TEST_LOCK.lock().await;
+        let prev = std::env::var("DOTZ_BASH_TIMEOUT_MS").ok();
+
+        std::env::remove_var("DOTZ_BASH_TIMEOUT_MS");
+        assert_eq!(bash_timeout().as_secs(), 300, "default is 5 minutes");
+
+        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "5000");
+        assert_eq!(
+            bash_timeout().as_millis(),
+            5000,
+            "valid override preserved"
+        );
+
+        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "50");
+        assert_eq!(
+            bash_timeout().as_millis(),
+            1000,
+            "too-small value clamped to minimum"
+        );
+
+        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "100000000");
+        assert_eq!(
+            bash_timeout().as_millis(),
+            3_600_000,
+            "too-large value clamped to maximum"
+        );
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_BASH_TIMEOUT_MS"),
+        }
+    }
+
+    /// A long-running `bash` command must not block the agent turn forever. The tool honors
+    /// `DOTZ_BASH_TIMEOUT_MS`, kills the child, and returns a clear timeout error.
+    #[tokio::test]
+    async fn run_bash_times_out_on_long_command() {
+        let _guard = BASH_TIMEOUT_TEST_LOCK.lock().await;
+        let prev = std::env::var("DOTZ_BASH_TIMEOUT_MS").ok();
+        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "1000");
+
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["bash".to_string()]);
+        let ctx = ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: None,
+        };
+        // A ~2s command with a 1s timeout must be killed mid-run.
+        let command = if cfg!(windows) {
+            "ping -n 3 127.0.0.1"
+        } else {
+            "sleep 2"
+        };
+
+        let start = std::time::Instant::now();
+        let err = registry
+            .run("bash", &json!({"command": command}), &ctx)
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_BASH_TIMEOUT_MS"),
+        }
+
+        assert!(
+            err.contains("[timeout]"),
+            "timed-out bash command must report a timeout error, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "bash timeout should return promptly, elapsed: {elapsed:?}"
         );
     }
 }
