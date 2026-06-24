@@ -751,6 +751,47 @@ mod tests {
         session::dispose(&sid);
     }
 
+    /// A model id with a redundant provider prefix passed at session creation must be normalized
+    /// to a bare id, matching the global config behavior.
+    #[tokio::test]
+    async fn create_session_normalizes_redundant_provider_prefix() {
+        let body = Json(json!({
+            "model": { "provider": "ollama", "modelId": "ollama/glm-5.2" }
+        }));
+        let resp = create_session(Some(body)).await.unwrap();
+        let sid = resp.0["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(resp.0["model"]["provider"], "ollama");
+        assert_eq!(resp.0["model"]["modelId"], "glm-5.2");
+        session::dispose(&sid);
+    }
+
+    /// POST /api/sessions/:id/model must normalize a redundant provider prefix so the upstream
+    /// API receives the bare model id.
+    #[tokio::test]
+    async fn post_model_normalizes_redundant_provider_prefix() {
+        let create_resp = create_session(Some(Json(json!({
+            "model": { "provider": "ollama", "modelId": "glm-5.2" }
+        }))))
+        .await
+        .unwrap();
+        let sid = create_resp.0["sessionId"].as_str().unwrap().to_string();
+
+        let body = Json(json!({
+            "provider": "ollama",
+            "modelId": "ollama/glm-5.2"
+        }));
+        let resp = post_model(
+            axum::extract::Path(sid.clone()),
+            Some(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.0["model"]["provider"], "ollama");
+        assert_eq!(resp.0["model"]["modelId"], "glm-5.2");
+
+        session::dispose(&sid);
+    }
+
     #[tokio::test]
     async fn create_session_rejects_unknown_profile() {
         let body = Json(json!({ "profileId": "not-a-profile" }));
