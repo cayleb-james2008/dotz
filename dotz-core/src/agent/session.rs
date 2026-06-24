@@ -450,6 +450,10 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     };
     let cancel = session.lock().unwrap().cancel.clone();
 
+    // Accumulate every tool result from this turn so the final turn_end event can surface them
+    // to the UI (workflow step links, error markers, etc.).
+    let mut tool_results: Vec<ToolResult> = Vec::new();
+
     // The agent loop: up to a bounded number of tool-rounds.
     const MAX_ROUNDS: usize = 12;
     for _round in 0..MAX_ROUNDS {
@@ -555,13 +559,12 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             .collect();
 
         if calls.is_empty() || stop_reason == "aborted" {
-            // No tools → turn is done.
-            finish_turn(&session, assistant_msg, Vec::new());
+            // No tools → turn is done (tool_results is empty unless tools ran earlier).
+            finish_turn(&session, assistant_msg, tool_results);
             return;
         }
 
         // Run each tool, emit tool_execution_start/end, append a tool-result message to history.
-        let mut tool_results: Vec<ToolResult> = Vec::new();
         for (call_id, name, args) in calls {
             {
                 let s = session.lock().unwrap();
@@ -646,7 +649,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         .find(|m| m.role == "assistant")
         .cloned();
     if let Some(msg) = last {
-        finish_turn(&session, msg, Vec::new());
+        finish_turn(&session, msg, tool_results);
     }
 }
 
@@ -826,7 +829,7 @@ fn finish_turn(
         };
         (cwd, user_text, assistant_text)
     };
-    if crate::memory::is_autonomy_enabled() {
+    if crate::memory::is_autonomy_enabled() && tokio::runtime::Handle::try_current().is_ok() {
         tokio::spawn(async move {
             let cwd_opt = if cwd.is_empty() {
                 None
@@ -1024,5 +1027,50 @@ mod tests {
             start_pos.unwrap() < end_pos.unwrap(),
             "message_start must precede message_end in error path: {kinds:?}"
         );
+    }
+
+    #[test]
+    fn finish_turn_emits_tool_results_in_turn_end() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        let final_msg = Message::assistant_shell("ollama", "glm-5.2", now_ms());
+        let result = ToolResult {
+            tool_call_id: "tc-1".into(),
+            tool_name: "bash".into(),
+            is_error: true,
+            result: json!({ "output": "hello" }),
+        };
+        finish_turn(&sess, final_msg, vec![result]);
+
+        let mut found = None;
+        while let Ok(frame) = rx.try_recv() {
+            if let Some("turn_end") = frame
+                .get("event")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str())
+            {
+                found = Some(frame);
+            }
+        }
+
+        dispose(&sid);
+
+        let event = found
+            .expect("turn_end event should be emitted")
+            .get("event")
+            .cloned()
+            .unwrap();
+        let results = event
+            .get("toolResults")
+            .and_then(|v| v.as_array())
+            .expect("turn_end should include toolResults");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["toolCallId"], "tc-1");
+        assert_eq!(results[0]["toolName"], "bash");
+        assert_eq!(results[0]["isError"], true);
+        assert_eq!(results[0]["result"]["output"], "hello");
     }
 }
