@@ -193,6 +193,15 @@ fn baselines() -> &'static Mutex<HashMap<String, Value>> {
     BASELINE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Lock the RSI baselines mutex, recovering from a poisoned lock. A panic while holding the
+/// baselines lock (e.g. inside a serde callback or a baseline comparison) must not permanently
+/// brick the `rsi_baseline` / `rsi_compare` tools.
+fn baselines_guard() -> std::sync::MutexGuard<'static, HashMap<String, Value>> {
+    baselines()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Run the gate command in cwd (default: `npm test`), capture output, parse pass/fail counts.
 /// Pick the default gate command from the project manifest: Rust crates run
 /// `cargo test -p <name>`; the dotz workspace root is detected and pinned to
@@ -441,7 +450,7 @@ impl Tool for RsiBaselineTool {
         let cmd = args.get("command").and_then(|v| v.as_str());
         let result = run_gate(&ctx.cwd, cmd).await;
         let key = ctx.cwd.to_string_lossy().to_string();
-        baselines().lock().unwrap().insert(key, result.clone());
+        baselines_guard().insert(key, result.clone());
         Ok(format!("baseline captured: {result}"))
     }
 }
@@ -460,7 +469,7 @@ impl Tool for RsiCompareTool {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let key = ctx.cwd.to_string_lossy().to_string();
-        let base = baselines().lock().unwrap().get(&key).cloned();
+        let base = baselines_guard().get(&key).cloned();
         let Some(base) = base else {
             return Err("no baseline — call rsi_baseline first".into());
         };
@@ -488,9 +497,18 @@ fn gates() -> &'static Mutex<HashMap<String, oneshot::Sender<(bool, Option<Strin
     GATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Lock the human-gate mutex, recovering from a poisoned lock. A panic while holding the gates
+/// lock (e.g. inside a gate resolution callback) must not permanently brick the `human_gate`
+/// tool or the /ws `gate.approve` / `gate.reject` handler.
+fn gates_guard() -> std::sync::MutexGuard<'static, HashMap<String, oneshot::Sender<(bool, Option<String>)>>> {
+    gates()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Called by the /ws handler on a {kind:"gate.approve"|"gate.reject"} client message.
 pub fn resolve_gate(gate_id: &str, approved: bool, feedback: Option<String>) {
-    if let Some(tx) = gates().lock().unwrap().remove(gate_id) {
+    if let Some(tx) = gates_guard().remove(gate_id) {
         let _ = tx.send((approved, feedback));
     }
 }
@@ -519,11 +537,11 @@ impl Tool for HumanGateTool {
         };
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
-        gates().lock().unwrap().insert(id.clone(), tx);
+        gates_guard().insert(id.clone(), tx);
         // Emit the gate request over the session WS (app.js renders the approval card).
         let _ = ws_tx.send(json!({ "kind": "gate", "gateId": id, "plan": plan }));
         let result = tokio::time::timeout(Duration::from_secs(300), rx).await;
-        gates().lock().unwrap().remove(&id);
+        gates_guard().remove(&id);
         match result {
             Ok(Ok((true, feedback))) => Ok(format!(
                 "APPROVED{}",
@@ -831,5 +849,54 @@ mod tests {
     fn parse_counts_counts_standalone_pass_and_passed() {
         assert_eq!(parse_counts("5 pass, 1 fail"), (5, 1));
         assert_eq!(parse_counts("5 passed, 1 failed"), (5, 1));
+    }
+
+    /// A panic while holding the RSI baselines mutex must not permanently brick the RSI loop.
+    /// With poison recovery, `rsi_baseline` can still store a new baseline and `rsi_compare` can
+    /// read it back after a previous lock owner panicked mid-operation.
+    #[test]
+    fn baselines_guard_recovers_from_poisoned_mutex() {
+        // Ensure the mutex is initialized.
+        drop(baselines().lock().unwrap());
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = baselines().lock().unwrap();
+            panic!("intentional baselines mutex poison");
+        }));
+        assert!(poisoned.is_err(), "baselines mutex should be poisoned");
+
+        let key = "proj:/tmp/recover-test".to_string();
+        {
+            let mut guard = baselines_guard();
+            guard.insert(key.clone(), json!({ "ok": true, "passed": 7, "failed": 0 }));
+        }
+
+        let value = baselines_guard().get(&key).cloned();
+        assert_eq!(value.and_then(|v| v.get("passed").and_then(|x| x.as_i64())), Some(7));
+    }
+
+    /// A panic while holding the human-gate mutex must not permanently brick the gate UI or the
+    /// /ws approval handler. With poison recovery, `resolve_gate` keeps working after a previous
+    /// lock owner panicked.
+    #[test]
+    fn gates_guard_recovers_from_poisoned_mutex() {
+        // Ensure the mutex is initialized.
+        drop(gates().lock().unwrap());
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = gates().lock().unwrap();
+            panic!("intentional gates mutex poison");
+        }));
+        assert!(poisoned.is_err(), "gates mutex should be poisoned");
+
+        // resolve_gate must not panic on a poisoned mutex; with no matching gate it is a no-op.
+        resolve_gate("no-such-gate", true, None);
+
+        // A live gate can still be registered and resolved after recovery.
+        let (tx, mut rx) = oneshot::channel();
+        gates_guard().insert("recover-gate".to_string(), tx);
+        resolve_gate("recover-gate", false, Some("needs work".to_string()));
+        let result = rx.try_recv().expect("gate resolution should deliver after poison recovery");
+        assert_eq!(result, (false, Some("needs work".to_string())));
     }
 }
