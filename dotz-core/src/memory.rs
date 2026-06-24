@@ -882,7 +882,9 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_tmp_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("dotz-memory-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let result = f(&dir);
@@ -899,8 +901,14 @@ mod tests {
 
     #[test]
     fn scope_user_project_normalizes_path() {
-        assert_eq!(scope_user("project", Some("C:\\Projects\\Dotz")), "proj:c:/projects/dotz");
-        assert_eq!(scope_user("project", Some("/home/user/dotz")), "proj:/home/user/dotz");
+        assert_eq!(
+            scope_user("project", Some("C:\\Projects\\Dotz")),
+            "proj:c:/projects/dotz"
+        );
+        assert_eq!(
+            scope_user("project", Some("/home/user/dotz")),
+            "proj:/home/user/dotz"
+        );
     }
 
     #[test]
