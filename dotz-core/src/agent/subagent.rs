@@ -405,6 +405,20 @@ fn build_subagent_registry(agent: &AgentConfig) -> ToolRegistry {
     r
 }
 
+/// Parse a subagent model string into (provider, model_id). Accepts a bare id (falls back to
+/// ollama) or "provider/model-id". Strips a redundant provider prefix so the upstream API receives
+/// the bare model id, matching the executive session + config normalization behavior.
+fn parse_subagent_model(effective_model: &str) -> (String, String) {
+    match effective_model.split_once('/') {
+        Some((p, m)) if !p.is_empty() && !m.is_empty() => {
+            let provider_id = p.to_string();
+            let model_id = crate::types::strip_matching_provider_prefix(&provider_id, m);
+            (provider_id, model_id)
+        }
+        _ => ("ollama".to_string(), effective_model.to_string()),
+    }
+}
+
 /// Run one subagent to completion: a fresh agent loop with the agent's system prompt + the resolved
 /// model, NO memory autonomy (the agent's own prompt only), and the agent's tool set (or the default
 /// active set). Captures the message list + usage as a SingleResult. A wall-clock timeout prevents a
@@ -445,10 +459,9 @@ async fn run_single_agent_inner(
         })
         .unwrap_or_else(|| "ollama/minimax-m3".to_string());
     // Split "provider/model-id" → (provider, model_id). A bare id falls back to ollama.
-    let (provider_id, model_id) = match effective_model.split_once('/') {
-        Some((p, m)) if !p.is_empty() && !m.is_empty() => (p.to_string(), m.to_string()),
-        _ => ("ollama".to_string(), effective_model.clone()),
-    };
+    // Normalize a redundant "provider/" prefix so the upstream API receives a bare model id,
+    // matching the executive session + config behavior.
+    let (provider_id, model_id) = parse_subagent_model(&effective_model);
 
     let mut result = SingleResult {
         agent: agent.name.clone(),
@@ -1111,6 +1124,39 @@ mod tests {
         assert_eq!(id, "call_abc");
         assert_eq!(name, "bash");
         assert_eq!(args["command"], "echo hi");
+    }
+
+    #[test]
+    fn parse_subagent_model_handles_bare_and_prefixed_ids() {
+        // Bare model id falls back to the default ollama provider.
+        assert_eq!(
+            parse_subagent_model("glm-5.2"),
+            ("ollama".to_string(), "glm-5.2".to_string())
+        );
+        // Clean provider/model pair passes through unchanged.
+        assert_eq!(
+            parse_subagent_model("ollama/minimax-m3"),
+            ("ollama".to_string(), "minimax-m3".to_string())
+        );
+        assert_eq!(
+            parse_subagent_model("openrouter/nex-agi/nex-n2-pro:free"),
+            (
+                "openrouter".to_string(),
+                "nex-agi/nex-n2-pro:free".to_string()
+            )
+        );
+        // Redundant provider prefix (a common copy/paste mistake) is stripped so the upstream
+        // API receives the bare model id instead of failing on "ollama/ollama/glm-5.2".
+        assert_eq!(
+            parse_subagent_model("ollama/ollama/glm-5.2"),
+            ("ollama".to_string(), "glm-5.2".to_string())
+        );
+        // A mismatched provider prefix must be preserved so cross-provider namespaces are not
+        // corrupted (e.g. an OpenRouter id that happens to start with "ollama/").
+        assert_eq!(
+            parse_subagent_model("openrouter/ollama/glm-5.2"),
+            ("openrouter".to_string(), "ollama/glm-5.2".to_string())
+        );
     }
 
     #[test]
