@@ -271,6 +271,9 @@ impl Tool for BashTool {
             Ok(Err(e)) => return Err(format!("exec: {e}")),
             Err(_) => {
                 let _ = child.start_kill();
+                // Reap the killed child so it does not become a zombie (Unix) or leak a process
+                // handle (Windows) after the timeout path returns.
+                let _ = child.wait().await;
                 return Err(format!("[timeout] killed after {}ms", timeout.as_millis()));
             }
         };
@@ -900,6 +903,65 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "bash timeout should return promptly, elapsed: {elapsed:?}"
         );
+    }
+
+    /// A timed-out bash child must be reaped, not left as a zombie (Unix) or leaking handles
+    /// (Windows). We verify the reap on Unix by checking `kill -0 <pid>` after the timeout path
+    /// returns; on Windows we still verify the timeout result shape.
+    #[tokio::test]
+    async fn run_bash_reaps_child_after_timeout() {
+        let _guard = BASH_TIMEOUT_TEST_LOCK.lock().await;
+        let prev = std::env::var("DOTZ_BASH_TIMEOUT_MS").ok();
+        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "500");
+
+        let base =
+            std::env::temp_dir().join(format!("dotz-bash-reap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let pidfile = base.join("pid");
+
+        let command = if cfg!(windows) {
+            "ping -n 3 127.0.0.1".to_string()
+        } else {
+            format!("echo $$ > {} ; sleep 30", pidfile.to_string_lossy())
+        };
+
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["bash".to_string()]);
+        let ctx = ToolCtx {
+            cwd: base.clone(),
+            tx: None,
+        };
+        let err = registry
+            .run("bash", &json!({"command": command}), &ctx)
+            .await
+            .unwrap_err();
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_BASH_TIMEOUT_MS"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(
+            err.contains("[timeout]"),
+            "timed-out bash command must report a timeout error, got: {err}"
+        );
+
+        #[cfg(unix)]
+        {
+            let pid_text = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            let pid: i32 = pid_text.trim().parse().unwrap_or(-1);
+            assert!(pid > 0, "test should have captured a valid child pid");
+            let gone = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+                .map(|o| !o.status.success())
+                .unwrap_or(true);
+            assert!(
+                gone,
+                "timed-out bash child (pid {pid}) should have been killed and reaped, not still running"
+            );
+        }
     }
 
     /// The file-tool sandbox must reject paths that escape the session cwd, whether via `..`
