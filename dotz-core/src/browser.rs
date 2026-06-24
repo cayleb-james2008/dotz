@@ -38,13 +38,15 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(75);
 /// fall through action_args() to None and be silently no-op'd while returning a 200 "ready"
 /// observation — act() rejects it up front instead.
 const ACTION_NAMES: [&str; 12] = [
-    "navigate", "observe", "back", "forward", "reload", "click", "clickAt", "type", "key", "select",
-    "scroll", "wait",
+    "navigate", "observe", "back", "forward", "reload", "click", "clickAt", "type", "key",
+    "select", "scroll", "wait",
 ];
 
 // ---- ISO-8601 timestamp (UTC, ms) without a chrono dependency ----
 fn now_iso() -> String {
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let total_ms = dur.as_millis() as i64;
     let secs = total_ms / 1000;
     let ms = (total_ms % 1000) as i64;
@@ -87,7 +89,10 @@ fn normalize_origin(value: &str) -> Result<String, String> {
         .unwrap_or("")
         .to_ascii_lowercase();
     // strip userinfo if present
-    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(&authority);
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(&authority);
     if authority.is_empty() {
         return Err(format!("invalid browser URL: {value}"));
     }
@@ -97,7 +102,10 @@ fn normalize_origin(value: &str) -> Result<String, String> {
 /// The host portion of a normalized origin (for the `--allowed-domains` flag).
 fn origin_host(origin: &str) -> String {
     let host = origin.split_once("://").map(|(_, h)| h).unwrap_or(origin);
-    host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host).to_string()
+    host.rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host)
+        .to_string()
 }
 
 // ---- BrowserObservation (serde camelCase, contract shape) ----
@@ -252,12 +260,20 @@ fn resolve_executable() -> Result<PathBuf, String> {
     let base = std::env::var("DOTZ_RESOURCES")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let bundled = base.join("node_modules").join("agent-browser").join("bin").join(name);
+    let bundled = base
+        .join("node_modules")
+        .join("agent-browser")
+        .join("bin")
+        .join(name);
     if bundled.exists() {
         return Ok(bundled);
     }
     // PATH fallback (the oracle's final "agent-browser" candidate).
-    let bare = if cfg!(target_os = "windows") { "agent-browser.exe" } else { "agent-browser" };
+    let bare = if cfg!(target_os = "windows") {
+        "agent-browser.exe"
+    } else {
+        "agent-browser"
+    };
     Ok(PathBuf::from(bare))
 }
 
@@ -309,19 +325,29 @@ fn result_lines(v: &Value) -> Vec<String> {
     let arr = if data.is_array() {
         data.as_array().cloned()
     } else if let Some(obj) = data.as_object() {
-        obj.values().find(|x| x.is_array()).and_then(|x| x.as_array().cloned())
+        obj.values()
+            .find(|x| x.is_array())
+            .and_then(|x| x.as_array().cloned())
     } else {
         None
     };
     if let Some(arr) = arr {
         return arr
             .iter()
-            .map(|x| x.as_str().map(String::from).unwrap_or_else(|| x.to_string()))
+            .map(|x| {
+                x.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| x.to_string())
+            })
             .filter(|s| !s.is_empty())
             .collect();
     }
     if let Some(s) = data.as_str() {
-        return s.lines().map(String::from).filter(|s| !s.is_empty()).collect();
+        return s
+            .lines()
+            .map(String::from)
+            .filter(|s| !s.is_empty())
+            .collect();
     }
     Vec::new()
 }
@@ -330,7 +356,9 @@ fn result_lines(v: &Value) -> Vec<String> {
 fn snapshot_elements(snapshot: &str, observation_seq: i64) -> Vec<ElementRef> {
     let mut out = Vec::new();
     for line in snapshot.lines() {
-        let Some(reff) = first_ref(line) else { continue };
+        let Some(reff) = first_ref(line) else {
+            continue;
+        };
         // descriptor: strip a leading "- "/"* " bullet, then drop the "[ref=eN] …" tail.
         let mut descriptor = line.trim_start();
         descriptor = descriptor.trim_start_matches(['-', '*', ' ']);
@@ -338,7 +366,11 @@ fn snapshot_elements(snapshot: &str, observation_seq: i64) -> Vec<ElementRef> {
         let (role, name) = split_role_name(descriptor.trim());
         out.push(ElementRef {
             r#ref: reff,
-            role: if role.is_empty() { "element".into() } else { role },
+            role: if role.is_empty() {
+                "element".into()
+            } else {
+                role
+            },
             name,
             observation_seq,
         });
@@ -352,7 +384,10 @@ fn first_ref(line: &str) -> Option<String> {
         if let Some(pos) = line.find(token) {
             let after = &line[pos + token.len()..];
             if let Some(stripped) = after.strip_prefix('e') {
-                let digits: String = stripped.chars().take_while(|c| c.is_ascii_digit()).collect();
+                let digits: String = stripped
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
                 if !digits.is_empty() {
                     return Some(format!("e{digits}"));
                 }
@@ -378,7 +413,10 @@ fn all_refs(snapshot: &str) -> Vec<String> {
         let Some((pos, tok)) = pos else { break };
         let after = &rest[pos + tok.len()..];
         if let Some(stripped) = after.strip_prefix('e') {
-            let digits: String = stripped.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let digits: String = stripped
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             if !digits.is_empty() {
                 let reff = format!("e{digits}");
                 if !seen.contains(&reff) {
@@ -421,26 +459,45 @@ fn split_role_name(descriptor: &str) -> (String, String) {
 /// Spawn agent-browser ONE-SHOT with the exact security flags + AGENT_BROWSER_HEADED=false, a 35s
 /// timeout, capture stdout/stderr, kill-tree on timeout, parse stdout as JSON. `command` is the
 /// trailing `--json <command...>` portion.
-async fn run(session_id: &str, profile_dir: &PathBuf, allowed_origins: &[String], command: &[&str]) -> Result<Value, String> {
+async fn run(
+    session_id: &str,
+    profile_dir: &PathBuf,
+    allowed_origins: &[String],
+    command: &[&str],
+) -> Result<Value, String> {
     // Abort if a concurrent stop() tore the session down — the teardown's own "close" is exempt.
     {
-        let disposed = sessions().lock().unwrap().get(session_id).map(|r| r.disposed).unwrap_or(false);
+        let disposed = sessions()
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|r| r.disposed)
+            .unwrap_or(false);
         if disposed && command.first() != Some(&"close") {
             return Err("browser session stopped".into());
         }
     }
     let executable = resolve_executable()?;
-    let domains = allowed_origins.iter().map(|o| origin_host(o)).collect::<Vec<_>>().join(",");
+    let domains = allowed_origins
+        .iter()
+        .map(|o| origin_host(o))
+        .collect::<Vec<_>>()
+        .join(",");
     let profile_str = profile_dir.to_string_lossy().to_string();
     let max_output = MAX_OUTPUT.to_string();
 
     let mut args: Vec<String> = vec![
-        "--session".into(), session_id.to_string(),
-        "--profile".into(), profile_str,
-        "--allowed-domains".into(), domains,
+        "--session".into(),
+        session_id.to_string(),
+        "--profile".into(),
+        profile_str,
+        "--allowed-domains".into(),
+        domains,
         "--content-boundaries".into(),
-        "--max-output".into(), max_output,
-        "--confirm-actions".into(), "eval,download,upload,clipboard".into(),
+        "--max-output".into(),
+        max_output,
+        "--confirm-actions".into(),
+        "eval,download,upload,clipboard".into(),
         "--json".into(),
     ];
     for c in command {
@@ -453,8 +510,10 @@ async fn run(session_id: &str, profile_dir: &PathBuf, allowed_origins: &[String]
     let nonce = uuid::Uuid::new_v4().to_string();
     let out_path = profile_dir.join(format!("command-{nonce}.out"));
     let err_path = profile_dir.join(format!("command-{nonce}.err"));
-    let out_file = std::fs::File::create(&out_path).map_err(|e| format!("browser stdout file: {e}"))?;
-    let err_file = std::fs::File::create(&err_path).map_err(|e| format!("browser stderr file: {e}"))?;
+    let out_file =
+        std::fs::File::create(&out_path).map_err(|e| format!("browser stdout file: {e}"))?;
+    let err_file =
+        std::fs::File::create(&err_path).map_err(|e| format!("browser stderr file: {e}"))?;
 
     let mut cmd = tokio::process::Command::new(&executable);
     cmd.args(&args)
@@ -468,7 +527,9 @@ async fn run(session_id: &str, profile_dir: &PathBuf, allowed_origins: &[String]
         cmd.creation_flags(CREATE_NO_WINDOW); // inherent on tokio::process::Command (no CommandExt import needed)
     }
 
-    let mut child = cmd.spawn().map_err(|e| format!("agent-browser spawn failed: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("agent-browser spawn failed: {e}"))?;
     let pid = child.id();
 
     let status = match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
@@ -533,7 +594,10 @@ fn clamp_i64(v: i64, lo: i64, hi: i64) -> i64 {
 // ---- observation building ----
 /// Re-observe the page after an action: validate the post-nav origin FIRST, then snapshot/title/
 /// console/errors/screenshot, bump seq, and rebuild the observation. Mutates the stored record.
-async fn observe(session_id: &str, action: Option<CurrentAction>) -> Result<BrowserObservation, String> {
+async fn observe(
+    session_id: &str,
+    action: Option<CurrentAction>,
+) -> Result<BrowserObservation, String> {
     let (profile_dir, allowed_origins) = {
         let store = sessions().lock().unwrap();
         let r = store.get(session_id).ok_or("no such browser session")?;
@@ -544,17 +608,36 @@ async fn observe(session_id: &str, action: Option<CurrentAction>) -> Result<Brow
     let url_result = run(session_id, &profile_dir, &allowed_origins, &["get", "url"]).await?;
     let new_url = string_value(&url_result, "url");
     let effective_url = if new_url.is_empty() {
-        sessions().lock().unwrap().get(session_id).map(|r| r.observation.page.url.clone()).unwrap_or_default()
+        sessions()
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|r| r.observation.page.url.clone())
+            .unwrap_or_default()
     } else {
         new_url.clone()
     };
     let post_origin = normalize_origin(&effective_url)?;
     if !allowed_origins.contains(&post_origin) {
-        return Err(format!("browser navigated outside the allowlist: {effective_url}"));
+        return Err(format!(
+            "browser navigated outside the allowlist: {effective_url}"
+        ));
     }
 
-    let title_result = run(session_id, &profile_dir, &allowed_origins, &["get", "title"]).await?;
-    let snapshot_result = run(session_id, &profile_dir, &allowed_origins, &["snapshot", "-i", "-c"]).await?;
+    let title_result = run(
+        session_id,
+        &profile_dir,
+        &allowed_origins,
+        &["get", "title"],
+    )
+    .await?;
+    let snapshot_result = run(
+        session_id,
+        &profile_dir,
+        &allowed_origins,
+        &["snapshot", "-i", "-c"],
+    )
+    .await?;
     let console_result = run(session_id, &profile_dir, &allowed_origins, &["console"]).await?;
     let errors_result = run(session_id, &profile_dir, &allowed_origins, &["errors"]).await?;
 
@@ -564,7 +647,9 @@ async fn observe(session_id: &str, action: Option<CurrentAction>) -> Result<Brow
             s
         } else {
             let d = data_value(&snapshot_result);
-            d.as_str().map(String::from).unwrap_or_else(|| d.to_string())
+            d.as_str()
+                .map(String::from)
+                .unwrap_or_else(|| d.to_string())
         }
     };
     let console_lines: Vec<String> = result_lines(&console_result)
@@ -585,7 +670,14 @@ async fn observe(session_id: &str, action: Option<CurrentAction>) -> Result<Brow
         session_id,
         &profile_dir,
         &allowed_origins,
-        &["screenshot", &frame_path_str, "--screenshot-format", "jpeg", "--screenshot-quality", "72"],
+        &[
+            "screenshot",
+            &frame_path_str,
+            "--screenshot-format",
+            "jpeg",
+            "--screenshot-quality",
+            "72",
+        ],
     )
     .await?;
     let frame_bytes = tokio::fs::read(&frame_path).await.ok();
@@ -611,9 +703,18 @@ async fn observe(session_id: &str, action: Option<CurrentAction>) -> Result<Brow
     r.observation.counters.network_errors = network_lines.len() as i64;
     r.observation.error = None;
     if let Some(bytes) = frame_bytes {
-        let (w, h) = (r.observation.page.viewport.width, r.observation.page.viewport.height);
+        let (w, h) = (
+            r.observation.page.viewport.width,
+            r.observation.page.viewport.height,
+        );
         r.frame_data = Some(bytes);
-        r.observation.frame = Some(FrameMeta { seq, mime: "image/jpeg".into(), width: w, height: h, available: true });
+        r.observation.frame = Some(FrameMeta {
+            seq,
+            mime: "image/jpeg".into(),
+            width: w,
+            height: h,
+            available: true,
+        });
     }
     Ok(r.observation.clone())
 }
@@ -652,7 +753,9 @@ pub async fn start(
         return Err("projectId is required".into());
     }
     let initial_origin = normalize_origin(url)?;
-    let raw = allowed_origins.filter(|v| !v.is_empty()).unwrap_or_else(|| vec![initial_origin.clone()]);
+    let raw = allowed_origins
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![initial_origin.clone()]);
     let mut allowed: Vec<String> = Vec::new();
     for o in &raw {
         let n = normalize_origin(o)?;
@@ -661,12 +764,17 @@ pub async fn start(
         }
     }
     if !allowed.contains(&initial_origin) {
-        return Err(format!("initial URL origin {initial_origin} is not in the allowlist"));
+        return Err(format!(
+            "initial URL origin {initial_origin} is not in the allowlist"
+        ));
     }
 
     let session_id = format!("dotz-{}", uuid::Uuid::new_v4());
     let (vw, vh) = viewport.unwrap_or((1280, 800));
-    let viewport = Viewport { width: clamp_i64(vw, 320, 2560), height: clamp_i64(vh, 240, 1600) };
+    let viewport = Viewport {
+        width: clamp_i64(vw, 320, 2560),
+        height: clamp_i64(vh, 240, 1600),
+    };
 
     // Disposable profile dir under temp_dir()/dotz-browser-<id>.
     let profile_dir = std::env::temp_dir().join(format!("dotz-browser-{session_id}"));
@@ -688,7 +796,14 @@ pub async fn start(
         },
         started_at: now.clone(),
         updated_at: now,
-        page: Page { url: url.to_string(), title: String::new(), viewport: Viewport { width: viewport.width, height: viewport.height } },
+        page: Page {
+            url: url.to_string(),
+            title: String::new(),
+            viewport: Viewport {
+                width: viewport.width,
+                height: viewport.height,
+            },
+        },
         allowed_origins: allowed.clone(),
         refs: Vec::new(),
         elements: Vec::new(),
@@ -696,7 +811,11 @@ pub async fn start(
         current_action: None,
         cursor: None,
         frame: None,
-        counters: Counters { actions: 0, console_errors: 0, network_errors: 0 },
+        counters: Counters {
+            actions: 0,
+            console_errors: 0,
+            network_errors: 0,
+        },
         console_errors: Vec::new(),
         network_errors: Vec::new(),
         error: None,
@@ -705,13 +824,32 @@ pub async fn start(
     let vh = viewport.height;
     sessions().lock().unwrap().insert(
         session_id.clone(),
-        SessionRecord { profile_dir: profile_dir.clone(), observation, frame_data: None, disposed: false },
+        SessionRecord {
+            profile_dir: profile_dir.clone(),
+            observation,
+            frame_data: None,
+            disposed: false,
+        },
     );
 
     let outcome: Result<BrowserObservation, String> = async {
-        run(&session_id, &profile_dir, &allowed, &["set", "viewport", &vw.to_string(), &vh.to_string()]).await?;
+        run(
+            &session_id,
+            &profile_dir,
+            &allowed,
+            &["set", "viewport", &vw.to_string(), &vh.to_string()],
+        )
+        .await?;
         run(&session_id, &profile_dir, &allowed, &["open", url]).await?;
-        observe(&session_id, Some(CurrentAction { name: "navigate".into(), target_ref: None, summary: format!("opened {url}") })).await
+        observe(
+            &session_id,
+            Some(CurrentAction {
+                name: "navigate".into(),
+                target_ref: None,
+                summary: format!("opened {url}"),
+            }),
+        )
+        .await
     }
     .await;
 
@@ -730,8 +868,16 @@ pub async fn start(
 /// act(): validate the action + sequence/ref binding (409 cases surface as the "stale"/"unknown ref"
 /// error text), set cursor, run the mapped command, bump the actions counter, re-observe.
 pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
-    let session_id = input.get("sessionId").and_then(|v| v.as_str()).ok_or("sessionId is required")?.to_string();
-    let action = input.get("action").and_then(|v| v.as_str()).ok_or("action is required")?.to_string();
+    let session_id = input
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .ok_or("sessionId is required")?
+        .to_string();
+    let action = input
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or("action is required")?
+        .to_string();
 
     let (profile_dir, allowed_origins, cur_seq, refs, viewport, status) = {
         let store = sessions().lock().unwrap();
@@ -741,7 +887,10 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
             r.observation.allowed_origins.clone(),
             r.observation.seq,
             r.observation.refs.clone(),
-            (r.observation.page.viewport.width, r.observation.page.viewport.height),
+            (
+                r.observation.page.viewport.width,
+                r.observation.page.viewport.height,
+            ),
             r.observation.status.clone(),
         )
     };
@@ -752,16 +901,27 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
         return Err(format!("unknown browser action: {action}"));
     }
 
-    let target_ref = input.get("targetRef").and_then(|v| v.as_str()).map(String::from);
+    let target_ref = input
+        .get("targetRef")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let text = input.get("text").and_then(|v| v.as_str()).map(String::from);
     let url = input.get("url").and_then(|v| v.as_str()).map(String::from);
     let key = input.get("key").and_then(|v| v.as_str()).map(String::from);
     let values: Vec<String> = input
         .get("values")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-    let direction = input.get("direction").and_then(|v| v.as_str()).unwrap_or("down").to_string();
+    let direction = input
+        .get("direction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("down")
+        .to_string();
     let pixels = input.get("pixels").and_then(|v| v.as_f64());
     let milliseconds = input.get("milliseconds").and_then(|v| v.as_f64());
     let x = input.get("x").and_then(|v| v.as_f64());
@@ -769,9 +929,12 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
     let expected_seq = input.get("expectedSeq").and_then(|v| v.as_i64());
 
     // Sequence-bound actions require a matching expectedSeq (these surface as 409 in the route).
-    let sequence_bound = target_ref.is_some() || action == "clickAt" || (action == "type" && target_ref.is_none());
+    let sequence_bound =
+        target_ref.is_some() || action == "clickAt" || (action == "type" && target_ref.is_none());
     if sequence_bound && expected_seq != Some(cur_seq) {
-        return Err(format!("stale browser action: expected observation seq {cur_seq}"));
+        return Err(format!(
+            "stale browser action: expected observation seq {cur_seq}"
+        ));
     }
     if let Some(tr) = &target_ref {
         let bare = tr.strip_prefix('@').unwrap_or(tr);
@@ -797,8 +960,18 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
     let run_action = async {
         // Cursor: ref → box center; clickAt → the given coords.
         if let Some(tr) = &target_ref {
-            let reff = if tr.starts_with('@') { tr.clone() } else { format!("@{tr}") };
-            let box_result = run(&session_id, &profile_dir, &allowed_origins, &["get", "box", &reff]).await?;
+            let reff = if tr.starts_with('@') {
+                tr.clone()
+            } else {
+                format!("@{tr}")
+            };
+            let box_result = run(
+                &session_id,
+                &profile_dir,
+                &allowed_origins,
+                &["get", "box", &reff],
+            )
+            .await?;
             let bv = data_value(&box_result);
             let bx = bv.get("x").and_then(|v| v.as_f64());
             let by = bv.get("y").and_then(|v| v.as_f64());
@@ -808,7 +981,11 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
                 if [bx, by, bw, bh].iter().all(|f| f.is_finite()) {
                     let mut store = sessions().lock().unwrap();
                     if let Some(r) = store.get_mut(&session_id) {
-                        r.observation.cursor = Some(Cursor { x: bx + bw / 2.0, y: by + bh / 2.0, kind: action.clone() });
+                        r.observation.cursor = Some(Cursor {
+                            x: bx + bw / 2.0,
+                            y: by + bh / 2.0,
+                            kind: action.clone(),
+                        });
                     }
                 }
             }
@@ -817,7 +994,11 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
                 if x.is_finite() && y.is_finite() {
                     let mut store = sessions().lock().unwrap();
                     if let Some(r) = store.get_mut(&session_id) {
-                        r.observation.cursor = Some(Cursor { x, y, kind: action.clone() });
+                        r.observation.cursor = Some(Cursor {
+                            x,
+                            y,
+                            kind: action.clone(),
+                        });
                     }
                 }
             }
@@ -833,10 +1014,39 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
             if xi < 0 || yi < 0 || xi >= vw || yi >= vh {
                 return Err(format!("clickAt coordinates must be inside {vw}x{vh}"));
             }
-            run(&session_id, &profile_dir, &allowed_origins, &["mouse", "move", &xi.to_string(), &yi.to_string()]).await?;
-            run(&session_id, &profile_dir, &allowed_origins, &["mouse", "down", "left"]).await?;
-            run(&session_id, &profile_dir, &allowed_origins, &["mouse", "up", "left"]).await?;
-        } else if let Some(args) = action_args(&action, &allowed_origins, &url, &target_ref, &text, &key, &values, &direction, pixels, milliseconds)? {
+            run(
+                &session_id,
+                &profile_dir,
+                &allowed_origins,
+                &["mouse", "move", &xi.to_string(), &yi.to_string()],
+            )
+            .await?;
+            run(
+                &session_id,
+                &profile_dir,
+                &allowed_origins,
+                &["mouse", "down", "left"],
+            )
+            .await?;
+            run(
+                &session_id,
+                &profile_dir,
+                &allowed_origins,
+                &["mouse", "up", "left"],
+            )
+            .await?;
+        } else if let Some(args) = action_args(
+            &action,
+            &allowed_origins,
+            &url,
+            &target_ref,
+            &text,
+            &key,
+            &values,
+            &direction,
+            pixels,
+            milliseconds,
+        )? {
             let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             run(&session_id, &profile_dir, &allowed_origins, &arg_refs).await?;
         }
@@ -847,7 +1057,11 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
                 r.observation.counters.actions += 1;
             }
         }
-        let action_record = sessions().lock().unwrap().get(&session_id).and_then(|r| r.observation.current_action.clone());
+        let action_record = sessions()
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .and_then(|r| r.observation.current_action.clone());
         observe(&session_id, action_record).await
     };
 
@@ -874,9 +1088,13 @@ fn action_args(
     pixels: Option<f64>,
     milliseconds: Option<f64>,
 ) -> Result<Option<Vec<String>>, String> {
-    let reff = target_ref
-        .as_ref()
-        .map(|t| if t.starts_with('@') { t.clone() } else { format!("@{t}") });
+    let reff = target_ref.as_ref().map(|t| {
+        if t.starts_with('@') {
+            t.clone()
+        } else {
+            format!("@{t}")
+        }
+    });
     match action {
         "observe" => Ok(None),
         "back" => Ok(Some(vec!["back".into()])),
@@ -886,7 +1104,9 @@ fn action_args(
             let url = url.as_ref().ok_or("navigate requires url")?;
             let origin = normalize_origin(url)?;
             if !allowed_origins.contains(&origin) {
-                return Err(format!("navigation origin {origin} is not in the allowlist"));
+                return Err(format!(
+                    "navigation origin {origin} is not in the allowlist"
+                ));
             }
             Ok(Some(vec!["open".into(), url.clone()]))
         }
@@ -917,20 +1137,37 @@ fn action_args(
         }
         "scroll" => {
             let px = pixels.map(|p| p as i64).unwrap_or(500).max(1);
-            Ok(Some(vec!["scroll".into(), direction.to_string(), px.to_string()]))
+            Ok(Some(vec![
+                "scroll".into(),
+                direction.to_string(),
+                px.to_string(),
+            ]))
         }
         "wait" => {
             let ms = milliseconds.map(|m| m as i64).unwrap_or(500);
-            Ok(Some(vec!["wait".into(), clamp_i64(ms, 0, 30_000).to_string()]))
+            Ok(Some(vec![
+                "wait".into(),
+                clamp_i64(ms, 0, 30_000).to_string(),
+            ]))
         }
         _ => Ok(None),
     }
 }
 
-fn action_summary(action: &str, url: &Option<String>, target_ref: &Option<String>, x: Option<f64>, y: Option<f64>) -> String {
+fn action_summary(
+    action: &str,
+    url: &Option<String>,
+    target_ref: &Option<String>,
+    x: Option<f64>,
+    y: Option<f64>,
+) -> String {
     match action {
         "navigate" => format!("navigate {}", url.clone().unwrap_or_default()),
-        "clickAt" => format!("click ({}, {})", x.unwrap_or(0.0).round() as i64, y.unwrap_or(0.0).round() as i64),
+        "clickAt" => format!(
+            "click ({}, {})",
+            x.unwrap_or(0.0).round() as i64,
+            y.unwrap_or(0.0).round() as i64
+        ),
         "type" if target_ref.is_none() => "type into focused element".into(),
         _ => match target_ref {
             Some(t) => format!("{action} {t}"),
@@ -971,13 +1208,21 @@ fn state(session_id: Option<&str>) -> Option<BrowserObservation> {
     match session_id {
         Some(id) => store.get(id).map(|r| r.observation.clone()),
         // newest by startedAt — HashMap has no order, so pick max updatedAt.
-        None => store.values().max_by(|a, b| a.observation.updated_at.cmp(&b.observation.updated_at)).map(|r| r.observation.clone()),
+        None => store
+            .values()
+            .max_by(|a, b| a.observation.updated_at.cmp(&b.observation.updated_at))
+            .map(|r| r.observation.clone()),
     }
 }
 
 /// list(): every session's observation.
 fn list() -> Vec<BrowserObservation> {
-    sessions().lock().unwrap().values().map(|r| r.observation.clone()).collect()
+    sessions()
+        .lock()
+        .unwrap()
+        .values()
+        .map(|r| r.observation.clone())
+        .collect()
 }
 
 /// frame(sessionId, afterSeq): the latest JPEG bytes + seq, or None when not newer than afterSeq.
@@ -1050,16 +1295,26 @@ async fn get_state(Query(q): Query<HashMap<String, String>>) -> Json<Value> {
 
 async fn get_frame(Query(q): Query<HashMap<String, String>>) -> Response {
     let Some(session_id) = q.get("sessionId") else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "sessionId required" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "sessionId required" })),
+        )
+            .into_response();
     };
-    let after_seq = q.get("afterSeq").and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1);
+    let after_seq = q
+        .get("afterSeq")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(-1);
     match frame(session_id, after_seq) {
         Some((seq, data)) => (
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, "image/jpeg".to_string()),
                 (header::CACHE_CONTROL, "no-store".to_string()),
-                (header::HeaderName::from_static("x-dotz-frame-seq"), seq.to_string()),
+                (
+                    header::HeaderName::from_static("x-dotz-frame-seq"),
+                    seq.to_string(),
+                ),
             ],
             axum::body::Bytes::from(data),
         )
@@ -1072,19 +1327,32 @@ async fn post_start(body: Option<Json<Value>>) -> Response {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let project_id = b.get("projectId").and_then(|v| v.as_str()).unwrap_or("");
     let url = b.get("url").and_then(|v| v.as_str()).unwrap_or("");
-    let allowed_origins = b
-        .get("allowedOrigins")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>());
+    let allowed_origins = b.get("allowedOrigins").and_then(|v| v.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect::<Vec<_>>()
+    });
     let viewport = b.get("viewport").and_then(|v| {
         let w = v.get("width").and_then(|x| x.as_i64())?;
         let h = v.get("height").and_then(|x| x.as_i64())?;
         Some((w, h))
     });
-    let workflow_id = b.get("workflowId").and_then(|v| v.as_str()).map(String::from);
+    let workflow_id = b
+        .get("workflowId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let step_id = b.get("stepId").and_then(|v| v.as_str()).map(String::from);
 
-    match start(project_id, url, allowed_origins, viewport, workflow_id, step_id).await {
+    match start(
+        project_id,
+        url,
+        allowed_origins,
+        viewport,
+        workflow_id,
+        step_id,
+    )
+    .await
+    {
         Ok(obs) => (StatusCode::OK, Json(serde_json::to_value(obs).unwrap())).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
@@ -1101,7 +1369,11 @@ async fn post_act(body: Option<Json<Value>>) -> Response {
 async fn post_stop(body: Option<Json<Value>>) -> Response {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let Some(session_id) = b.get("sessionId").and_then(|v| v.as_str()) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "sessionId required" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "sessionId required" })),
+        )
+            .into_response();
     };
     match stop(session_id).await {
         Ok(obs) => (StatusCode::OK, Json(serde_json::to_value(obs).unwrap())).into_response(),

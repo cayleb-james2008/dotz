@@ -81,7 +81,9 @@ impl Message {
     pub fn user(text: &str, timestamp: i64) -> Self {
         Message {
             role: "user".into(),
-            content: vec![ContentBlock::Text { text: text.to_string() }],
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             api: None,
             provider: None,
             model: None,
