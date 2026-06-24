@@ -1,47 +1,88 @@
+<div align="center">
+
+<img src="docs/dotz-logo.png" alt="dotz" width="120" />
+
 # dotz
 
-> **Rust rewrite (this branch).** The backend is now native Rust — an **axum** server + a **Tauri**
-> (WebView2) desktop shell + **`ort`** ONNX embeddings — with dotz's own agent runtime replacing the
-> third-party pi SDK. It serves the **same `web/` UI** and the same REST + WebSocket contract, so the
-> feature prose below still applies; only the stack names (Electron→Tauri, Fastify→axum,
-> transformers.js→`ort`, pi-SDK→native runtime) have changed. See `DEPLOY.md` for the Rust build/ship flow.
+**The ultra-code agent dashboard — one prompt becomes a team of AI coding agents.**
 
-A **Claude-Desktop-style coding-agent dashboard** — a clean chat interface for dotz's own
-coding agent, with live controls for **model, reasoning effort, tools, skills, and subagent
-orchestration**, packaged as a native desktop app.
+[![Download](https://img.shields.io/github/v/release/cayleb-james2008/dotz?label=download&color=b4befe)](https://github.com/cayleb-james2008/dotz/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/cayleb-james2008/dotz/total?color=a6e3a1)](https://github.com/cayleb-james2008/dotz/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-Windows-89b4fa)](https://github.com/cayleb-james2008/dotz/releases/latest)
+[![Built with](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri-cba6f7)](https://tauri.app)
 
-dotz is **native Rust**: `dotz-core` is an [axum](https://github.com/tokio-rs/axum) server with
-dotz's own agent runtime (no third-party agent SDK, no subprocess), and a [Tauri](https://tauri.app)
-(WebView2) shell wraps it into a signed, self-updating desktop app. The axum backend exposes a
-REST + WebSocket surface on `127.0.0.1:4317`; a single self-contained cyberbrutalist UI (`web/`,
-vanilla HTML/CSS/JS) binds to it. dotz is **multi-provider** (not just OpenRouter), keeps
+</div>
+
+dotz is a **native-Rust, Claude-Desktop-style coding-agent dashboard**. Give it one task and it
+decomposes the work, disperses it to a team of subagents, runs them in parallel on a **live workflow
+graph**, and adversarially verifies the result — with live controls for **model, reasoning effort,
+tools, skills, and subagent orchestration**, all in a single self-updating desktop app.
+
+Under the hood: `dotz-core` is an [axum](https://github.com/tokio-rs/axum) server with dotz's own
+agent runtime (no third-party agent SDK, no subprocess), and a [Tauri](https://tauri.app) (WebView2)
+shell wraps it into a signed, self-updating app. It is **multi-provider** (not just OpenRouter), keeps
 **persistent projects** + an on-device **memory store** (`ort` ONNX embeddings) injected into the
-agent's system prompt, and ships a **sandbox** with a live web preview the agent can drive an
-on-screen cursor over, plus a native **Open Design** workspace (150+ design systems, live preview,
-HTML/PDF export).
+agent's prompt, ships a **sandbox** with a live web preview the agent drives an on-screen cursor over,
+and a native **Open Design** workspace (150+ design systems, live preview, HTML/PDF export).
+
+<div align="center">
+<img src="docs/screenshot.png" alt="dotz — the ultra-code agent dashboard" width="820" />
+</div>
+
+## How it works
+
+```mermaid
+flowchart LR
+    U([Your prompt]) --> L[Lead agent]
+    L -->|decompose + disperse| S[scout]
+    L --> P[planner]
+    L --> W[worker]
+    L --> R[reviewer]
+    S --> V{adversarial verify}
+    P --> V
+    W --> V
+    R --> V
+    V -->|pass| D([Verified result])
+    V -->|gaps| L
+```
+
+Every non-trivial task fans out to `scout` / `planner` / `worker` / `reviewer` subagents that run in
+parallel, then their output is adversarially verified before it lands. Pick a **profile** to change the
+strategy (WORKFLOW · SOLO · PLAN · FRONTEND · BACKEND · DESIGN).
 
 ## Architecture
 
-```
-dotz  (Tauri / WebView2)
- ├─ src-tauri/        — thin Rust shell: starts dotz-core on 127.0.0.1:4317, opens the WebView2
- │                      window on it, wires the tauri-plugin-updater (signed cross-device updates)
- ├─ dotz-core/  (Rust, axum) — the backend + agent runtime:
- │    agent/          — dotz's own agent runtime (chat loop, tools, subagents, providers)
- │    profiles.rs     — operating profiles + bundled .pi loader (injects doctrine + project memory)
- │    projects.rs     — persistent named workspaces (cwd + profile + model + thinking defaults)
- │    memory.rs       — on-device autonomous memory (capture/recall/consolidate)
- │    embed.rs        — local ONNX embedder via `ort` (all-MiniLM-L6-v2, 384-dim)
- │    sandbox / browser — terminal + web sandbox runner with agent-cursor overlay
- │    server/         — axum: REST controls + WS event stream + static UI; `serve` headless bin
- │    .pi/            — bundled agent resources: agents, workflow prompts + vendored Open Design
- │                      content (150+ design-systems + design-skills) for DESIGN mode
- └─ web/             — the cyberbrutalist chat UI (vanilla HTML/CSS/JS), same in browser + app
+```mermaid
+flowchart TD
+    subgraph App["dotz desktop app · Tauri / WebView2"]
+        UI["web/ UI<br/>vanilla HTML · CSS · JS"]
+        Shell["src-tauri shell<br/>+ auto-updater"]
+    end
+    subgraph Core["dotz-core · Rust / axum @ 127.0.0.1:4317"]
+        API["REST + WebSocket"]
+        Agent["agent runtime<br/>chat · tools · subagents · providers"]
+        Mem["memory<br/>ort ONNX embeddings"]
+        Sand["sandbox + browser<br/>agent-cursor overlay"]
+        Dsgn[".pi · Open Design<br/>150+ design systems"]
+    end
+    GH[(GitHub Releases)]
+    UI <-->|fetch + WS| API
+    Shell --> API
+    API --> Agent
+    Agent --> Mem
+    Agent --> Sand
+    Agent --> Dsgn
+    Shell -.->|signed update| GH
 ```
 
-The UI is a plain web app (`fetch` + `WebSocket`), so it runs identically in a browser pointed at
-the headless `serve` binary and inside the Tauri window. See [docs/api-contract.md](docs/api-contract.md) for
-the full UI↔backend contract, and [docs/design-prompt.md](docs/design-prompt.md) for the UI spec.
+- **`src-tauri/`** — thin Rust shell: starts dotz-core on `127.0.0.1:4317`, opens the WebView2 window, wires `tauri-plugin-updater` (signed cross-device updates).
+- **`dotz-core/`** — axum server + dotz's own agent runtime: `agent/` (chat loop, tools, subagents, providers), `memory.rs` + `embed.rs` (on-device `ort` embeddings, all-MiniLM-L6-v2), `sandbox`/`browser` (agent-cursor overlay), `profiles.rs`/`projects.rs`, `server/` (REST + WS + the `serve` headless bin).
+- **`web/`** — the cyberbrutalist chat UI (vanilla HTML/CSS/JS), identical in a browser and in the app.
+- **`.pi/`** — bundled agent resources: agents, workflow prompts, and vendored Open Design content (150+ design systems + design skills).
+
+The UI is a plain web app (`fetch` + `WebSocket`), so it runs identically in a browser pointed at the
+headless `serve` binary and inside the Tauri window. See [docs/api-contract.md](docs/api-contract.md)
+for the full UI↔backend contract, and [docs/design-prompt.md](docs/design-prompt.md) for the UI spec.
 
 ## Controls (the five knobs)
 
