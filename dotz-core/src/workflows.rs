@@ -432,6 +432,29 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
             }
         }
 
+        // Cascade an explicit skip to descendants so a skipped branch doesn't leave children
+        // pending forever (matching the error-path sweep, but without marking the run errored).
+        if step_status == "skipped" {
+            let mut queue: Vec<String> = run.steps[step_idx].children.clone();
+            while let Some(child_id) = queue.pop() {
+                if let Some(ci) = run.steps.iter().position(|s| s.id == child_id) {
+                    if run.steps[ci].status == "pending"
+                        || run.steps[ci].status == "ready"
+                        || run.steps[ci].status == "running"
+                    {
+                        run.steps[ci].status = "skipped".to_string();
+                        if run.steps[ci].ended_at.is_none() {
+                            run.steps[ci].ended_at = Some(now);
+                        }
+                    }
+                    for next in run.steps[ci].children.clone() {
+                        queue.push(next);
+                    }
+                }
+            }
+            run.updated_at = now;
+        }
+
         // If every step is terminal (done|skipped), finish the run — evaluated after a "done" OR a
         // "skipped" transition. Guarded so a late update on an already terminal run can't resurrect it.
         let all_terminal = run
@@ -885,6 +908,78 @@ mod tests {
                 s.ended_at.is_some(),
                 "explicitly skipped step must have endedAt"
             );
+        });
+    }
+
+    #[test]
+    fn skipped_parent_cascades_to_descendants_and_finishes_run() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(0)])),
+                step("c", "C", Some(vec![json!(1)])),
+            ];
+            let run = create(None, None, "skip-cascade".into(), None, &inputs).unwrap();
+            let run = start(&run.id).unwrap();
+            let parent_id = run.steps[0].id.clone();
+
+            let updated = step_state(
+                &run.id,
+                &parent_id,
+                StepPatch {
+                    status: Some("skipped".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                updated.status, "done",
+                "run should finish after skip cascade"
+            );
+            assert_eq!(
+                updated.steps[0].status, "skipped",
+                "parent should be skipped"
+            );
+            assert_eq!(
+                updated.steps[1].status, "skipped",
+                "child of skipped parent should be skipped"
+            );
+            assert_eq!(
+                updated.steps[2].status, "skipped",
+                "grandchild of skipped parent should be skipped"
+            );
+            for s in &updated.steps {
+                assert!(
+                    s.ended_at.is_some(),
+                    "every skipped step must have endedAt: {:?}",
+                    s
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn skipped_leaf_finishes_run() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "skip-leaf".into(), None, &inputs).unwrap();
+            let run = start(&run.id).unwrap();
+            let step_id = run.steps[0].id.clone();
+
+            let updated = step_state(
+                &run.id,
+                &step_id,
+                StepPatch {
+                    status: Some("skipped".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(updated.status, "done");
+            assert_eq!(updated.steps[0].status, "skipped");
+            assert!(updated.steps[0].ended_at.is_some());
         });
     }
 
