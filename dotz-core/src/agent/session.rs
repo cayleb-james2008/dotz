@@ -687,16 +687,23 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     }
 
     // Hit the round cap — finish with whatever the last assistant message was.
-    let last = session
-        .lock()
-        .unwrap()
+    finish_round_cap(&session, tool_results);
+}
+
+/// Finish a turn that has hit the MAX_ROUNDS cap by reusing the last assistant message.
+/// Uses `session_guard` so a poisoned mutex does not panic the cleanup path.
+fn finish_round_cap(
+    session: &std::sync::Arc<Mutex<AgentSession>>,
+    tool_results: Vec<ToolResult>,
+) {
+    let last = session_guard(session)
         .history
         .iter()
         .rev()
         .find(|m| m.role == "assistant")
         .cloned();
     if let Some(msg) = last {
-        finish_turn(&session, msg, tool_results);
+        finish_turn(session, msg, tool_results);
     }
 }
 
@@ -1614,6 +1621,58 @@ mod tests {
         assert_eq!(results[0]["toolName"], "bash");
         assert_eq!(results[0]["isError"], true);
         assert_eq!(results[0]["result"]["output"], "hello");
+    }
+
+    /// The MAX_ROUNDS fallback in run_turn reads the session mutex to find the last assistant
+    /// message. That read must recover from a poisoned mutex like every other session access; a
+    /// panic here would leave the turn unfinished and the UI stuck.
+    #[test]
+    fn finish_round_cap_recovers_from_poisoned_mutex() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        {
+            let mut g = sess.lock().unwrap();
+            g.history.push(Message::assistant_shell("ollama", "glm-5.2", now_ms()));
+        }
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        // Intentionally poison the mutex while a fake assistant message is in history.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sess.lock().unwrap();
+            panic!("intentional poison for finish_round_cap test");
+        }));
+        assert!(poisoned.is_err(), "mutex should be poisoned");
+
+        finish_round_cap(&sess, Vec::new());
+
+        let mut found_turn_end = false;
+        let mut found_agent_end = false;
+        while let Ok(frame) = rx.try_recv() {
+            if let Some(kind) = frame
+                .get("event")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str())
+            {
+                if kind == "turn_end" {
+                    found_turn_end = true;
+                }
+                if kind == "agent_end" {
+                    found_agent_end = true;
+                }
+            }
+        }
+
+        dispose(&sid);
+
+        assert!(
+            found_turn_end,
+            "round-cap finish must emit turn_end even with a poisoned mutex"
+        );
+        assert!(
+            found_agent_end,
+            "round-cap finish must emit agent_end even with a poisoned mutex"
+        );
     }
 
     /// A hung provider stream must not keep run_turn alive after session::abort. Before the
