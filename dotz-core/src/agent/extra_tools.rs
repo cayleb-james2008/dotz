@@ -554,7 +554,10 @@ mod tests {
     use std::fs;
 
     /// Serialize tests that mutate the process-global `DOTZ_GATE_TIMEOUT_MS` env var.
-    static GATE_TIMEOUT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Uses an async-aware Mutex because the tests hold the lock across `.await` points; a
+    /// `std::sync::MutexGuard` held across an await can block the tokio executor and risks
+    /// deadlocks with other async tasks.
+    static GATE_TIMEOUT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn tmp_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("dotz-gate-test-{}", uuid::Uuid::new_v4()));
@@ -661,9 +664,9 @@ mod tests {
         assert_eq!(parse_counts("8 passed / 0 failed"), (8, 0));
     }
 
-    #[test]
-    fn gate_timeout_clamps_invalid_values() {
-        let _guard = GATE_TIMEOUT_TEST_LOCK.lock().unwrap();
+    #[tokio::test]
+    async fn gate_timeout_clamps_invalid_values() {
+        let _guard = GATE_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_GATE_TIMEOUT_MS").ok();
 
         std::env::remove_var("DOTZ_GATE_TIMEOUT_MS");
@@ -700,7 +703,7 @@ mod tests {
     /// `DOTZ_GATE_TIMEOUT_MS`, kills the child process, and returns a clear timeout error.
     #[tokio::test]
     async fn run_gate_times_out_on_hung_command() {
-        let _guard = GATE_TIMEOUT_TEST_LOCK.lock().unwrap();
+        let _guard = GATE_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_GATE_TIMEOUT_MS").ok();
         std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "1000");
 
@@ -743,7 +746,7 @@ mod tests {
     /// returns; on Windows we still verify the timeout result shape.
     #[tokio::test]
     async fn run_gate_reaps_child_after_timeout() {
-        let _guard = GATE_TIMEOUT_TEST_LOCK.lock().unwrap();
+        let _guard = GATE_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_GATE_TIMEOUT_MS").ok();
         std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "500");
 
@@ -794,6 +797,19 @@ mod tests {
                 "timed-out gate child (pid {pid}) should have been killed and reaped, not still running"
             );
         }
+    }
+
+    /// The gate-timeout test lock must be async-safe so it can be held across `.await` without
+    /// blocking the tokio executor. We hold the lock while a concurrent task sleeps; both
+    /// finish, confirming the async Mutex does not pin an executor thread.
+    #[tokio::test]
+    async fn gate_timeout_lock_can_be_held_across_await() {
+        let _guard = GATE_TIMEOUT_TEST_LOCK.lock().await;
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
