@@ -192,12 +192,18 @@ mod tests {
     #[test]
     fn low_cost_models_includes_ollama_and_openrouter_workers() {
         let models = low_cost_models();
-        assert!(models.iter().any(|m| m.provider == "ollama" && m.model_id == "minimax-m3"));
-        assert!(models.iter().any(|m| m.provider == "ollama" && m.model_id == "kimi-k2.7-code"));
+        assert!(models
+            .iter()
+            .any(|m| m.provider == "ollama" && m.model_id == "minimax-m3"));
+        assert!(models
+            .iter()
+            .any(|m| m.provider == "ollama" && m.model_id == "kimi-k2.7-code"));
         assert!(models.iter().any(|m| {
             m.provider == "openrouter" && m.model_id == "nvidia/nemotron-3-ultra-550b-a55b:free"
         }));
-        assert!(models.iter().any(|m| m.provider == "openrouter" && m.model_id == "nex-agi/nex-n2-pro:free"));
+        assert!(models
+            .iter()
+            .any(|m| m.provider == "openrouter" && m.model_id == "nex-agi/nex-n2-pro:free"));
     }
 
     #[test]

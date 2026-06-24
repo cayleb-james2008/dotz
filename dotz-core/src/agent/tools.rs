@@ -706,6 +706,9 @@ mod tests {
             .run("bash", &json!({"command": "echo hello"}), &ctx)
             .await
             .unwrap();
-        assert!(out.contains("hello"), "active bash should execute, got: {out}");
+        assert!(
+            out.contains("hello"),
+            "active bash should execute, got: {out}"
+        );
     }
 }
