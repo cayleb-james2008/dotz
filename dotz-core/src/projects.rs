@@ -477,50 +477,187 @@ pub fn router() -> Router<()> {
             get(get_project).patch(patch_project).delete(delete_project),
         )
         .route("/api/projects/{id}/files", get(project_files))
+        .merge(agents_md::router())
+}
+
+/// AGENTS.md doctrine REST surface for the UI's DOCTRINE panel.
+///
+/// `GET /api/agents_md?projectId=<id>` reads the project's root `AGENTS.md`.
+/// `PATCH /api/agents_md?projectId=<id>` overwrites it.
+mod agents_md {
+    use super::{bad, cwd_for_project, not_found};
+    use axum::{
+        extract::Query,
+        http::StatusCode,
+        routing::get,
+        Json, Router,
+    };
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn resolve_path(q: &HashMap<String, String>) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+        let pid = q.get("projectId").cloned().unwrap_or_default();
+        if pid.is_empty() {
+            return Err(bad("projectId is required"));
+        }
+        let cwd = cwd_for_project(Some(&pid)).ok_or_else(not_found)?;
+        Ok(PathBuf::from(&cwd).join("AGENTS.md"))
+    }
+
+    async fn get_agents_md(
+        Query(q): Query<HashMap<String, String>>,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        let path = resolve_path(&q)?;
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        Ok(Json(
+            json!({ "content": content, "path": path.to_string_lossy() }),
+        ))
+    }
+
+    async fn patch_agents_md(
+        Query(q): Query<HashMap<String, String>>,
+        body: Option<Json<Value>>,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        let path = resolve_path(&q)?;
+        let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+        let content = body
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| bad("content must be a string"))?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&path, content).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })?;
+        Ok(Json(
+            json!({ "ok": true, "content": content, "path": path.to_string_lossy() }),
+        ))
+    }
+
+    pub fn router() -> Router<()> {
+        Router::new().route("/api/agents_md", get(get_agents_md).patch(patch_agents_md))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use super::super::{create_project, with_tmp_projects_file};
+
+        fn tmp_dir() -> std::path::PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("dotz-agents-md-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[tokio::test]
+        async fn get_agents_md_returns_empty_when_missing() {
+            let _g = with_tmp_projects_file();
+            let dir = tmp_dir();
+            let body = Json(json!({ "name": "demo", "cwd": dir.to_string_lossy() }));
+            let created = create_project(Some(body)).await.unwrap().0;
+            let id = created["id"].as_str().unwrap().to_string();
+
+            let mut q = HashMap::new();
+            q.insert("projectId".to_string(), id);
+            let resp = get_agents_md(Query(q)).await.unwrap().0;
+            assert_eq!(resp["content"], "");
+            assert!(resp["path"].as_str().unwrap().contains("AGENTS.md"));
+        }
+
+        #[tokio::test]
+        async fn patch_agents_md_writes_and_get_reads_back() {
+            let _g = with_tmp_projects_file();
+            let dir = tmp_dir();
+            let body = Json(json!({ "name": "demo", "cwd": dir.to_string_lossy() }));
+            let created = create_project(Some(body)).await.unwrap().0;
+            let id = created["id"].as_str().unwrap().to_string();
+
+            let mut q = HashMap::new();
+            q.insert("projectId".to_string(), id.clone());
+            let patch_body = Json(json!({ "content": "# Doctrine\n\nRule 1." }));
+            let patched = patch_agents_md(Query(q.clone()), Some(patch_body))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(patched["ok"], true);
+            assert_eq!(patched["content"], "# Doctrine\n\nRule 1.");
+
+            let resp = get_agents_md(Query(q)).await.unwrap().0;
+            assert_eq!(resp["content"], "# Doctrine\n\nRule 1.");
+        }
+
+        #[tokio::test]
+        async fn agents_md_rejects_missing_project_id() {
+            let err = get_agents_md(Query(HashMap::new())).await.unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn agents_md_returns_404_for_unknown_project() {
+            let mut q = HashMap::new();
+            q.insert("projectId".to_string(), "not-a-real-id".to_string());
+            let err = get_agents_md(Query(q)).await.unwrap_err();
+            assert_eq!(err.0, StatusCode::NOT_FOUND);
+        }
+    }
+}
+
+/// Test-only helper: isolated projects file + store reset.
+#[cfg(test)]
+static LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+struct TmpFileGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    file: std::path::PathBuf,
+    prev: Option<String>,
+}
+
+#[cfg(test)]
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(p) => std::env::set_var("DOTZ_PROJECTS_FILE", p),
+            None => std::env::remove_var("DOTZ_PROJECTS_FILE"),
+        }
+        let _ = std::fs::remove_file(&self.file);
+    }
+}
+
+/// Point DOTZ_PROJECTS_FILE at an isolated temp file, reset the in-memory store, and return a
+/// guard that restores the previous env + removes the temp file when dropped.
+#[cfg(test)]
+fn with_tmp_projects_file() -> TmpFileGuard {
+    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let file =
+        std::env::temp_dir().join(format!("dotz-projects-test-{}.json", uuid::Uuid::new_v4()));
+    let prev = std::env::var("DOTZ_PROJECTS_FILE").ok();
+    std::env::set_var("DOTZ_PROJECTS_FILE", &file);
+    {
+        let mut store_guard = store_guard();
+        *store_guard = Vec::new();
+    }
+    TmpFileGuard {
+        _lock: guard,
+        file,
+        prev,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    // (std::sync::Mutex is not imported here because the shared LOCK lives in the parent module.)
+    use super::with_tmp_projects_file;
 
     // Serialize projects tests: they share the module-level in-memory store.
-    static LOCK: Mutex<()> = Mutex::new(());
-
-    struct TmpFileGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        file: std::path::PathBuf,
-        prev: Option<String>,
-    }
-
-    impl Drop for TmpFileGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(p) => std::env::set_var("DOTZ_PROJECTS_FILE", p),
-                None => std::env::remove_var("DOTZ_PROJECTS_FILE"),
-            }
-            let _ = std::fs::remove_file(&self.file);
-        }
-    }
-
-    /// Point DOTZ_PROJECTS_FILE at an isolated temp file, reset the in-memory store, and return a
-    /// guard that restores the previous env + removes the temp file when dropped.
-    fn with_tmp_projects_file() -> TmpFileGuard {
-        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let file =
-            std::env::temp_dir().join(format!("dotz-projects-test-{}.json", uuid::Uuid::new_v4()));
-        let prev = std::env::var("DOTZ_PROJECTS_FILE").ok();
-        std::env::set_var("DOTZ_PROJECTS_FILE", &file);
-        {
-            let mut store_guard = store_guard();
-            *store_guard = Vec::new();
-        }
-        TmpFileGuard {
-            _lock: guard,
-            file,
-            prev,
-        }
-    }
+    // (LOCK lives in the parent module so the test helper is reusable.)
 
     #[test]
     fn patch_project_clears_empty_optional_strings() {
