@@ -54,18 +54,27 @@ fn store() -> &'static Mutex<Vec<Project>> {
     STORE.get_or_init(|| Mutex::new(read_all_from_disk()))
 }
 
+/// Lock the project store, recovering from a poisoned mutex. A panic while holding the store lock
+/// (e.g. inside a serde error path or a callback) must not permanently brick the projects REST
+/// endpoints or the agent session binder.
+fn store_guard() -> std::sync::MutexGuard<'static, Vec<Project>> {
+    store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Resolve a project's cwd by id (for memory scoping; mirrors server.ts cwdForProject).
 /// None id or unknown id => None (global scope).
 pub fn cwd_for_project(id: Option<&str>) -> Option<String> {
     let id = id?;
-    let g = store().lock().unwrap();
+    let g = store_guard();
     g.iter().find(|p| p.id == id).map(|p| p.cwd.clone())
 }
 
 /// Fetch a full project by id (clone), for the agent session binder. None => unknown id.
 /// (Named `find`, not `get`, to avoid clashing with the `axum::routing::get` import.)
 pub fn find(id: &str) -> Option<Project> {
-    store().lock().unwrap().iter().find(|p| p.id == id).cloned()
+    store_guard().iter().find(|p| p.id == id).cloned()
 }
 
 fn projects_file() -> std::path::PathBuf {
@@ -198,7 +207,7 @@ fn build_file_tree(cwd: &FsPath, depth: usize) -> Vec<Value> {
 
 /// GET /api/projects -> { projects: [Project…] }
 async fn list_projects() -> Json<Value> {
-    let all = store().lock().unwrap().clone();
+    let all = store_guard().clone();
     Json(json!({ "projects": all }))
 }
 
@@ -298,7 +307,7 @@ async fn create_project(
     };
 
     {
-        let mut guard = store().lock().unwrap();
+        let mut guard = store_guard();
         guard.push(project.clone());
         write_all(&guard);
     }
@@ -307,7 +316,7 @@ async fn create_project(
 
 /// GET /api/projects/:id -> Project or 404.
 async fn get_project(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let guard = store().lock().unwrap();
+    let guard = store_guard();
     match guard.iter().find(|p| p.id == id) {
         Some(p) => Ok(Json(serde_json::to_value(p).unwrap())),
         None => Err(not_found()),
@@ -398,7 +407,7 @@ async fn patch_project(
         new_gate_command = Some(s.trim().to_string()).filter(|s| !s.is_empty());
     }
 
-    let mut guard = store().lock().unwrap();
+    let mut guard = store_guard();
     let idx = match guard.iter().position(|p| p.id == id) {
         Some(i) => i,
         None => return Err(not_found()),
@@ -435,7 +444,7 @@ async fn patch_project(
 
 /// DELETE /api/projects/:id -> { ok: bool }. ok=false when no project matched.
 async fn delete_project(Path(id): Path<String>) -> Json<Value> {
-    let mut guard = store().lock().unwrap();
+    let mut guard = store_guard();
     let before = guard.len();
     guard.retain(|p| p.id != id);
     let removed = guard.len() != before;
@@ -448,7 +457,7 @@ async fn delete_project(Path(id): Path<String>) -> Json<Value> {
 /// GET /api/projects/:id/files -> { tree: [FileTreeNode…] } or 404.
 async fn project_files(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let cwd = {
-        let guard = store().lock().unwrap();
+        let guard = store_guard();
         match guard.iter().find(|p| p.id == id) {
             Some(p) => p.cwd.clone(),
             None => return Err(not_found()),
@@ -503,7 +512,7 @@ mod tests {
         let prev = std::env::var("DOTZ_PROJECTS_FILE").ok();
         std::env::set_var("DOTZ_PROJECTS_FILE", &file);
         {
-            let mut store_guard = store().lock().unwrap();
+            let mut store_guard = store_guard();
             *store_guard = Vec::new();
         }
         TmpFileGuard {
@@ -586,6 +595,44 @@ mod tests {
             assert_eq!(patched["name"], "renamed");
             assert_eq!(patched["appUrl"], "http://localhost:3000");
             assert_eq!(patched["gateCommand"], "npm test");
+        });
+    }
+
+    /// A panic while holding the project-store mutex (e.g. inside a serde callback) poisons it.
+    /// Every accessor must recover via `store_guard()` so the store remains usable; otherwise a
+    /// single panic would brick session creation, memory scoping, and the projects REST surface.
+    #[test]
+    fn store_guard_recovers_from_poisoned_mutex() {
+        let _g = with_tmp_projects_file();
+
+        // Create a project so the store is non-empty.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let id = rt.block_on(async {
+            let body = Json(json!({
+                "name": "poison-test",
+                "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+            }));
+            let created = create_project(Some(body)).await.unwrap().0;
+            created["id"].as_str().unwrap().to_string()
+        });
+
+        // Intentionally poison the store mutex while holding the lock.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store().lock().unwrap();
+            panic!("intentional projects store poison");
+        }));
+        assert!(poisoned.is_err(), "mutex should be poisoned");
+
+        // Subsequent reads must recover instead of panicking.
+        let found = find(&id);
+        assert!(found.is_some(), "find should recover from poisoned mutex");
+        assert_eq!(found.unwrap().name, "poison-test");
+
+        // Subsequent mutations must also recover.
+        rt.block_on(async {
+            let body = Json(json!({ "name": "renamed" }));
+            let patched = patch_project(Path(id), Some(body)).await.unwrap().0;
+            assert_eq!(patched["name"], "renamed");
         });
     }
 }

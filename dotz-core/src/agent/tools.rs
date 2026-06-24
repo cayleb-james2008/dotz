@@ -156,8 +156,8 @@ impl Tool for EditTool {
 /// override with `DOTZ_BASH_TIMEOUT_MS` (clamped to [1s, 1h]).
 fn bash_timeout() -> Duration {
     const DEFAULT_MS: u64 = 300_000; // 5 minutes
-    const MIN_MS: u64 = 1_000;       // 1 second
-    const MAX_MS: u64 = 3_600_000;   // 1 hour
+    const MIN_MS: u64 = 1_000; // 1 second
+    const MAX_MS: u64 = 3_600_000; // 1 hour
     std::env::var("DOTZ_BASH_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -234,10 +234,7 @@ impl Tool for BashTool {
             Ok(Err(e)) => return Err(format!("exec: {e}")),
             Err(_) => {
                 let _ = child.start_kill();
-                return Err(format!(
-                    "[timeout] killed after {}ms",
-                    timeout.as_millis()
-                ));
+                return Err(format!("[timeout] killed after {}ms", timeout.as_millis()));
             }
         };
 
@@ -803,11 +800,7 @@ mod tests {
         assert_eq!(bash_timeout().as_secs(), 300, "default is 5 minutes");
 
         std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "5000");
-        assert_eq!(
-            bash_timeout().as_millis(),
-            5000,
-            "valid override preserved"
-        );
+        assert_eq!(bash_timeout().as_millis(), 5000, "valid override preserved");
 
         std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "50");
         assert_eq!(

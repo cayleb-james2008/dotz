@@ -257,8 +257,8 @@ fn workspace_has_dotz_core(cargo_toml: &str) -> bool {
 /// loop forever. Defaults to 10 minutes; override with `DOTZ_GATE_TIMEOUT_MS` (clamped to [1s, 1h]).
 fn gate_timeout() -> Duration {
     const DEFAULT_MS: u64 = 600_000; // 10 minutes
-    const MIN_MS: u64 = 1_000;       // 1 second — zero would time out before any gate starts
-    const MAX_MS: u64 = 3_600_000;   // 1 hour
+    const MIN_MS: u64 = 1_000; // 1 second — zero would time out before any gate starts
+    const MAX_MS: u64 = 3_600_000; // 1 hour
     std::env::var("DOTZ_GATE_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
