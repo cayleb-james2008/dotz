@@ -1067,12 +1067,19 @@ mod tests {
 
     #[tokio::test]
     async fn capture_exchange_respects_autonomy_gate() {
-        let guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let prev = AUTONOMY.load(Ordering::Relaxed);
-        // Disable autonomy to simulate a subagent/non-main process.
-        AUTONOMY.store(false, Ordering::Relaxed);
+        // Toggle the autonomy flag under the serialized test lock, but never hold the
+        // std::sync::MutexGuard across an await point — that would block the tokio executor
+        // and can deadlock other async tasks.
+        let prev = {
+            let guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let prev = AUTONOMY.load(Ordering::Relaxed);
+            // Disable autonomy to simulate a subagent/non-main process.
+            AUTONOMY.store(false, Ordering::Relaxed);
+            drop(guard);
+            prev
+        };
 
         // Use text long enough to bypass the trivial-exchange filter so the only reason we get an
         // empty result is the autonomy gate, not the length heuristic.
@@ -1084,8 +1091,13 @@ mod tests {
         .await;
 
         // Restore the previous autonomy flag so other tests see their expected state.
-        AUTONOMY.store(prev, Ordering::Relaxed);
-        drop(guard);
+        {
+            let guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            AUTONOMY.store(prev, Ordering::Relaxed);
+            drop(guard);
+        }
 
         assert!(
             kept.is_empty(),
