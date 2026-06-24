@@ -227,6 +227,9 @@ impl Provider for OpenAiChat {
         let mut stream = resp.bytes_stream().eventsource();
         let mut usage_seen: Option<Usage> = None;
         let mut stop: Option<String> = None;
+        // Providers may stream a tool-call name across multiple chunks. Track started indices so
+        // we emit ToolCallStart exactly once per index and preserve the original id.
+        let mut tool_call_started: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         while let Some(ev) = stream.next().await {
             let ev = match ev {
@@ -281,13 +284,14 @@ impl Provider for OpenAiChat {
             }
 
             // Tool calls (function calling). Each chunk carries a partial arg-fragment per index.
+            // Some providers split the name across chunks; only emit ToolCallStart once per index.
             if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
                 for tc in tcs {
                     let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                     let func = tc.get("function");
                     let name = func.and_then(|f| f.get("name")).and_then(|n| n.as_str());
                     if let Some(name) = name {
-                        if !name.is_empty() {
+                        if !name.is_empty() && tool_call_started.insert(index) {
                             let id = tc
                                 .get("id")
                                 .and_then(|i| i.as_str())
@@ -379,5 +383,125 @@ pub fn adapter_for(provider: &str) -> Box<dyn Provider> {
         "anthropic" => Box::new(super::provider_anthropic::AnthropicMessages::new()),
         "google" => Box::new(super::provider_google::GoogleGemini::new()),
         _ => Box::new(OpenAiChat::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn sse(data: &str) -> String {
+        format!("data: {data}\n\n")
+    }
+
+    /// Some OpenAI-compatible providers stream a tool-call name across multiple chunks, or repeat
+    /// the name in later fragments. Without the `tool_call_started` guard the adapter emitted a
+    /// new `ToolCallStart` (with a freshly-generated id) for every chunk containing a name,
+    /// producing duplicate tool-call blocks in the assistant message and breaking tool_call_id
+    /// matching.
+    #[tokio::test]
+    async fn streaming_tool_call_start_emitted_once_per_index() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::with_capacity(8192);
+            loop {
+                let mut tmp = [0u8; 1024];
+                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = headers_tx.send(());
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+            let _ = stream.write_all(response).await;
+            // First chunk establishes id + name.
+            let _ = stream
+                .write_all(
+                    sse(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"bash","arguments":""}}]}}]}"#)
+                        .as_bytes(),
+                )
+                .await;
+            // Second chunk repeats the name for the same index; must NOT start a second call.
+            let _ = stream
+                .write_all(
+                    sse(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"bash","arguments":"{"}}]}}]}"#)
+                        .as_bytes(),
+                )
+                .await;
+            // Third chunk completes the arguments.
+            let _ = stream
+                .write_all(
+                    sse(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"command\":\"echo hi\"}"}}]}}]}"#)
+                        .as_bytes(),
+                )
+                .await;
+            // Final chunk ends the turn.
+            let _ = stream
+                .write_all(sse(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#).as_bytes())
+                .await;
+            // Close the connection so the client stream ends cleanly.
+        });
+
+        let client = OpenAiChat::new();
+        let model = ResolvedModel {
+            provider: "test".into(),
+            model_id: "test".into(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key_ref: "test-key".into(),
+            context_window: 1000,
+            reasoning: false,
+        };
+        let req = ChatRequest {
+            model,
+            messages: vec![],
+            tools: vec![],
+            reasoning_effort: None,
+        };
+        let (tx, mut rx) = mpsc::channel::<StreamDelta>(16);
+
+        let stream_task = tokio::spawn(async move { client.stream(req, tx).await });
+        // Wait until the fake server has accepted the request so we know streaming is in progress.
+        let _ = headers_rx.await;
+
+        let mut starts = 0;
+        let mut arg_chunks = 0;
+        let mut final_stop = String::new();
+        while let Some(d) = rx.recv().await {
+            match d {
+                StreamDelta::ToolCallStart { ref id, ref name, .. } => {
+                    starts += 1;
+                    assert_eq!(id, "call_abc");
+                    assert_eq!(name, "bash");
+                }
+                StreamDelta::ToolCallArgs { .. } => arg_chunks += 1,
+                StreamDelta::Stop(s) => final_stop = s,
+                _ => {}
+            }
+        }
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), stream_task)
+            .await
+            .expect("stream task timed out")
+            .unwrap();
+        assert!(result.is_ok(), "stream ended with error: {:?}", result);
+
+        assert_eq!(
+            starts, 1,
+            "only one ToolCallStart should be emitted per index even when name repeats"
+        );
+        assert_eq!(arg_chunks, 2, "both argument fragments should still be delivered");
+        assert_eq!(final_stop, "tool_use");
     }
 }
