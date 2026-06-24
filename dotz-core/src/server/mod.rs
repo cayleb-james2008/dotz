@@ -18,6 +18,15 @@ pub struct AppState {
 }
 pub type Shared = Arc<AppState>;
 
+/// Lock the shared config mutex, recovering from a poisoned lock. A panic while holding the
+/// config lock (e.g. inside a validation callback) must not permanently brick the config REST
+/// endpoints.
+fn state_config(s: &AppState) -> std::sync::MutexGuard<'_, DotzConfig> {
+    s.config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Build the app: REST API + static `web/` UI fallback. Unmatched paths fall through to the
 /// unchanged `web/` SPA, which talks to this backend over `location.host`.
 pub fn app(web_dir: PathBuf, state: Shared) -> Router {
@@ -55,7 +64,7 @@ async fn profiles_list() -> Json<Value> {
 }
 
 async fn get_config(State(s): State<Shared>) -> Json<Value> {
-    let c = s.config.lock().unwrap().clone();
+    let c = state_config(&s).clone();
     Json(json!({
         "config": c,
         "providerDefaults": types::provider_defaults_json(),
@@ -107,7 +116,7 @@ async fn post_config(
 
     // Hold one lock across read → persist → write-back so concurrent POSTs cannot
     // interleave: a later request must see the persisted state of an earlier one.
-    let mut guard = s.config.lock().unwrap();
+    let mut guard = state_config(&s);
     let next = config::update(&guard, &clean).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -260,6 +269,25 @@ mod tests {
             result.is_ok(),
             "server exited with error: {:?}",
             result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_config_recovers_from_poisoned_mutex() {
+        let state = Arc::new(AppState {
+            config: Mutex::new(DotzConfig::default()),
+        });
+        let state2 = state.clone();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = state2.config.lock().unwrap();
+            panic!("intentional poison to test recovery");
+        }));
+        assert!(poisoned.is_err(), "mutex should be poisoned");
+
+        let Json(resp) = get_config(State(state)).await;
+        assert!(
+            resp.get("config").is_some(),
+            "get_config should recover from a poisoned mutex and return config"
         );
     }
 }
