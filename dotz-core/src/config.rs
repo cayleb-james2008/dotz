@@ -45,20 +45,36 @@ fn config_file() -> PathBuf {
 /// The bundled subagent extension reads DOTZ_SUBAGENT_MODEL to pin every dispersed subagent's model.
 /// Normalizes the subagent model so a persisted value that already includes the provider prefix
 /// (e.g. "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free") does not produce a doubled prefix
-/// like "openrouter/openrouter/...".
+/// like "openrouter/openrouter/...". If no subagent model is configured, derives the provider's
+/// default so the env var is always valid.
 pub fn apply_env(c: &DotzConfig) {
     let prefix = format!("{}/", c.provider);
     let model = if let Some(rest) = c.subagent_model.strip_prefix(&prefix) {
         rest.to_string()
+    } else if c.subagent_model.trim().is_empty() {
+        default_subagent_model(&c.provider)
     } else {
         c.subagent_model.clone()
     };
     std::env::set_var("DOTZ_SUBAGENT_MODEL", format!("{}/{}", c.provider, model));
 }
 
+/// Default subagent model id for a provider. Falls back to the global default provider's subagent
+/// when the provider has no registered default.
+fn default_subagent_model(provider: &str) -> String {
+    types::provider_default(provider)
+        .map(|(_, s)| s.to_string())
+        .unwrap_or_else(|| {
+            types::provider_default(types::DEFAULT_PROVIDER)
+                .map(|(_, s)| s.to_string())
+                .unwrap_or_default()
+        })
+}
+
 /// Load config.json, clamping any invalid present field to its default (mirror loadConfig).
 pub fn load() -> DotzConfig {
     let mut cfg = DotzConfig::default();
+    let mut explicit_subagent = false;
     if let Ok(raw) = std::fs::read_to_string(config_file()) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(p) = v.get("provider").and_then(|x| x.as_str()) {
@@ -74,6 +90,7 @@ pub fn load() -> DotzConfig {
             if let Some(m) = v.get("subagentModel").and_then(|x| x.as_str()) {
                 if !m.trim().is_empty() {
                     cfg.subagent_model = m.to_string();
+                    explicit_subagent = true;
                 }
             }
             if let Some(t) = v.get("thinkingLevel").and_then(|x| x.as_str()) {
@@ -82,6 +99,12 @@ pub fn load() -> DotzConfig {
                 }
             }
         }
+    }
+    // If the user changed provider but never set a subagent model, derive it from the new provider
+    // instead of leaving the old provider's default in place (which would pin subagents to the wrong
+    // model/ecosystem).
+    if !explicit_subagent {
+        cfg.subagent_model = default_subagent_model(&cfg.provider);
     }
     apply_env(&cfg);
     cfg
@@ -99,7 +122,9 @@ pub fn save(c: &DotzConfig) -> std::io::Result<()> {
 /// will be lost on restart.
 pub fn update(current: &DotzConfig, clean: &CleanPatch) -> std::io::Result<DotzConfig> {
     let mut next = current.clone();
+    let mut provider_changed = false;
     if let Some(p) = &clean.provider {
+        provider_changed = next.provider != *p;
         next.provider = p.clone();
     }
     if let Some(m) = &clean.executive_model {
@@ -107,6 +132,10 @@ pub fn update(current: &DotzConfig, clean: &CleanPatch) -> std::io::Result<DotzC
     }
     if let Some(m) = &clean.subagent_model {
         next.subagent_model = m.clone();
+    } else if provider_changed {
+        // Provider changed without an explicit subagent model: re-derive so subagents don't get
+        // pinned to a model from the previous provider's ecosystem.
+        next.subagent_model = default_subagent_model(&next.provider);
     }
     if let Some(t) = &clean.thinking_level {
         next.thinking_level = t.clone();
@@ -244,6 +273,110 @@ mod tests {
             assert_eq!(
                 std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
                 "ollama/minimax-m3"
+            );
+        });
+    }
+    #[test]
+    fn load_derives_subagent_model_when_missing() {
+        with_tmp_dir(|_| {
+            let cfg = DotzConfig {
+                provider: "openrouter".into(),
+                executive_model: "nex-agi/nex-n2-pro".into(),
+                subagent_model: "minimax-m3".into(),
+                thinking_level: "medium".into(),
+            };
+            save(&cfg).unwrap();
+
+            // Write a config that changes provider but omits subagentModel.
+            let file = config_file();
+            std::fs::write(
+                &file,
+                r#"{
+  "provider": "openrouter",
+  "executiveModel": "nex-agi/nex-n2-pro",
+  "thinkingLevel": "medium"
+}"#,
+            )
+            .unwrap();
+
+            let loaded = load();
+            assert_eq!(loaded.provider, "openrouter");
+            assert_eq!(
+                loaded.subagent_model, "nex-agi/nex-n2-pro",
+                "subagent_model must be derived from the configured provider when omitted"
+            );
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "openrouter/nex-agi/nex-n2-pro"
+            );
+        });
+    }
+
+    #[test]
+    fn update_re_derives_subagent_model_when_provider_changes() {
+        with_tmp_dir(|_| {
+            let base = DotzConfig {
+                provider: "ollama".into(),
+                executive_model: "glm-5.2".into(),
+                subagent_model: "minimax-m3".into(),
+                thinking_level: "high".into(),
+            };
+            let patch = CleanPatch {
+                provider: Some("openrouter".into()),
+                ..Default::default()
+            };
+            let next = update(&base, &patch).unwrap();
+            assert_eq!(next.provider, "openrouter");
+            assert_eq!(
+                next.subagent_model, "nex-agi/nex-n2-pro",
+                "provider change without explicit subagent_model must re-derive"
+            );
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "openrouter/nex-agi/nex-n2-pro"
+            );
+        });
+    }
+
+    #[test]
+    fn update_preserves_explicit_subagent_model_for_unrelated_changes() {
+        with_tmp_dir(|_| {
+            let base = DotzConfig {
+                provider: "ollama".into(),
+                executive_model: "glm-5.2".into(),
+                subagent_model: "minimax-m3".into(),
+                thinking_level: "high".into(),
+            };
+            let patch = CleanPatch {
+                thinking_level: Some("xhigh".into()),
+                ..Default::default()
+            };
+            let next = update(&base, &patch).unwrap();
+            assert_eq!(next.thinking_level, "xhigh");
+            assert_eq!(
+                next.subagent_model, "minimax-m3",
+                "unrelated patch must not re-derive subagent_model"
+            );
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "ollama/minimax-m3"
+            );
+        });
+    }
+
+    #[test]
+    fn apply_env_derives_when_subagent_model_empty() {
+        with_tmp_dir(|_| {
+            let cfg = DotzConfig {
+                provider: "openrouter".into(),
+                executive_model: "nex-agi/nex-n2-pro".into(),
+                subagent_model: "".into(),
+                thinking_level: "medium".into(),
+            };
+            apply_env(&cfg);
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "openrouter/nex-agi/nex-n2-pro"
             );
         });
     }
