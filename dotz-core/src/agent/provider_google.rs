@@ -14,8 +14,8 @@
 //!
 //! Streaming (alt=sse) yields JSON frames with `candidates[].content.parts[]` — plain text → Text,
 //! parts flagged `thought:true` → Thinking, `functionCall` → ToolCall, plus `usageMetadata` → Usage.
-//! Auth resolves the `$GEMINI_API_KEY` (or `$GOOGLE_API_KEY`) reference via the shared resolver and
-//! is sent as the `key` query parameter.
+//! Auth resolves `$GEMINI_API_KEY` first, falling back to `$GOOGLE_API_KEY`, and sends the key
+//! as the `key` query parameter.
 use super::event::{Cost, Usage};
 use super::provider::{resolve_api_key, ChatRequest, Provider, StreamDelta};
 use async_trait::async_trait;
@@ -43,10 +43,21 @@ impl Default for GoogleGemini {
     }
 }
 
+/// Resolve the Gemini API key. The provider endpoint references `$GEMINI_API_KEY`; if that is
+/// unset we fall back to `$GOOGLE_API_KEY` so users with the more standard Google env var can
+/// still use the Google provider without duplicating credentials.
+fn resolve_google_key(api_key_ref: &str) -> String {
+    let key = resolve_api_key(api_key_ref);
+    if !key.is_empty() {
+        return key;
+    }
+    std::env::var("GOOGLE_API_KEY").unwrap_or_default()
+}
+
 #[async_trait]
 impl Provider for GoogleGemini {
     async fn stream(&self, req: ChatRequest, tx: mpsc::Sender<StreamDelta>) -> Result<(), String> {
-        let key = resolve_api_key(&req.model.api_key_ref);
+        let key = resolve_google_key(&req.model.api_key_ref);
         // base_url points at the Gemini API root (https://generativelanguage.googleapis.com/v1beta).
         let url = format!(
             "{}/models/{}:streamGenerateContent?alt=sse&key={}",
@@ -321,5 +332,46 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..n])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes env-var mutation so concurrent tests don't race on GEMINI_API_KEY / GOOGLE_API_KEY.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn resolve_google_key_prefers_gemini_then_falls_back_to_google() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Neither set → empty.
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::remove_var("GOOGLE_API_KEY");
+        assert!(resolve_google_key("$GEMINI_API_KEY").is_empty());
+
+        // GEMINI_API_KEY wins when present.
+        std::env::set_var("GEMINI_API_KEY", "gemini-key");
+        assert_eq!(resolve_google_key("$GEMINI_API_KEY"), "gemini-key");
+
+        // Fallback to GOOGLE_API_KEY when GEMINI_API_KEY is absent.
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::set_var("GOOGLE_API_KEY", "google-key");
+        assert_eq!(resolve_google_key("$GEMINI_API_KEY"), "google-key");
+
+        // Cleanup.
+        std::env::remove_var("GOOGLE_API_KEY");
+    }
+
+    #[test]
+    fn resolve_google_key_returns_bare_literal_untouched() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::remove_var("GOOGLE_API_KEY");
+
+        // A bare literal key is passed through (matches the shared resolve_api_key rule).
+        assert_eq!(resolve_google_key("literal-key"), "literal-key");
     }
 }
