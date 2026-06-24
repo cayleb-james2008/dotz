@@ -353,6 +353,9 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
         }),
         Err(_) => {
             let _ = child.start_kill();
+            // Reap the killed child so it does not become a zombie (Unix) or leak handles
+            // (Windows) after the timeout path returns.
+            let _ = child.wait().await;
             json!({
                 "error": format!("[timeout] killed after {}ms", timeout.as_millis()),
                 "ok": false,
@@ -718,6 +721,64 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "gate timeout should return promptly, elapsed: {elapsed:?}"
         );
+    }
+
+    /// A timed-out gate child must be reaped, not left as a zombie (Unix) or leaking handles
+    /// (Windows). We verify the reap on Unix by checking `kill -0 <pid>` after the timeout path
+    /// returns; on Windows we still verify the timeout result shape.
+    #[tokio::test]
+    async fn run_gate_reaps_child_after_timeout() {
+        let _guard = GATE_TIMEOUT_TEST_LOCK.lock().unwrap();
+        let prev = std::env::var("DOTZ_GATE_TIMEOUT_MS").ok();
+        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "500");
+
+        let dir = tmp_dir();
+        let pidfile = dir.join("pid");
+
+        // Long enough that the 500ms timeout fires first; the child writes its own PID so we can
+        // confirm it no longer exists after run_gate returns.
+        let command = if cfg!(windows) {
+            // ~2s of wall-clock time; the 500ms timeout fires first. Short enough that even if the
+            // wrapper process outlives the killed cmd, it finishes quickly.
+            "ping -n 3 127.0.0.1".to_string()
+        } else {
+            format!("echo $$ > {} ; sleep 30", pidfile.to_string_lossy())
+        };
+
+        let result = run_gate(&dir, Some(&command)).await;
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_GATE_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_GATE_TIMEOUT_MS"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            result.get("ok").and_then(|v| v.as_bool()),
+            Some(false),
+            "timed-out gate must report ok:false: {result}"
+        );
+        let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            error.contains("[timeout]"),
+            "timed-out gate must report a timeout error, got: {error}"
+        );
+
+        #[cfg(unix)]
+        {
+            let pid_text = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            let pid: i32 = pid_text.trim().parse().unwrap_or(-1);
+            assert!(pid > 0, "test should have captured a valid child pid");
+            let gone = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+                .map(|o| !o.status.success())
+                .unwrap_or(true);
+            assert!(
+                gone,
+                "timed-out gate child (pid {pid}) should have been killed and reaped, not still running"
+            );
+        }
     }
 
     #[test]
