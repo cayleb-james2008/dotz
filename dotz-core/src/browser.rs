@@ -255,6 +255,15 @@ fn sessions() -> &'static Mutex<HashMap<String, SessionRecord>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Lock the browser session store, recovering from a poisoned mutex. A panic while holding the
+/// sessions lock (e.g. inside a JSON parse or agent-browser callback) must not permanently brick
+/// the browser controller.
+fn sessions_guard() -> std::sync::MutexGuard<'static, HashMap<String, SessionRecord>> {
+    sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // ---- executable resolution (mirror executableCandidates) ----
 /// The agent-browser binary name for this target. win32-x64 is the shipped target.
 fn binary_name() -> &'static str {
@@ -479,9 +488,7 @@ async fn run(
 ) -> Result<Value, String> {
     // Abort if a concurrent stop() tore the session down — the teardown's own "close" is exempt.
     {
-        let disposed = sessions()
-            .lock()
-            .unwrap()
+        let disposed = sessions_guard()
             .get(session_id)
             .map(|r| r.disposed)
             .unwrap_or(false);
@@ -611,7 +618,7 @@ async fn observe(
     action: Option<CurrentAction>,
 ) -> Result<BrowserObservation, String> {
     let (profile_dir, allowed_origins) = {
-        let store = sessions().lock().unwrap();
+        let store = sessions_guard();
         let r = store.get(session_id).ok_or("no such browser session")?;
         (r.profile_dir.clone(), r.observation.allowed_origins.clone())
     };
@@ -620,9 +627,7 @@ async fn observe(
     let url_result = run(session_id, &profile_dir, &allowed_origins, &["get", "url"]).await?;
     let new_url = string_value(&url_result, "url");
     let effective_url = if new_url.is_empty() {
-        sessions()
-            .lock()
-            .unwrap()
+        sessions_guard()
             .get(session_id)
             .map(|r| r.observation.page.url.clone())
             .unwrap_or_default()
@@ -697,7 +702,7 @@ async fn observe(
     let title = string_value(&title_result, "title");
     let refs = all_refs(&snapshot);
 
-    let mut store = sessions().lock().unwrap();
+    let mut store = sessions_guard();
     let r = store.get_mut(session_id).ok_or("no such browser session")?;
     r.observation.seq += 1;
     let seq = r.observation.seq;
@@ -733,7 +738,7 @@ async fn observe(
 
 /// Mark the record as failed (status "error", bump seq, attach error) unless already disposed.
 fn fail(session_id: &str, message: &str) {
-    let mut store = sessions().lock().unwrap();
+    let mut store = sessions_guard();
     if let Some(r) = store.get_mut(session_id) {
         if r.disposed {
             return;
@@ -834,7 +839,7 @@ pub async fn start(
     };
     let vw = viewport.width;
     let vh = viewport.height;
-    sessions().lock().unwrap().insert(
+    sessions_guard().insert(
         session_id.clone(),
         SessionRecord {
             profile_dir: profile_dir.clone(),
@@ -871,7 +876,7 @@ pub async fn start(
             fail(&session_id, &e);
             let _ = run(&session_id, &profile_dir, &allowed, &["close"]).await;
             let _ = tokio::fs::remove_dir_all(&profile_dir).await;
-            sessions().lock().unwrap().remove(&session_id);
+            sessions_guard().remove(&session_id);
             Err(e)
         }
     }
@@ -892,7 +897,7 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
         .to_string();
 
     let (profile_dir, allowed_origins, cur_seq, refs, viewport, status) = {
-        let store = sessions().lock().unwrap();
+        let store = sessions_guard();
         let r = store.get(&session_id).ok_or("no such browser session")?;
         (
             r.profile_dir.clone(),
@@ -957,7 +962,7 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
 
     // Move to "acting".
     {
-        let mut store = sessions().lock().unwrap();
+        let mut store = sessions_guard();
         if let Some(r) = store.get_mut(&session_id) {
             r.observation.status = "acting".into();
             r.observation.current_action = Some(CurrentAction {
@@ -991,7 +996,7 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
             let bh = bv.get("height").and_then(|v| v.as_f64());
             if let (Some(bx), Some(by), Some(bw), Some(bh)) = (bx, by, bw, bh) {
                 if [bx, by, bw, bh].iter().all(|f| f.is_finite()) {
-                    let mut store = sessions().lock().unwrap();
+                    let mut store = sessions_guard();
                     if let Some(r) = store.get_mut(&session_id) {
                         r.observation.cursor = Some(Cursor {
                             x: bx + bw / 2.0,
@@ -1004,7 +1009,7 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
         } else if action == "clickAt" {
             if let (Some(x), Some(y)) = (x, y) {
                 if x.is_finite() && y.is_finite() {
-                    let mut store = sessions().lock().unwrap();
+                    let mut store = sessions_guard();
                     if let Some(r) = store.get_mut(&session_id) {
                         r.observation.cursor = Some(Cursor {
                             x,
@@ -1064,14 +1069,12 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
         }
 
         {
-            let mut store = sessions().lock().unwrap();
+            let mut store = sessions_guard();
             if let Some(r) = store.get_mut(&session_id) {
                 r.observation.counters.actions += 1;
             }
         }
-        let action_record = sessions()
-            .lock()
-            .unwrap()
+        let action_record = sessions_guard()
             .get(&session_id)
             .and_then(|r| r.observation.current_action.clone());
         observe(&session_id, action_record).await
@@ -1191,7 +1194,7 @@ fn action_summary(
 /// stop(): mark disposed, close the process, set status "stopped", bump seq, dispose the profile dir.
 pub async fn stop(session_id: &str) -> Result<BrowserObservation, String> {
     let (profile_dir, allowed_origins) = {
-        let mut store = sessions().lock().unwrap();
+        let mut store = sessions_guard();
         let r = store.get_mut(session_id).ok_or("no such browser session")?;
         r.disposed = true; // abort any in-flight run() before we remove the profile dir
         (r.profile_dir.clone(), r.observation.allowed_origins.clone())
@@ -1199,7 +1202,7 @@ pub async fn stop(session_id: &str) -> Result<BrowserObservation, String> {
     let _ = run(session_id, &profile_dir, &allowed_origins, &["close"]).await;
 
     let stopped = {
-        let mut store = sessions().lock().unwrap();
+        let mut store = sessions_guard();
         let r = store.get_mut(session_id).ok_or("no such browser session")?;
         r.observation.status = "stopped".into();
         r.observation.seq += 1;
@@ -1210,13 +1213,13 @@ pub async fn stop(session_id: &str) -> Result<BrowserObservation, String> {
         r.observation.clone()
     };
     let _ = tokio::fs::remove_dir_all(&profile_dir).await;
-    sessions().lock().unwrap().remove(session_id);
+    sessions_guard().remove(session_id);
     Ok(stopped)
 }
 
 /// state(sessionId?): the newest (or named) observation. None when no such session.
 fn state(session_id: Option<&str>) -> Option<BrowserObservation> {
-    let store = sessions().lock().unwrap();
+    let store = sessions_guard();
     match session_id {
         Some(id) => store.get(id).map(|r| r.observation.clone()),
         // newest by startedAt — HashMap has no order, so pick max updatedAt.
@@ -1229,9 +1232,7 @@ fn state(session_id: Option<&str>) -> Option<BrowserObservation> {
 
 /// list(): every session's observation.
 fn list() -> Vec<BrowserObservation> {
-    sessions()
-        .lock()
-        .unwrap()
+    sessions_guard()
         .values()
         .map(|r| r.observation.clone())
         .collect()
@@ -1239,7 +1240,7 @@ fn list() -> Vec<BrowserObservation> {
 
 /// frame(sessionId, afterSeq): the latest JPEG bytes + seq, or None when not newer than afterSeq.
 fn frame(session_id: &str, after_seq: i64) -> Option<(i64, Vec<u8>)> {
-    let store = sessions().lock().unwrap();
+    let store = sessions_guard();
     let r = store.get(session_id)?;
     let seq = r.observation.frame.as_ref().map(|f| f.seq)?;
     let data = r.frame_data.as_ref()?;
@@ -1253,7 +1254,7 @@ fn frame(session_id: &str, after_seq: i64) -> Option<(i64, Vec<u8>)> {
 /// Called on app shutdown; safe to leave unused until the shutdown hook is wired.
 #[allow(dead_code)]
 pub async fn dispose_all() {
-    let ids: Vec<String> = sessions().lock().unwrap().keys().cloned().collect();
+    let ids: Vec<String> = sessions_guard().keys().cloned().collect();
     for id in ids {
         let _ = stop(&id).await;
     }
@@ -1590,5 +1591,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(wait, Some(vec!["wait".into(), "30000".into()]));
+    }
+
+    /// A panic while holding the browser sessions mutex must not permanently brick the browser
+    /// controller. With poison recovery, read-only queries (`state`, `list`) and lookups (`frame`)
+    /// keep working after a previous lock owner panicked.
+    #[test]
+    fn browser_sessions_recover_from_poisoned_mutex() {
+        // Poison the global sessions mutex by panicking while holding the lock.
+        let poison_thread = std::thread::spawn(|| {
+            let _guard = sessions().lock().unwrap();
+            panic!("intentional browser sessions poison");
+        });
+        assert!(
+            poison_thread.join().is_err(),
+            "panic must leave the sessions mutex poisoned"
+        );
+
+        // These calls used to panic on `lock().unwrap()`; now they recover and return gracefully.
+        let _ = state(None);
+        let _ = list();
+        assert!(frame("no-such", -1).is_none());
     }
 }
