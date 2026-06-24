@@ -873,3 +873,202 @@ pub fn router() -> Router<()> {
         .route("/api/memory/search", post(search_memory))
         .route("/api/memory/consolidate", post(consolidate_memory))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_tmp_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-memory-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let result = f(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(guard);
+        result
+    }
+
+    #[test]
+    fn scope_user_global_ignores_cwd() {
+        assert_eq!(scope_user("global", Some("/any/path")), "__global__");
+        assert_eq!(scope_user("global", None), "__global__");
+    }
+
+    #[test]
+    fn scope_user_project_normalizes_path() {
+        assert_eq!(scope_user("project", Some("C:\\Projects\\Dotz")), "proj:c:/projects/dotz");
+        assert_eq!(scope_user("project", Some("/home/user/dotz")), "proj:/home/user/dotz");
+    }
+
+    #[test]
+    fn norm_folder_strips_leading_separators_and_lower_cases() {
+        assert_eq!(norm_folder("./src/Memory"), "src/memory");
+        assert_eq!(norm_folder("/src/Memory"), "src/memory");
+        assert_eq!(norm_folder("src\\Memory"), "src/memory");
+    }
+
+    #[test]
+    fn cosine_identical_is_one() {
+        let v = vec![1.0f32, 2.0, 3.0];
+        assert!((cosine(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_orthogonal_is_zero() {
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![0.0f32, 1.0, 0.0];
+        assert!(cosine(&a, &b).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_zero_vector_is_zero() {
+        let a = vec![0.0f32; 4];
+        let b = vec![1.0f32, 0.0, 0.0, 0.0];
+        assert!(cosine(&a, &b).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_facts_bare_json_array() {
+        let content = r#"["Fact one", "Fact two"]"#;
+        let facts = parse_facts(content);
+        assert_eq!(facts, vec!["Fact one", "Fact two"]);
+    }
+
+    #[test]
+    fn parse_facts_extracts_array_from_prose() {
+        let content = "Here are the facts: [\"Fact A\", \"Fact B\"] Done.";
+        let facts = parse_facts(content);
+        assert_eq!(facts, vec!["Fact A", "Fact B"]);
+    }
+
+    #[test]
+    fn parse_facts_returns_empty_for_invalid_json() {
+        let content = "Just some prose without an array.";
+        assert!(parse_facts(content).is_empty());
+    }
+
+    #[test]
+    fn parse_facts_skips_empty_strings() {
+        let content = r#"["", "Real fact", "   "]"#;
+        let facts = parse_facts(content);
+        assert_eq!(facts, vec!["Real fact"]);
+    }
+
+    #[test]
+    fn render_recall_empty_returns_empty() {
+        assert_eq!(render_recall(&[]), "");
+    }
+
+    #[test]
+    fn render_recall_renders_items() {
+        let items = vec![
+            MemoryView {
+                id: "a".into(),
+                memory: "Use cargo test -p dotz-core for the gate.".into(),
+                scope: "global".into(),
+                category: None,
+                folder: None,
+                score: None,
+                created_at: None,
+                updated_at: None,
+            },
+            MemoryView {
+                id: "b".into(),
+                memory: "Project root is /home/user/dotz.".into(),
+                scope: "project".into(),
+                category: None,
+                folder: None,
+                score: None,
+                created_at: None,
+                updated_at: None,
+            },
+        ];
+        let rendered = render_recall(&items);
+        assert!(rendered.starts_with("# Relevant memory (recalled for this turn)\n"));
+        assert!(rendered.contains("Use cargo test -p dotz-core for the gate."));
+        assert!(rendered.contains("Project root is /home/user/dotz."));
+    }
+
+    #[test]
+    fn write_mirror_file_renders_empty_placeholder() {
+        with_tmp_dir(|dir| {
+            let file = dir.join("MEMORY.md");
+            render_mirror_file(&file, "test memory", &[]);
+            let raw = std::fs::read_to_string(&file).unwrap();
+            assert!(raw.starts_with("# test memory\n"));
+            assert!(raw.contains("_(no memories yet)_"));
+        });
+    }
+
+    #[test]
+    fn write_mirror_file_groups_by_category_sorted() {
+        with_tmp_dir(|dir| {
+            let file = dir.join("MEMORY.md");
+            let items = vec![
+                MemoryView {
+                    id: "z".into(),
+                    memory: "Zebra convention.".into(),
+                    scope: "global".into(),
+                    category: Some("zoo".into()),
+                    folder: None,
+                    score: None,
+                    created_at: Some(1),
+                    updated_at: None,
+                },
+                MemoryView {
+                    id: "a".into(),
+                    memory: "Alpha fact.".into(),
+                    scope: "global".into(),
+                    category: Some("abc".into()),
+                    folder: None,
+                    score: None,
+                    created_at: Some(2),
+                    updated_at: None,
+                },
+                MemoryView {
+                    id: "g".into(),
+                    memory: "General note.".into(),
+                    scope: "global".into(),
+                    category: None,
+                    folder: None,
+                    score: None,
+                    created_at: Some(3),
+                    updated_at: None,
+                },
+            ];
+            render_mirror_file(&file, "grouped memory", &items);
+            let raw = std::fs::read_to_string(&file).unwrap();
+            // Categories are sorted alphabetically; "general" is the default for missing category.
+            let abc_pos = raw.find("## abc").expect("abc category present");
+            let general_pos = raw.find("## general").expect("general category present");
+            let zoo_pos = raw.find("## zoo").expect("zoo category present");
+            assert!(abc_pos < general_pos && general_pos < zoo_pos);
+            assert!(raw.contains("- Alpha fact."));
+            assert!(raw.contains("- Zebra convention."));
+            assert!(raw.contains("- General note."));
+        });
+    }
+
+    #[test]
+    fn write_mirror_file_includes_folder_annotation() {
+        with_tmp_dir(|dir| {
+            let file = dir.join("MEMORY.md");
+            let items = vec![MemoryView {
+                id: "f".into(),
+                memory: "Foldered fact.".into(),
+                scope: "global".into(),
+                category: Some("general".into()),
+                folder: Some("src/memory".into()),
+                score: None,
+                created_at: Some(1),
+                updated_at: None,
+            }];
+            render_mirror_file(&file, "folder memory", &items);
+            let raw = std::fs::read_to_string(&file).unwrap();
+            assert!(raw.contains("- Foldered fact.  _(folder: src/memory)_"));
+        });
+    }
+}
