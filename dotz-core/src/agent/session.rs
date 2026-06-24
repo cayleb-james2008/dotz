@@ -1433,19 +1433,19 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), turn).await;
         assert!(result.is_ok(), "run_turn must finish promptly after abort");
 
-        let g = sess.lock().unwrap();
-        let last = g
-            .history
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant")
-            .cloned();
+        let last = {
+            let g = sess.lock().unwrap();
+            g.history
+                .iter()
+                .rev()
+                .find(|m| m.role == "assistant")
+                .cloned()
+        };
         assert_eq!(
             last.and_then(|m| m.stop_reason).as_deref(),
             Some("aborted"),
             "aborted turn should produce an assistant message with stopReason aborted"
         );
-        drop(g);
         dispose(&sid);
 
         match prev {
@@ -1559,14 +1559,16 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), turn).await;
         assert!(result.is_ok(), "run_turn must finish promptly after abort");
 
-        let g = sess.lock().unwrap();
-        let last = g
-            .history
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant")
-            .cloned();
-        let msg = last.expect("aborted turn should produce an assistant message");
+        let msg = {
+            let g = sess.lock().unwrap();
+            let last = g
+                .history
+                .iter()
+                .rev()
+                .find(|m| m.role == "assistant")
+                .cloned();
+            last.expect("aborted turn should produce an assistant message")
+        };
         assert_eq!(
             msg.stop_reason.as_deref(),
             Some("aborted"),
@@ -1579,7 +1581,6 @@ mod tests {
             "aborted assistant message must not contain partial tool calls: {:?}",
             msg.content
         );
-        drop(g);
         dispose(&sid);
 
         match prev {
