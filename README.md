@@ -207,3 +207,11 @@ signed releases live in this one public repo. Full topology and the release comm
   to the free model so `/implement` is runnable out of the box. Edit `.pi/agents/*.md` to change models.
 - **Fonts** load from Google Fonts (online). Bundle locally for fully-offline use.
 - The UI was specced for and can be refined in [claude.ai/design](https://claude.ai/design).
+
+## License
+
+dotz is **source-available, not open source**. The official binary releases are **free to download
+and use** (personal or commercial); the source is published so you can read it and so the app can
+self-update. Copying, modifying, forking, redistributing, or reusing the source/binaries is not
+permitted without written permission. Vendored third-party content under `.pi/` (the Open Design
+systems/skills) keeps its own Apache-2.0 license. See [LICENSE](LICENSE) for the full terms.
