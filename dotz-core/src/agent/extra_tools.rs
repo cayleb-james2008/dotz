@@ -189,17 +189,62 @@ fn baselines() -> &'static Mutex<HashMap<String, Value>> {
 }
 
 /// Run the gate command in cwd (default: `npm test`), capture output, parse pass/fail counts.
-/// Pick the default gate command from the project manifest: Rust workspaces run
-/// `cargo test`, Node projects run `npm test`. The native-Rust dotz repo therefore
-/// defaults to the correct gate without every project needing an explicit command.
+/// Pick the default gate command from the project manifest: Rust crates run
+/// `cargo test -p <name>`; the dotz workspace root is detected and pinned to
+/// `cargo test -p dotz-core` (the actual project gate). Node projects run `npm test`.
 fn default_gate_command(cwd: &Path) -> String {
     if cwd.join("Cargo.toml").exists() {
-        "cargo test".into()
-    } else if cwd.join("package.json").exists() {
-        "npm test".into()
-    } else {
-        "cargo test".into()
+        if let Ok(raw) = std::fs::read_to_string(cwd.join("Cargo.toml")) {
+            if let Some(name) = cargo_package_name(&raw) {
+                return format!("cargo test -p {name}");
+            }
+            if workspace_has_dotz_core(&raw) {
+                return "cargo test -p dotz-core".into();
+            }
+        }
+        return "cargo test".into();
     }
+    if cwd.join("package.json").exists() {
+        return "npm test".into();
+    }
+    "cargo test".into()
+}
+
+/// Extract `name` from a `[package]` table (no TOML dep — frontmatter-style line scan).
+fn cargo_package_name(cargo_toml: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if in_package && trimmed.starts_with("name") {
+            if let Some(v) = trimmed.splitn(2, '=').nth(1) {
+                let v = v.trim().trim_matches(|c| c == '\"' || c == '\'');
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True when the root `Cargo.toml` is a workspace that lists `dotz-core` as a member.
+fn workspace_has_dotz_core(cargo_toml: &str) -> bool {
+    let mut in_workspace = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_workspace = trimmed == "[workspace]";
+            continue;
+        }
+        if in_workspace && (trimmed.contains("\"dotz-core\"") || trimmed.contains("'dotz-core'")) {
+            return true;
+        }
+    }
+    false
 }
 
 async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
@@ -424,6 +469,38 @@ mod tests {
     fn default_gate_command_fallback_is_cargo() {
         let dir = tmp_dir();
         assert_eq!(default_gate_command(&dir), "cargo test");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_gate_command_uses_package_name_when_present() {
+        let dir = tmp_dir();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"dotz-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            default_gate_command(&dir),
+            "cargo test -p dotz-core",
+            "a named crate should be scoped to its package"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_gate_command_uses_dotz_core_for_workspace_root() {
+        let dir = tmp_dir();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"dotz-core\", \"src-tauri\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            default_gate_command(&dir),
+            "cargo test -p dotz-core",
+            "the dotz workspace root should default to the runtime crate gate"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
