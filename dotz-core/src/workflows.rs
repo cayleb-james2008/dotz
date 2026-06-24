@@ -101,7 +101,7 @@ struct CreateStepInput {
     agent: String,
     task: String,
     #[serde(default)]
-    parents: Option<Vec<String>>,
+    parents: Option<Vec<Value>>,
     #[serde(rename = "sandboxRunId", default)]
     sandbox_run_id: Option<String>,
     #[serde(rename = "browserSessionId", default)]
@@ -136,6 +136,11 @@ fn new_id() -> String {
 // ---- disk history (<dotz_dir>/ai-agents/workflows.json) ----
 
 fn workflows_file() -> PathBuf {
+    if let Ok(p) = std::env::var("DOTZ_WORKFLOWS_FILE") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     dotz_dir().join("ai-agents").join("workflows.json")
 }
 
@@ -189,6 +194,7 @@ fn prune_active(active: &mut HashMap<String, WorkflowRun>) {
 // ---- core store ops (port of WorkflowStore methods) ----
 
 /// Marker for a cyclic submission (maps to a 400 in the POST handler).
+#[derive(Debug)]
 struct CycleError;
 
 /// Create a new run with the given steps (parents/children resolved from inputs).
@@ -228,8 +234,9 @@ fn create(
         .collect();
 
     // Resolve parent refs to real step ids. A ref may be a positional index into the input steps
-    // ("0") OR an already-assigned step id; map both. Only a NON-EMPTY all-digits ref < len is a
-    // positional index; otherwise treat the ref as a literal id. Skip self-refs and duplicates.
+    // (integer or string "0") OR an already-assigned step id; map both. Only a non-empty all-digits
+    // string ref < len is a positional index; otherwise treat the ref as a literal id. Skip invalid
+    // types, self-refs, unknown ids, and duplicates.
     let ids: Vec<String> = steps.iter().map(|s| s.id.clone()).collect();
     let len = steps.len();
     for (idx, input) in inputs.iter().enumerate() {
@@ -237,19 +244,31 @@ fn create(
             continue;
         };
         for raw in parent_refs {
-            let trimmed = raw.trim();
-            let is_index = !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
-            let resolved: String = if is_index {
-                match trimmed.parse::<usize>() {
-                    Ok(n) if n < len => ids[n].clone(),
-                    _ => raw.clone(),
+            let resolved = match raw {
+                Value::Number(n) => match n.as_i64() {
+                    Some(i) if i >= 0 && (i as usize) < len => ids[i as usize].clone(),
+                    _ => continue,
+                },
+                Value::String(s) => {
+                    let trimmed = s.trim();
+                    let is_index =
+                        !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
+                    if is_index {
+                        match trimmed.parse::<usize>() {
+                            Ok(n) if n < len => ids[n].clone(),
+                            _ => s.clone(),
+                        }
+                    } else {
+                        s.clone()
+                    }
                 }
-            } else {
-                raw.clone()
+                _ => continue,
             };
             let self_id = &steps[idx].id;
-            let exists = ids.iter().any(|i| *i == resolved);
-            if resolved != *self_id && !steps[idx].parents.contains(&resolved) && exists {
+            if resolved != *self_id
+                && ids.contains(&resolved)
+                && !steps[idx].parents.contains(&resolved)
+            {
                 steps[idx].parents.push(resolved);
             }
         }
@@ -546,6 +565,11 @@ async fn create_handler(
             if !p.is_array() {
                 return Err(bad("step parents must be an array"));
             }
+            for item in p.as_array().unwrap() {
+                if !item.is_string() && !item.is_number() {
+                    return Err(bad("step parents must be strings or numbers"));
+                }
+            }
         }
     }
 
@@ -672,4 +696,146 @@ pub fn router() -> Router<()> {
         .route("/api/workflows/{id}", get(get_handler))
         .route("/api/workflows/{id}/step", post(step_handler))
         .route("/api/workflows/{id}/abort", post(abort_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn step(agent: &str, task: &str, parents: Option<Vec<Value>>) -> CreateStepInput {
+        CreateStepInput {
+            agent: agent.into(),
+            task: task.into(),
+            parents,
+            sandbox_run_id: None,
+            browser_session_id: None,
+            tool_call_ids: None,
+            thinking: None,
+        }
+    }
+
+    fn with_tmp_workflows_file<T>(f: impl FnOnce() -> T) -> T {
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let file = std::env::temp_dir().join(format!("dotz-workflows-test-{}.json", Uuid::new_v4()));
+        std::env::set_var("DOTZ_WORKFLOWS_FILE", file.to_string_lossy().to_string());
+        let result = f();
+        let _ = std::fs::remove_file(&file);
+        drop(guard);
+        result
+    }
+
+    #[test]
+    fn numeric_parent_refs_resolve_to_step_ids() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(0)])),
+                step("c", "C", Some(vec![json!(1)])),
+            ];
+            let run = create(None, None, "test".into(), None, &inputs).unwrap();
+            let ids: Vec<_> = run.steps.iter().map(|s| s.id.clone()).collect();
+
+            assert!(run.steps[0].parents.is_empty());
+            assert_eq!(run.steps[0].status, "ready");
+            assert_eq!(run.steps[1].parents, vec![ids[0].clone()]);
+            assert_eq!(run.steps[1].status, "pending");
+            assert_eq!(run.steps[2].parents, vec![ids[1].clone()]);
+            assert_eq!(run.steps[2].status, "pending");
+        });
+    }
+
+    #[test]
+    fn string_and_numeric_parent_refs_are_equivalent() {
+        with_tmp_workflows_file(|| {
+            let numeric = create(
+                None,
+                None,
+                "numeric".into(),
+                None,
+                &[
+                    step("a", "A", None),
+                    step("b", "B", Some(vec![json!(0)])),
+                ],
+            )
+            .unwrap();
+            let string = create(
+                None,
+                None,
+                "string".into(),
+                None,
+                &[
+                    step("a", "A", None),
+                    step("b", "B", Some(vec![json!("0")])),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                numeric.steps[1].parents,
+                vec![numeric.steps[0].id.clone()],
+                "numeric positional ref must resolve to step 0"
+            );
+            assert_eq!(
+                string.steps[1].parents,
+                vec![string.steps[0].id.clone()],
+                "string positional ref must resolve to step 0"
+            );
+        });
+    }
+
+    #[test]
+    fn out_of_range_numeric_parent_is_skipped() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(99)])),
+            ];
+            let run = create(None, None, "test".into(), None, &inputs).unwrap();
+            assert!(run.steps[1].parents.is_empty());
+            assert_eq!(run.steps[1].status, "ready");
+        });
+    }
+
+    #[test]
+    fn cyclic_steps_return_cycle_error() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", Some(vec![json!(1)])),
+                step("b", "B", Some(vec![json!(0)])),
+            ];
+            assert!(
+                matches!(create(None, None, "cycle".into(), None, &inputs), Err(CycleError)),
+                "a dependency cycle must be rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn duplicate_parents_are_deduped() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(0), json!(0)])),
+            ];
+            let run = create(None, None, "dup".into(), None, &inputs).unwrap();
+            assert_eq!(run.steps[1].parents.len(), 1);
+        });
+    }
+
+    #[test]
+    fn unknown_literal_parent_id_is_skipped() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!("no-such-id")])),
+            ];
+            let run = create(None, None, "test".into(), None, &inputs).unwrap();
+            assert!(run.steps[1].parents.is_empty());
+            assert_eq!(run.steps[1].status, "ready");
+        });
+    }
 }
