@@ -4,9 +4,14 @@
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::PathBuf;
+use tokenizers::utils::truncation::TruncationParams;
 use tokenizers::Tokenizer;
 
 pub const EMBED_DIM: usize = 384;
+/// all-MiniLM-L6-v2 max position embeddings. Truncate at the tokenizer so the ONNX session never
+/// receives a sequence longer than the model can attend to, which would otherwise silently corrupt
+/// embeddings or fail downstream memory search/recall.
+const MAX_SEQ_LENGTH: usize = 512;
 
 pub struct Embedder {
     session: Session,
@@ -52,8 +57,16 @@ fn models_root() -> PathBuf {
 impl Embedder {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let base = models_root().join("Xenova").join("all-MiniLM-L6-v2");
-        let tokenizer = Tokenizer::from_file(base.join("tokenizer.json"))
+        let mut tokenizer = Tokenizer::from_file(base.join("tokenizer.json"))
             .map_err(|e| format!("tokenizer: {e}"))?;
+        // Enforce the model's context limit regardless of the bundled tokenizer config. A
+        // malformed or oversized memory text must not crash the embedder or the memory store.
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_SEQ_LENGTH,
+                ..Default::default()
+            }))
+            .map_err(|e| format!("tokenizer truncation: {e}"))?;
         let session = Session::builder()?.commit_from_file(base.join("onnx").join("model.onnx"))?;
         Ok(Self { session, tokenizer })
     }
@@ -206,5 +219,21 @@ mod tests {
                 "batch embedding {i} must match the individual embedding, got cosine {c}"
             );
         }
+    }
+
+    /// A memory text longer than the model's 512-token context limit must embed without error and
+    /// still produce a 384-dim L2-normalized vector. Without explicit tokenizer truncation, an
+    /// oversized input can silently corrupt embeddings or fail the ONNX inference.
+    #[test]
+    fn long_input_embeds_without_error_and_stays_normalized() {
+        let mut e = shared();
+        let long = "dotz ".repeat(2000);
+        let v = e.embed(&long).unwrap();
+        assert_eq!(v.len(), EMBED_DIM);
+        let norm = l2_norm(&v);
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "long input embedding must stay L2-normalized, got norm {norm}"
+        );
     }
 }
