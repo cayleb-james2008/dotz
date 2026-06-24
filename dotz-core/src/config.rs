@@ -70,19 +70,6 @@ fn strip_any_provider_prefix(model: &str) -> String {
     trimmed.to_string()
 }
 
-/// Strip a leading "{provider}/" prefix from a model id when it matches the *current* provider.
-/// This fixes the common UI mistake of pasting a full "provider/model-id" string into the
-/// executive/subagent model field, which would otherwise be sent to the upstream API verbatim and
-/// fail. Prefixes that do not match the current provider are left alone so cross-provider model
-/// namespaces (e.g. OpenRouter's "ollama/llama3") are preserved.
-fn strip_matching_provider_prefix(provider: &str, model: &str) -> String {
-    let trimmed = model.trim();
-    if let Some(rest) = trimmed.strip_prefix(&format!("{provider}/")) {
-        return rest.to_string();
-    }
-    trimmed.to_string()
-}
-
 /// Default executive model id for a provider. Falls back to the global default provider's executive
 /// when the provider has no registered default.
 fn default_executive_model(provider: &str) -> String {
@@ -153,8 +140,8 @@ pub fn load() -> DotzConfig {
     }
     // Normalize explicit model ids so a "provider/model-id" value pasted by the operator does not
     // get sent to the upstream API with a doubled provider prefix.
-    cfg.executive_model = strip_matching_provider_prefix(&cfg.provider, &cfg.executive_model);
-    cfg.subagent_model = strip_matching_provider_prefix(&cfg.provider, &cfg.subagent_model);
+    cfg.executive_model = types::strip_matching_provider_prefix(&cfg.provider, &cfg.executive_model);
+    cfg.subagent_model = types::strip_matching_provider_prefix(&cfg.provider, &cfg.subagent_model);
     apply_env(&cfg);
     cfg
 }
@@ -192,8 +179,8 @@ pub fn update(current: &DotzConfig, clean: &CleanPatch) -> std::io::Result<DotzC
     }
     // Strip a matching provider prefix from explicitly-set model ids so they reach the API as bare
     // model ids (e.g. "ollama/glm-5.2" under provider "ollama" becomes "glm-5.2").
-    next.executive_model = strip_matching_provider_prefix(&next.provider, &next.executive_model);
-    next.subagent_model = strip_matching_provider_prefix(&next.provider, &next.subagent_model);
+    next.executive_model = types::strip_matching_provider_prefix(&next.provider, &next.executive_model);
+    next.subagent_model = types::strip_matching_provider_prefix(&next.provider, &next.subagent_model);
     if let Some(t) = &clean.thinking_level {
         next.thinking_level = t.clone();
     }

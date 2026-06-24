@@ -123,6 +123,19 @@ pub fn render_low_cost_models() -> String {
     )
 }
 
+/// Strip a leading "{provider}/" prefix from a model id when it matches the current provider.
+/// This fixes the common UI mistake of pasting a full "provider/model-id" string into the model
+/// field, which would otherwise be sent to the upstream API verbatim and fail. Prefixes that do
+/// not match the current provider are preserved so cross-provider model namespaces (e.g. an
+/// OpenRouter id that starts with "ollama/") are not corrupted.
+pub fn strip_matching_provider_prefix(provider: &str, model_id: &str) -> String {
+    let trimmed = model_id.trim();
+    if let Some(rest) = trimmed.strip_prefix(&format!("{provider}/")) {
+        return rest.to_string();
+    }
+    trimmed.to_string()
+}
+
 /// (executive, subagent) defaults for a provider, if known.
 pub fn provider_default(id: &str) -> Option<(&'static str, &'static str)> {
     match id {
@@ -187,6 +200,38 @@ mod tests {
             Some(("qwen2.5-coder", "qwen2.5-coder"))
         );
         assert_eq!(provider_default("unknown"), None);
+    }
+
+    #[test]
+    fn strip_matching_provider_prefix_removes_current_provider() {
+        assert_eq!(
+            strip_matching_provider_prefix("ollama", "ollama/glm-5.2"),
+            "glm-5.2"
+        );
+    }
+
+    #[test]
+    fn strip_matching_provider_prefix_preserves_mismatched_provider() {
+        assert_eq!(
+            strip_matching_provider_prefix("openrouter", "ollama/glm-5.2"),
+            "ollama/glm-5.2"
+        );
+    }
+
+    #[test]
+    fn strip_matching_provider_prefix_preserves_bare_model_id() {
+        assert_eq!(
+            strip_matching_provider_prefix("ollama", "glm-5.2"),
+            "glm-5.2"
+        );
+    }
+
+    #[test]
+    fn strip_matching_provider_prefix_trims_whitespace() {
+        assert_eq!(
+            strip_matching_provider_prefix("ollama", "  ollama/glm-5.2  "),
+            "glm-5.2"
+        );
     }
 
     #[test]
