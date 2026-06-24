@@ -83,6 +83,17 @@ Capture, update, consolidation, and recall are **automatic** (no operator action
 durable facts from the completed exchange. Legacy `~/.dotz/ai-agents/memory.json` + project
 `memory.json` are imported once on first run (the JSON files are kept as a backup).
 
+### AGENTS.md doctrine editor
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/api/agents_md?projectId=<id>` | — | `{ content, path }` |
+| PATCH | `/api/agents_md?projectId=<id>` | `{ content: string }` | `{ ok, content, path }` |
+
+Reads or overwrites the project's root `AGENTS.md` doctrine file. `content` is the full file
+body (plain Markdown). The UI's DOCTRINE panel edits this directly; changes take effect on the
+next session context reload because AGENTS.md is read at session-build time.
+
 ### Sandbox (visual web preview + agent cursor)
 
 | Method | Path | Body | Returns |

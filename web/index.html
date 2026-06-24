@@ -428,6 +428,30 @@
       </div>
     </template>
 
+    <template id="tpl-doctrine">
+      <div class="panel" data-panel="doctrine" role="region" aria-label="Doctrine">
+        <div class="panel-head" draggable="true"><span class="panel-icon">◈</span> DOCTRINE <button class="panel-close">×</button></div>
+        <div class="panel-body doctrine-body">
+          <div class="doctrine-toolbar">
+            <button id="doctrine-reload" class="btn-mini" title="reload from AGENTS.md">↻ RELOAD</button>
+            <button id="doctrine-save" class="btn-mini btn-go" title="save to AGENTS.md">SAVE</button>
+            <span id="doctrine-status" class="doctrine-status dim mono">loading…</span>
+          </div>
+          <div class="doctrine-split">
+            <div class="doctrine-pane">
+              <div class="sb-pane-head">EDIT (AGENTS.md)</div>
+              <textarea id="doctrine-editor" class="doctrine-editor" spellcheck="false" placeholder="# AGENTS.md
+Project doctrine — conventions, architecture, standing instructions. Edits take effect on the next session context reload."></textarea>
+            </div>
+            <div class="doctrine-pane">
+              <div class="sb-pane-head">PREVIEW</div>
+              <div id="doctrine-preview" class="doctrine-preview assistant-text md"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
     <script src="/app.js"></script>
   </body>
 </html>
