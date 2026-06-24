@@ -51,7 +51,7 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
 
 async fn health(State(_s): State<Shared>) -> Json<Value> {
     Json(
-        json!({ "ok": true, "sessions": crate::agent::session_count(), "sandboxRuns": crate::sandbox::run_count() }),
+        json!({ "ok": true, "sessions": crate::agent::session_count(), "sandboxRuns": crate::sandbox::run_count(), "workflowRuns": crate::workflows::active_count() }),
     )
 }
 
@@ -299,6 +299,10 @@ mod tests {
         assert!(
             text.contains("\"sandboxRuns\""),
             "health body missing sandboxRuns field: {text}"
+        );
+        assert!(
+            text.contains("\"workflowRuns\""),
+            "health body missing workflowRuns field: {text}"
         );
 
         let _ = tx.send(());
