@@ -652,8 +652,11 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Run a tool by name. Unknown/inactive tool → Err.
+    /// Run a tool by name. Unknown or inactive tool → Err.
     pub async fn run(&self, name: &str, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        if !self.active.iter().any(|n| n == name) {
+            return Err(format!("tool is not active: {name}"));
+        }
         let tool = self
             .tools
             .get(name)
@@ -665,5 +668,44 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_rejects_inactive_tool() {
+        // bash exists in the registry but is not in the active set after we restrict it.
+        let mut restricted = ToolRegistry::new();
+        restricted.set_active(&["read".to_string()]);
+        let ctx = ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: None,
+        };
+        let err = restricted
+            .run("bash", &json!({"command": "echo hi"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not active"),
+            "inactive tool should be rejected, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_allows_active_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["bash".to_string()]);
+        let ctx = ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: None,
+        };
+        let out = registry
+            .run("bash", &json!({"command": "echo hello"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("hello"), "active bash should execute, got: {out}");
     }
 }
