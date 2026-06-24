@@ -70,6 +70,18 @@ fn strip_any_provider_prefix(model: &str) -> String {
     trimmed.to_string()
 }
 
+/// Default executive model id for a provider. Falls back to the global default provider's executive
+/// when the provider has no registered default.
+fn default_executive_model(provider: &str) -> String {
+    types::provider_default(provider)
+        .map(|(e, _)| e.to_string())
+        .unwrap_or_else(|| {
+            types::provider_default(types::DEFAULT_PROVIDER)
+                .map(|(e, _)| e.to_string())
+                .unwrap_or_default()
+        })
+}
+
 /// Default subagent model id for a provider. Falls back to the global default provider's subagent
 /// when the provider has no registered default.
 fn default_subagent_model(provider: &str) -> String {
@@ -85,17 +97,22 @@ fn default_subagent_model(provider: &str) -> String {
 /// Load config.json, clamping any invalid present field to its default (mirror loadConfig).
 pub fn load() -> DotzConfig {
     let mut cfg = DotzConfig::default();
+    let mut explicit_executive = false;
     let mut explicit_subagent = false;
+    let mut provider_invalid = false;
     if let Ok(raw) = std::fs::read_to_string(config_file()) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(p) = v.get("provider").and_then(|x| x.as_str()) {
                 if types::is_known_provider(p) {
                     cfg.provider = p.to_string();
+                } else {
+                    provider_invalid = true;
                 }
             }
             if let Some(m) = v.get("executiveModel").and_then(|x| x.as_str()) {
                 if !m.trim().is_empty() {
                     cfg.executive_model = m.to_string();
+                    explicit_executive = true;
                 }
             }
             if let Some(m) = v.get("subagentModel").and_then(|x| x.as_str()) {
@@ -111,9 +128,13 @@ pub fn load() -> DotzConfig {
             }
         }
     }
-    // If the user changed provider but never set a subagent model, derive it from the new provider
-    // instead of leaving the old provider's default in place (which would pin subagents to the wrong
-    // model/ecosystem).
+    // If the user changed provider but never set an executive/subagent model, derive both from the
+    // new provider instead of leaving stale defaults in place (which would pin the lead/sub agents
+    // to models from the previous provider's ecosystem, or break outright when the persisted
+    // provider string was invalid and clamped to the default).
+    if provider_invalid || !explicit_executive {
+        cfg.executive_model = default_executive_model(&cfg.provider);
+    }
     if !explicit_subagent {
         cfg.subagent_model = default_subagent_model(&cfg.provider);
     }
@@ -140,6 +161,10 @@ pub fn update(current: &DotzConfig, clean: &CleanPatch) -> std::io::Result<DotzC
     }
     if let Some(m) = &clean.executive_model {
         next.executive_model = m.clone();
+    } else if provider_changed {
+        // Provider changed without an explicit executive model: re-derive so the lead agent doesn't
+        // get pinned to a model from the previous provider's ecosystem.
+        next.executive_model = default_executive_model(&next.provider);
     }
     if let Some(m) = &clean.subagent_model {
         next.subagent_model = m.clone();
@@ -343,6 +368,66 @@ mod tests {
         });
     }
 
+    /// A config that switches provider without specifying an executive model must not keep the old
+    /// provider's executive model (which would produce an invalid provider/model pair at runtime).
+    #[test]
+    fn load_derives_executive_model_when_missing() {
+        with_tmp_dir(|_| {
+            let cfg = DotzConfig {
+                provider: "ollama".into(),
+                executive_model: "glm-5.2".into(),
+                subagent_model: "minimax-m3".into(),
+                thinking_level: "medium".into(),
+            };
+            save(&cfg).unwrap();
+
+            // Provider changes to openrouter, but executiveModel is omitted.
+            let file = config_file();
+            std::fs::write(
+                &file,
+                r#"{
+  "provider": "openrouter",
+  "subagentModel": "nex-agi/nex-n2-pro:free",
+  "thinkingLevel": "medium"
+}"#,
+            )
+            .unwrap();
+
+            let loaded = load();
+            assert_eq!(loaded.provider, "openrouter");
+            assert_eq!(
+                loaded.executive_model, "nex-agi/nex-n2-pro:free",
+                "executive_model must be derived from the configured provider when omitted"
+            );
+        });
+    }
+
+    /// An invalid persisted provider is clamped to the default provider, and the executive model
+    /// must be re-derived so it matches the clamped provider instead of keeping a stale value
+    /// from the invalid one.
+    #[test]
+    fn load_derives_executive_model_when_provider_invalid() {
+        with_tmp_dir(|_| {
+            let file = config_file();
+            std::fs::write(
+                &file,
+                r#"{
+  "provider": "not-a-real-provider",
+  "executiveModel": "some-foreign-model",
+  "thinkingLevel": "medium"
+}"#,
+            )
+            .unwrap();
+
+            let loaded = load();
+            assert_eq!(loaded.provider, types::DEFAULT_PROVIDER);
+            assert_eq!(
+                loaded.executive_model, "glm-5.2",
+                "executive_model must be derived after an invalid provider is clamped to default"
+            );
+        });
+    }
+
     #[test]
     fn update_re_derives_subagent_model_when_provider_changes() {
         with_tmp_dir(|_| {
@@ -365,6 +450,30 @@ mod tests {
             assert_eq!(
                 std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
                 "openrouter/nex-agi/nex-n2-pro:free"
+            );
+        });
+    }
+
+    /// Changing provider via update() without an explicit executive model must re-derive it, just
+    /// like subagent_model, so the lead agent doesn't end up with the previous provider's model.
+    #[test]
+    fn update_re_derives_executive_model_when_provider_changes() {
+        with_tmp_dir(|_| {
+            let base = DotzConfig {
+                provider: "ollama".into(),
+                executive_model: "glm-5.2".into(),
+                subagent_model: "minimax-m3".into(),
+                thinking_level: "high".into(),
+            };
+            let patch = CleanPatch {
+                provider: Some("openrouter".into()),
+                ..Default::default()
+            };
+            let next = update(&base, &patch).unwrap();
+            assert_eq!(next.provider, "openrouter");
+            assert_eq!(
+                next.executive_model, "nex-agi/nex-n2-pro:free",
+                "provider change without explicit executive_model must re-derive"
             );
         });
     }
