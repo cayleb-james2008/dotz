@@ -225,6 +225,12 @@ pub fn create(opts: CreateOpts) -> Result<Value, String> {
         provider: cfg.provider.clone(),
         model_id: cfg.executive_model.clone(),
     });
+    // Normalize a redundant "provider/model-id" prefix so the upstream API receives a bare
+    // model id, matching the global config normalization behavior.
+    let model = types::ModelRef {
+        provider: model.provider.clone(),
+        model_id: types::strip_matching_provider_prefix(&model.provider, &model.model_id),
+    };
     let thinking = thinking.unwrap_or_else(|| profile.thinking_level.to_string());
 
     let system_prompt =
@@ -1009,7 +1015,7 @@ pub fn set_model(id: &str, provider_id: &str, model_id: &str) -> Result<Value, S
     let s = get(id).ok_or("no such session")?;
     let mut g = session_guard(&s);
     g.provider = provider_id.to_string();
-    g.model_id = model_id.to_string();
+    g.model_id = types::strip_matching_provider_prefix(provider_id, model_id);
     Ok(g.summary())
 }
 
@@ -1097,6 +1103,59 @@ mod tests {
             !sess.lock().unwrap().turn_active.load(Ordering::SeqCst),
             "TurnGuard must clear turn_active on drop"
         );
+        dispose(&sid);
+    }
+
+    /// A model id pasted with a redundant "provider/" prefix must be normalized to a bare id so
+    /// the upstream API receives the correct value. Without this, "ollama/glm-5.2" under the
+    /// "ollama" provider would be sent verbatim and fail.
+    #[test]
+    fn create_normalizes_redundant_provider_prefix_in_model() {
+        let opts = CreateOpts {
+            model: Some(types::ModelRef {
+                provider: "ollama".into(),
+                model_id: "ollama/glm-5.2".into(),
+            }),
+            ..Default::default()
+        };
+        let summary = create(opts).unwrap();
+        assert_eq!(summary["model"]["provider"], "ollama");
+        assert_eq!(summary["model"]["modelId"], "glm-5.2");
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        dispose(&sid);
+    }
+
+    /// A mismatched provider prefix must be preserved so cross-provider model namespaces are
+    /// not corrupted (e.g. an OpenRouter id that starts with "ollama/").
+    #[test]
+    fn create_preserves_mismatched_provider_prefix_in_model() {
+        let opts = CreateOpts {
+            model: Some(types::ModelRef {
+                provider: "openrouter".into(),
+                model_id: "ollama/glm-5.2".into(),
+            }),
+            ..Default::default()
+        };
+        let summary = create(opts).unwrap();
+        assert_eq!(summary["model"]["provider"], "openrouter");
+        assert_eq!(summary["model"]["modelId"], "ollama/glm-5.2");
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        dispose(&sid);
+    }
+
+    /// set_model must apply the same provider-prefix normalization as create.
+    #[test]
+    fn set_model_normalizes_redundant_provider_prefix() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let updated = set_model(
+            &sid,
+            "ollama",
+            "  ollama/glm-5.2  "
+        )
+        .unwrap();
+        assert_eq!(updated["model"]["provider"], "ollama");
+        assert_eq!(updated["model"]["modelId"], "glm-5.2");
         dispose(&sid);
     }
 
