@@ -64,17 +64,24 @@ struct SkillView {
 }
 
 /// Resolve the bundled `.pi` dir the way `design.rs` / the Node code does: a `DOTZ_PI` override
-/// (pointing at the `.pi` dir itself), else `<cwd>/.pi`.
-fn pi_dir() -> PathBuf {
-    std::env::var("DOTZ_PI")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".pi")
-        })
+/// (pointing at the `.pi` dir itself), else `<cwd>/.pi`, else the workspace root derived from
+/// this crate's manifest (used when tests run from the `dotz-core` package dir).
+pub fn pi_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("DOTZ_PI") {
+        if !d.is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    let cwd_pi = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".pi");
+    if cwd_pi.exists() {
+        return cwd_pi;
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.join(".pi"))
+        .unwrap_or(cwd_pi)
 }
 
 /// `~/.dotz/ai-agents/skills` — the per-user dotz skill root, honoring `DOTZ_CONFIG_DIR` via
@@ -428,6 +435,22 @@ fn not_found() -> Response {
 /// (96+ skills here) must NOT dump every full description into every turn's prompt; the overflow is
 /// summarized and any skill is still loadable by name via the `skill` tool.
 const INDEX_CAP: usize = 80;
+
+/// Skill rows formatted for the composer slash-palette (`GET /api/sessions/:id/commands`).
+/// Each row is `{ name, description, kind: "skill" }` so the UI can mix presets and skills.
+pub fn command_views() -> Vec<serde_json::Value> {
+    let guard = index().lock().unwrap();
+    guard
+        .values()
+        .map(|s| {
+            json!({
+                "name": s.name.clone(),
+                "description": s.description.clone(),
+                "kind": "skill",
+            })
+        })
+        .collect()
+}
 
 /// Render the skill index (names + truncated descriptions) for system-prompt injection. Byte-faithful
 /// to skillLoader.renderIndex(): capped at `INDEX_CAP` rows, each description clipped to 160 chars,
