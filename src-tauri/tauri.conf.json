@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "dotz",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "identifier": "com.cayleb.dotz",
   "build": {
     "frontendDist": "../web"
@@ -28,9 +28,9 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/cayleb-james2008/dotz-releases/releases/latest/download/latest.json"
+        "https://github.com/cayleb-james2008/dotz/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI4RDREMTRCOUQ3MThGMzkKUldRNWozR2RTOUhVS0I2bVV2WEJQNS9YQ3BnS1BlbjVVUFhSN1E0MnFZOW5BVHd4bHZnekFtdmMK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzMTgzMTA5QUU3RTlBMEQKUldRTm1uNnVDVEVZOHo1eE0vV1kxOC9VMjRlUjlxVytmTDNNcW1pbDk5dnQ4Smo1T0RBWDZYMUwK"
     }
   }
 }
