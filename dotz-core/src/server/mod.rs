@@ -105,19 +105,16 @@ async fn post_config(
         }
     }
 
-    let next = {
-        let guard = s.config.lock().unwrap();
-        let n = config::update(&guard, &clean).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("failed to persist config: {e}") })),
-            )
-        })?;
-        drop(guard);
-        let mut guard = s.config.lock().unwrap();
-        *guard = n.clone();
-        n
-    };
+    // Hold one lock across read → persist → write-back so concurrent POSTs cannot
+    // interleave: a later request must see the persisted state of an earlier one.
+    let mut guard = s.config.lock().unwrap();
+    let next = config::update(&guard, &clean).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to persist config: {e}") })),
+        )
+    })?;
+    *guard = next.clone();
     Ok(Json(json!({ "config": next })))
 }
 
@@ -156,6 +153,72 @@ pub async fn serve(addr: SocketAddr, web_dir: PathBuf) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Two concurrent POST /api/config patches on different fields must both survive: the
+    /// second request has to observe the first request's persisted state, not the original
+    /// in-memory snapshot. Before the single-lock fix the save/write-back window let one patch
+    /// overwrite the other in memory and on disk. We use OS threads + a barrier to force real
+    /// contention; the tokio task scheduler alone does not interleave the synchronous bodies.
+    #[test]
+    fn post_config_serializes_concurrent_updates() {
+        use std::sync::Barrier;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let guard = LOCK.lock().unwrap();
+
+        let dir =
+            std::env::temp_dir().join(format!("dotz-server-config-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev_dir = std::env::var("DOTZ_CONFIG_DIR").ok();
+        let prev_subagent = std::env::var("DOTZ_SUBAGENT_MODEL").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+
+        let state = Arc::new(AppState {
+            config: Mutex::new(config::load()),
+        });
+        let barrier = Arc::new(Barrier::new(2));
+
+        let spawn = |state: Arc<AppState>, barrier: Arc<Barrier>, body: Value| {
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                barrier.wait();
+                rt.block_on(post_config(State(state), Some(Json(body))))
+                    .unwrap()
+            })
+        };
+
+        let t1 = spawn(
+            state.clone(),
+            barrier.clone(),
+            json!({ "provider": "openrouter" }),
+        );
+        let t2 = spawn(state.clone(), barrier.clone(), json!({ "thinkingLevel": "xhigh" }));
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        let in_memory = state.config.lock().unwrap().clone();
+        assert_eq!(in_memory.provider, "openrouter");
+        assert_eq!(in_memory.thinking_level, "xhigh");
+
+        // Persisted file must also reflect both mutations (not just whichever save happened last).
+        let persisted = config::load();
+        assert_eq!(persisted.provider, "openrouter");
+        assert_eq!(persisted.thinking_level, "xhigh");
+
+        // Returned JSON matches the final in-memory config.
+        assert_eq!(r1.0["config"]["provider"], "openrouter");
+        assert_eq!(r2.0["config"]["thinkingLevel"], "xhigh");
+
+        match prev_dir {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        match prev_subagent {
+            Some(p) => std::env::set_var("DOTZ_SUBAGENT_MODEL", p),
+            None => std::env::remove_var("DOTZ_SUBAGENT_MODEL"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(guard);
+    }
 
     #[tokio::test]
     async fn health_endpoint_ok_and_graceful_shutdown_works() {
