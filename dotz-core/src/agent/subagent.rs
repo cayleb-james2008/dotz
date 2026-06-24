@@ -1019,7 +1019,7 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
         );
         return Dispatch {
             text,
-            is_error: false,
+            is_error: success != results.len(),
             details: make_details("parallel", results),
         };
     }
@@ -1158,6 +1158,33 @@ mod tests {
             names.contains(&"bash".to_string()),
             "explicit agent.tools listing bash should be honored"
         );
+    }
+
+    /// A parallel subagent fan-out must report `is_error: true` when any of its tasks fail.
+    /// Single and chain modes already do this; parallel was returning success even when every
+    /// subagent errored, which misled the executive loop and workflow graph.
+    #[tokio::test]
+    async fn parallel_dispatch_marks_error_when_tasks_fail() {
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+        let args = json!({
+            "tasks": [
+                { "agent": "dotz-parallel-unknown-1", "task": "task" },
+                { "agent": "dotz-parallel-unknown-2", "task": "task" }
+            ]
+        });
+        let d = dispatch(&args, &cwd).await;
+        assert!(
+            d.is_error,
+            "parallel dispatch must report error when tasks fail: {}",
+            d.text
+        );
+        assert!(
+            d.text.contains("0/2 succeeded"),
+            "summary should report zero successes: {}",
+            d.text
+        );
+        assert_eq!(d.details.mode, "parallel");
+        assert_eq!(d.details.results.len(), 2);
     }
 
     /// The configurable subagent timeout must clamp to sane bounds. A zero or extremely small
