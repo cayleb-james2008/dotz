@@ -517,14 +517,25 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             }
         }
 
-        // Join the stream task to surface a transport error as an error message.
+        // If the user aborted, make sure the final message reports it even if the stream channel
+        // closed before the select re-evaluated the cancel branch.
+        let aborted = cancel.is_cancelled();
+        if aborted {
+            stop_reason = "aborted".into();
+        }
+
+        // Join the stream task. If the user aborted we abort the provider task first so a hung
+        // network read does not keep the turn alive; its result is irrelevant.
+        if aborted {
+            stream_task.abort();
+        }
         match stream_task.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+            Ok(Err(e)) if !aborted => {
                 finish_error(&session, &e, tool_results);
                 return;
             }
-            Err(e) => {
+            Err(e) if !aborted => {
                 finish_error(
                     &session,
                     &format!("stream task panicked: {e}"),
@@ -532,6 +543,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
                 );
                 return;
             }
+            _ => {}
         }
 
         acc.msg.stop_reason = Some(stop_reason.clone());
@@ -967,6 +979,8 @@ pub fn models(id: &str) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::agent::tools;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn turn_guard_clears_flag_on_drop() {
@@ -1192,5 +1206,94 @@ mod tests {
         assert_eq!(results[0]["toolName"], "bash");
         assert_eq!(results[0]["isError"], true);
         assert_eq!(results[0]["result"]["output"], "hello");
+    }
+
+    /// A hung provider stream must not keep run_turn alive after session::abort. Before the
+    /// abort-task fix, the loop would leave the provider task running and await it, stalling until
+    /// the network stack gave up.
+    #[tokio::test]
+    async fn run_turn_aborts_hung_stream_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        // Server: accept one connection, drain request headers, send an SSE 200, then park until
+        // the test drops the signal.
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel::<()>();
+        let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::with_capacity(8192);
+            loop {
+                let mut tmp = [0u8; 1024];
+                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+            let _ = stream.write_all(response).await;
+            let _ = headers_tx.send(());
+            let _ = server_rx.recv().await;
+        });
+
+        let prev = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
+        std::env::set_var(
+            "DOTZ_LOCAL_BASE_URL",
+            format!("http://127.0.0.1:{port}/v1"),
+        );
+
+        let opts = CreateOpts {
+            model: Some(types::ModelRef {
+                provider: "local".into(),
+                model_id: "test".into(),
+            }),
+            ..Default::default()
+        };
+        let summary = create(opts).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+
+        let mut turn = tokio::spawn(run_turn(sess.clone(), "hello".into()));
+
+        // Wait until the SSE response headers are on the wire. If the turn finishes first, the
+        // provider never connected and the test should fail with a clear message.
+        tokio::select! {
+            _ = headers_rx => {}
+            r = &mut turn => panic!("turn finished before provider stream started: {r:?}"),
+        }
+
+        assert!(abort(&sid), "abort should find the active session");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), turn).await;
+        assert!(
+            result.is_ok(),
+            "run_turn must finish promptly after abort"
+        );
+
+        let g = sess.lock().unwrap();
+        let last = g
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .cloned();
+        assert_eq!(
+            last.and_then(|m| m.stop_reason).as_deref(),
+            Some("aborted"),
+            "aborted turn should produce an assistant message with stopReason aborted"
+        );
+        drop(g);
+        dispose(&sid);
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
+            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+        }
+        let _ = server_tx.send(()).await;
     }
 }
