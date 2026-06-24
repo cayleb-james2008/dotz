@@ -444,6 +444,16 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         format!("{system_prompt}\n\n{recall_block}")
     };
 
+    // Notify the UI of the recalled memories for this turn (contract: {kind:"memory_recall", items}).
+    {
+        let s = session.lock().unwrap();
+        let _ = s.tx.send(serde_json::json!({
+            "kind": "memory_recall",
+            "sessionId": s.id,
+            "items": recall,
+        }));
+    }
+
     let ctx = ToolCtx {
         cwd: cwd.clone(),
         tx: Some(session.lock().unwrap().tx.clone()),
@@ -982,6 +992,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    /// Serializes the two hung-SSE tests below so they don't race on the
+    /// process-global `DOTZ_LOCAL_BASE_URL` env var.
+    static SSE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn turn_guard_clears_flag_on_drop() {
         let summary = create(CreateOpts::default()).unwrap();
@@ -1213,6 +1227,7 @@ mod tests {
     /// the network stack gave up.
     #[tokio::test]
     async fn run_turn_aborts_hung_stream_promptly() {
+        let _guard = SSE_TEST_LOCK.lock().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
@@ -1242,10 +1257,7 @@ mod tests {
         });
 
         let prev = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
-        std::env::set_var(
-            "DOTZ_LOCAL_BASE_URL",
-            format!("http://127.0.0.1:{port}/v1"),
-        );
+        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
 
         let opts = CreateOpts {
             model: Some(types::ModelRef {
@@ -1270,10 +1282,7 @@ mod tests {
         assert!(abort(&sid), "abort should find the active session");
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), turn).await;
-        assert!(
-            result.is_ok(),
-            "run_turn must finish promptly after abort"
-        );
+        assert!(result.is_ok(), "run_turn must finish promptly after abort");
 
         let g = sess.lock().unwrap();
         let last = g
@@ -1288,6 +1297,93 @@ mod tests {
             "aborted turn should produce an assistant message with stopReason aborted"
         );
         drop(g);
+        dispose(&sid);
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
+            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+        }
+        let _ = server_tx.send(()).await;
+    }
+
+    /// The UI renders the recalled-memory list from a `{kind:"memory_recall"}` WS frame.
+    /// run_turn must emit it after building the effective system prompt so the operator sees what
+    /// memories informed the turn, even while the model stream is still in progress.
+    #[tokio::test]
+    async fn run_turn_emits_memory_recall_before_streaming() {
+        let _guard = SSE_TEST_LOCK.lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel::<()>();
+        let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::with_capacity(8192);
+            loop {
+                let mut tmp = [0u8; 1024];
+                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+            let _ = stream.write_all(response).await;
+            let _ = headers_tx.send(());
+            let _ = server_rx.recv().await;
+        });
+
+        let prev = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
+        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+
+        let opts = CreateOpts {
+            model: Some(types::ModelRef {
+                provider: "local".into(),
+                model_id: "test".into(),
+            }),
+            ..Default::default()
+        };
+        let summary = create(opts).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        let mut turn = tokio::spawn(run_turn(sess.clone(), "what is the gate command?".into()));
+
+        tokio::select! {
+            _ = headers_rx => {}
+            r = &mut turn => panic!("turn finished before provider stream started: {r:?}"),
+        }
+
+        assert!(abort(&sid), "abort should find the active session");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), turn).await;
+        assert!(result.is_ok(), "run_turn must finish promptly after abort");
+
+        let mut found = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.get("kind").and_then(|k| k.as_str()) == Some("memory_recall") {
+                assert_eq!(
+                    frame.get("sessionId").and_then(|s| s.as_str()),
+                    Some(sid.as_str())
+                );
+                assert!(
+                    frame.get("items").and_then(|i| i.as_array()).is_some(),
+                    "memory_recall must carry an items array"
+                );
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "memory_recall event should be emitted during run_turn"
+        );
+
         dispose(&sid);
 
         match prev {
