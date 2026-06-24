@@ -17,6 +17,7 @@ pub mod subagent;
 pub mod tools;
 
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
         Path, Query,
@@ -29,6 +30,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 use crate::{skills, types};
@@ -310,14 +312,8 @@ async fn post_abort(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, 
 async fn post_reload(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match session::reload(&id) {
         Ok(summary) => Ok(Json(summary)),
-        Err(e) if e.contains("busy") => Err((
-            StatusCode::CONFLICT,
-            Json(json!({ "error": e })),
-        )),
-        Err(e) => Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": e })),
-        )),
+        Err(e) if e.contains("busy") => Err((StatusCode::CONFLICT, Json(json!({ "error": e })))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({ "error": e })))),
     }
 }
 
@@ -359,6 +355,17 @@ async fn recv_broadcast(rx: &mut broadcast::Receiver<Value>) -> Option<Value> {
     }
 }
 
+/// Configurable WebSocket keep-alive interval. Browsers and most clients auto-respond to ping
+/// frames with pong, which keeps idle connections alive through proxies/firewalls. Defaults to
+/// 30s; override with `DOTZ_WS_PING_INTERVAL_MS` (e.g. for fast tests).
+fn ws_ping_interval() -> Duration {
+    std::env::var("DOTZ_WS_PING_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(30))
+}
+
 async fn ws_loop(socket: WebSocket, session_id: String) {
     let (mut sink, mut stream) = socket.split();
 
@@ -391,18 +398,36 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
     let done = tokio_util::sync::CancellationToken::new();
     let done2 = done.clone();
 
-    // Fan agent events (broadcast) → socket.
+    // Fan agent events (broadcast) → socket, plus periodic keep-alive pings. The ping keeps the
+    // connection alive through proxies that drop idle sockets; browsers auto-pong in response.
+    let ping_interval = ws_ping_interval();
     let fan = tokio::spawn(async move {
-        while let Some(frame) = recv_broadcast(&mut rx).await {
-            if sink
-                .send(WsMessage::Text(frame.to_string().into()))
-                .await
-                .is_err()
-            {
-                break;
+        let start = tokio::time::Instant::now() + ping_interval;
+        let mut ping_tick = tokio::time::interval_at(start, ping_interval);
+        ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = done2.cancelled() => break,
+                _ = ping_tick.tick() => {
+                    if sink.send(WsMessage::Ping(Bytes::new())).await.is_err() {
+                        break;
+                    }
+                }
+                frame = recv_broadcast(&mut rx) => {
+                    match frame {
+                        Some(f) => {
+                            if sink.send(WsMessage::Text(f.to_string().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
             }
         }
-        // Broadcast closed means the session was disposed. Wake the reader so the socket drops.
+        // Broadcast closed means the session was disposed, or the socket send failed. Wake the
+        // reader so the socket drops promptly.
         done2.cancel();
     });
 
@@ -494,6 +519,10 @@ pub fn session_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serialize WebSocket integration tests that mutate the process-global ping-interval env var
+    /// so they do not interfere with each other when run concurrently.
+    static WS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn recv_broadcast_returns_none_when_closed() {
@@ -677,6 +706,8 @@ mod tests {
         use std::time::Duration;
         use tokio_tungstenite::connect_async;
 
+        let _guard = WS_TEST_LOCK.lock().await;
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
@@ -726,6 +757,84 @@ mod tests {
         assert!(
             handle.await.unwrap().is_ok(),
             "server should shut down cleanly"
+        );
+    }
+
+    /// A connected WebSocket should receive periodic keep-alive ping frames from the server.
+    /// Browsers and compliant clients auto-respond with pong, keeping idle sessions alive through
+    /// proxies and firewalls that drop silent connections.
+    #[tokio::test]
+    async fn websocket_sends_keepalive_pings() {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        use tokio_tungstenite::connect_async;
+
+        let _guard = WS_TEST_LOCK.lock().await;
+
+        // Use a very short ping interval so the test finishes quickly.
+        let prev_interval = std::env::var("DOTZ_WS_PING_INTERVAL_MS").ok();
+        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "100");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(crate::server::serve_with_shutdown(
+            listener,
+            std::path::PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/sessions"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let summary = resp.json::<Value>().await.unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let url = format!("ws://127.0.0.1:{port}/ws?sessionId={sid}");
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(
+            ready.to_text().unwrap().contains("\"ready\""),
+            "first WS frame should be ready: {ready:?}"
+        );
+
+        let mut found_ping = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), ws.next()).await {
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::protocol::Message::Ping(_)))) => {
+                    found_ping = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+
+        match prev_interval {
+            Some(p) => std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p),
+            None => std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS"),
+        }
+
+        // The server should also still be healthy after the ping exchange.
+        let _ = tx.send(());
+        assert!(
+            handle.await.unwrap().is_ok(),
+            "server should shut down cleanly"
+        );
+        assert!(
+            found_ping,
+            "expected a WebSocket ping frame from the server"
         );
     }
 }
