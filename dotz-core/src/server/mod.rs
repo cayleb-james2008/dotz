@@ -41,8 +41,7 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
 }
 
 async fn health(State(_s): State<Shared>) -> Json<Value> {
-    // ponytail: sessions/sandboxRuns are 0 until those stores land (Phase 3/4).
-    Json(json!({ "ok": true, "sessions": crate::agent::session_count(), "sandboxRuns": 0 }))
+    Json(json!({ "ok": true, "sessions": crate::agent::session_count(), "sandboxRuns": crate::sandbox::run_count() }))
 }
 
 async fn providers() -> Json<Value> {
@@ -177,6 +176,10 @@ mod tests {
         assert!(
             text.contains("\"ok\":true") || text.contains("\"ok\": true"),
             "health body missing ok:true: {text}"
+        );
+        assert!(
+            text.contains("\"sandboxRuns\""),
+            "health body missing sandboxRuns field: {text}"
         );
 
         let _ = tx.send(());

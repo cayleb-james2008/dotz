@@ -96,6 +96,11 @@ fn runs() -> &'static Mutex<HashMap<String, RunEntry>> {
     RUNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Live sandbox run count, for the `/api/health` merge.
+pub fn run_count() -> usize {
+    runs().lock().unwrap().len()
+}
+
 pub fn router() -> Router<()> {
     Router::new()
         .route("/api/sandbox/languages", get(languages))
@@ -494,4 +499,44 @@ fn bad(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
 
 fn not_found(msg: &str) -> (StatusCode, Json<Value>) {
     (StatusCode::NOT_FOUND, Json(json!({ "error": msg })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_count_reflects_store_entries() {
+        let baseline = run_count();
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut store = runs().lock().unwrap();
+            store.insert(
+                id.clone(),
+                RunEntry {
+                    run: SandboxRun {
+                        id: id.clone(),
+                        project_id: None,
+                        language: "shell".to_string(),
+                        code: String::new(),
+                        status: "running".to_string(),
+                        output: String::new(),
+                        exit_code: None,
+                        started_at: now_ms(),
+                        ended_at: None,
+                    },
+                    pid: None,
+                    killed_by_us: false,
+                    mode: "terminal".to_string(),
+                    port: None,
+                },
+            );
+        }
+        assert_eq!(run_count(), baseline + 1, "run_count should include the inserted entry");
+        {
+            let mut store = runs().lock().unwrap();
+            store.remove(&id);
+        }
+        assert_eq!(run_count(), baseline, "run_count should return to baseline after removal");
+    }
 }
