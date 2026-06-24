@@ -17,7 +17,7 @@
 //! Auth resolves `$GEMINI_API_KEY` first, falling back to `$GOOGLE_API_KEY`, and sends the key
 //! as the `key` query parameter.
 use super::event::{Cost, Usage};
-use super::provider::{resolve_api_key, ChatRequest, Provider, StreamDelta};
+use super::provider::{request_timeout, resolve_api_key, ChatRequest, Provider, StreamDelta};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -85,6 +85,7 @@ impl Provider for GoogleGemini {
         let resp = self
             .client
             .post(&url)
+            .timeout(request_timeout())
             .header("content-type", "application/json")
             .json(&body)
             .send()
