@@ -18,6 +18,14 @@ pub struct Embedder {
     tokenizer: Tokenizer,
 }
 
+/// True when the bundled ONNX model files are present at the resolved models root. Used by the
+/// health endpoint so operators can see at a glance whether memory / recall (which depend on the
+/// `ort` embedder) are going to work.
+pub fn model_files_present() -> bool {
+    let base = models_root().join("Xenova").join("all-MiniLM-L6-v2");
+    base.join("tokenizer.json").exists() && base.join("onnx").join("model.onnx").exists()
+}
+
 /// assets/models root: DOTZ_MODELS (the models dir) | DOTZ_ASSETS/models | <cwd>/assets/models |
 /// <workspace>/assets/models derived from the crate manifest dir. The manifest fallback makes
 /// tests and binaries runnable from the `dotz-core` crate dir as well as the workspace root.
@@ -129,6 +137,10 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
+    // Serialize tests that mutate the process-global `DOTZ_MODELS` env var so they do not race
+    // with the shared embedder initialization or with each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     // The ONNX Session + Tokenizer are not cheap to create; share one instance across tests and
     // serialize on it so parallel test runners do not load the model multiple times.
     static EMBEDDER: OnceLock<Mutex<Embedder>> = OnceLock::new();
@@ -235,5 +247,32 @@ mod tests {
             (norm - 1.0).abs() < 1e-4,
             "long input embedding must stay L2-normalized, got norm {norm}"
         );
+    }
+
+    /// `model_files_present` must reflect whether the tokenizer + ONNX files exist at the resolved
+    /// models root. When the bundled model is present (the normal case) it is true; with an
+    /// intentionally bogus DOTZ_MODELS override it is false.
+    #[test]
+    fn model_files_present_matches_disk_state() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Normal workspace/crate layout: the bundled model should be discoverable.
+        assert!(
+            model_files_present(),
+            "bundled all-MiniLM-L6-v2 files should be present"
+        );
+
+        let prev = std::env::var("DOTZ_MODELS").ok();
+        let tmp = std::env::temp_dir().join(format!("dotz-embed-missing-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("DOTZ_MODELS", &tmp);
+        assert!(
+            !model_files_present(),
+            "bogus DOTZ_MODELS dir should report embedder not ready"
+        );
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_MODELS", p),
+            None => std::env::remove_var("DOTZ_MODELS"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
