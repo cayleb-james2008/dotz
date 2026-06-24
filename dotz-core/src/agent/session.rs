@@ -470,6 +470,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
                     &format!(
                         "provider '{provider_id}' not resolvable (anthropic/google are Phase 3b)"
                     ),
+                    tool_results,
                 );
                 return;
             }
@@ -520,11 +521,11 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         match stream_task.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                finish_error(&session, &e);
+                finish_error(&session, &e, tool_results);
                 return;
             }
             Err(e) => {
-                finish_error(&session, &format!("stream task panicked: {e}"));
+                finish_error(&session, &format!("stream task panicked: {e}"), tool_results);
                 return;
             }
         }
@@ -842,7 +843,13 @@ fn finish_turn(
 }
 
 /// Finish the turn with an error assistant message (stopReason "error").
-fn finish_error(session: &std::sync::Arc<Mutex<AgentSession>>, detail: &str) {
+/// Any tool results already collected this turn are preserved in `turn_end.toolResults` so the
+/// UI can still surface sandbox/workflow links even when the model stream fails.
+fn finish_error(
+    session: &std::sync::Arc<Mutex<AgentSession>>,
+    detail: &str,
+    tool_results: Vec<ToolResult>,
+) {
     let mut s = session.lock().unwrap();
     let mut msg = Message::assistant_shell(&s.provider, &s.model_id, now_ms());
     msg.stop_reason = Some("error".into());
@@ -866,7 +873,7 @@ fn finish_error(session: &std::sync::Arc<Mutex<AgentSession>>, detail: &str) {
         &s,
         &AgentEvent::TurnEnd {
             message: msg,
-            tool_results: Vec::new(),
+            tool_results,
         },
     );
     emit(
@@ -998,7 +1005,7 @@ mod tests {
         let sess = get(&sid).unwrap();
         let mut rx = sess.lock().unwrap().tx.subscribe();
 
-        finish_error(&sess, "provider unreachable");
+        finish_error(&sess, "provider unreachable", Vec::new());
 
         let mut kinds: Vec<String> = Vec::new();
         while let Ok(frame) = rx.try_recv() {
@@ -1027,6 +1034,50 @@ mod tests {
             start_pos.unwrap() < end_pos.unwrap(),
             "message_start must precede message_end in error path: {kinds:?}"
         );
+    }
+
+    #[test]
+    fn finish_error_preserves_tool_results_in_turn_end() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        let result = ToolResult {
+            tool_call_id: "tc-1".into(),
+            tool_name: "bash".into(),
+            is_error: true,
+            result: json!({ "output": "hello" }),
+        };
+        finish_error(&sess, "provider unreachable", vec![result]);
+
+        let mut found = None;
+        while let Ok(frame) = rx.try_recv() {
+            if let Some("turn_end") = frame
+                .get("event")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str())
+            {
+                found = Some(frame);
+            }
+        }
+
+        dispose(&sid);
+
+        let event = found
+            .expect("turn_end event should be emitted")
+            .get("event")
+            .cloned()
+            .unwrap();
+        let results = event
+            .get("toolResults")
+            .and_then(|v| v.as_array())
+            .expect("turn_end should include toolResults");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["toolCallId"], "tc-1");
+        assert_eq!(results[0]["toolName"], "bash");
+        assert_eq!(results[0]["isError"], true);
+        assert_eq!(results[0]["result"]["output"], "hello");
     }
 
     #[test]
