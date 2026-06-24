@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// One streamed increment from the provider, normalized across model dialects.
@@ -81,6 +82,21 @@ pub fn resolve_api_key(reference: &str) -> String {
         return std::env::var(var).unwrap_or_default();
     }
     r.to_string()
+}
+
+/// Configurable HTTP request timeout for every upstream LLM call. A hung provider connection
+/// otherwise blocks the executive turn (or a subagent) indefinitely. Defaults to 5 minutes;
+/// override with `DOTZ_PROVIDER_TIMEOUT_MS` (clamped to [1s, 1h]).
+pub(crate) fn request_timeout() -> Duration {
+    const DEFAULT_MS: u64 = 300_000; // 5 minutes
+    const MIN_MS: u64 = 1_000;       // 1 second
+    const MAX_MS: u64 = 3_600_000;   // 1 hour
+    std::env::var("DOTZ_PROVIDER_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|ms| ms.clamp(MIN_MS, MAX_MS))
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_MS))
 }
 
 // ---- catalog (port of the .pi provider registrations + types.ts PROVIDERS) ----
@@ -208,6 +224,7 @@ impl Provider for OpenAiChat {
         let resp = self
             .client
             .post(&url)
+            .timeout(request_timeout())
             .bearer_auth(key)
             .json(&body)
             .send()
@@ -503,5 +520,77 @@ mod tests {
         );
         assert_eq!(arg_chunks, 2, "both argument fragments should still be delivered");
         assert_eq!(final_stop, "tool_use");
+    }
+
+    /// A hung provider that accepts the HTTP connection but never sends a response must not block
+    /// the adapter forever. The configurable `DOTZ_PROVIDER_TIMEOUT_MS` bounds the wait and the
+    /// adapter returns an error promptly.
+    #[tokio::test]
+    async fn provider_request_times_out_on_hung_endpoint() {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = LOCK.lock().await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        // Server: accept the connection, drain request headers, then park forever.
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::with_capacity(8192);
+            let mut tmp = [0u8; 256];
+            loop {
+                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let prev = std::env::var("DOTZ_PROVIDER_TIMEOUT_MS").ok();
+        std::env::set_var("DOTZ_PROVIDER_TIMEOUT_MS", "750");
+
+        let client = OpenAiChat::new();
+        let model = ResolvedModel {
+            provider: "test".into(),
+            model_id: "test".into(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key_ref: "test-key".into(),
+            context_window: 1000,
+            reasoning: false,
+        };
+        let req = ChatRequest {
+            model,
+            messages: vec![],
+            tools: vec![],
+            reasoning_effort: None,
+        };
+        let (tx, _rx) = mpsc::channel::<StreamDelta>(4);
+
+        let start = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.stream(req, tx),
+        )
+        .await
+        .expect("test wrapper timed out waiting for provider timeout");
+        let elapsed = start.elapsed();
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_PROVIDER_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_PROVIDER_TIMEOUT_MS"),
+        }
+        server.abort();
+
+        assert!(result.is_err(), "hung provider should return an error, got: {result:?}");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "adapter should wait for the configured timeout before returning, elapsed: {elapsed:?}"
+        );
     }
 }

@@ -18,7 +18,7 @@
 //! (clamped to Anthropic's low|medium|high|max set) per the claude-api skill. Auth resolves the
 //! `$ANTHROPIC_API_KEY` reference via the shared `resolve_api_key`.
 use super::event::{Cost, Usage};
-use super::provider::{resolve_api_key, ChatRequest, Provider, StreamDelta};
+use super::provider::{request_timeout, resolve_api_key, ChatRequest, Provider, StreamDelta};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -76,6 +76,7 @@ impl Provider for AnthropicMessages {
         let resp = self
             .client
             .post(&url)
+            .timeout(request_timeout())
             .header("x-api-key", key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
