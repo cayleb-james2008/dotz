@@ -333,12 +333,12 @@ mod tests {
             let loaded = load();
             assert_eq!(loaded.provider, "openrouter");
             assert_eq!(
-                loaded.subagent_model, "nex-agi/nex-n2-pro",
+                loaded.subagent_model, "nex-agi/nex-n2-pro:free",
                 "subagent_model must be derived from the configured provider when omitted"
             );
             assert_eq!(
                 std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
-                "openrouter/nex-agi/nex-n2-pro"
+                "openrouter/nex-agi/nex-n2-pro:free"
             );
         });
     }
@@ -359,12 +359,12 @@ mod tests {
             let next = update(&base, &patch).unwrap();
             assert_eq!(next.provider, "openrouter");
             assert_eq!(
-                next.subagent_model, "nex-agi/nex-n2-pro",
+                next.subagent_model, "nex-agi/nex-n2-pro:free",
                 "provider change without explicit subagent_model must re-derive"
             );
             assert_eq!(
                 std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
-                "openrouter/nex-agi/nex-n2-pro"
+                "openrouter/nex-agi/nex-n2-pro:free"
             );
         });
     }
@@ -407,7 +407,7 @@ mod tests {
             apply_env(&cfg);
             assert_eq!(
                 std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
-                "openrouter/nex-agi/nex-n2-pro"
+                "openrouter/nex-agi/nex-n2-pro:free"
             );
         });
     }
