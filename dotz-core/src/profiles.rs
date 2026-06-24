@@ -68,6 +68,11 @@ pub struct Profile {
 
 const PLAN_TOOLS: &[&str] = &["read", "grep", "find", "ls", "subagent"];
 
+/// True for one of the six known profile ids.
+pub fn is_valid(id: &str) -> bool {
+    matches!(id, "workflow" | "solo" | "plan" | "frontend" | "backend" | "design")
+}
+
 /// Resolve a profile by id (default = "workflow"), returning its runtime config.
 pub fn get(id: Option<&str>) -> Profile {
     match id.unwrap_or("workflow") {
@@ -190,4 +195,25 @@ pub fn summaries() -> Vec<ProfileSummary> {
             model: m(),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_valid_accepts_known_profiles() {
+        for id in ["workflow", "solo", "plan", "frontend", "backend", "design"] {
+            assert!(is_valid(id), "{id} should be valid");
+        }
+    }
+
+    #[test]
+    fn is_valid_rejects_unknown_profiles() {
+        assert!(!is_valid(""));
+        assert!(!is_valid("workflow "));
+        assert!(!is_valid("WORKFLOW"));
+        assert!(!is_valid("unknown"));
+        assert!(!is_valid("plan;drop table"));
+    }
 }
