@@ -62,10 +62,13 @@ fn scope_user(scope: &str, cwd: Option<&str>) -> String {
         ("global", _) | (_, None) => GLOBAL_USER.to_string(),
         (_, Some(c)) => {
             let norm = c.replace('\\', "/");
+            // Strip trailing separators so "/foo/bar/" and "/foo/bar" resolve to the same scope,
+            // preventing duplicate memory scopes for the same project.
+            let norm = norm.trim_end_matches('/');
             let norm = if cfg!(windows) {
                 norm.to_lowercase()
             } else {
-                norm
+                norm.to_string()
             };
             format!("proj:{norm}")
         }
@@ -924,13 +927,25 @@ mod tests {
     #[test]
     fn scope_user_project_normalizes_path() {
         assert_eq!(
-            scope_user("project", Some("C:\\Projects\\Dotz")),
-            "proj:c:/projects/dotz"
-        );
-        assert_eq!(
             scope_user("project", Some("/home/user/dotz")),
             "proj:/home/user/dotz"
         );
+        assert_eq!(
+            scope_user("project", Some("/home/user/dotz/")),
+            "proj:/home/user/dotz",
+            "trailing separator must be stripped"
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                scope_user("project", Some("C:\\Projects\\Dotz")),
+                "proj:c:/projects/dotz"
+            );
+            assert_eq!(
+                scope_user("project", Some("C:\\Projects\\Dotz\\")),
+                "proj:c:/projects/dotz",
+                "trailing separator must be stripped on Windows"
+            );
+        }
     }
 
     #[test]
