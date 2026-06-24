@@ -22,7 +22,7 @@ use axum::{
         Path, Query,
     },
     http::StatusCode,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -191,22 +191,29 @@ async fn post_reload(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode,
 
 // ---- WebSocket: GET /ws?sessionId=... ----
 
-async fn ws_handler(ws: WebSocketUpgrade, Query(q): Query<HashMap<String, String>>) -> Response {
+fn require_ws_session(q: &HashMap<String, String>) -> Result<String, (StatusCode, Json<Value>)> {
     let session_id = q.get("sessionId").cloned().unwrap_or_default();
-    ws.on_upgrade(move |socket| ws_loop(socket, session_id))
+    if session_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "sessionId is required" }))));
+    }
+    if session::get(&session_id).is_none() {
+        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "no such session" }))));
+    }
+    Ok(session_id)
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, Query(q): Query<HashMap<String, String>>) -> Response {
+    match require_ws_session(&q) {
+        Ok(session_id) => ws.on_upgrade(move |socket| ws_loop(socket, session_id)),
+        Err(resp) => resp.into_response(),
+    }
 }
 
 async fn ws_loop(socket: WebSocket, session_id: String) {
     let (mut sink, mut stream) = socket.split();
 
-    // No such session → error frame + close (matches server.ts).
-    let mut rx = match session::subscribe(&session_id) {
-        Some(rx) => rx,
-        None => {
-            let _ = sink.send(WsMessage::Text(json!({ "kind": "error", "error": "no such session" }).to_string().into())).await;
-            return;
-        }
-    };
+    // Session existence was validated before the HTTP upgrade, so subscribe cannot fail here.
+    let mut rx = session::subscribe(&session_id).expect("session validated before WebSocket upgrade");
 
     // ready frame.
     let _ = sink.send(WsMessage::Text(json!({ "kind": "ready", "sessionId": session_id }).to_string().into())).await;
@@ -283,4 +290,35 @@ pub fn router() -> Router<()> {
 /// Live session count, for the /api/health merge.
 pub fn session_count() -> usize {
     session::count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_validation_rejects_missing_session_id() {
+        let err = require_ws_session(&HashMap::new()).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!((err.1).0["error"], "sessionId is required");
+    }
+
+    #[test]
+    fn ws_validation_rejects_unknown_session() {
+        let mut q = HashMap::new();
+        q.insert("sessionId".to_string(), "no-such-id".to_string());
+        let err = require_ws_session(&q).unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!((err.1).0["error"], "no such session");
+    }
+
+    #[test]
+    fn ws_validation_accepts_valid_session() {
+        let summary = session::create(session::CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let mut q = HashMap::new();
+        q.insert("sessionId".to_string(), sid.clone());
+        assert_eq!(require_ws_session(&q).unwrap(), sid);
+        session::dispose(&sid);
+    }
 }
