@@ -661,12 +661,16 @@ async fn run_tool(
     args: &Value,
     ctx: &ToolCtx,
 ) -> Result<String, String> {
-    // The registry is owned by the session; we take a short snapshot reference by running through a
-    // dedicated method. Since ToolRegistry isn't Clone, build a fresh registry for execution — the
-    // built-ins are stateless, so a fresh registry behaves identically. (Active-set filtering already
-    // happened when assembling the request specs.)
-    let _ = session;
-    let registry = ToolRegistry::new();
+    // Snapshot the session's active tool set so execution respects set_tools restrictions.
+    let active = {
+        let s = session.lock().unwrap();
+        s.tools.active_names()
+    };
+    let registry = {
+        let mut r = ToolRegistry::new();
+        r.set_active(&active);
+        r
+    };
     registry.run(name, args, ctx).await
 }
 
@@ -958,6 +962,7 @@ pub fn models(id: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tools;
 
     #[test]
     fn turn_guard_clears_flag_on_drop() {
@@ -1078,6 +1083,63 @@ mod tests {
         assert_eq!(results[0]["toolName"], "bash");
         assert_eq!(results[0]["isError"], true);
         assert_eq!(results[0]["result"]["output"], "hello");
+    }
+
+    #[tokio::test]
+    async fn run_tool_respects_session_active_tool_set() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+
+        // Restrict the session to only the read tool.
+        sess.lock().unwrap().tools.set_active(&["read".to_string()]);
+
+        let ctx = tools::ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: Some(sess.lock().unwrap().tx.clone()),
+        };
+        let err = run_tool(
+            &sess,
+            "bash",
+            &json!({ "command": "echo hi" }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        dispose(&sid);
+        assert!(
+            err.contains("not active"),
+            "run_tool should reject a tool disabled by set_tools, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_allows_active_tool() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+
+        sess.lock().unwrap().tools.set_active(&["bash".to_string()]);
+
+        let ctx = tools::ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: Some(sess.lock().unwrap().tx.clone()),
+        };
+        let out = run_tool(
+            &sess,
+            "bash",
+            &json!({ "command": "echo hello-from-session" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        dispose(&sid);
+        assert!(
+            out.contains("hello-from-session"),
+            "run_tool should execute an active tool, got: {out}"
+        );
     }
 
     #[test]
