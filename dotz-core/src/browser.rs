@@ -403,23 +403,10 @@ fn snapshot_elements(snapshot: &str, observation_seq: i64) -> Vec<ElementRef> {
     out
 }
 
-/// Find the first `@eN` or `ref=eN` ref token on a line.
+/// Find the first `@eN` or `ref=eN` ref token on a line, skipping non-ref `@` text
+/// (e.g. an email address or literal @ symbol) that would otherwise hide a later valid ref.
 fn first_ref(line: &str) -> Option<String> {
-    for token in ["@", "ref="] {
-        if let Some(pos) = line.find(token) {
-            let after = &line[pos + token.len()..];
-            if let Some(stripped) = after.strip_prefix('e') {
-                let digits: String = stripped
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if !digits.is_empty() {
-                    return Some(format!("e{digits}"));
-                }
-            }
-        }
-    }
-    None
+    all_refs(line).into_iter().next()
 }
 
 /// All unique refs on a line/snapshot, in order.
@@ -1490,6 +1477,17 @@ mod tests {
             strip_default_port("other", "example.com:80".into()),
             "example.com:80"
         );
+    }
+
+    /// A snapshot line may contain an `@` that is not a valid element ref (e.g. an email
+    /// address or literal text). `first_ref` must skip that false positive and still find the
+    /// real `ref=eN` or `@eN` token that appears later on the same line. Before the fix it only
+    /// checked the first occurrence of each token type, so a bogus `@foo` masked `ref=e5`.
+    #[test]
+    fn first_ref_skips_invalid_at_token_and_finds_later_valid_ref() {
+        assert_eq!(first_ref("button Email @foo ref=e5"), Some("e5".into()));
+        assert_eq!(first_ref("label @bad @e12 text"), Some("e12".into()));
+        assert_eq!(first_ref("plain text @notref and more"), None);
     }
 
     #[test]
