@@ -70,6 +70,19 @@ fn strip_any_provider_prefix(model: &str) -> String {
     trimmed.to_string()
 }
 
+/// Strip a leading "{provider}/" prefix from a model id when it matches the *current* provider.
+/// This fixes the common UI mistake of pasting a full "provider/model-id" string into the
+/// executive/subagent model field, which would otherwise be sent to the upstream API verbatim and
+/// fail. Prefixes that do not match the current provider are left alone so cross-provider model
+/// namespaces (e.g. OpenRouter's "ollama/llama3") are preserved.
+fn strip_matching_provider_prefix(provider: &str, model: &str) -> String {
+    let trimmed = model.trim();
+    if let Some(rest) = trimmed.strip_prefix(&format!("{provider}/")) {
+        return rest.to_string();
+    }
+    trimmed.to_string()
+}
+
 /// Default executive model id for a provider. Falls back to the global default provider's executive
 /// when the provider has no registered default.
 fn default_executive_model(provider: &str) -> String {
@@ -138,6 +151,10 @@ pub fn load() -> DotzConfig {
     if !explicit_subagent {
         cfg.subagent_model = default_subagent_model(&cfg.provider);
     }
+    // Normalize explicit model ids so a "provider/model-id" value pasted by the operator does not
+    // get sent to the upstream API with a doubled provider prefix.
+    cfg.executive_model = strip_matching_provider_prefix(&cfg.provider, &cfg.executive_model);
+    cfg.subagent_model = strip_matching_provider_prefix(&cfg.provider, &cfg.subagent_model);
     apply_env(&cfg);
     cfg
 }
@@ -173,6 +190,10 @@ pub fn update(current: &DotzConfig, clean: &CleanPatch) -> std::io::Result<DotzC
         // pinned to a model from the previous provider's ecosystem.
         next.subagent_model = default_subagent_model(&next.provider);
     }
+    // Strip a matching provider prefix from explicitly-set model ids so they reach the API as bare
+    // model ids (e.g. "ollama/glm-5.2" under provider "ollama" becomes "glm-5.2").
+    next.executive_model = strip_matching_provider_prefix(&next.provider, &next.executive_model);
+    next.subagent_model = strip_matching_provider_prefix(&next.provider, &next.subagent_model);
     if let Some(t) = &clean.thinking_level {
         next.thinking_level = t.clone();
     }
@@ -517,6 +538,108 @@ mod tests {
             assert_eq!(
                 std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
                 "openrouter/nex-agi/nex-n2-pro:free"
+            );
+        });
+    }
+
+    /// A persisted executiveModel that redundantly includes the current provider prefix (a common
+    /// copy/paste mistake) must be normalized to a bare model id so the upstream API receives the
+    /// correct value. Without this, the provider call would use "ollama/glm-5.2" as the model id
+    /// and fail.
+    #[test]
+    fn load_strips_matching_provider_prefix_from_model_ids() {
+        with_tmp_dir(|_| {
+            let file = config_file();
+            std::fs::write(
+                &file,
+                r#"{
+  "provider": "ollama",
+  "executiveModel": "ollama/glm-5.2",
+  "subagentModel": "ollama/minimax-m3",
+  "thinkingLevel": "medium"
+}"#,
+            )
+            .unwrap();
+
+            let loaded = load();
+            assert_eq!(loaded.provider, "ollama");
+            assert_eq!(
+                loaded.executive_model, "glm-5.2",
+                "matching provider prefix must be stripped from executive_model"
+            );
+            assert_eq!(
+                loaded.subagent_model, "minimax-m3",
+                "matching provider prefix must be stripped from subagent_model"
+            );
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "ollama/minimax-m3"
+            );
+        });
+    }
+
+    /// update() must normalize explicit model ids that include the current provider prefix.
+    /// The returned config and the persisted file should both store bare model ids.
+    #[test]
+    fn update_strips_matching_provider_prefix_from_model_ids() {
+        with_tmp_dir(|_| {
+            let base = DotzConfig {
+                provider: "ollama".into(),
+                executive_model: "glm-5.2".into(),
+                subagent_model: "minimax-m3".into(),
+                thinking_level: "high".into(),
+            };
+            let patch = CleanPatch {
+                provider: Some("openrouter".into()),
+                executive_model: Some("openrouter/nex-agi/nex-n2-pro:free".into()),
+                subagent_model: Some("openrouter/nvidia/nemotron-3-ultra-550b-a55b:free".into()),
+                thinking_level: None,
+            };
+            let next = update(&base, &patch).unwrap();
+            assert_eq!(next.provider, "openrouter");
+            assert_eq!(
+                next.executive_model, "nex-agi/nex-n2-pro:free",
+                "update must strip matching provider prefix from executive_model"
+            );
+            assert_eq!(
+                next.subagent_model, "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "update must strip matching provider prefix from subagent_model"
+            );
+
+            let raw = std::fs::read_to_string(config_file()).unwrap();
+            assert!(
+                !raw.contains("openrouter/nex-agi"),
+                "persisted executive_model must not contain the provider prefix"
+            );
+            assert!(
+                !raw.contains("openrouter/nvidia"),
+                "persisted subagent_model must not contain the provider prefix"
+            );
+        });
+    }
+
+    /// Prefixes that do NOT match the current provider must be preserved so cross-provider model
+    /// namespaces (e.g. an OpenRouter model id that starts with "ollama/") are not corrupted.
+    #[test]
+    fn load_preserves_mismatched_provider_prefix() {
+        with_tmp_dir(|_| {
+            let file = config_file();
+            std::fs::write(
+                &file,
+                r#"{
+  "provider": "openrouter",
+  "executiveModel": "ollama/glm-5.2",
+  "subagentModel": "ollama/minimax-m3",
+  "thinkingLevel": "medium"
+}"#,
+            )
+            .unwrap();
+
+            let loaded = load();
+            assert_eq!(loaded.provider, "openrouter");
+            assert_eq!(
+                loaded.executive_model, "ollama/glm-5.2",
+                "a mismatched provider prefix must not be stripped"
             );
         });
     }
