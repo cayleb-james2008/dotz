@@ -373,9 +373,20 @@ async fn recv_broadcast(rx: &mut broadcast::Receiver<Value>) -> Option<Value> {
 async fn ws_loop(socket: WebSocket, session_id: String) {
     let (mut sink, mut stream) = socket.split();
 
-    // Session existence was validated before the HTTP upgrade, so subscribe cannot fail here.
-    let mut rx =
-        session::subscribe(&session_id).expect("session validated before WebSocket upgrade");
+    // Session existence was validated before the HTTP upgrade, but a concurrent dispose can race
+    // and remove the session before we subscribe. Close the socket gracefully instead of panicking.
+    let mut rx = match session::subscribe(&session_id) {
+        Some(rx) => rx,
+        None => {
+            let _ = sink
+                .send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                    code: axum::extract::ws::close_code::NORMAL,
+                    reason: "session disposed before websocket subscription".into(),
+                })))
+                .await;
+            return;
+        }
+    };
 
     // ready frame.
     let _ = sink
@@ -542,6 +553,21 @@ mod tests {
         q.insert("sessionId".to_string(), sid.clone());
         assert_eq!(require_ws_session(&q).unwrap(), sid);
         session::dispose(&sid);
+    }
+
+    #[test]
+    fn subscribe_is_none_after_session_disposed() {
+        let summary = session::create(session::CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        assert!(
+            session::subscribe(&sid).is_some(),
+            "active session must be subscribable"
+        );
+        assert!(session::dispose(&sid), "dispose should succeed");
+        assert!(
+            session::subscribe(&sid).is_none(),
+            "disposed session must not be subscribable"
+        );
     }
 
     #[test]
