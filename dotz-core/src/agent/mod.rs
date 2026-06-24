@@ -403,6 +403,11 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
         ))
         .await;
 
+    // Shared cancellation so a disposed session closes the WebSocket promptly from the server
+    // side, instead of leaving the read half blocked until the client sends something.
+    let done = tokio_util::sync::CancellationToken::new();
+    let done2 = done.clone();
+
     // Fan agent events (broadcast) → socket.
     let fan = tokio::spawn(async move {
         while let Some(frame) = recv_broadcast(&mut rx).await {
@@ -414,54 +419,66 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                 break;
             }
         }
+        // Broadcast closed means the session was disposed. Wake the reader so the socket drops.
+        done2.cancel();
     });
 
     // Read client messages (prompt/steer/followUp/abort).
-    while let Some(Ok(msg)) = stream.next().await {
-        let text = match msg {
-            WsMessage::Text(t) => t.to_string(),
-            WsMessage::Close(_) => break,
-            _ => continue,
-        };
-        let v: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-        let body = v
-            .get("text")
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string();
-        match kind {
-            // prompt/steer/followUp all drive a turn. (steer/followUp queueing collapses to a turn
-            // here — single-agent path; the richer queueing semantics are Phase 4.)
-            "prompt" | "steer" | "followUp" => {
-                if body.trim().is_empty() {
-                    continue;
-                }
-                if let Some(sess) = session::get(&session_id) {
-                    let sid = session_id.clone();
-                    let _ = sid;
-                    tokio::spawn(async move {
-                        session::run_turn(sess, body).await;
-                    });
+    loop {
+        tokio::select! {
+            msg = stream.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(_)) => break,
+                    None => break,
+                };
+                let text = match msg {
+                    WsMessage::Text(t) => t.to_string(),
+                    WsMessage::Close(_) => break,
+                    _ => continue,
+                };
+                let v: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                let body = v
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                match kind {
+                    // prompt/steer/followUp all drive a turn. (steer/followUp queueing collapses to a turn
+                    // here — single-agent path; the richer queueing semantics are Phase 4.)
+                    "prompt" | "steer" | "followUp" => {
+                        if body.trim().is_empty() {
+                            continue;
+                        }
+                        if let Some(sess) = session::get(&session_id) {
+                            let sid = session_id.clone();
+                            let _ = sid;
+                            tokio::spawn(async move {
+                                session::run_turn(sess, body).await;
+                            });
+                        }
+                    }
+                    "abort" => {
+                        session::abort(&session_id);
+                    }
+                    // Resolve a pending human_gate (app.js sends {kind:"gate.approve"|"gate.reject", gateId, feedback?}).
+                    "gate.approve" | "gate.reject" => {
+                        if let Some(gid) = v.get("gateId").and_then(|g| g.as_str()) {
+                            let fb = v
+                                .get("feedback")
+                                .and_then(|f| f.as_str())
+                                .map(|s| s.to_string());
+                            extra_tools::resolve_gate(gid, kind == "gate.approve", fb);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            "abort" => {
-                session::abort(&session_id);
-            }
-            // Resolve a pending human_gate (app.js sends {kind:"gate.approve"|"gate.reject", gateId, feedback?}).
-            "gate.approve" | "gate.reject" => {
-                if let Some(gid) = v.get("gateId").and_then(|g| g.as_str()) {
-                    let fb = v
-                        .get("feedback")
-                        .and_then(|f| f.as_str())
-                        .map(|s| s.to_string());
-                    extra_tools::resolve_gate(gid, kind == "gate.approve", fb);
-                }
-            }
-            _ => {}
+            _ = done.cancelled() => break,
         }
     }
 
@@ -661,5 +678,66 @@ mod tests {
         let sid = resp.0["sessionId"].as_str().unwrap().to_string();
         assert!(!sid.is_empty(), "create_session should return a session id");
         session::dispose(&sid);
+    }
+
+    /// A connected WebSocket must close promptly when its session is disposed server-side.
+    /// Before the cancellation-token fix, the read half stayed blocked until the client sent
+    /// something, leaving the UI connected to a dead session.
+    #[tokio::test]
+    async fn websocket_closes_when_session_disposed() {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        use tokio_tungstenite::connect_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(crate::server::serve_with_shutdown(
+            listener,
+            std::path::PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/sessions"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let summary = resp.json::<Value>().await.unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let url = format!("ws://127.0.0.1:{port}/ws?sessionId={sid}");
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(
+            ready.to_text().unwrap().contains("\"ready\""),
+            "first WS frame should be ready: {ready:?}"
+        );
+
+        let resp = client
+            .delete(format!("http://127.0.0.1:{port}/api/sessions/{sid}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        let close = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
+        match close {
+            Ok(None) | Ok(Some(Err(_))) => {}
+            other => panic!("expected WS to close after session disposal, got {other:?}"),
+        }
+
+        let _ = tx.send(());
+        assert!(
+            handle.await.unwrap().is_ok(),
+            "server should shut down cleanly"
+        );
     }
 }

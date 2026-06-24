@@ -1070,6 +1070,7 @@ dependencies = [
  "serde_yaml",
  "tokenizers",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tower-http",
  "uuid",
