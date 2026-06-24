@@ -569,6 +569,21 @@ fn memory_llm() -> (String, String, String) {
     (base_url, model, key)
 }
 
+/// Configurable wall-clock timeout for the memory-autonomy LLM call (fact extraction). A hung
+/// memory endpoint otherwise blocks the async capture task indefinitely. Defaults to 30s;
+/// override with `DOTZ_MEMORY_TIMEOUT_MS` (clamped to [1s, 5m]).
+fn memory_timeout() -> std::time::Duration {
+    const DEFAULT_MS: u64 = 30_000; // 30 seconds
+    const MIN_MS: u64 = 1_000; // 1 second
+    const MAX_MS: u64 = 300_000; // 5 minutes
+    std::env::var("DOTZ_MEMORY_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|ms| ms.clamp(MIN_MS, MAX_MS))
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_millis(DEFAULT_MS))
+}
+
 /// Ask the configured LLM to extract durable facts from one user↔assistant exchange. Returns a list
 /// of self-contained fact strings (possibly empty). Best-effort: any transport/parse error → empty.
 async fn extract_facts(user_text: &str, assistant_text: &str) -> Vec<String> {
@@ -600,6 +615,7 @@ async fn extract_facts(user_text: &str, assistant_text: &str) -> Vec<String> {
         .post(&url)
         .bearer_auth(&key)
         .json(&body)
+        .timeout(memory_timeout())
         .send()
         .await
     {
@@ -908,6 +924,7 @@ pub fn router() -> Router<()> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tokio::io::AsyncReadExt;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1222,5 +1239,79 @@ mod tests {
         // The global embedder may or may not be loaded depending on test ordering; the invariant
         // here is that embedder_guard recovers from a poisoned mutex and returns a usable guard.
         let _ = guard.is_some();
+    }
+
+    /// Serialize tests that hit the memory-autonomy LLM endpoint so env-var overrides don't race
+    /// with each other or with the fact-extraction implementation.
+    static MEMORY_ENDPOINT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn extract_facts_times_out_on_hung_memory_llm() {
+        let _guard = MEMORY_ENDPOINT_LOCK.lock().await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = accept_tx.send(());
+            let mut buf = Vec::new();
+            loop {
+                let mut tmp = [0u8; 256];
+                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let prev_base = std::env::var("DOTZ_MEMORY_BASE_URL").ok();
+        let prev_key = std::env::var("DOTZ_MEMORY_API_KEY").ok();
+        let prev_timeout = std::env::var("DOTZ_MEMORY_TIMEOUT_MS").ok();
+        std::env::set_var("DOTZ_MEMORY_BASE_URL", format!("http://{}", addr));
+        std::env::set_var("DOTZ_MEMORY_API_KEY", "test-key");
+        std::env::set_var("DOTZ_MEMORY_TIMEOUT_MS", "250");
+
+        // Wait until the fake server has accepted the TCP connection so the timeout measures the
+        // response wait, not the connection handshake.
+        let extract_task = tokio::spawn(async move {
+            extract_facts(
+                "User asked a substantive question that is clearly over eight characters.",
+                "Assistant replied with a detailed answer that is well over forty characters and contains durable facts worth remembering.",
+            )
+            .await
+        });
+        let _ = accept_rx.await;
+
+        let start = std::time::Instant::now();
+        let facts = extract_task.await.unwrap();
+        let elapsed = start.elapsed();
+
+        match prev_base {
+            Some(p) => std::env::set_var("DOTZ_MEMORY_BASE_URL", p),
+            None => std::env::remove_var("DOTZ_MEMORY_BASE_URL"),
+        }
+        match prev_key {
+            Some(p) => std::env::set_var("DOTZ_MEMORY_API_KEY", p),
+            None => std::env::remove_var("DOTZ_MEMORY_API_KEY"),
+        }
+        match prev_timeout {
+            Some(p) => std::env::set_var("DOTZ_MEMORY_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_MEMORY_TIMEOUT_MS"),
+        }
+
+        assert!(
+            facts.is_empty(),
+            "hung memory LLM must be best-effort skipped: {facts:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "extract_facts should return promptly after timeout, elapsed: {elapsed:?}"
+        );
     }
 }
