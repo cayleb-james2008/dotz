@@ -893,6 +893,13 @@ fn apply_delta(
     }
 }
 
+/// True when an autonomous memory capture is appropriate for a completed turn.
+/// Aborted turns are intentionally skipped: the assistant message is incomplete
+/// (partial stream or tool chain) and would pollute durable memory with fragments.
+fn should_capture_memory(stop_reason: Option<&str>) -> bool {
+    stop_reason != Some("aborted")
+}
+
 /// Emit turn_end + agent_end, then (main session only) fire-and-forget autonomous memory capture.
 fn finish_turn(
     session: &std::sync::Arc<Mutex<AgentSession>>,
@@ -941,7 +948,10 @@ fn finish_turn(
         };
         (cwd, user_text, assistant_text)
     };
-    if crate::memory::is_autonomy_enabled() && tokio::runtime::Handle::try_current().is_ok() {
+    if crate::memory::is_autonomy_enabled()
+        && tokio::runtime::Handle::try_current().is_ok()
+        && should_capture_memory(final_msg.stop_reason.as_deref())
+    {
         tokio::spawn(async move {
             let cwd_opt = if cwd.is_empty() {
                 None
@@ -1683,6 +1693,64 @@ mod tests {
         assert_eq!(results[0]["toolName"], "bash");
         assert_eq!(results[0]["isError"], true);
         assert_eq!(results[0]["result"]["output"], "hello");
+    }
+
+    /// Autonomous memory capture should run for normal completions but be skipped for aborted
+    /// turns, whose partial assistant stream/tool chain would pollute durable memory.
+    #[test]
+    fn should_capture_memory_allows_normal_completions_and_skips_aborted() {
+        assert!(
+            should_capture_memory(Some("stop")),
+            "normal stop reason should allow capture"
+        );
+        assert!(
+            should_capture_memory(Some("tool_use")),
+            "tool_use stop reason should allow capture"
+        );
+        assert!(
+            should_capture_memory(None),
+            "absent stop reason should allow capture"
+        );
+        assert!(
+            !should_capture_memory(Some("aborted")),
+            "aborted stop reason must skip capture"
+        );
+    }
+
+    /// finish_turn still emits turn_end and agent_end when the final message is aborted; only
+    /// the autonomous capture side-effect is suppressed.
+    #[test]
+    fn finish_turn_emits_events_for_aborted_final_message() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        let mut final_msg = Message::assistant_shell("ollama", "glm-5.2", now_ms());
+        final_msg.stop_reason = Some("aborted".into());
+        finish_turn(&sess, final_msg, Vec::new());
+
+        let mut found_turn_end = false;
+        let mut found_agent_end = false;
+        while let Ok(frame) = rx.try_recv() {
+            if let Some(kind) = frame
+                .get("event")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str())
+            {
+                if kind == "turn_end" {
+                    found_turn_end = true;
+                }
+                if kind == "agent_end" {
+                    found_agent_end = true;
+                }
+            }
+        }
+
+        dispose(&sid);
+
+        assert!(found_turn_end, "aborted finish_turn must emit turn_end");
+        assert!(found_agent_end, "aborted finish_turn must emit agent_end");
     }
 
     /// The MAX_ROUNDS fallback in run_turn reads the session mutex to find the last assistant
