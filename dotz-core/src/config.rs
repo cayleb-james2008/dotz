@@ -140,7 +140,8 @@ pub fn load() -> DotzConfig {
     }
     // Normalize explicit model ids so a "provider/model-id" value pasted by the operator does not
     // get sent to the upstream API with a doubled provider prefix.
-    cfg.executive_model = types::strip_matching_provider_prefix(&cfg.provider, &cfg.executive_model);
+    cfg.executive_model =
+        types::strip_matching_provider_prefix(&cfg.provider, &cfg.executive_model);
     cfg.subagent_model = types::strip_matching_provider_prefix(&cfg.provider, &cfg.subagent_model);
     apply_env(&cfg);
     cfg
@@ -179,8 +180,10 @@ pub fn update(current: &DotzConfig, clean: &CleanPatch) -> std::io::Result<DotzC
     }
     // Strip a matching provider prefix from explicitly-set model ids so they reach the API as bare
     // model ids (e.g. "ollama/glm-5.2" under provider "ollama" becomes "glm-5.2").
-    next.executive_model = types::strip_matching_provider_prefix(&next.provider, &next.executive_model);
-    next.subagent_model = types::strip_matching_provider_prefix(&next.provider, &next.subagent_model);
+    next.executive_model =
+        types::strip_matching_provider_prefix(&next.provider, &next.executive_model);
+    next.subagent_model =
+        types::strip_matching_provider_prefix(&next.provider, &next.subagent_model);
     if let Some(t) = &clean.thinking_level {
         next.thinking_level = t.clone();
     }

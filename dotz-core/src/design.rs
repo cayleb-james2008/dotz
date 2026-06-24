@@ -195,7 +195,9 @@ mod tests {
 
     /// Create an isolated `.pi/design-systems/<slug>/components.html` tree and point DOTZ_PI at it.
     fn with_tmp_design_systems() -> (PiDirGuard, std::path::PathBuf) {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let pi = std::env::temp_dir().join(format!("dotz-design-test-{}", uuid::Uuid::new_v4()));
         let prev = std::env::var("DOTZ_PI").ok();
         std::env::set_var("DOTZ_PI", &pi);
@@ -225,11 +227,15 @@ mod tests {
 
         let headers = resp.headers();
         assert_eq!(
-            headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("text/html")
         );
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body = String::from_utf8_lossy(&bytes);
         assert_eq!(body, html);
     }
@@ -242,7 +248,9 @@ mod tests {
         let resp = system_components(Path("missing".to_string())).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "no components for this system");
     }
@@ -254,7 +262,9 @@ mod tests {
         let resp = system_components(Path("_schema".to_string())).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "bad id");
     }

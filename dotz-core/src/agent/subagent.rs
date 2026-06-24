@@ -38,7 +38,7 @@ const MAX_ROUNDS: usize = 12;
 const DEFAULT_SUBAGENT_TIMEOUT_MS: u64 = 1000 * 60 * 5; // 5 minutes
 
 fn subagent_timeout() -> Duration {
-    const MIN_MS: u64 = 1_000;     // 1 second — zero would time out before any stream arrives.
+    const MIN_MS: u64 = 1_000; // 1 second — zero would time out before any stream arrives.
     const MAX_MS: u64 = 3_600_000; // 1 hour — anything larger defeats the purpose of the cap.
     std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS")
         .ok()
@@ -1094,7 +1094,11 @@ mod tests {
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolCall { id, name, arguments } => Some((id.clone(), name.clone(), arguments.clone())),
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.clone(), name.clone(), arguments.clone())),
                 _ => None,
             })
             .collect();
@@ -1287,15 +1291,7 @@ mod tests {
         // wire we know the provider stream is hung and the timeout is actually being exercised.
         let mut run = tokio::spawn(async move {
             let agents = [agent];
-            run_single_agent(
-                &agents,
-                "test",
-                "task",
-                Some("local/test"),
-                &cwd,
-                None,
-            )
-            .await
+            run_single_agent(&agents, "test", "task", Some("local/test"), &cwd, None).await
         });
 
         tokio::select! {
@@ -1318,7 +1314,10 @@ mod tests {
         }
         let _ = server_tx.send(()).await;
 
-        assert_eq!(result.exit_code, 1, "timed-out subagent must report failure");
+        assert_eq!(
+            result.exit_code, 1,
+            "timed-out subagent must report failure"
+        );
         assert_eq!(
             result.stop_reason.as_deref(),
             Some("timeout"),
@@ -1401,15 +1400,7 @@ mod tests {
 
         let mut run = tokio::spawn(async move {
             let agents = [agent];
-            run_single_agent(
-                &agents,
-                "test",
-                "task",
-                Some("local/test"),
-                &cwd,
-                None,
-            )
-            .await
+            run_single_agent(&agents, "test", "task", Some("local/test"), &cwd, None).await
         });
 
         tokio::select! {
