@@ -51,6 +51,10 @@ pub struct AgentSession {
     /// session (e.g. a prompt task spawned just before disposal) must bail out instead of starting
     /// a new turn against a disposed session.
     pub disposed: AtomicBool,
+    /// Armed when `abort()` is called while no turn is running. The next `run_turn` checks this
+    /// flag and cancels immediately, closing the race where an abort sent just before a prompt
+    /// would otherwise be ignored because the new cancellation token replaced the cancelled one.
+    pub abort_pending: AtomicBool,
 }
 
 impl AgentSession {
@@ -271,6 +275,7 @@ pub fn create(opts: CreateOpts) -> Result<Value, String> {
         cancel: CancellationToken::new(),
         turn_active: AtomicBool::new(false),
         disposed: AtomicBool::new(false),
+        abort_pending: AtomicBool::new(false),
     };
     let summary = session.summary();
     store_guard().insert(id.clone(), std::sync::Arc::new(Mutex::new(session)));
@@ -419,9 +424,11 @@ impl Drop for TurnGuard {
         // Recover from a poisoned mutex: a panic inside the turn (e.g. in a tool or provider
         // callback) must not make the guard's own drop panic, which would leave the session
         // permanently marked as busy and crash the task.
-        session_guard(&self.session)
-            .turn_active
-            .store(false, Ordering::SeqCst);
+        let s = session_guard(&self.session);
+        s.turn_active.store(false, Ordering::SeqCst);
+        // Clear any stale pending-abort state so future turns are not rejected after this one
+        // finishes (aborted or otherwise).
+        s.abort_pending.store(false, Ordering::SeqCst);
     }
 }
 
@@ -448,6 +455,17 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
                 "kind": "error",
                 "sessionId": s.id,
                 "error": "A turn is already in progress. Wait for it to finish or send abort."
+            }));
+            return;
+        }
+        if s.abort_pending.swap(false, Ordering::SeqCst) {
+            // An abort arrived while no turn was active (or during the tiny window before this
+            // turn acquired the lock). Reject the turn and clear the pending flag.
+            s.turn_active.store(false, Ordering::SeqCst);
+            let _ = s.tx.send(serde_json::json!({
+                "kind": "error",
+                "sessionId": s.id,
+                "error": "Turn aborted before it started."
             }));
             return;
         }
@@ -1024,9 +1042,18 @@ fn finish_error(
 }
 
 /// Abort the running turn (CancellationToken). The select! in run_turn observes it.
+/// If no turn is currently active, arm `abort_pending` so a turn that is about to start bails
+/// out instead of running against a stale cancellation token.
 pub fn abort(id: &str) -> bool {
     if let Some(s) = get(id) {
-        session_guard(&s).cancel.cancel();
+        let g = session_guard(&s);
+        g.cancel.cancel();
+        if !g.turn_active.load(Ordering::SeqCst) {
+            // No turn is active: the cancellation token may be replaced before the next turn
+            // observes it, so mark the session as pending-abort. run_turn checks this flag while
+            // still holding the lock and cancels the new turn immediately.
+            g.abort_pending.store(true, Ordering::SeqCst);
+        }
         true
     } else {
         false
@@ -1488,6 +1515,63 @@ mod tests {
             found,
             "run_turn should emit a disposed-session error frame"
         );
+    }
+
+    /// An abort sent while the session is idle must not be silently lost. Before the
+    /// `abort_pending` guard, the next `run_turn` would install a fresh cancellation token and
+    /// run normally, ignoring the abort. Now it bails out with a clear error and leaves history
+    /// untouched; the pending flag is cleared so subsequent turns can run.
+    #[tokio::test]
+    async fn abort_before_turn_rejects_next_prompt_with_error() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        // No turn is active, but abort still arms the pending-abort guard.
+        assert!(
+            abort(&sid),
+            "abort on an idle session should succeed and arm the guard"
+        );
+
+        run_turn(sess.clone(), "prompt after idle abort".into()).await;
+
+        let g = sess.lock().unwrap();
+        assert!(
+            g.history.is_empty(),
+            "turn must not append to history when aborted before start"
+        );
+        assert!(
+            !g.turn_active.load(Ordering::SeqCst),
+            "turn_active must be cleared after the rejected turn"
+        );
+        assert!(
+            !g.abort_pending.load(Ordering::SeqCst),
+            "abort_pending must be cleared after the rejected turn"
+        );
+        drop(g);
+
+        let mut found = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.get("kind").and_then(|k| k.as_str()) == Some("error") {
+                assert_eq!(
+                    frame.get("sessionId").and_then(|s| s.as_str()),
+                    Some(sid.as_str())
+                );
+                let err = frame.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                assert!(
+                    err.contains("aborted"),
+                    "error should explain the turn was aborted: {err}"
+                );
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "run_turn should emit an abort error frame when aborted before start"
+        );
+
+        dispose(&sid);
     }
 
     #[test]
