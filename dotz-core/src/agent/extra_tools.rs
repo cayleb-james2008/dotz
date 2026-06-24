@@ -281,28 +281,45 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
 
 /// Parse common test-runner output for pass/fail counts (node:test, vitest, jest, pytest).
 fn parse_counts(text: &str) -> (i64, i64) {
-    let num_before = |kw: &str| -> i64 {
+    let num_around = |kw: &str| -> i64 {
         for line in text.lines() {
             let l = line.to_lowercase();
             if let Some(idx) = l.find(kw) {
-                // take the last number appearing before the keyword on this line
-                let prefix = &l[..idx];
-                let n: String = prefix
-                    .chars()
-                    .rev()
-                    .skip_while(|c| !c.is_ascii_digit())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if let Ok(v) = n.chars().rev().collect::<String>().parse::<i64>() {
-                    return v;
+                // Number immediately before the keyword (only whitespace/punctuation in between).
+                let mut i = idx;
+                while i > 0 && l.as_bytes()[i - 1].is_ascii_whitespace() {
+                    i -= 1;
+                }
+                let mut j = i;
+                while j > 0 && l.as_bytes()[j - 1].is_ascii_digit() {
+                    j -= 1;
+                }
+                if j < i {
+                    if let Ok(v) = l[j..i].parse::<i64>() {
+                        return v;
+                    }
+                }
+                // Number immediately after the keyword (node:test "# pass N" / "# fail N").
+                let mut k = idx + kw.len();
+                while k < l.len() && l.as_bytes()[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                let mut m = k;
+                while m < l.len() && l.as_bytes()[m].is_ascii_digit() {
+                    m += 1;
+                }
+                if m > k {
+                    if let Ok(v) = l[k..m].parse::<i64>() {
+                        return v;
+                    }
                 }
             }
         }
         0
     };
     // node:test "# pass N / # fail N"; vitest/jest "N passed / N failed"; pytest "N passed / N failed".
-    let passed = num_before("pass").max(num_before("passed"));
-    let failed = num_before("fail").max(num_before("failed"));
+    let passed = num_around("pass").max(num_around("passed"));
+    let failed = num_around("fail").max(num_around("failed"));
     (passed, failed)
 }
 
@@ -502,5 +519,22 @@ mod tests {
             "the dotz workspace root should default to the runtime crate gate"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_counts_reads_node_test_after_keyword() {
+        assert_eq!(parse_counts("# pass 5\n# fail 1"), (5, 1));
+        assert_eq!(parse_counts("# pass 5 / # fail 0"), (5, 0));
+    }
+
+    #[test]
+    fn parse_counts_reads_number_before_keyword() {
+        assert_eq!(parse_counts("5 passed, 1 failed"), (5, 1));
+        assert_eq!(parse_counts("8 passed / 0 failed"), (8, 0));
+    }
+
+    #[test]
+    fn parse_counts_returns_zero_for_missing_counts() {
+        assert_eq!(parse_counts("Tests completed."), (0, 0));
     }
 }
