@@ -367,39 +367,54 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
 }
 
 /// Parse common test-runner output for pass/fail counts (node:test, vitest, jest, pytest).
+///
+/// Only counts the keyword when it appears as a standalone token (not as a substring of a
+/// longer word like "passphrase" or "failure") so unrelated output cannot inflate the counts.
 fn parse_counts(text: &str) -> (i64, i64) {
     let num_around = |kw: &str| -> i64 {
         for line in text.lines() {
             let l = line.to_lowercase();
-            if let Some(idx) = l.find(kw) {
-                // Number immediately before the keyword (only whitespace/punctuation in between).
-                let mut i = idx;
-                while i > 0 && l.as_bytes()[i - 1].is_ascii_whitespace() {
-                    i -= 1;
-                }
-                let mut j = i;
-                while j > 0 && l.as_bytes()[j - 1].is_ascii_digit() {
-                    j -= 1;
-                }
-                if j < i {
-                    if let Ok(v) = l[j..i].parse::<i64>() {
-                        return v;
+            let mut search_from = 0usize;
+            while let Some(rel) = l[search_from..].find(kw) {
+                let idx = search_from + rel;
+                let after_idx = idx + kw.len();
+                let boundary_ok = {
+                    let before = idx.checked_sub(1).map(|i| l.as_bytes()[i]);
+                    let after = l.as_bytes().get(after_idx).copied();
+                    !before.map(|b| b.is_ascii_alphanumeric()).unwrap_or(false)
+                        && !after.map(|b| b.is_ascii_alphanumeric()).unwrap_or(false)
+                };
+                if boundary_ok {
+                    // Number immediately before the keyword (only whitespace/punctuation in between).
+                    let mut i = idx;
+                    while i > 0 && l.as_bytes()[i - 1].is_ascii_whitespace() {
+                        i -= 1;
+                    }
+                    let mut j = i;
+                    while j > 0 && l.as_bytes()[j - 1].is_ascii_digit() {
+                        j -= 1;
+                    }
+                    if j < i {
+                        if let Ok(v) = l[j..i].parse::<i64>() {
+                            return v;
+                        }
+                    }
+                    // Number immediately after the keyword (node:test "# pass N" / "# fail N").
+                    let mut k = after_idx;
+                    while k < l.len() && l.as_bytes()[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    let mut m = k;
+                    while m < l.len() && l.as_bytes()[m].is_ascii_digit() {
+                        m += 1;
+                    }
+                    if m > k {
+                        if let Ok(v) = l[k..m].parse::<i64>() {
+                            return v;
+                        }
                     }
                 }
-                // Number immediately after the keyword (node:test "# pass N" / "# fail N").
-                let mut k = idx + kw.len();
-                while k < l.len() && l.as_bytes()[k].is_ascii_whitespace() {
-                    k += 1;
-                }
-                let mut m = k;
-                while m < l.len() && l.as_bytes()[m].is_ascii_digit() {
-                    m += 1;
-                }
-                if m > k {
-                    if let Ok(v) = l[k..m].parse::<i64>() {
-                        return v;
-                    }
-                }
+                search_from = idx + 1;
             }
         }
         0
@@ -784,5 +799,21 @@ mod tests {
     #[test]
     fn parse_counts_returns_zero_for_missing_counts() {
         assert_eq!(parse_counts("Tests completed."), (0, 0));
+    }
+
+    /// Keywords embedded inside unrelated words (e.g. "passphrase", "failure") must not be
+    /// mistaken for standalone pass/fail tokens. Without a word-boundary check a token like
+    /// "pass" inside "passphrase" could pick up a nearby number and fake a pass count.
+    #[test]
+    fn parse_counts_ignores_keyword_inside_longer_word() {
+        assert_eq!(parse_counts("5 passphrase, 1 failure"), (0, 0));
+    }
+
+    /// Both the bare keyword ("pass" / "fail") and the past-tense form ("passed" / "failed")
+    /// should be counted, but only when they stand alone.
+    #[test]
+    fn parse_counts_counts_standalone_pass_and_passed() {
+        assert_eq!(parse_counts("5 pass, 1 fail"), (5, 1));
+        assert_eq!(parse_counts("5 passed, 1 failed"), (5, 1));
     }
 }
