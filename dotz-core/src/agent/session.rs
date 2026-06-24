@@ -925,6 +925,31 @@ pub fn abort(id: &str) -> bool {
     }
 }
 
+/// Reload an existing session in place: rebuild the system prompt from the current
+/// profile/project/settings, clear conversation history, and reset the cancellation token so the
+/// next turn can run. The session id and broadcast channel are preserved, so existing WebSocket
+/// subscribers stay connected. Returns 409-style "session is busy" if a turn is in flight.
+pub fn reload(id: &str) -> Result<Value, String> {
+    let s = get(id).ok_or("no such session")?;
+    let mut g = s.lock().unwrap();
+    if g.turn_active.load(Ordering::SeqCst) {
+        return Err("session is busy".into());
+    }
+    let app_url = g
+        .project_id
+        .as_ref()
+        .and_then(|pid| crate::projects::find(pid).and_then(|p| p.app_url));
+    g.system_prompt = build_system_prompt(
+        &g.cwd.to_string_lossy(),
+        &g.profile_id,
+        g.project_id.as_deref(),
+        app_url.as_deref(),
+    );
+    g.history.clear();
+    g.cancel = CancellationToken::new();
+    Ok(g.summary())
+}
+
 // ---- control mutations used by the REST handlers ----
 
 pub fn set_model(id: &str, provider_id: &str, model_id: &str) -> Result<Value, String> {
@@ -1123,6 +1148,61 @@ mod tests {
         assert_eq!(results[0]["toolName"], "bash");
         assert_eq!(results[0]["isError"], true);
         assert_eq!(results[0]["result"]["output"], "hello");
+    }
+
+    #[test]
+    fn reload_context_preserves_session_id_and_broadcast_channel() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        let reloaded = reload(&sid).unwrap();
+        assert_eq!(
+            reloaded["sessionId"], sid,
+            "reload must keep the same session id"
+        );
+
+        // The broadcast channel must still be alive — a closed channel would return
+        // RecvError::Closed instead of Empty.
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "reload must preserve the broadcast channel so existing WS subscribers stay connected"
+        );
+
+        // History is cleared so the next turn starts from a blank conversation.
+        assert!(
+            sess.lock().unwrap().history.is_empty(),
+            "reload must clear conversation history"
+        );
+
+        dispose(&sid);
+    }
+
+    #[test]
+    fn reload_context_rejects_busy_session() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        sess.lock()
+            .unwrap()
+            .turn_active
+            .store(true, Ordering::SeqCst);
+
+        let err = reload(&sid).unwrap_err();
+        assert!(
+            err.contains("busy"),
+            "reload should reject a busy session, got: {err}"
+        );
+
+        sess.lock()
+            .unwrap()
+            .turn_active
+            .store(false, Ordering::SeqCst);
+        dispose(&sid);
     }
 
     #[tokio::test]
