@@ -173,7 +173,6 @@ pub fn router() -> Router<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -258,5 +257,45 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "bad id");
+    }
+
+    /// GET /api/design/systems must scan slugs in lexicographic order, read manifest.json fields,
+    /// and fall back to the slug as the name when the manifest is missing.
+    #[tokio::test]
+    async fn list_systems_sorts_by_slug_and_reads_manifest() {
+        let (_guard, pi) = with_tmp_design_systems();
+
+        let beta_dir = make_slug_dir(&pi, "beta");
+        std::fs::write(
+            beta_dir.join("manifest.json"),
+            r#"{"name":"Beta System","category":"visual","description":"Beta desc"}"#,
+        )
+        .unwrap();
+
+        let alpha_dir = make_slug_dir(&pi, "alpha");
+        std::fs::write(
+            alpha_dir.join("manifest.json"),
+            r#"{"name":"Alpha System"}"#,
+        )
+        .unwrap();
+
+        // No manifest → fallback to slug name with empty category/description.
+        let _gamma_dir = make_slug_dir(&pi, "gamma");
+
+        let resp = list_systems().await;
+        let systems = resp.0["systems"].as_array().expect("systems array");
+        assert_eq!(systems.len(), 3);
+
+        assert_eq!(systems[0]["id"], "alpha");
+        assert_eq!(systems[0]["name"], "Alpha System");
+        assert_eq!(systems[0]["category"], "");
+
+        assert_eq!(systems[1]["id"], "beta");
+        assert_eq!(systems[1]["name"], "Beta System");
+        assert_eq!(systems[1]["category"], "visual");
+        assert_eq!(systems[1]["description"], "Beta desc");
+
+        assert_eq!(systems[2]["id"], "gamma");
+        assert_eq!(systems[2]["name"], "gamma");
     }
 }
