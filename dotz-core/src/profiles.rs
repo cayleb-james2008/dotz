@@ -71,12 +71,42 @@ const PLAN_TOOLS: &[&str] = &["read", "grep", "find", "ls", "subagent"];
 /// Resolve a profile by id (default = "workflow"), returning its runtime config.
 pub fn get(id: Option<&str>) -> Profile {
     match id.unwrap_or("workflow") {
-        "solo" => Profile { id: "solo", thinking_level: "medium", workflow: false, tools: None },
-        "plan" => Profile { id: "plan", thinking_level: "high", workflow: true, tools: Some(PLAN_TOOLS) },
-        "frontend" => Profile { id: "frontend", thinking_level: "high", workflow: true, tools: None },
-        "backend" => Profile { id: "backend", thinking_level: "high", workflow: true, tools: None },
-        "design" => Profile { id: "design", thinking_level: "high", workflow: true, tools: None },
-        _ => Profile { id: "workflow", thinking_level: "high", workflow: true, tools: None },
+        "solo" => Profile {
+            id: "solo",
+            thinking_level: "medium",
+            workflow: false,
+            tools: None,
+        },
+        "plan" => Profile {
+            id: "plan",
+            thinking_level: "high",
+            workflow: true,
+            tools: Some(PLAN_TOOLS),
+        },
+        "frontend" => Profile {
+            id: "frontend",
+            thinking_level: "high",
+            workflow: true,
+            tools: None,
+        },
+        "backend" => Profile {
+            id: "backend",
+            thinking_level: "high",
+            workflow: true,
+            tools: None,
+        },
+        "design" => Profile {
+            id: "design",
+            thinking_level: "high",
+            workflow: true,
+            tools: None,
+        },
+        _ => Profile {
+            id: "workflow",
+            thinking_level: "high",
+            workflow: true,
+            tools: None,
+        },
     }
 }
 
@@ -88,7 +118,10 @@ pub fn doctrine(id: &str, design_systems_dir: &str) -> String {
         "plan" => PLAN_DOCTRINE.to_string(),
         "frontend" => format!("{WORKFLOW_DOCTRINE}{FRONTEND_DOMAIN}"),
         "backend" => format!("{WORKFLOW_DOCTRINE}{BACKEND_DOMAIN}"),
-        "design" => format!("{WORKFLOW_DOCTRINE}{}", DESIGN_DOMAIN.replace("{SYS}", design_systems_dir)),
+        "design" => format!(
+            "{WORKFLOW_DOCTRINE}{}",
+            DESIGN_DOMAIN.replace("{SYS}", design_systems_dir)
+        ),
         _ => WORKFLOW_DOCTRINE.to_string(),
     }
 }
@@ -108,11 +141,53 @@ pub struct ProfileSummary {
 pub fn summaries() -> Vec<ProfileSummary> {
     let m = default_model;
     vec![
-        ProfileSummary { id: "workflow", name: "WORKFLOW", tagline: "Multi-agent dispersal by default · ultra", workflow: true, thinking_level: "high", model: m() },
-        ProfileSummary { id: "solo", name: "SOLO", tagline: "Single agent · direct execution", workflow: false, thinking_level: "medium", model: m() },
-        ProfileSummary { id: "plan", name: "PLAN", tagline: "Read-only research & planning", workflow: true, thinking_level: "high", model: m() },
-        ProfileSummary { id: "frontend", name: "FRONTEND", tagline: "UI / design workflow", workflow: true, thinking_level: "high", model: m() },
-        ProfileSummary { id: "backend", name: "BACKEND", tagline: "APIs / data / infra workflow", workflow: true, thinking_level: "high", model: m() },
-        ProfileSummary { id: "design", name: "DESIGN", tagline: "Graphic & visual design · Open Design (native)", workflow: true, thinking_level: "high", model: m() },
+        ProfileSummary {
+            id: "workflow",
+            name: "WORKFLOW",
+            tagline: "Multi-agent dispersal by default · ultra",
+            workflow: true,
+            thinking_level: "high",
+            model: m(),
+        },
+        ProfileSummary {
+            id: "solo",
+            name: "SOLO",
+            tagline: "Single agent · direct execution",
+            workflow: false,
+            thinking_level: "medium",
+            model: m(),
+        },
+        ProfileSummary {
+            id: "plan",
+            name: "PLAN",
+            tagline: "Read-only research & planning",
+            workflow: true,
+            thinking_level: "high",
+            model: m(),
+        },
+        ProfileSummary {
+            id: "frontend",
+            name: "FRONTEND",
+            tagline: "UI / design workflow",
+            workflow: true,
+            thinking_level: "high",
+            model: m(),
+        },
+        ProfileSummary {
+            id: "backend",
+            name: "BACKEND",
+            tagline: "APIs / data / infra workflow",
+            workflow: true,
+            thinking_level: "high",
+            model: m(),
+        },
+        ProfileSummary {
+            id: "design",
+            name: "DESIGN",
+            tagline: "Graphic & visual design · Open Design (native)",
+            workflow: true,
+            thinking_level: "high",
+            model: m(),
+        },
     ]
 }

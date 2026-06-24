@@ -7,12 +7,7 @@
 //! Node module-singleton `projectStore`). The cache is the source of truth in-process; every mutating
 //! op also writes the full array back to disk. No AppState fields, no axum State.
 use crate::types::{self, ModelRef};
-use axum::{
-    extract::Path,
-    http::StatusCode,
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -39,7 +34,11 @@ pub struct Project {
     pub thinking_level: String,
     #[serde(rename = "appUrl", skip_serializing_if = "Option::is_none", default)]
     pub app_url: Option<String>,
-    #[serde(rename = "gateCommand", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "gateCommand",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub gate_command: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: u64,
@@ -104,7 +103,9 @@ fn now_millis() -> u64 {
 // ---- validation helpers (port of server.ts trust-boundary helpers) ----
 
 fn is_non_empty_str(v: Option<&Value>) -> bool {
-    v.and_then(|x| x.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false)
+    v.and_then(|x| x.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// `m` is a valid ModelRef: an object with non-empty string `provider` and `modelId`.
@@ -115,7 +116,10 @@ fn parse_valid_model(v: &Value) -> Option<ModelRef> {
     if provider.trim().is_empty() || model_id.trim().is_empty() {
         return None;
     }
-    Some(ModelRef { provider: provider.to_string(), model_id: model_id.to_string() })
+    Some(ModelRef {
+        provider: provider.to_string(),
+        model_id: model_id.to_string(),
+    })
 }
 
 /// Validate a cwd: MUST be an absolute path that EXISTS as a directory. Returns an error string for
@@ -132,11 +136,17 @@ fn validate_cwd(cwd: &str) -> Option<String> {
 }
 
 fn bad(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg.into() })))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg.into() })),
+    )
 }
 
 fn not_found() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_FOUND, Json(json!({ "error": "no such project" })))
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "no such project" })),
+    )
 }
 
 // ---- file tree (port of buildFileTree) ----
@@ -198,8 +208,16 @@ async fn create_project(
         return Err(bad("name and cwd are required (non-empty strings)"));
     }
     // name/cwd confirmed non-empty strings above.
-    let name = body.get("name").and_then(|v| v.as_str()).unwrap().to_string();
-    let cwd = body.get("cwd").and_then(|v| v.as_str()).unwrap().to_string();
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+    let cwd = body
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
 
     // model: if present (key exists; `null` counts as present, like JS `!== undefined`), must be a
     // valid { provider, modelId } — a present-but-invalid model (incl. null) 400s.

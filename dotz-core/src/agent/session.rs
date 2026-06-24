@@ -18,7 +18,10 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 /// A live agent session. Mutable runtime state behind the store's Mutex; the turn loop snapshots
@@ -77,7 +80,11 @@ impl AgentSession {
         let window = provider::resolve(&self.provider, &self.model_id)
             .map(|m| m.context_window)
             .unwrap_or(256_000);
-        let percent = if window > 0 { (total as f64 / window as f64) * 100.0 } else { 0.0 };
+        let percent = if window > 0 {
+            (total as f64 / window as f64) * 100.0
+        } else {
+            0.0
+        };
         json!({
             "tokens": { "input": input, "output": output, "totalTokens": total },
             "cost": cost,
@@ -106,13 +113,22 @@ pub struct CreateOpts {
 
 /// Assemble the system prompt: profile doctrine + memory recall seed + project block + skill index +
 /// low-cost directive. Mirrors profiles.ts buildResourceLoader's appendSystemPrompt assembly.
-fn build_system_prompt(cwd: &str, profile_id: &str, project_id: Option<&str>, app_url: Option<&str>) -> String {
+fn build_system_prompt(
+    cwd: &str,
+    profile_id: &str,
+    project_id: Option<&str>,
+    app_url: Option<&str>,
+) -> String {
     let pi = skills_pi_design_dir();
     let mut parts: Vec<String> = vec![profiles::doctrine(profile_id, &pi)];
 
     // Memory seed: project-relevant (when bound) + global. Recall a recent slice as the always-on
     // baseline (the per-turn query-relevant recall happens in run_turn).
-    let seed_cwd = if project_id.is_some() { Some(cwd) } else { None };
+    let seed_cwd = if project_id.is_some() {
+        Some(cwd)
+    } else {
+        None
+    };
     let seed = memory::list_public(seed_cwd);
     if !seed.is_empty() {
         let mut block = String::from("# Durable memory (seed)\n");
@@ -149,14 +165,22 @@ fn skills_pi_design_dir() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".pi"));
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".pi")
+        });
     pi.join("design-systems").to_string_lossy().to_string()
 }
 
 /// Create a session, resolving project binding + defaults exactly like pi.create.
 pub fn create(opts: CreateOpts) -> Result<Value, String> {
     let cfg = config::load();
-    let mut cwd = opts.cwd.unwrap_or_else(|| std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| ".".into()));
+    let mut cwd = opts.cwd.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".into())
+    });
     let mut profile_id = opts.profile_id.unwrap_or_else(|| "workflow".into());
     let mut model = opts.model;
     let mut thinking = opts.thinking_level;
@@ -176,10 +200,14 @@ pub fn create(opts: CreateOpts) -> Result<Value, String> {
     }
 
     let profile = profiles::get(Some(&profile_id));
-    let model = model.unwrap_or_else(|| types::ModelRef { provider: cfg.provider.clone(), model_id: cfg.executive_model.clone() });
+    let model = model.unwrap_or_else(|| types::ModelRef {
+        provider: cfg.provider.clone(),
+        model_id: cfg.executive_model.clone(),
+    });
     let thinking = thinking.unwrap_or_else(|| profile.thinking_level.to_string());
 
-    let system_prompt = build_system_prompt(&cwd, &profile_id, project_id.as_deref(), app_url.as_deref());
+    let system_prompt =
+        build_system_prompt(&cwd, &profile_id, project_id.as_deref(), app_url.as_deref());
 
     let mut tools = ToolRegistry::new();
     if let Some(t) = &opts.tools {
@@ -206,7 +234,10 @@ pub fn create(opts: CreateOpts) -> Result<Value, String> {
         cancel: CancellationToken::new(),
     };
     let summary = session.summary();
-    store().lock().unwrap().insert(id.clone(), std::sync::Arc::new(Mutex::new(session)));
+    store()
+        .lock()
+        .unwrap()
+        .insert(id.clone(), std::sync::Arc::new(Mutex::new(session)));
     Ok(summary)
 }
 
@@ -215,7 +246,12 @@ pub fn get(id: &str) -> Option<std::sync::Arc<Mutex<AgentSession>>> {
 }
 
 pub fn list_summaries() -> Vec<Value> {
-    store().lock().unwrap().values().map(|s| s.lock().unwrap().summary()).collect()
+    store()
+        .lock()
+        .unwrap()
+        .values()
+        .map(|s| s.lock().unwrap().summary())
+        .collect()
 }
 
 pub fn count() -> usize {
@@ -246,24 +282,42 @@ fn to_openai_messages(system_prompt: &str, history: &[Message]) -> Vec<Value> {
     for m in history {
         match m.role.as_str() {
             "user" => {
-                let text = m.content.iter().filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.clone()),
-                    _ => None,
-                }).collect::<Vec<_>>().join("");
+                let text = m
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
                 out.push(json!({ "role": "user", "content": text }));
             }
             "assistant" => {
-                let text = m.content.iter().filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.clone()),
-                    _ => None,
-                }).collect::<Vec<_>>().join("");
-                let tool_calls: Vec<Value> = m.content.iter().filter_map(|b| match b {
-                    ContentBlock::ToolCall { id, name, arguments } => Some(json!({
-                        "id": id, "type": "function",
-                        "function": { "name": name, "arguments": arguments.to_string() }
-                    })),
-                    _ => None,
-                }).collect();
+                let text = m
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                let tool_calls: Vec<Value> = m
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => Some(json!({
+                            "id": id, "type": "function",
+                            "function": { "name": name, "arguments": arguments.to_string() }
+                        })),
+                        _ => None,
+                    })
+                    .collect();
                 let mut msg = json!({ "role": "assistant", "content": text });
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = json!(tool_calls);
@@ -272,10 +326,15 @@ fn to_openai_messages(system_prompt: &str, history: &[Message]) -> Vec<Value> {
             }
             "tool" => {
                 // Tool result messages carry the tool_call_id in response_id (reused) + text content.
-                let text = m.content.iter().filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.clone()),
-                    _ => None,
-                }).collect::<Vec<_>>().join("");
+                let text = m
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": m.response_id.clone().unwrap_or_default(),
@@ -320,8 +379,18 @@ pub async fn run_turn(session: std::sync::Arc<Mutex<AgentSession>>, prompt: Stri
         let user_msg = Message::user(&prompt, ts);
         emit(&s, &AgentEvent::AgentStart);
         emit(&s, &AgentEvent::TurnStart);
-        emit(&s, &AgentEvent::MessageStart { message: user_msg.clone() });
-        emit(&s, &AgentEvent::MessageEnd { message: user_msg.clone() });
+        emit(
+            &s,
+            &AgentEvent::MessageStart {
+                message: user_msg.clone(),
+            },
+        );
+        emit(
+            &s,
+            &AgentEvent::MessageEnd {
+                message: user_msg.clone(),
+            },
+        );
         s.history.push(user_msg);
         (
             s.id.clone(),
@@ -343,7 +412,10 @@ pub async fn run_turn(session: std::sync::Arc<Mutex<AgentSession>>, prompt: Stri
         format!("{system_prompt}\n\n{recall_block}")
     };
 
-    let ctx = ToolCtx { cwd: cwd.clone(), tx: Some(session.lock().unwrap().tx.clone()) };
+    let ctx = ToolCtx {
+        cwd: cwd.clone(),
+        tx: Some(session.lock().unwrap().tx.clone()),
+    };
     let cancel = session.lock().unwrap().cancel.clone();
 
     // The agent loop: up to a bounded number of tool-rounds.
@@ -357,7 +429,12 @@ pub async fn run_turn(session: std::sync::Arc<Mutex<AgentSession>>, prompt: Stri
         let resolved = match provider::resolve(&provider_id, &model_id) {
             Some(r) => r,
             None => {
-                finish_error(&session, &format!("provider '{provider_id}' not resolvable (anthropic/google are Phase 3b)"));
+                finish_error(
+                    &session,
+                    &format!(
+                        "provider '{provider_id}' not resolvable (anthropic/google are Phase 3b)"
+                    ),
+                );
                 return;
             }
         };
@@ -376,9 +453,12 @@ pub async fn run_turn(session: std::sync::Arc<Mutex<AgentSession>>, prompt: Stri
         let start_ts = now_ms();
         {
             let s = session.lock().unwrap();
-            emit(&s, &AgentEvent::MessageStart {
-                message: Message::assistant_shell(&provider_id, &model_id, start_ts),
-            });
+            emit(
+                &s,
+                &AgentEvent::MessageStart {
+                    message: Message::assistant_shell(&provider_id, &model_id, start_ts),
+                },
+            );
         }
 
         let mut acc = Accumulator::new(&provider_id, &model_id, start_ts);
@@ -419,7 +499,12 @@ pub async fn run_turn(session: std::sync::Arc<Mutex<AgentSession>>, prompt: Stri
         // message_end for the assistant message.
         {
             let mut s = session.lock().unwrap();
-            emit(&s, &AgentEvent::MessageEnd { message: assistant_msg.clone() });
+            emit(
+                &s,
+                &AgentEvent::MessageEnd {
+                    message: assistant_msg.clone(),
+                },
+            );
             s.history.push(assistant_msg.clone());
         }
 
@@ -428,9 +513,11 @@ pub async fn run_turn(session: std::sync::Arc<Mutex<AgentSession>>, prompt: Stri
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolCall { id, name, arguments } => {
-                    Some((id.clone(), name.clone(), arguments.clone()))
-                }
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.clone(), name.clone(), arguments.clone())),
                 _ => None,
             })
             .collect();
@@ -446,11 +533,14 @@ pub async fn run_turn(session: std::sync::Arc<Mutex<AgentSession>>, prompt: Stri
         for (call_id, name, args) in calls {
             {
                 let s = session.lock().unwrap();
-                emit(&s, &AgentEvent::ToolExecutionStart {
-                    tool_call_id: call_id.clone(),
-                    tool_name: name.clone(),
-                    args: args.clone(),
-                });
+                emit(
+                    &s,
+                    &AgentEvent::ToolExecutionStart {
+                        tool_call_id: call_id.clone(),
+                        tool_name: name.clone(),
+                        args: args.clone(),
+                    },
+                );
             }
             // Execute without holding the session lock (the registry is stateless).
             // subagent is special-cased so its SubagentDetails reach result.details (the workflow bridge reads it).
@@ -465,41 +555,76 @@ pub async fn run_turn(session: std::sync::Arc<Mutex<AgentSession>>, prompt: Stri
                 (rv, d.is_error, d.text)
             } else {
                 match run_tool(&session, &name, &args, &ctx).await {
-                    Ok(text) => (json!({ "content": [{ "type": "text", "text": text }] }), false, text),
-                    Err(e) => (json!({ "content": [{ "type": "text", "text": e.clone() }], "isError": true }), true, e),
+                    Ok(text) => (
+                        json!({ "content": [{ "type": "text", "text": text }] }),
+                        false,
+                        text,
+                    ),
+                    Err(e) => (
+                        json!({ "content": [{ "type": "text", "text": e.clone() }], "isError": true }),
+                        true,
+                        e,
+                    ),
                 }
             };
             {
                 let mut s = session.lock().unwrap();
-                emit(&s, &AgentEvent::ToolExecutionEnd {
-                    tool_call_id: call_id.clone(),
-                    tool_name: name.clone(),
-                    is_error,
-                    result: result_value.clone(),
-                });
+                emit(
+                    &s,
+                    &AgentEvent::ToolExecutionEnd {
+                        tool_call_id: call_id.clone(),
+                        tool_name: name.clone(),
+                        is_error,
+                        result: result_value.clone(),
+                    },
+                );
                 // Append the tool result as a `tool` message (response_id carries the tool_call_id).
                 s.history.push(Message {
                     role: "tool".into(),
-                    content: vec![ContentBlock::Text { text: result_text.clone() }],
-                    api: None, provider: None, model: None, usage: None, stop_reason: None,
-                    error_message: None, timestamp: now_ms(),
+                    content: vec![ContentBlock::Text {
+                        text: result_text.clone(),
+                    }],
+                    api: None,
+                    provider: None,
+                    model: None,
+                    usage: None,
+                    stop_reason: None,
+                    error_message: None,
+                    timestamp: now_ms(),
                     response_id: Some(call_id.clone()),
                 });
             }
-            tool_results.push(ToolResult { tool_call_id: call_id, tool_name: name, is_error, result: result_value });
+            tool_results.push(ToolResult {
+                tool_call_id: call_id,
+                tool_name: name,
+                is_error,
+                result: result_value,
+            });
         }
         // Loop again so the model can consume the tool results.
     }
 
     // Hit the round cap — finish with whatever the last assistant message was.
-    let last = session.lock().unwrap().history.iter().rev().find(|m| m.role == "assistant").cloned();
+    let last = session
+        .lock()
+        .unwrap()
+        .history
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .cloned();
     if let Some(msg) = last {
         finish_turn(&session, msg, Vec::new());
     }
 }
 
 /// Execute a tool against the session's registry (no session lock held across the await).
-async fn run_tool(session: &std::sync::Arc<Mutex<AgentSession>>, name: &str, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+async fn run_tool(
+    session: &std::sync::Arc<Mutex<AgentSession>>,
+    name: &str,
+    args: &Value,
+    ctx: &ToolCtx,
+) -> Result<String, String> {
     // The registry is owned by the session; we take a short snapshot reference by running through a
     // dedicated method. Since ToolRegistry isn't Clone, build a fresh registry for execution — the
     // built-ins are stateless, so a fresh registry behaves identically. (Active-set filtering already
@@ -510,7 +635,13 @@ async fn run_tool(session: &std::sync::Arc<Mutex<AgentSession>>, name: &str, arg
 }
 
 /// Apply one StreamDelta to the accumulator, emitting the matching message_update event.
-fn apply_delta(session: &std::sync::Arc<Mutex<AgentSession>>, sess_id: &str, acc: &mut Accumulator, delta: StreamDelta, stop_reason: &mut String) {
+fn apply_delta(
+    session: &std::sync::Arc<Mutex<AgentSession>>,
+    sess_id: &str,
+    acc: &mut Accumulator,
+    delta: StreamDelta,
+    stop_reason: &mut String,
+) {
     let mut ame_kind: Option<&str> = None;
     let mut delta_text: Option<String> = None;
     let mut content_index = 0usize;
@@ -526,7 +657,10 @@ fn apply_delta(session: &std::sync::Arc<Mutex<AgentSession>>, sess_id: &str, acc
                     i
                 }
                 None => {
-                    acc.msg.content.push(ContentBlock::Thinking { thinking: t.clone(), thinking_signature: "reasoning".into() });
+                    acc.msg.content.push(ContentBlock::Thinking {
+                        thinking: t.clone(),
+                        thinking_signature: "reasoning".into(),
+                    });
                     let i = acc.msg.content.len() - 1;
                     acc.thinking_idx = Some(i);
                     ame_kind = Some("thinking_start");
@@ -557,9 +691,14 @@ fn apply_delta(session: &std::sync::Arc<Mutex<AgentSession>>, sess_id: &str, acc
             delta_text = Some(t);
         }
         StreamDelta::ToolCallStart { index, id, name } => {
-            acc.msg.content.push(ContentBlock::ToolCall { id: id.clone(), name: name.clone(), arguments: json!({}) });
+            acc.msg.content.push(ContentBlock::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: json!({}),
+            });
             let block_idx = acc.msg.content.len() - 1;
-            acc.tool_calls.insert(index, (block_idx, id, name, String::new()));
+            acc.tool_calls
+                .insert(index, (block_idx, id, name, String::new()));
             ame_kind = Some("toolcall_start");
             content_index = block_idx;
         }
@@ -568,7 +707,8 @@ fn apply_delta(session: &std::sync::Arc<Mutex<AgentSession>>, sess_id: &str, acc
                 entry.3.push_str(&frag);
                 // Try to parse the accumulated buffer; update the block's arguments when valid.
                 if let Ok(parsed) = serde_json::from_str::<Value>(&entry.3) {
-                    if let ContentBlock::ToolCall { arguments, .. } = &mut acc.msg.content[entry.0] {
+                    if let ContentBlock::ToolCall { arguments, .. } = &mut acc.msg.content[entry.0]
+                    {
                         *arguments = parsed;
                     }
                 }
@@ -596,15 +736,22 @@ fn apply_delta(session: &std::sync::Arc<Mutex<AgentSession>>, sess_id: &str, acc
             content: None,
             partial: acc.msg.clone(),
         };
-        let _ = s.tx.send(ws_frame(sess_id, &AgentEvent::MessageUpdate {
-            assistant_message_event: ame,
-            message: acc.msg.clone(),
-        }));
+        let _ = s.tx.send(ws_frame(
+            sess_id,
+            &AgentEvent::MessageUpdate {
+                assistant_message_event: ame,
+                message: acc.msg.clone(),
+            },
+        ));
     }
 }
 
 /// Emit turn_end + agent_end, then (main session only) fire-and-forget autonomous memory capture.
-fn finish_turn(session: &std::sync::Arc<Mutex<AgentSession>>, final_msg: Message, tool_results: Vec<ToolResult>) {
+fn finish_turn(
+    session: &std::sync::Arc<Mutex<AgentSession>>,
+    final_msg: Message,
+    tool_results: Vec<ToolResult>,
+) {
     let join_text = |m: &Message| {
         m.content
             .iter()
@@ -617,17 +764,43 @@ fn finish_turn(session: &std::sync::Arc<Mutex<AgentSession>>, final_msg: Message
     };
     let (cwd, user_text, assistant_text) = {
         let s = session.lock().unwrap();
-        let user_text = s.history.iter().rev().find(|m| m.role == "user").map(&join_text).unwrap_or_default();
+        let user_text = s
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(&join_text)
+            .unwrap_or_default();
         let assistant_text = join_text(&final_msg);
-        emit(&s, &AgentEvent::TurnEnd { message: final_msg.clone(), tool_results });
-        emit(&s, &AgentEvent::AgentEnd { messages: s.history.clone(), will_retry: false });
+        emit(
+            &s,
+            &AgentEvent::TurnEnd {
+                message: final_msg.clone(),
+                tool_results,
+            },
+        );
+        emit(
+            &s,
+            &AgentEvent::AgentEnd {
+                messages: s.history.clone(),
+                will_retry: false,
+            },
+        );
         // Capture to PROJECT scope only when the session is project-bound; otherwise global (matches Node).
-        let cwd = if s.project_id.is_some() { s.cwd.to_string_lossy().to_string() } else { String::new() };
+        let cwd = if s.project_id.is_some() {
+            s.cwd.to_string_lossy().to_string()
+        } else {
+            String::new()
+        };
         (cwd, user_text, assistant_text)
     };
     if crate::memory::is_autonomy_enabled() {
         tokio::spawn(async move {
-            let cwd_opt = if cwd.is_empty() { None } else { Some(cwd.as_str()) };
+            let cwd_opt = if cwd.is_empty() {
+                None
+            } else {
+                Some(cwd.as_str())
+            };
             crate::memory::capture_exchange(&user_text, &assistant_text, cwd_opt).await;
         });
     }
@@ -639,10 +812,27 @@ fn finish_error(session: &std::sync::Arc<Mutex<AgentSession>>, detail: &str) {
     let mut msg = Message::assistant_shell(&s.provider, &s.model_id, now_ms());
     msg.stop_reason = Some("error".into());
     msg.error_message = Some(detail.to_string());
-    emit(&s, &AgentEvent::MessageEnd { message: msg.clone() });
+    emit(
+        &s,
+        &AgentEvent::MessageEnd {
+            message: msg.clone(),
+        },
+    );
     s.history.push(msg.clone());
-    emit(&s, &AgentEvent::TurnEnd { message: msg, tool_results: Vec::new() });
-    emit(&s, &AgentEvent::AgentEnd { messages: s.history.clone(), will_retry: false });
+    emit(
+        &s,
+        &AgentEvent::TurnEnd {
+            message: msg,
+            tool_results: Vec::new(),
+        },
+    );
+    emit(
+        &s,
+        &AgentEvent::AgentEnd {
+            messages: s.history.clone(),
+            will_retry: false,
+        },
+    );
 }
 
 /// Abort the running turn (CancellationToken). The select! in run_turn observes it.

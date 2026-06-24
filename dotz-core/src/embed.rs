@@ -82,7 +82,10 @@ impl Embedder {
     }
 
     /// Embed many — one at a time (per-row results are identical to a padded batch; mask handles it).
-    pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    pub fn embed_batch(
+        &mut self,
+        texts: &[&str],
+    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
         texts.iter().map(|t| self.embed(t)).collect()
     }
 }

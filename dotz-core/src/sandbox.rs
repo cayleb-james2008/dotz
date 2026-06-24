@@ -25,15 +25,24 @@ use tokio::io::AsyncReadExt;
 
 /// Language list, in the exact order of LANGUAGES in sandbox.ts (Object.keys order).
 /// Matches fixtures/sandbox.languages.json exactly.
-const SANDBOX_LANGUAGES: [&str; 6] =
-    ["javascript", "typescript", "python", "bash", "powershell", "shell"];
+const SANDBOX_LANGUAGES: [&str; 6] = [
+    "javascript",
+    "typescript",
+    "python",
+    "bash",
+    "powershell",
+    "shell",
+];
 
 const DEFAULT_TIMEOUT_MS: i64 = 30_000;
 /// Output cap, matching the spirit of the Node streaming buffer — keep memory bounded.
 const OUTPUT_CAP: usize = 50 * 1024;
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 /// Per-language { file, command } mapping, mirroring LANGUAGES in sandbox.ts.
@@ -43,7 +52,10 @@ fn lang_spec(language: &str) -> Option<(&'static str, Vec<&'static str>)> {
         "typescript" => Some(("run.ts", vec!["npx", "tsx", "run.ts"])),
         "python" => Some(("run.py", vec!["python", "run.py"])),
         "bash" => Some(("run.sh", vec!["bash", "run.sh"])),
-        "powershell" => Some(("run.ps1", vec!["powershell", "-NoProfile", "-File", "run.ps1"])),
+        "powershell" => Some((
+            "run.ps1",
+            vec!["powershell", "-NoProfile", "-File", "run.ps1"],
+        )),
         "shell" => Some(("run.sh", vec!["sh", "run.sh"])),
         _ => None,
     }
@@ -112,7 +124,9 @@ async fn get_run(Path(id): Path<String>) -> Result<Json<SandboxRun>, (StatusCode
 }
 
 /// POST /api/sandbox/runs — create the run, spawn the process async, return the run (status "running").
-async fn create_run(body: Option<Json<Value>>) -> Result<Json<SandboxRun>, (StatusCode, Json<Value>)> {
+async fn create_run(
+    body: Option<Json<Value>>,
+) -> Result<Json<SandboxRun>, (StatusCode, Json<Value>)> {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
 
     let language = match b.get("language").and_then(|v| v.as_str()) {
@@ -136,7 +150,10 @@ async fn create_run(body: Option<Json<Value>>) -> Result<Json<SandboxRun>, (Stat
         Some(Value::String(s)) if s == "terminal" || s == "web" => s.clone(),
         _ => return Err(bad("mode must be \"terminal\" or \"web\"")),
     };
-    let project_id = b.get("projectId").and_then(|v| v.as_str()).map(String::from);
+    let project_id = b
+        .get("projectId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     // A non-finite/absent timeout coerces to the default — never silently disable the timeout.
     let timeout_ms = match b.get("timeoutMs").and_then(|v| v.as_i64()) {
         Some(n) if n > 0 => n,
@@ -159,7 +176,13 @@ async fn create_run(body: Option<Json<Value>>) -> Result<Json<SandboxRun>, (Stat
         let mut store = runs().lock().unwrap();
         store.insert(
             id.clone(),
-            RunEntry { run: run.clone(), pid: None, killed_by_us: false, mode, port: None },
+            RunEntry {
+                run: run.clone(),
+                pid: None,
+                killed_by_us: false,
+                mode,
+                port: None,
+            },
         );
     }
 
@@ -393,7 +416,9 @@ async fn run_port(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Js
         return Ok(Json(json!({ "port": p })));
     }
     if mode != "web" {
-        return Err(not_found("no web port detected (terminal run or not yet listening)"));
+        return Err(not_found(
+            "no web port detected (terminal run or not yet listening)",
+        ));
     }
     // Scan the captured output for a listener banner, then TCP-probe the candidate.
     for cand in scan_ports(&output) {
@@ -404,14 +429,23 @@ async fn run_port(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Js
             return Ok(Json(json!({ "port": cand })));
         }
     }
-    Err(not_found("no web port detected (terminal run or not yet listening)"))
+    Err(not_found(
+        "no web port detected (terminal run or not yet listening)",
+    ))
 }
 
 /// Extract candidate ports from server-listener banners, mirroring the PortDetector regex intent in
 /// sandbox.ts: a listener keyword near a port-with-prefix on the same line. Avoids bare ":<port>"
 /// and the generic word "server" so client-talk lines can't hijack the preview.
 fn scan_ports(text: &str) -> Vec<u16> {
-    const KEYWORDS: [&str; 6] = ["listening", "serving", "running", "started", "ready", "local"];
+    const KEYWORDS: [&str; 6] = [
+        "listening",
+        "serving",
+        "running",
+        "started",
+        "ready",
+        "local",
+    ];
     const PREFIXES: [&str; 4] = ["port ", "localhost:", "127.0.0.1:", "0.0.0.0:"];
     let mut out: Vec<u16> = Vec::new();
     for line in text.lines() {
@@ -452,7 +486,10 @@ async fn is_port_open(port: u16) -> bool {
 }
 
 fn bad(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg.into() })))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg.into() })),
+    )
 }
 
 fn not_found(msg: &str) -> (StatusCode, Json<Value>) {

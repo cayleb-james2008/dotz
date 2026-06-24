@@ -31,7 +31,9 @@ pub struct GoogleGemini {
 
 impl GoogleGemini {
     pub fn new() -> Self {
-        GoogleGemini { client: reqwest::Client::new() }
+        GoogleGemini {
+            client: reqwest::Client::new(),
+        }
     }
 }
 
@@ -81,7 +83,10 @@ impl Provider for GoogleGemini {
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
-            return Err(format!("google returned {status}: {}", truncate(&detail, 400)));
+            return Err(format!(
+                "google returned {status}: {}",
+                truncate(&detail, 400)
+            ));
         }
 
         let mut stream = resp.bytes_stream().eventsource();
@@ -130,7 +135,11 @@ impl Provider for GoogleGemini {
             for part in parts {
                 // functionCall part → a tool call.
                 if let Some(fc) = part.get("functionCall") {
-                    let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    let name = fc
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                     let index = tool_index;
                     tool_index += 1;
@@ -139,7 +148,10 @@ impl Provider for GoogleGemini {
                         .send(StreamDelta::ToolCallStart { index, id, name })
                         .await;
                     let _ = tx
-                        .send(StreamDelta::ToolCallArgs { index, json: args.to_string() })
+                        .send(StreamDelta::ToolCallArgs {
+                            index,
+                            json: args.to_string(),
+                        })
                         .await;
                     continue;
                 }
@@ -148,7 +160,10 @@ impl Provider for GoogleGemini {
                     if t.is_empty() {
                         continue;
                     }
-                    let is_thought = part.get("thought").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let is_thought = part
+                        .get("thought")
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false);
                     if is_thought {
                         let _ = tx.send(StreamDelta::Thinking(t.to_string())).await;
                     } else {
@@ -161,7 +176,9 @@ impl Provider for GoogleGemini {
         if let Some(u) = usage_seen {
             let _ = tx.send(StreamDelta::Usage(u)).await;
         }
-        let _ = tx.send(StreamDelta::Stop(stop.unwrap_or_else(|| "stop".into()))).await;
+        let _ = tx
+            .send(StreamDelta::Stop(stop.unwrap_or_else(|| "stop".into())))
+            .await;
         Ok(())
     }
 }
@@ -198,12 +215,16 @@ fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
                     for tc in tcs {
                         let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
                         let func = tc.get("function");
-                        let name = func.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+                        let name = func
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("");
                         let args_str = func
                             .and_then(|f| f.get("arguments"))
                             .and_then(|a| a.as_str())
                             .unwrap_or("{}");
-                        let args: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+                        let args: Value =
+                            serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
                         if !id.is_empty() {
                             id_to_name.insert(id.to_string(), name.to_string());
                         }
@@ -219,7 +240,10 @@ fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
                 let id = m.get("tool_call_id").and_then(|i| i.as_str()).unwrap_or("");
                 let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 // Recover the function name; fall back to the id if unknown.
-                let name = id_to_name.get(id).cloned().unwrap_or_else(|| id.to_string());
+                let name = id_to_name
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| id.to_string());
                 out.push(json!({
                     "role": "user",
                     "parts": [{
@@ -245,8 +269,14 @@ fn convert_tools(tools: &[Value]) -> Vec<Value> {
         .filter_map(|t| {
             let func = t.get("function")?;
             let name = func.get("name")?.as_str()?;
-            let description = func.get("description").and_then(|d| d.as_str()).unwrap_or("");
-            let params = func.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object" }));
+            let description = func
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            let params = func
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "object" }));
             Some(json!({
                 "name": name,
                 "description": description,

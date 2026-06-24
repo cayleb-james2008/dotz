@@ -33,7 +33,9 @@ pub struct AnthropicMessages {
 
 impl AnthropicMessages {
     pub fn new() -> Self {
-        AnthropicMessages { client: reqwest::Client::new() }
+        AnthropicMessages {
+            client: reqwest::Client::new(),
+        }
     }
 }
 
@@ -85,7 +87,10 @@ impl Provider for AnthropicMessages {
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
-            return Err(format!("anthropic returned {status}: {}", truncate(&detail, 400)));
+            return Err(format!(
+                "anthropic returned {status}: {}",
+                truncate(&detail, 400)
+            ));
         }
 
         let mut stream = resp.bytes_stream().eventsource();
@@ -130,10 +135,12 @@ impl Provider for AnthropicMessages {
                     }
                 }
                 "content_block_start" => {
-                    let index =
-                        v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                    let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                     let block = v.get("content_block");
-                    let btype = block.and_then(|b| b.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+                    let btype = block
+                        .and_then(|b| b.get("type"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
                     match btype {
                         "tool_use" => {
                             let id = block
@@ -161,8 +168,9 @@ impl Provider for AnthropicMessages {
                             }
                         }
                         "thinking" => {
-                            if let Some(t) =
-                                block.and_then(|b| b.get("thinking")).and_then(|x| x.as_str())
+                            if let Some(t) = block
+                                .and_then(|b| b.get("thinking"))
+                                .and_then(|x| x.as_str())
                             {
                                 if !t.is_empty() {
                                     let _ = tx.send(StreamDelta::Thinking(t.to_string())).await;
@@ -173,32 +181,43 @@ impl Provider for AnthropicMessages {
                     }
                 }
                 "content_block_delta" => {
-                    let index =
-                        v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                    let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                     let delta = v.get("delta");
-                    let dtype = delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+                    let dtype = delta
+                        .and_then(|d| d.get("type"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
                     match dtype {
                         "text_delta" => {
-                            if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|x| x.as_str()) {
+                            if let Some(t) =
+                                delta.and_then(|d| d.get("text")).and_then(|x| x.as_str())
+                            {
                                 if !t.is_empty() {
                                     let _ = tx.send(StreamDelta::Text(t.to_string())).await;
                                 }
                             }
                         }
                         "thinking_delta" => {
-                            if let Some(t) = delta.and_then(|d| d.get("thinking")).and_then(|x| x.as_str()) {
+                            if let Some(t) = delta
+                                .and_then(|d| d.get("thinking"))
+                                .and_then(|x| x.as_str())
+                            {
                                 if !t.is_empty() {
                                     let _ = tx.send(StreamDelta::Thinking(t.to_string())).await;
                                 }
                             }
                         }
                         "input_json_delta" => {
-                            if let Some(j) =
-                                delta.and_then(|d| d.get("partial_json")).and_then(|x| x.as_str())
+                            if let Some(j) = delta
+                                .and_then(|d| d.get("partial_json"))
+                                .and_then(|x| x.as_str())
                             {
                                 if !j.is_empty() {
                                     let _ = tx
-                                        .send(StreamDelta::ToolCallArgs { index, json: j.to_string() })
+                                        .send(StreamDelta::ToolCallArgs {
+                                            index,
+                                            json: j.to_string(),
+                                        })
                                         .await;
                                 }
                             }
@@ -212,8 +231,10 @@ impl Provider for AnthropicMessages {
                             output_tokens = o;
                         }
                     }
-                    if let Some(sr) =
-                        v.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str())
+                    if let Some(sr) = v
+                        .get("delta")
+                        .and_then(|d| d.get("stop_reason"))
+                        .and_then(|s| s.as_str())
                     {
                         stop = Some(map_stop_reason(sr));
                     }
@@ -241,7 +262,9 @@ impl Provider for AnthropicMessages {
             cost: Cost::default(),
         };
         let _ = tx.send(StreamDelta::Usage(usage)).await;
-        let _ = tx.send(StreamDelta::Stop(stop.unwrap_or_else(|| "stop".into()))).await;
+        let _ = tx
+            .send(StreamDelta::Stop(stop.unwrap_or_else(|| "stop".into())))
+            .await;
         Ok(())
     }
 }
@@ -279,13 +302,17 @@ fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
                     for tc in tcs {
                         let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
                         let func = tc.get("function");
-                        let name = func.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+                        let name = func
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("");
                         // OpenAI stores arguments as a JSON string; Anthropic wants a parsed object.
                         let args_str = func
                             .and_then(|f| f.get("arguments"))
                             .and_then(|a| a.as_str())
                             .unwrap_or("{}");
-                        let input: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+                        let input: Value =
+                            serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
                         blocks.push(json!({
                             "type": "tool_use",
                             "id": id,
@@ -326,8 +353,14 @@ fn convert_tools(tools: &[Value]) -> Vec<Value> {
         .filter_map(|t| {
             let func = t.get("function")?;
             let name = func.get("name")?.as_str()?;
-            let description = func.get("description").and_then(|d| d.as_str()).unwrap_or("");
-            let schema = func.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object" }));
+            let description = func
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            let schema = func
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "object" }));
             Some(json!({
                 "name": name,
                 "description": description,

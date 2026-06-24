@@ -101,11 +101,24 @@ fn scan_roots() -> Vec<(PathBuf, &'static str)> {
         (pi.join("design-skills"), "design"),
         (home_join(&[".hermes", "skills"]), "hermes"),
         (
-            home_join(&[".codex", "plugins", "cache", "openai-curated", "superpowers"]),
+            home_join(&[
+                ".codex",
+                "plugins",
+                "cache",
+                "openai-curated",
+                "superpowers",
+            ]),
             "superpowers",
         ),
         (
-            home_join(&[".codex", "marketplaces", "ecc-local", "plugins", "ecc", "skills"]),
+            home_join(&[
+                ".codex",
+                "marketplaces",
+                "ecc-local",
+                "plugins",
+                "ecc",
+                "skills",
+            ]),
             "ecc",
         ),
         (home_join(&[".codex", "skills"]), "codex"),
@@ -156,11 +169,7 @@ fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
         if ft.is_dir() {
             walk(&full, out);
         } else if ft.is_file()
-            && ent
-                .file_name()
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                == "skill.md"
+            && ent.file_name().to_string_lossy().to_ascii_lowercase() == "skill.md"
         {
             out.push(full);
         }
@@ -332,7 +341,10 @@ fn build_index() -> BTreeMap<String, Skill> {
     let mut parsed: Vec<Option<Skill>> = (0..n).map(|_| None).collect();
 
     // 2. Parse in parallel, each thread owning a disjoint slice of inputs+outputs (no locking).
-    let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(8);
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(8);
     let chunk = n.div_ceil(threads.max(1)).max(1);
     if n > 0 {
         std::thread::scope(|s| {
@@ -498,9 +510,14 @@ mod tests {
         let par = build_index();
         let par_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-        let par_paths: BTreeMap<String, PathBuf> =
-            par.iter().map(|(k, v)| (k.clone(), v.path.clone())).collect();
-        assert_eq!(seq, par_paths, "parallel build_index diverged from the sequential reference");
+        let par_paths: BTreeMap<String, PathBuf> = par
+            .iter()
+            .map(|(k, v)| (k.clone(), v.path.clone()))
+            .collect();
+        assert_eq!(
+            seq, par_paths,
+            "parallel build_index diverged from the sequential reference"
+        );
 
         eprintln!(
             "skills index over {} skills: sequential {seq_ms:.1}ms, parallel {par_ms:.1}ms",

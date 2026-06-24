@@ -26,8 +26,15 @@ use tokio::sync::mpsc;
 pub enum StreamDelta {
     Text(String),
     Thinking(String),
-    ToolCallStart { index: usize, id: String, name: String },
-    ToolCallArgs { index: usize, json: String },
+    ToolCallStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    ToolCallArgs {
+        index: usize,
+        json: String,
+    },
     Usage(Usage),
     Stop(String),
 }
@@ -96,7 +103,10 @@ fn provider_endpoint(provider: &str) -> Option<(String, String)> {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "http://localhost:11434/v1".into());
-            let key = if std::env::var("DOTZ_LOCAL_API_KEY").map(|s| !s.is_empty()).unwrap_or(false) {
+            let key = if std::env::var("DOTZ_LOCAL_API_KEY")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+            {
                 "$DOTZ_LOCAL_API_KEY".to_string()
             } else {
                 "local".to_string()
@@ -104,7 +114,10 @@ fn provider_endpoint(provider: &str) -> Option<(String, String)> {
             Some((base, key))
         }
         "anthropic" => pair("https://api.anthropic.com/v1", "$ANTHROPIC_API_KEY"),
-        "google" => pair("https://generativelanguage.googleapis.com/v1beta", "$GEMINI_API_KEY"),
+        "google" => pair(
+            "https://generativelanguage.googleapis.com/v1beta",
+            "$GEMINI_API_KEY",
+        ),
         _ => None,
     }
 }
@@ -157,7 +170,9 @@ pub struct OpenAiChat {
 
 impl OpenAiChat {
     pub fn new() -> Self {
-        OpenAiChat { client: reqwest::Client::new() }
+        OpenAiChat {
+            client: reqwest::Client::new(),
+        }
     }
 }
 
@@ -171,7 +186,10 @@ impl Default for OpenAiChat {
 impl Provider for OpenAiChat {
     async fn stream(&self, req: ChatRequest, tx: mpsc::Sender<StreamDelta>) -> Result<(), String> {
         let key = resolve_api_key(&req.model.api_key_ref);
-        let url = format!("{}/chat/completions", req.model.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            req.model.base_url.trim_end_matches('/')
+        );
 
         let mut body = json!({
             "model": req.model.model_id,
@@ -199,7 +217,11 @@ impl Provider for OpenAiChat {
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
-            return Err(format!("{} returned {status}: {}", req.model.provider, truncate(&detail, 400)));
+            return Err(format!(
+                "{} returned {status}: {}",
+                req.model.provider,
+                truncate(&detail, 400)
+            ));
         }
 
         let mut stream = resp.bytes_stream().eventsource();
@@ -272,14 +294,24 @@ impl Provider for OpenAiChat {
                                 .map(|s| s.to_string())
                                 .unwrap_or_else(|| format!("call_{index}"));
                             let _ = tx
-                                .send(StreamDelta::ToolCallStart { index, id, name: name.to_string() })
+                                .send(StreamDelta::ToolCallStart {
+                                    index,
+                                    id,
+                                    name: name.to_string(),
+                                })
                                 .await;
                         }
                     }
-                    if let Some(args) = func.and_then(|f| f.get("arguments")).and_then(|a| a.as_str()) {
+                    if let Some(args) = func
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|a| a.as_str())
+                    {
                         if !args.is_empty() {
                             let _ = tx
-                                .send(StreamDelta::ToolCallArgs { index, json: args.to_string() })
+                                .send(StreamDelta::ToolCallArgs {
+                                    index,
+                                    json: args.to_string(),
+                                })
                                 .await;
                         }
                     }
@@ -290,7 +322,9 @@ impl Provider for OpenAiChat {
         if let Some(u) = usage_seen {
             let _ = tx.send(StreamDelta::Usage(u)).await;
         }
-        let _ = tx.send(StreamDelta::Stop(stop.unwrap_or_else(|| "stop".into()))).await;
+        let _ = tx
+            .send(StreamDelta::Stop(stop.unwrap_or_else(|| "stop".into())))
+            .await;
         Ok(())
     }
 }
@@ -314,7 +348,10 @@ fn parse_usage(u: &Value) -> Usage {
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
-    let total = u.get("total_tokens").and_then(|x| x.as_u64()).unwrap_or(input + output);
+    let total = u
+        .get("total_tokens")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(input + output);
     Usage {
         input,
         output,
