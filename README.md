@@ -6,39 +6,41 @@
 > feature prose below still applies; only the stack names (Electron→Tauri, Fastify→axum,
 > transformers.js→`ort`, pi-SDK→native runtime) have changed. See `DEPLOY.md` for the Rust build/ship flow.
 
-A **pi.dev-based, Claude-Desktop-style coding-agent dashboard** — a clean chat interface for
-the [pi](https://pi.dev) coding agent, with live controls for **model, reasoning effort, tools,
-skills, and subagent orchestration**, packaged as its own desktop app.
+A **Claude-Desktop-style coding-agent dashboard** — a clean chat interface for dotz's own
+coding agent, with live controls for **model, reasoning effort, tools, skills, and subagent
+orchestration**, packaged as a native desktop app.
 
-dotz embeds pi's SDK directly (`@earendil-works/pi-coding-agent`), so the dashboard server *is*
-the agent — no subprocess, nothing to version separately. A lean Fastify backend exposes a
-REST + WebSocket surface; a single self-contained cyberbrutalist UI binds to it; Electron wraps
-it into a native window / portable `.exe`. dotz is **multi-provider** (not just OpenRouter),
-keeps **persistent projects** + a **memory store** injected into the agent's system prompt, and
-ships a **sandbox** with a live web preview the agent can drive an on-screen cursor over, plus a
-native **Open Design** workspace (150+ design systems, live preview, HTML/PDF export).
+dotz is **native Rust**: `dotz-core` is an [axum](https://github.com/tokio-rs/axum) server with
+dotz's own agent runtime (no third-party agent SDK, no subprocess), and a [Tauri](https://tauri.app)
+(WebView2) shell wraps it into a signed, self-updating desktop app. The axum backend exposes a
+REST + WebSocket surface on `127.0.0.1:4317`; a single self-contained cyberbrutalist UI (`web/`,
+vanilla HTML/CSS/JS) binds to it. dotz is **multi-provider** (not just OpenRouter), keeps
+**persistent projects** + an on-device **memory store** (`ort` ONNX embeddings) injected into the
+agent's system prompt, and ships a **sandbox** with a live web preview the agent can drive an
+on-screen cursor over, plus a native **Open Design** workspace (150+ design systems, live preview,
+HTML/PDF export).
 
 ## Architecture
 
 ```
-dotz.exe  (Electron)
- ├─ main process (Node): boots the embedded pi SDK + Fastify on 127.0.0.1:4317
- │    src/pi.ts       — PiSessions: owns AgentSession lifecycle, fans events to WS subscribers
- │    src/profiles.ts — 6 operating profiles + bundled .pi loader (injects doctrine + project memory)
- │    src/projects.ts — persistent named workspaces (cwd + profile + model + thinking defaults)
- │    src/memory.ts   — mem0-backed autonomous memory (on-device; capture/recall/consolidate)
- │    src/embedder.ts — bundled local transformers.js embedder (all-MiniLM-L6-v2, 384-dim)
- │    src/sandbox.ts  — terminal + web sandbox runner with agent-cursor overlay
- │    src/types.ts    — shared types (ModelRef, ProviderMeta, Project, MemoryView, SandboxRun)
- │    src/server.ts   — Fastify: REST controls + WS event stream + static UI
- │    src/main.ts     — Electron: start server, open BrowserWindow → localhost
- │    .pi/            — bundled agent resources: extensions, agents, workflow prompts, + vendored
- │                    Open Design content (150+ design-systems + design-skills) for DESIGN mode
- └─ renderer: web/   — the cyberbrutalist chat UI (vanilla HTML/CSS/JS), same in browser + app
+dotz  (Tauri / WebView2)
+ ├─ src-tauri/        — thin Rust shell: starts dotz-core on 127.0.0.1:4317, opens the WebView2
+ │                      window on it, wires the tauri-plugin-updater (signed cross-device updates)
+ ├─ dotz-core/  (Rust, axum) — the backend + agent runtime:
+ │    agent/          — dotz's own agent runtime (chat loop, tools, subagents, providers)
+ │    profiles.rs     — operating profiles + bundled .pi loader (injects doctrine + project memory)
+ │    projects.rs     — persistent named workspaces (cwd + profile + model + thinking defaults)
+ │    memory.rs       — on-device autonomous memory (capture/recall/consolidate)
+ │    embed.rs        — local ONNX embedder via `ort` (all-MiniLM-L6-v2, 384-dim)
+ │    sandbox / browser — terminal + web sandbox runner with agent-cursor overlay
+ │    server/         — axum: REST controls + WS event stream + static UI; `serve` headless bin
+ │    .pi/            — bundled agent resources: agents, workflow prompts + vendored Open Design
+ │                      content (150+ design-systems + design-skills) for DESIGN mode
+ └─ web/             — the cyberbrutalist chat UI (vanilla HTML/CSS/JS), same in browser + app
 ```
 
-The UI is a plain web app (`fetch` + `WebSocket`), so it runs identically in a browser during
-development and inside the Electron window. See [docs/api-contract.md](docs/api-contract.md) for
+The UI is a plain web app (`fetch` + `WebSocket`), so it runs identically in a browser pointed at
+the headless `serve` binary and inside the Tauri window. See [docs/api-contract.md](docs/api-contract.md) for
 the full UI↔backend contract, and [docs/design-prompt.md](docs/design-prompt.md) for the UI spec.
 
 ## Controls (the five knobs)
@@ -110,12 +112,13 @@ since the bundled systems are static HTML/CSS — a hardened default that still 
 ## Setup
 
 ```bash
-npm install
+npm install        # ships the agent-browser binary + the @huggingface/transformers model fetcher
+npm run fetch-model    # downloads the all-MiniLM-L6-v2 ONNX model into assets/models/ (bundled by Tauri)
 ```
 
-dotz uses pi's normal auth resolution (`~/.pi/agent/auth.json` → env vars). Set keys for the
-providers you use — **Ollama Cloud** is the primary (executive `glm-5.2`, subagent `minimax-m3`)
-and **OpenRouter** is the free fallback (`nex-agi/nex-n2-pro:free`):
+dotz resolves provider auth from `~/.pi/agent/auth.json` → env vars. Set keys for the providers you
+use — **Ollama Cloud** is the primary (executive `glm-5.2`, subagent `minimax-m3`) and **OpenRouter**
+is the free fallback (`nex-agi/nex-n2-pro:free`):
 
 ```bash
 OLLAMA_API_KEY=...        # primary — Ollama Cloud
@@ -127,35 +130,29 @@ See [.env.example](.env.example). Never commit real keys.
 ## Run
 
 ```bash
-# Browser (no Electron) — fastest dev loop; open http://127.0.0.1:4317
-npm run dev:server
+# Headless backend (browser dev loop) — open http://127.0.0.1:4317
+cargo run -p dotz-core --bin serve
 
-# Native desktop window (Electron)
-npm run electron
+# Native desktop window (Tauri / WebView2)
+cargo tauri dev
 ```
 
-## Build the single exe
+## Build the installer
 
 ```bash
-npm run dist        # → release/dotz.exe  (the one Windows launcher)
+cargo tauri build   # → src-tauri/target/release/bundle/nsis/  (signed NSIS installer + latest.json)
 ```
 
-`npm run build` bundles `src/` into `dist/` with esbuild (node_modules left external so pi's
-runtime extension loading works); `electron-builder` then produces the portable executable.
+The signed build needs the updater signing key in the environment — see
+[src-tauri/DEPLOY.md](src-tauri/DEPLOY.md) for the full build + release flow.
 
-## Source-rebuild updater
+## Cross-device auto-update
 
-The portable `.exe` updates itself by **git pull + rebuild + relaunch** (electron-updater can't
-self-replace a running portable exe). On launch it runs a background git check; if the local checkout
-is behind its tracking branch, the UI shows an UPDATE AVAILABLE card with the behind-count and short
-shas. **UPDATE & RESTART** spawns a detached helper that waits for dotz to exit, runs
-`git pull --ff-only` + `npm run dist:portable`, and relaunches the freshly-built exe.
-
-This assumes the dotz **source repo + node/npm are present** on the machine. The repo is resolved from
-`DOTZ_REPO_DIR` or by walking up from the running exe to the nearest `.git`. A dirty working tree
-blocks the update (an ff pull would fail) — commit or stash first.
-
-Test the updater logic offline: `npm run test:updater`.
+The installed app self-updates via `tauri-plugin-updater`: it checks the **public** releases repo
+(`cayleb-james2008/dotz-releases`) for a minisign-signed `latest.json`, verifies it against the
+bundled pubkey, and installs + relaunches in place. The **source repo stays private**; only the
+signed installer + `latest.json` are published publicly. Full topology and the release commands are
+in [src-tauri/DEPLOY.md](src-tauri/DEPLOY.md).
 
 ## Notes & caveats
 
@@ -165,7 +162,7 @@ Test the updater logic offline: `npm run test:updater`.
   (`OPENROUTER_API_KEY`, the free fallback). **OpenRouter credits**: provider errors surface
   in-chat (e.g. `402 … can only afford N tokens`). Use `:free` models (the default
   `nex-agi/nex-n2-pro:free`) when the account balance is low.
-- **Subagents** spawn separate `pi` processes (each an LLM run); the bundled agents default to the
-  free model so `/implement` is runnable out of the box. Edit `.pi/agents/*.md` to change models.
+- **Subagents** run in dotz's native runtime (each a separate LLM run); the bundled agents default
+  to the free model so `/implement` is runnable out of the box. Edit `.pi/agents/*.md` to change models.
 - **Fonts** load from Google Fonts (online). Bundle locally for fully-offline use.
 - The UI was specced for and can be refined in [claude.ai/design](https://claude.ai/design).

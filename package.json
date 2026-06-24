@@ -2,53 +2,15 @@
   "name": "dotz",
   "version": "0.2.0",
   "private": true,
-  "description": "dotz — ultra code mode. A pi.dev-based Claude-Code-style multi-agent coding dashboard with on-the-fly workflow graphs, unified skills, and bento UI.",
+  "description": "dotz — a native Rust (axum + Tauri + ort) Claude-Code-style multi-agent coding dashboard: on-the-fly workflow graphs, unified skills, on-device memory, and a bento UI. (This package.json only supports the Rust build — it ships the agent-browser binary and fetches the ONNX embedding model.)",
   "type": "module",
-  "main": "dist/main.js",
   "scripts": {
-    "postinstall": "electron-rebuild -f -w better-sqlite3",
-    "rebuild:native": "electron-rebuild -f -w better-sqlite3",
-    "dev:server": "tsx watch src/server.ts",
-    "start": "tsx src/server.ts",
-    "wsclient": "tsx scripts/wsclient.ts",
-    "typecheck": "tsc --noEmit",
-    "check": "node scripts/check-no-window.mjs",
-    "build": "npm run check && node esbuild.config.mjs",
-    "fetch-model": "node scripts/fetch-embed-model.mjs",
-    "verify-memory": "tsx scripts/verify-memory.ts",
-    "test:updater": "node --test --import tsx scripts/verify-updater.ts",
-    "test:config": "node --test --import tsx scripts/verify-config.ts",
-    "test:workflows": "node --test --import tsx scripts/verify-workflows.ts",
-    "test:sandbox": "node --test --import tsx scripts/verify-sandbox.mjs",
-    "test:agents-md": "node --import tsx scripts/verify-agents-md.mjs",
-    "test:metrics": "node --test --import tsx scripts/verify-metrics.ts",
-    "test:templates": "node --test --import tsx scripts/verify-templates.ts",
-    "electron": "npm run build && electron .",
-    "clean:release": "node -e \"require('node:fs').rmSync('release',{recursive:true,force:true})\"",
-    "dist": "npm run clean:release && npm run check && npm run fetch-model && npm run build && electron-builder --win portable",
-    "dist:portable": "npm run dist",
-    "dist:publish": "npm run clean:release && npm run fetch-model && npm run build && electron-builder --win portable --publish always"
+    "fetch-model": "node scripts/fetch-embed-model.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.79.6",
-    "@fastify/static": "^9.1.3",
-    "@fastify/websocket": "^11.2.0",
-    "@huggingface/transformers": "^4.2.0",
-    "agent-browser": "0.27.0",
-    "better-sqlite3": "^12.11.1",
-    "fastify": "^5.8.5",
-    "gray-matter": "^4.0.3",
-    "mem0ai": "^3.0.9"
+    "agent-browser": "0.27.0"
   },
   "devDependencies": {
-    "@electron/rebuild": "^4.0.4",
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^25.9.3",
-    "electron": "^42.4.1",
-    "electron-builder": "^26.15.3",
-    "esbuild": "^0.28.1",
-    "tsx": "^4.22.4",
-    "typebox": "^1.2.16",
-    "typescript": "^6.0.3"
+    "@huggingface/transformers": "^4.2.0"
   }
 }
