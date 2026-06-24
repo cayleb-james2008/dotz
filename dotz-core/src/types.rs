@@ -72,7 +72,7 @@ pub fn provider_ids() -> Vec<&'static str> {
 pub fn provider_defaults_json() -> Value {
     json!({
         "ollama": { "executive": "glm-5.2", "subagent": "minimax-m3" },
-        "openrouter": { "executive": "nex-agi/nex-n2-pro", "subagent": "nex-agi/nex-n2-pro" },
+        "openrouter": { "executive": "nex-agi/nex-n2-pro:free", "subagent": "nex-agi/nex-n2-pro:free" },
         "local": { "executive": "qwen2.5-coder", "subagent": "qwen2.5-coder" },
     })
 }
@@ -127,7 +127,7 @@ pub fn render_low_cost_models() -> String {
 pub fn provider_default(id: &str) -> Option<(&'static str, &'static str)> {
     match id {
         "ollama" => Some(("glm-5.2", "minimax-m3")),
-        "openrouter" => Some(("nex-agi/nex-n2-pro", "nex-agi/nex-n2-pro")),
+        "openrouter" => Some(("nex-agi/nex-n2-pro:free", "nex-agi/nex-n2-pro:free")),
         "local" => Some(("qwen2.5-coder", "qwen2.5-coder")),
         _ => None,
     }
@@ -180,13 +180,24 @@ mod tests {
         assert_eq!(provider_default("ollama"), Some(("glm-5.2", "minimax-m3")));
         assert_eq!(
             provider_default("openrouter"),
-            Some(("nex-agi/nex-n2-pro", "nex-agi/nex-n2-pro"))
+            Some(("nex-agi/nex-n2-pro:free", "nex-agi/nex-n2-pro:free"))
         );
         assert_eq!(
             provider_default("local"),
             Some(("qwen2.5-coder", "qwen2.5-coder"))
         );
         assert_eq!(provider_default("unknown"), None);
+    }
+
+    #[test]
+    fn provider_defaults_json_matches_low_cost_openrouter_models() {
+        let defs = provider_defaults_json();
+        let or = defs.get("openrouter").expect("openrouter defaults present");
+        assert_eq!(or.get("executive").and_then(|v| v.as_str()), Some("nex-agi/nex-n2-pro:free"));
+        assert_eq!(or.get("subagent").and_then(|v| v.as_str()), Some("nex-agi/nex-n2-pro:free"));
+        let ollama = defs.get("ollama").expect("ollama defaults present");
+        assert_eq!(ollama.get("executive").and_then(|v| v.as_str()), Some("glm-5.2"));
+        assert_eq!(ollama.get("subagent").and_then(|v| v.as_str()), Some("minimax-m3"));
     }
 
     #[test]
