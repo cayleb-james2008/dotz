@@ -627,29 +627,8 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             }
             // Execute without holding the session lock (the registry is stateless).
             // subagent is special-cased so its SubagentDetails reach result.details (the workflow bridge reads it).
-            let (result_value, is_error, result_text) = if name == "subagent" {
-                let cwd = ctx.cwd.to_string_lossy().to_string();
-                let d = super::subagent::dispatch(&args, &cwd).await;
-                let rv = json!({
-                    "content": [{ "type": "text", "text": d.text.clone() }],
-                    "details": d.details_json(),
-                    "isError": d.is_error,
-                });
-                (rv, d.is_error, d.text)
-            } else {
-                match run_tool(&session, &name, &args, &ctx).await {
-                    Ok(text) => (
-                        json!({ "content": [{ "type": "text", "text": text }] }),
-                        false,
-                        text,
-                    ),
-                    Err(e) => (
-                        json!({ "content": [{ "type": "text", "text": e.clone() }], "isError": true }),
-                        true,
-                        e,
-                    ),
-                }
-            };
+            let (result_value, is_error, result_text) =
+                execute_tool(&session, &name, &args, &ctx).await;
             {
                 let mut s = session.lock().unwrap();
                 emit(
@@ -698,6 +677,51 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         .cloned();
     if let Some(msg) = last {
         finish_turn(&session, msg, tool_results);
+    }
+}
+
+/// Execute a single tool call, respecting the session's active tool set. subagent is special-cased
+/// so its SubagentDetails reach result.details, but it still honors set_tools restrictions.
+async fn execute_tool(
+    session: &std::sync::Arc<Mutex<AgentSession>>,
+    name: &str,
+    args: &Value,
+    ctx: &ToolCtx,
+) -> (Value, bool, String) {
+    if name == "subagent" {
+        let active = {
+            let s = session.lock().unwrap();
+            s.tools.active_names()
+        };
+        if !active.iter().any(|n| n == "subagent") {
+            let e = "tool is not active: subagent".to_string();
+            return (
+                json!({ "content": [{ "type": "text", "text": e.clone() }], "isError": true }),
+                true,
+                e,
+            );
+        }
+        let cwd = ctx.cwd.to_string_lossy().to_string();
+        let d = super::subagent::dispatch(args, &cwd).await;
+        let rv = json!({
+            "content": [{ "type": "text", "text": d.text.clone() }],
+            "details": d.details_json(),
+            "isError": d.is_error,
+        });
+        (rv, d.is_error, d.text)
+    } else {
+        match run_tool(session, name, args, ctx).await {
+            Ok(text) => (
+                json!({ "content": [{ "type": "text", "text": text }] }),
+                false,
+                text,
+            ),
+            Err(e) => (
+                json!({ "content": [{ "type": "text", "text": e.clone() }], "isError": true }),
+                true,
+                e,
+            ),
+        }
     }
 }
 
@@ -1299,7 +1323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_allows_active_tool() {
+    async fn execute_tool_allows_active_tool() {
         let summary = create(CreateOpts::default()).unwrap();
         let sid = summary["sessionId"].as_str().unwrap().to_string();
         let sess = get(&sid).unwrap();
@@ -1324,6 +1348,45 @@ mod tests {
             out.contains("hello-from-session"),
             "run_tool should execute an active tool, got: {out}"
         );
+    }
+
+    /// The subagent tool is special-cased in the executive loop so its SubagentDetails reach the
+    /// workflow bridge. That special case must still respect set_tools: if subagent is disabled,
+    /// a subagent tool call must be rejected just like any other inactive tool.
+    #[tokio::test]
+    async fn execute_tool_rejects_subagent_when_disabled() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+
+        // Restrict the session to the core tools, explicitly excluding subagent.
+        sess.lock()
+            .unwrap()
+            .tools
+            .set_active(&["read".to_string(), "bash".to_string()]);
+
+        let ctx = tools::ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: Some(sess.lock().unwrap().tx.clone()),
+        };
+        let (rv, is_error, text) = execute_tool(
+            &sess,
+            "subagent",
+            &json!({ "agent": "scout", "task": "explore" }),
+            &ctx,
+        )
+        .await;
+
+        dispose(&sid);
+        assert!(
+            is_error,
+            "execute_tool should reject subagent when it is not in the active tool set"
+        );
+        assert!(
+            text.contains("not active"),
+            "error should explain the tool is inactive: {text}"
+        );
+        assert_eq!(rv["isError"], true, "result JSON should mark the error");
     }
 
     #[test]
