@@ -398,9 +398,10 @@ struct TurnGuard {
 
 impl Drop for TurnGuard {
     fn drop(&mut self) {
-        self.session
-            .lock()
-            .unwrap()
+        // Recover from a poisoned mutex: a panic inside the turn (e.g. in a tool or provider
+        // callback) must not make the guard's own drop panic, which would leave the session
+        // permanently marked as busy and crash the task.
+        session_guard(&self.session)
             .turn_active
             .store(false, Ordering::SeqCst);
     }
@@ -1102,6 +1103,41 @@ mod tests {
         assert!(
             !sess.lock().unwrap().turn_active.load(Ordering::SeqCst),
             "TurnGuard must clear turn_active on drop"
+        );
+        dispose(&sid);
+    }
+
+    /// A panic while holding the session mutex (e.g. inside a tool callback) poisons the mutex.
+    /// The TurnGuard that clears `turn_active` must recover from that poison instead of panicking
+    /// in its own drop, which would leave the session wedged as "busy" and abort the task.
+    #[test]
+    fn turn_guard_clears_flag_even_when_mutex_is_poisoned() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        sess.lock()
+            .unwrap()
+            .turn_active
+            .store(true, Ordering::SeqCst);
+
+        // Intentionally poison the mutex while turn_active is set.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sess.lock().unwrap();
+            panic!("intentional poison for TurnGuard test");
+        }));
+        assert!(poisoned.is_err(), "mutex should be poisoned");
+
+        // The guard's drop must still run and clear the flag.
+        {
+            let _guard = TurnGuard {
+                session: sess.clone(),
+            };
+        }
+        assert!(
+            !session_guard(&sess)
+                .turn_active
+                .load(Ordering::SeqCst),
+            "TurnGuard must clear turn_active even when the session mutex is poisoned"
         );
         dispose(&sid);
     }
