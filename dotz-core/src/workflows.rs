@@ -527,6 +527,11 @@ fn list_active() -> Vec<WorkflowRun> {
     store().lock().unwrap().values().cloned().collect()
 }
 
+/// Number of workflow runs currently in the active map. Surfaced in `/api/health`.
+pub fn active_count() -> usize {
+    store().lock().unwrap().len()
+}
+
 fn list_history(project_id: Option<&str>) -> Vec<WorkflowRun> {
     let all = read_all();
     match project_id {
@@ -1062,6 +1067,26 @@ mod tests {
             let run = create(None, None, "test".into(), None, &inputs).unwrap();
             assert!(run.steps[1].parents.is_empty());
             assert_eq!(run.steps[1].status, "ready");
+        });
+    }
+
+    /// `active_count` must reflect the number of runs in the in-memory active store so the
+    /// `/api/health` endpoint can surface live workflow activity to the operator.
+    #[test]
+    fn active_count_returns_store_size() {
+        with_tmp_workflows_file(|| {
+            let baseline = active_count();
+            let run = create(None, None, "count".into(), None, &[step("a", "A", None)]).unwrap();
+            assert_eq!(active_count(), baseline + 1, "active_count should include the new run");
+
+            // Abort marks the run terminal but keeps it in the active map (eviction only happens
+            // when the cap is exceeded), so the count stays elevated.
+            abort(&run.id);
+            assert_eq!(
+                active_count(),
+                baseline + 1,
+                "active_count should still include the aborted run"
+            );
         });
     }
 }
