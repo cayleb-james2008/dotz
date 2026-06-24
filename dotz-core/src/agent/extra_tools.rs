@@ -189,25 +189,30 @@ fn baselines() -> &'static Mutex<HashMap<String, Value>> {
 }
 
 /// Run the gate command in cwd (default: `npm test`), capture output, parse pass/fail counts.
+/// Pick the default gate command from the project manifest: Rust workspaces run
+/// `cargo test`, Node projects run `npm test`. The native-Rust dotz repo therefore
+/// defaults to the correct gate without every project needing an explicit command.
+fn default_gate_command(cwd: &Path) -> String {
+    if cwd.join("Cargo.toml").exists() {
+        "cargo test".into()
+    } else if cwd.join("package.json").exists() {
+        "npm test".into()
+    } else {
+        "cargo test".into()
+    }
+}
+
 async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
     let cwd = cwd.to_path_buf();
-    let command = command.map(|s| s.to_string());
+    let command = command
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| default_gate_command(&cwd));
     tokio::task::spawn_blocking(move || {
-        let (program, args): (&str, Vec<String>) = match &command {
-            Some(c) if !c.trim().is_empty() => {
-                if cfg!(windows) {
-                    ("cmd", vec!["/C".into(), c.clone()])
-                } else {
-                    ("sh", vec!["-c".into(), c.clone()])
-                }
-            }
-            _ => {
-                if cfg!(windows) {
-                    ("cmd", vec!["/C".into(), "npm test".into()])
-                } else {
-                    ("npm", vec!["test".into()])
-                }
-            }
+        let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+            ("cmd", vec!["/C".into(), command.clone()])
+        } else {
+            ("sh", vec!["-c".into(), command.clone()])
         };
         let out = std::process::Command::new(program).args(&args).current_dir(&cwd).output();
         match out {
@@ -377,4 +382,48 @@ pub fn register(add: &mut dyn FnMut(Box<dyn Tool>)) {
     add(Box::new(RsiBaselineTool));
     add(Box::new(RsiCompareTool));
     add(Box::new(HumanGateTool));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("dotz-gate-test-{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn default_gate_command_uses_cargo_for_rust_project() {
+        let dir = tmp_dir();
+        fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(default_gate_command(&dir), "cargo test");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_gate_command_uses_npm_for_node_project() {
+        let dir = tmp_dir();
+        fs::write(dir.join("package.json"), "{}\n").unwrap();
+        assert_eq!(default_gate_command(&dir), "npm test");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_gate_command_prefers_cargo_when_both_manifests_exist() {
+        let dir = tmp_dir();
+        fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(dir.join("package.json"), "{}\n").unwrap();
+        assert_eq!(default_gate_command(&dir), "cargo test");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_gate_command_fallback_is_cargo() {
+        let dir = tmp_dir();
+        assert_eq!(default_gate_command(&dir), "cargo test");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
