@@ -414,18 +414,11 @@ async fn run_single_agent(
     cwd: &str,
     step: Option<usize>,
 ) -> SingleResult {
-    match tokio::time::timeout(
-        subagent_timeout(),
-        run_single_agent_inner(agents, agent_name, task, model_override, cwd, step),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => timeout_result(agent_name, task, step),
-    }
+    run_single_agent_inner(agents, agent_name, task, model_override, cwd, step).await
 }
 
-/// The actual subagent loop — kept separate so `run_single_agent` can wrap it in a timeout.
+/// The actual subagent loop. The provider stream task is aborted on the wall-clock timeout so a
+/// hung provider cannot keep holding a connection (and a tokio task) after the subagent returns.
 async fn run_single_agent_inner(
     agents: &[AgentConfig],
     agent_name: &str,
@@ -513,11 +506,19 @@ async fn run_single_agent_inner(
         let (delta_tx, mut delta_rx) = mpsc::channel::<StreamDelta>(256);
         let adapter = provider::adapter_for(&provider_id);
         let stream_task = tokio::spawn(async move { adapter.stream(req, delta_tx).await });
+        let deadline = tokio::time::Instant::now() + subagent_timeout();
 
         let mut acc = Acc::new(&provider_id, &model_id, now_ms());
         let mut stop_reason = "stop".to_string();
-        while let Some(delta) = delta_rx.recv().await {
-            apply_delta(&mut acc, delta, &mut stop_reason);
+        loop {
+            match tokio::time::timeout_at(deadline, delta_rx.recv()).await {
+                Ok(Some(delta)) => apply_delta(&mut acc, delta, &mut stop_reason),
+                Ok(None) => break,
+                Err(_) => {
+                    stream_task.abort();
+                    return timeout_result(agent_name, task, step);
+                }
+            }
         }
 
         match stream_task.await {
@@ -1094,8 +1095,10 @@ mod tests {
         );
     }
 
-    /// A subagent whose provider stream hangs must not stall the executive turn forever.
-    /// Before the timeout fix, `run_single_agent` would await the stream indefinitely.
+    /// A subagent whose provider stream hangs must not stall the executive turn forever, and the
+    /// provider stream task must be aborted so the underlying connection is released. Before the
+    /// timeout fix, `run_single_agent` would await the stream indefinitely; before the abort fix,
+    /// the timed-out task detached and kept the connection open.
     #[tokio::test]
     async fn run_single_agent_times_out_on_hung_provider() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1196,5 +1199,111 @@ mod tests {
             "error message should mention timeout: {:?}",
             result.error_message
         );
+    }
+
+    /// A timed-out subagent must abort the provider stream task, releasing the underlying TCP
+    /// connection. We verify this by having the fake server detect EOF after the client aborts.
+    #[tokio::test]
+    async fn run_single_agent_aborts_provider_stream_task_on_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let _guard = crate::agent::session::SSE_TEST_LOCK.lock().await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel::<()>();
+        let (closed_tx, mut closed_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut read_half, mut write_half) = stream.into_split();
+            let mut buf = Vec::with_capacity(8192);
+            loop {
+                let mut tmp = [0u8; 1024];
+                let n = read_half.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+            let _ = write_half.write_all(response).await;
+            let _ = headers_tx.send(());
+            // The client should close the connection once `stream_task.abort()` runs.
+            tokio::spawn(async move {
+                let mut after = [0u8; 1];
+                match tokio::time::timeout(Duration::from_secs(3), read_half.read(&mut after)).await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) => {
+                        let _ = closed_tx.send(());
+                    }
+                    _ => {}
+                }
+            });
+            let _ = done_rx.recv().await;
+        });
+
+        let prev_url = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
+        let prev_timeout = std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS").ok();
+        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "500");
+
+        let agent = AgentConfig {
+            name: "test".into(),
+            description: "test".into(),
+            tools: None,
+            model: None,
+            system_prompt: "sys".into(),
+            source: "test",
+        };
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+
+        let mut run = tokio::spawn(async move {
+            let agents = [agent];
+            run_single_agent(
+                &agents,
+                "test",
+                "task",
+                Some("local/test"),
+                &cwd,
+                None,
+            )
+            .await
+        });
+
+        tokio::select! {
+            _ = headers_rx => {}
+            r = &mut run => panic!("run_single_agent finished before provider stream started: {r:?}"),
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.stop_reason.as_deref(), Some("timeout"));
+
+        match prev_url {
+            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
+            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+        }
+        match prev_timeout {
+            Some(p) => std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS"),
+        }
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), closed_rx.recv())
+                .await
+                .is_ok(),
+            "timed-out subagent must abort the provider stream task and close the connection"
+        );
+        let _ = done_tx.send(()).await;
     }
 }
