@@ -131,6 +131,33 @@ fn bad(msg: String) -> (StatusCode, Json<Value>) {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg })))
 }
 
+/// Wait for SIGINT (all platforms) or SIGTERM (Unix) so the axum server can drain open
+/// connections instead of leaving them hanging on a hard kill. Exposed from `dotz-core::server`
+/// so both the headless `serve` bin and any future caller share the same shutdown behavior.
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
 /// Serve with an explicit graceful-shutdown future. Callers (e.g. the headless `serve` bin) can
 /// stop cleanly on SIGINT/SIGTERM; Tauri uses `serve()` and lets the process die with the window.
 pub async fn serve_with_shutdown(
@@ -153,9 +180,16 @@ pub async fn serve_with_shutdown(
         .await
 }
 
-pub async fn serve(addr: SocketAddr, web_dir: PathBuf) -> std::io::Result<()> {
+/// Convenience: bind `addr`, then run the server until `shutdown` resolves. Mirrors the common
+/// "bind + serve with shutdown" pattern used by the headless bin and lets callers avoid
+/// duplicating bind logic.
+pub async fn serve_with_shutdown_addr(
+    addr: SocketAddr,
+    web_dir: PathBuf,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_with_shutdown(listener, web_dir, std::future::pending::<()>()).await
+    serve_with_shutdown(listener, web_dir, shutdown).await
 }
 
 #[cfg(test)]
@@ -292,6 +326,106 @@ mod tests {
         assert!(
             resp.get("config").is_some(),
             "get_config should recover from a poisoned mutex and return config"
+        );
+    }
+
+    /// `serve_with_shutdown_addr` must bind a free ephemeral port, serve the REST surface, and
+    /// shut down cleanly when its future resolves. This covers the new convenience wrapper that
+    /// both the headless `serve` bin and any future caller (e.g. the Tauri shell) can use.
+    #[tokio::test]
+    async fn serve_with_shutdown_addr_binds_and_serves() {
+        // Bind a dummy listener on port 0, read the assigned port, then immediately drop it so
+        // `serve_with_shutdown_addr` can reuse the same port deterministically.
+        let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dummy.local_addr().unwrap();
+        drop(dummy);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(serve_with_shutdown_addr(
+            addr,
+            PathBuf::from("web"),
+            shutdown,
+        ));
+
+        // Wait for the server to start accepting on the known port.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("200 OK"), "health did not return 200: {text}");
+        assert!(
+            text.contains("\"ok\":true") || text.contains("\"ok\": true"),
+            "health body missing ok:true: {text}"
+        );
+
+        let _ = tx.send(());
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "serve_with_shutdown_addr exited with error: {:?}",
+            result.err()
+        );
+    }
+
+    /// `serve_with_shutdown_addr` must drain and exit when the shutdown future is driven by a
+    /// `tokio::sync::watch` channel — the exact pattern the Tauri shell uses for graceful shutdown.
+    #[tokio::test]
+    async fn serve_with_shutdown_addr_drain_on_watch_shutdown() {
+        let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dummy.local_addr().unwrap();
+        drop(dummy);
+
+        let (tx, mut rx) = tokio::sync::watch::channel(());
+        let shutdown = async move {
+            let _ = rx.changed().await;
+        };
+        let handle = tokio::spawn(serve_with_shutdown_addr(
+            addr,
+            PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/api/health", addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "health should be reachable before shutdown"
+        );
+
+        let _ = tx.send(());
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "serve_with_shutdown_addr should exit cleanly on watch shutdown: {:?}",
+            result.err()
+        );
+    }
+
+    /// `serve_with_shutdown_addr` must fail fast when the requested address is already bound,
+    /// surfacing the bind error to the caller instead of panicking or swallowing it.
+    #[tokio::test]
+    async fn serve_with_shutdown_addr_fails_when_port_in_use() {
+        let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dummy.local_addr().unwrap();
+        let result =
+            serve_with_shutdown_addr(addr, PathBuf::from("web"), std::future::pending()).await;
+        assert!(
+            result.is_err(),
+            "binding to an in-use port should return an error: {result:?}"
         );
     }
 }

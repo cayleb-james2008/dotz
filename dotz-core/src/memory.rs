@@ -131,7 +131,9 @@ fn embedder() -> &'static Mutex<Option<Embedder>> {
 /// Lock the embedder mutex, recovering from a poisoned lock. A panic during embedder load or
 /// inference must not permanently brick all future memory operations.
 fn embedder_guard() -> std::sync::MutexGuard<'static, Option<Embedder>> {
-    embedder().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    embedder()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn embed_text(text: &str) -> Result<Vec<f32>, String> {

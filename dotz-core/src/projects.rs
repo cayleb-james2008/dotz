@@ -486,12 +486,7 @@ pub fn router() -> Router<()> {
 /// `PATCH /api/agents_md?projectId=<id>` overwrites it.
 mod agents_md {
     use super::{bad, cwd_for_project, not_found};
-    use axum::{
-        extract::Query,
-        http::StatusCode,
-        routing::get,
-        Json, Router,
-    };
+    use axum::{extract::Query, http::StatusCode, routing::get, Json, Router};
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -545,12 +540,12 @@ mod agents_md {
 
     #[cfg(test)]
     mod tests {
-        use super::*;
         use super::super::{create_project, with_tmp_projects_file};
+        use super::*;
 
         fn tmp_dir() -> std::path::PathBuf {
-            let dir = std::env::temp_dir()
-                .join(format!("dotz-agents-md-test-{}", uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("dotz-agents-md-test-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             dir
         }

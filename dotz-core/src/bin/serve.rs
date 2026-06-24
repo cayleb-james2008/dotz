@@ -14,15 +14,12 @@ async fn main() {
     }
     let web_dir = web_dir();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("error: failed to bind {addr}: {e}");
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) =
-        dotz_core::server::serve_with_shutdown(listener, web_dir.into(), shutdown_signal()).await
+    if let Err(e) = dotz_core::server::serve_with_shutdown_addr(
+        addr,
+        web_dir.into(),
+        dotz_core::server::shutdown_signal(),
+    )
+    .await
     {
         eprintln!("server error: {e}");
         std::process::exit(1);
@@ -36,32 +33,6 @@ fn web_dir() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "web".into())
-}
-
-/// Wait for SIGINT (all platforms) or SIGTERM (Unix) so the axum server can drain open
-/// connections instead of leaving them hanging on a hard kill.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
 }
 
 #[cfg(test)]
