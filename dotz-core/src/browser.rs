@@ -794,10 +794,7 @@ pub async fn start(
     };
 
     // Disposable profile dir under temp_dir()/dotz-browser-<id>.
-    let profile_dir = std::env::temp_dir().join(format!("dotz-browser-{session_id}"));
-    tokio::fs::create_dir_all(&profile_dir)
-        .await
-        .map_err(|e| format!("create profile dir: {e}"))?;
+    let profile_dir = fresh_profile_dir(&session_id).await?;
 
     let now = now_iso();
     let observation = BrowserObservation {
@@ -1188,6 +1185,24 @@ fn action_summary(
             Some(t) => format!("{action} {t}"),
             None => action.to_string(),
         },
+    }
+}
+
+/// Create a fresh, disposable browser profile directory for `session_id` under the OS temp dir.
+/// If a stale directory exists from a previous crash, it is removed first so the new session
+/// never inherits another session's cookies, storage, or state.
+async fn fresh_profile_dir(session_id: &str) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("dotz-browser-{session_id}"));
+    match tokio::fs::create_dir(&dir).await {
+        Ok(()) => Ok(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            tokio::fs::create_dir(&dir)
+                .await
+                .map_err(|e| format!("create profile dir: {e}"))?;
+            Ok(dir)
+        }
+        Err(e) => Err(format!("create profile dir: {e}")),
     }
 }
 
@@ -1591,6 +1606,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(wait, Some(vec!["wait".into(), "30000".into()]));
+    }
+
+    /// `fresh_profile_dir` must create a clean directory under the OS temp dir. If a stale
+    /// directory already exists (e.g. from a previous crash), it must be removed and a fresh,
+    /// empty directory created in its place so browser sessions never reuse another session's
+    /// profile state.
+    #[tokio::test]
+    async fn fresh_profile_dir_creates_clean_dir_and_removes_stale() {
+        let sid = format!("test-{}", uuid::Uuid::new_v4());
+        let dir = fresh_profile_dir(&sid)
+            .await
+            .expect("fresh_profile_dir should succeed");
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "profile dir should live under the OS temp dir"
+        );
+        let meta = tokio::fs::metadata(&dir)
+            .await
+            .expect("profile dir should exist");
+        assert!(meta.is_dir(), "profile path should be a directory");
+
+        // Simulate a stale profile from a previous crash.
+        tokio::fs::write(dir.join("stale-cookie.txt"), "old")
+            .await
+            .expect("writing stale file should succeed");
+
+        // Re-creating for the same session id must wipe the stale dir and return a fresh one.
+        let dir2 = fresh_profile_dir(&sid)
+            .await
+            .expect("fresh_profile_dir should clean stale dir");
+        assert_eq!(
+            dir, dir2,
+            "profile dir path should be stable per session id"
+        );
+        assert!(
+            !dir2.join("stale-cookie.txt").exists(),
+            "stale profile data must be removed"
+        );
+
+        // Cleanup.
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// A panic while holding the browser sessions mutex must not permanently brick the browser
