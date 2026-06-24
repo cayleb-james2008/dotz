@@ -279,8 +279,6 @@ async fn execute_run(id: String, language: String, code: String, timeout_ms: i64
         Some(run_fut.await)
     };
 
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-
     match result {
         Some((out, err, status)) => {
             let mut output = String::new();
@@ -308,6 +306,7 @@ async fn execute_run(id: String, language: String, code: String, timeout_ms: i64
                     finish(&id, "error", None, &cap(&output));
                 }
             }
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         }
         None => {
             // Timeout: kill the child tree, capture whatever output streamed, mark killed.
@@ -327,7 +326,12 @@ async fn execute_run(id: String, language: String, code: String, timeout_ms: i64
             output.push_str(&String::from_utf8_lossy(&out));
             output.push_str(&String::from_utf8_lossy(&err));
             output.push_str(&format!("\n[timeout] killed after {timeout_ms}ms\n"));
+            // Reap the killed child before removing its temp dir. Without this wait the Child
+            // handle can be dropped while the process still holds its current directory, which
+            // on Windows causes remove_dir_all to fail and leaves stale dotz-sandbox-* dirs.
+            let _ = child.wait().await;
             finish(&id, "killed", None, &cap(&output));
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         }
     }
 }
@@ -621,5 +625,74 @@ mod tests {
         let output = "ready\nLocal: http://localhost:3000\nAdmin: http://127.0.0.1:4000\n";
         let ports = scan_ports(output);
         assert_eq!(ports, vec![3000, 4000]);
+    }
+
+    /// A timed-out sandbox run must reap its child and remove its temp dir. Before the fix the
+    /// timeout path killed the child but did not wait for it to exit, so on Windows the process
+    /// still held its current directory and `remove_dir_all` silently failed, leaking stale
+    /// `dotz-sandbox-*` directories.
+    #[tokio::test]
+    async fn timeout_run_reaps_child_and_removes_temp_dir() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let temp_dir = std::env::temp_dir().join(format!("dotz-sandbox-{id}"));
+        {
+            let mut store = runs().lock().unwrap();
+            store.insert(
+                id.clone(),
+                RunEntry {
+                    run: SandboxRun {
+                        id: id.clone(),
+                        project_id: None,
+                        language: "bash".to_string(),
+                        code: String::new(),
+                        status: "running".to_string(),
+                        output: String::new(),
+                        exit_code: None,
+                        started_at: now_ms(),
+                        ended_at: None,
+                    },
+                    pid: None,
+                    killed_by_us: false,
+                    mode: "terminal".to_string(),
+                    port: None,
+                },
+            );
+        }
+
+        // Use a command that outlives the 500ms timeout so we exercise the timeout cleanup path.
+        let (language, code) = if cfg!(windows) {
+            ("powershell", "Start-Sleep -Seconds 3")
+        } else {
+            ("bash", "sleep 2")
+        };
+        execute_run(id.clone(), language.to_string(), code.to_string(), 500).await;
+
+        let status = {
+            let store = runs().lock().unwrap();
+            let entry = store.get(&id).expect("run entry should exist");
+            entry.run.status.clone()
+        };
+        assert_eq!(status, "killed");
+
+        // Give Windows a moment to finish taskkill and release handles, then assert the temp
+        // dir was cleaned up. (Linux allows removing an in-use dir, so this primarily guards
+        // Windows, but it still validates the cleanup path everywhere.)
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut gone = false;
+        while tokio::time::Instant::now() < deadline {
+            if !temp_dir.exists() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(gone, "timed-out sandbox run should remove its temp dir");
+
+        // Be a good citizen: remove the terminal run entry and any leftover temp dir.
+        {
+            let mut store = runs().lock().unwrap();
+            store.remove(&id);
+        }
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }
