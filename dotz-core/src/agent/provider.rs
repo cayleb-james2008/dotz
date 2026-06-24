@@ -244,10 +244,14 @@ impl Provider for OpenAiChat {
         let mut stream = resp.bytes_stream().eventsource();
         let mut usage_seen: Option<Usage> = None;
         let mut stop: Option<String> = None;
-        // Providers may stream a tool-call name across multiple chunks. Track started indices so
-        // we emit ToolCallStart exactly once per index and preserve the original id.
+        // Providers may stream a tool-call id and name across multiple chunks, sometimes sending
+        // the id before the name. Track both the started indices and the id seen so far for each
+        // index so we emit ToolCallStart exactly once, using the real id even when it arrived in
+        // an earlier chunk.
         let mut tool_call_started: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
+        let mut tool_call_ids: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
 
         while let Some(ev) = stream.next().await {
             let ev = match ev {
@@ -302,18 +306,29 @@ impl Provider for OpenAiChat {
             }
 
             // Tool calls (function calling). Each chunk carries a partial arg-fragment per index.
-            // Some providers split the name across chunks; only emit ToolCallStart once per index.
+            // Some providers split the id and name across chunks; only emit ToolCallStart once per
+            // index, but keep the real id even when it arrived before the name.
             if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
                 for tc in tcs {
                     let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                    // Capture the id as soon as it appears, regardless of whether the name is here yet.
+                    if let Some(id) = tc
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        tool_call_ids.insert(index, id.to_string());
+                    }
                     let func = tc.get("function");
                     let name = func.and_then(|f| f.get("name")).and_then(|n| n.as_str());
                     if let Some(name) = name {
                         if !name.is_empty() && tool_call_started.insert(index) {
-                            let id = tc
-                                .get("id")
-                                .and_then(|i| i.as_str())
-                                .map(|s| s.to_string())
+                            let id = tool_call_ids
+                                .get(&index)
+                                .cloned()
+                                .or_else(|| {
+                                    tc.get("id").and_then(|i| i.as_str()).map(|s| s.to_string())
+                                })
                                 .unwrap_or_else(|| format!("call_{index}"));
                             let _ = tx
                                 .send(StreamDelta::ToolCallStart {
@@ -526,6 +541,109 @@ mod tests {
             "both argument fragments should still be delivered"
         );
         assert_eq!(final_stop, "tool_use");
+    }
+
+    /// Some OpenAI-compatible providers stream the tool-call id in one chunk and the name in a
+    /// later chunk. The adapter must preserve that id so the emitted `ToolCallStart` carries the
+    /// provider's real tool_call_id; otherwise the downstream tool result would use a generated
+    /// fallback id and the API would reject the mismatched tool_call_id.
+    #[tokio::test]
+    async fn streaming_tool_call_id_preserved_across_chunks() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::with_capacity(8192);
+            loop {
+                let mut tmp = [0u8; 1024];
+                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = headers_tx.send(());
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+            let _ = stream.write_all(response).await;
+            // First chunk carries only the id — the function name is empty/absent.
+            let _ = stream
+                .write_all(
+                    sse(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_real","function":{"name":"","arguments":""}}]}}]}"#)
+                        .as_bytes(),
+                )
+                .await;
+            // Second chunk finally carries the name for the same index.
+            let _ = stream
+                .write_all(
+                    sse(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"bash"}}]}}]}"#)
+                        .as_bytes(),
+                )
+                .await;
+            // Third chunk completes the arguments.
+            let _ = stream
+                .write_all(
+                    sse(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"echo hi\"}"}}]}}]}"#)
+                        .as_bytes(),
+                )
+                .await;
+            let _ = stream
+                .write_all(sse(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#).as_bytes())
+                .await;
+        });
+
+        let client = OpenAiChat::new();
+        let model = ResolvedModel {
+            provider: "test".into(),
+            model_id: "test".into(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key_ref: "test-key".into(),
+            context_window: 1000,
+            reasoning: false,
+        };
+        let req = ChatRequest {
+            model,
+            messages: vec![],
+            tools: vec![],
+            reasoning_effort: None,
+        };
+        let (tx, mut rx) = mpsc::channel::<StreamDelta>(16);
+
+        let stream_task = tokio::spawn(async move { client.stream(req, tx).await });
+        let _ = headers_rx.await;
+
+        let mut start: Option<StreamDelta> = None;
+        while let Some(d) = rx.recv().await {
+            if matches!(d, StreamDelta::ToolCallStart { .. }) {
+                start = Some(d);
+            }
+        }
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), stream_task)
+            .await
+            .expect("stream task timed out")
+            .unwrap();
+        assert!(result.is_ok(), "stream ended with error: {:?}", result);
+
+        match start {
+            Some(StreamDelta::ToolCallStart { id, name, .. }) => {
+                assert_eq!(
+                    id, "call_real",
+                    "ToolCallStart must use the id from the earlier chunk, not a fallback"
+                );
+                assert_eq!(name, "bash");
+            }
+            other => panic!(
+                "expected exactly one ToolCallStart with id 'call_real', got {:?}",
+                other
+            ),
+        }
     }
 
     /// A hung provider that accepts the HTTP connection but never sends a response must not block
