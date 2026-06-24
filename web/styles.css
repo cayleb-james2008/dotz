@@ -384,6 +384,7 @@ code { font-family: var(--mono); color: var(--peach); }
 .panel[data-panel="skills"] { grid-column: span 4; grid-row: span 4; }
 .panel[data-panel="connections"] { grid-column: span 4; grid-row: span 3; }
 .panel[data-panel="design"] { grid-column: span 6; grid-row: span 6; }
+.panel[data-panel="doctrine"] { grid-column: span 6; grid-row: span 5; }
 .design-body { padding: 10px; overflow: hidden; display: flex; flex-direction: column; gap: 6px; }
 .design-toolbar { display: flex; gap: 6px; align-items: center; }
 .design-toolbar .pf-input { flex: 1; }
@@ -392,6 +393,38 @@ code { font-family: var(--mono); color: var(--peach); }
 .design-preview-wrap { flex: 1; display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
 .design-iframe { flex: 1; width: 100%; border: none; background: #fff; }
 .skill-source.design { background: var(--lav); color: #1e1e2e; }
+
+/* ---- DOCTRINE PANEL ---- */
+.doctrine-body { display: flex; flex-direction: column; overflow: hidden; }
+.doctrine-toolbar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 8px; background: rgba(17,17,27,0.5); border-bottom: 1px solid var(--border); min-height: 30px;
+}
+.doctrine-toolbar .btn-go { min-width: 64px; }
+.doctrine-status { margin-left: auto; font-size: 10px; }
+.doctrine-status.red { color: var(--red); }
+.doctrine-status.yellow { color: var(--yellow); }
+.doctrine-split {
+  flex: 1; display: flex; gap: 8px; overflow: hidden; min-height: 0; padding: 8px;
+}
+.doctrine-pane {
+  flex: 1 1 50%; display: flex; flex-direction: column; min-width: 0;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden;
+}
+.doctrine-editor {
+  flex: 1; width: 100%; resize: none; background: var(--bg); color: var(--green);
+  border: none; padding: 10px 12px; font-family: var(--mono); font-size: 12px; line-height: 1.45;
+  outline: none; white-space: pre; overflow: auto;
+}
+.doctrine-editor:focus { background: var(--bg-2); }
+.doctrine-preview {
+  flex: 1; overflow-y: auto; padding: 10px 12px; background: var(--bg); color: var(--text);
+  font-size: 12px; line-height: 1.5;
+}
+@media (max-width: 900px) {
+  .doctrine-split { flex-direction: column; }
+  .doctrine-pane { flex: 1 1 auto; }
+}
 
 /* ---- CHAT PANEL ---- */
 .chat-body { display: flex; flex-direction: column; overflow: hidden; }

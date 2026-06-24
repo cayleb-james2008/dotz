@@ -24,7 +24,7 @@ import {
   type ThinkingLevel,
 } from "./pi";
 import { projectStore } from "./projects";
-import { memoryStore, onMemoryRecall, enableMemoryAutonomy } from "./memory";
+import { memoryStore, onMemoryRecall, enableMemoryAutonomy, readAgentsMd, writeAgentsMd } from "./memory";
 import { sandbox, SANDBOX_LANGUAGES, type SandboxEvent } from "./sandbox";
 import { skillLoader } from "./skills";
 import { workflowStore, WorkflowCycleError } from "./workflows";
@@ -340,6 +340,30 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const body = (req.body ?? {}) as { projectId?: string };
     return memoryStore.consolidate(await cwdForProject(body.projectId));
   });
+
+  // ---- AGENTS.md doctrine editor ----
+  // Exposes the project doctrine file directly to the UI so operators can edit AGENTS.md
+  // without hand-editing files or invoking the agent. Read uses the same helper as the
+  // agents_md tool; PATCH writes the full file back.
+  app.get("/api/agents_md", async (req, reply) => {
+    const projectId = (req.query as { projectId?: string }).projectId;
+    if (!projectId) { reply.code(400).send({ error: "projectId required" }); return; }
+    const p = await projectStore.get(projectId);
+    if (!p) { reply.code(404).send({ error: "no such project" }); return; }
+    const content = await readAgentsMd(p.cwd);
+    return { content, path: path.join(p.cwd, "AGENTS.md") };
+  });
+  app.patch("/api/agents_md", async (req, reply) => {
+    const projectId = (req.query as { projectId?: string }).projectId;
+    const body = (req.body ?? {}) as { content?: unknown };
+    if (!projectId) { reply.code(400).send({ error: "projectId required" }); return; }
+    if (typeof body.content !== "string") { reply.code(400).send({ error: "content must be a string" }); return; }
+    const p = await projectStore.get(projectId);
+    if (!p) { reply.code(404).send({ error: "no such project" }); return; }
+    await writeAgentsMd(p.cwd, body.content);
+    return { ok: true, content: body.content, path: path.join(p.cwd, "AGENTS.md") };
+  });
+
   // ---- skills (unified pool) ----
   app.get("/api/skills", async () => {
     await skillLoader.load();
