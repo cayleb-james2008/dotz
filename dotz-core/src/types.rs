@@ -88,6 +88,14 @@ pub fn low_cost_models() -> Vec<ModelRef> {
             provider: "ollama".into(),
             model_id: "kimi-k2.7-code".into(),
         },
+        ModelRef {
+            provider: "openrouter".into(),
+            model_id: "nvidia/nemotron-3-ultra-550b-a55b:free".into(),
+        },
+        ModelRef {
+            provider: "openrouter".into(),
+            model_id: "nex-agi/nex-n2-pro:free".into(),
+        },
     ]
 }
 
@@ -181,6 +189,17 @@ mod tests {
     }
 
     #[test]
+    fn low_cost_models_includes_ollama_and_openrouter_workers() {
+        let models = low_cost_models();
+        assert!(models.iter().any(|m| m.provider == "ollama" && m.model_id == "minimax-m3"));
+        assert!(models.iter().any(|m| m.provider == "ollama" && m.model_id == "kimi-k2.7-code"));
+        assert!(models.iter().any(|m| {
+            m.provider == "openrouter" && m.model_id == "nvidia/nemotron-3-ultra-550b-a55b:free"
+        }));
+        assert!(models.iter().any(|m| m.provider == "openrouter" && m.model_id == "nex-agi/nex-n2-pro:free"));
+    }
+
+    #[test]
     fn resolve_subagent_model_uses_override_when_present() {
         assert_eq!(
             resolve_subagent_model(Some("openrouter/nvidia/nemotron-3-ultra-550b-a55b:free")),
@@ -198,6 +217,8 @@ mod tests {
     fn render_low_cost_models_contains_default_and_low_cost_list() {
         let rendered = render_low_cost_models();
         assert!(rendered.contains("ollama/minimax-m3"));
+        assert!(rendered.contains("nvidia/nemotron-3-ultra-550b-a55b:free"));
+        assert!(rendered.contains("nex-agi/nex-n2-pro:free"));
         assert!(rendered.contains("Do NOT pass a `model` override"));
         assert!(rendered.contains("minimax-m3"));
     }
