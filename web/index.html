@@ -428,6 +428,44 @@
       </div>
     </template>
 
+    <template id="tpl-templates">
+      <div class="panel" data-panel="templates" role="region" aria-label="Templates">
+        <div class="panel-head" draggable="true"><span class="panel-icon">⬡</span> TEMPLATES <button class="panel-close">×</button></div>
+        <div class="panel-body templates-body">
+          <div class="templates-toolbar">
+            <input id="templates-search" class="pf-input" placeholder="search templates…" />
+            <button id="templates-new" class="btn-mini btn-go">+ NEW</button>
+          </div>
+          <div id="templates-count" class="skills-count dim mono">loading…</div>
+          <div class="templates-split">
+            <div id="templates-list" class="templates-list"></div>
+            <div id="templates-detail" class="templates-detail hidden">
+              <div class="templates-detail-head">
+                <span id="templates-detail-name" class="skill-name"></span>
+                <span id="templates-detail-source" class="skill-source"></span>
+              </div>
+              <div class="templates-detail-meta">
+                <input id="templates-detail-title" class="pf-input" placeholder="name" />
+                <input id="templates-detail-desc" class="pf-input" placeholder="description" />
+              </div>
+              <textarea id="templates-detail-body" class="templates-editor" spellcheck="false" placeholder="template body… use $@ for user arguments"></textarea>
+              <div class="templates-detail-actions">
+                <button id="templates-run" class="btn-mini btn-go">▶ RUN</button>
+                <button id="templates-fork" class="btn-mini">FORK</button>
+                <button id="templates-save" class="btn-mini btn-go">SAVE</button>
+                <button id="templates-delete" class="btn-mini btn-stop hidden">DELETE</button>
+                <button id="templates-cancel" class="btn-mini">CLOSE</button>
+              </div>
+              <div id="templates-run-args" class="templates-run-args hidden">
+                <input id="templates-args-input" class="pf-input" placeholder="arguments for $@…" />
+                <button id="templates-args-run" class="btn-mini btn-go">▶ RUN</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
     <template id="tpl-doctrine">
       <div class="panel" data-panel="doctrine" role="region" aria-label="Doctrine">
         <div class="panel-head" draggable="true"><span class="panel-icon">◈</span> DOCTRINE <button class="panel-close">×</button></div>

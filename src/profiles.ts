@@ -11,6 +11,8 @@ import { getAgentDir, SettingsManager, DefaultResourceLoader, type ResourceLoade
 import { DEFAULT_MODEL, renderLowCostModels, type ModelRef, type ThinkingLevel } from "./types";
 import { memoryStore } from "./memory";
 import { skillLoader } from "./skills";
+import { userTemplatesDir } from "./templates";
+import fs from "node:fs/promises";
 
 /** Bundled .pi (skills / extensions / prompts) — resolved relative to this module so it works
  *  both in dev (src/) and in the packaged app (dist/, with .pi shipped alongside). */
@@ -203,6 +205,9 @@ export async function buildResourceLoader(
   // Inject the unified skill index (names + one-line descriptions) so the agent knows what
   // skills are available without loading every full body. The `skill` tool loads bodies on demand.
   await skillLoader.load();
+  // Ensure the user template directory exists before handing it to the resource loader so the SDK
+  // never trips over a missing path on first run.
+  await fs.mkdir(userTemplatesDir(), { recursive: true });
   const skillIndex = skillLoader.renderIndex();
   if (skillIndex) prompts.push(skillIndex);
   // Inject the low-cost sub-model list so the main model can select sub-models for task distribution.
@@ -219,7 +224,7 @@ export async function buildResourceLoader(
       path.join(DOTZ_PI, "extensions", "dotz-tools"),
     ],
     additionalSkillPaths: [path.join(DOTZ_PI, "skills")],
-    additionalPromptTemplatePaths: [path.join(DOTZ_PI, "prompts")],
+    additionalPromptTemplatePaths: [path.join(DOTZ_PI, "prompts"), userTemplatesDir()],
   });
   await resLoader.reload();
   return resLoader;
