@@ -832,7 +832,10 @@ mod tests {
     #[test]
     fn out_of_range_numeric_string_parent_is_skipped() {
         with_tmp_workflows_file(|| {
-            let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!("99")]))];
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!("99")])),
+            ];
             let run = create(None, None, "test".into(), None, &inputs).unwrap();
             assert!(run.steps[1].parents.is_empty());
             assert_eq!(run.steps[1].status, "ready");

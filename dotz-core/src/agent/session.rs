@@ -74,7 +74,11 @@ impl AgentSession {
         // app.js refreshStats reads tokens.input/output → tokens MUST be an object, not a scalar.
         // FilterMap over a double-ended iterator: .last() walks the whole history; .next_back()
         // is O(1) and gives the same final element.
-        let last = self.history.iter().filter_map(|m| m.usage.as_ref()).next_back();
+        let last = self
+            .history
+            .iter()
+            .filter_map(|m| m.usage.as_ref())
+            .next_back();
         let (input, output, total) = last
             .map(|u| (u.input, u.output, u.total_tokens))
             .unwrap_or((0, 0, 0));
@@ -694,10 +698,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
 
 /// Finish a turn that has hit the MAX_ROUNDS cap by reusing the last assistant message.
 /// Uses `session_guard` so a poisoned mutex does not panic the cleanup path.
-fn finish_round_cap(
-    session: &std::sync::Arc<Mutex<AgentSession>>,
-    tool_results: Vec<ToolResult>,
-) {
+fn finish_round_cap(session: &std::sync::Arc<Mutex<AgentSession>>, tool_results: Vec<ToolResult>) {
     let last = session_guard(session)
         .history
         .iter()
@@ -1240,9 +1241,11 @@ mod tests {
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolCall { id, name, arguments } => {
-                    Some((id.clone(), name.clone(), arguments.clone()))
-                }
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.clone(), name.clone(), arguments.clone())),
                 _ => None,
             })
             .collect();
@@ -1286,9 +1289,7 @@ mod tests {
             };
         }
         assert!(
-            !session_guard(&sess)
-                .turn_active
-                .load(Ordering::SeqCst),
+            !session_guard(&sess).turn_active.load(Ordering::SeqCst),
             "TurnGuard must clear turn_active even when the session mutex is poisoned"
         );
         dispose(&sid);
@@ -1336,12 +1337,7 @@ mod tests {
     fn set_model_normalizes_redundant_provider_prefix() {
         let summary = create(CreateOpts::default()).unwrap();
         let sid = summary["sessionId"].as_str().unwrap().to_string();
-        let updated = set_model(
-            &sid,
-            "ollama",
-            "  ollama/glm-5.2  "
-        )
-        .unwrap();
+        let updated = set_model(&sid, "ollama", "  ollama/glm-5.2  ").unwrap();
         assert_eq!(updated["model"]["provider"], "ollama");
         assert_eq!(updated["model"]["modelId"], "glm-5.2");
         dispose(&sid);
@@ -1699,7 +1695,8 @@ mod tests {
         let sess = get(&sid).unwrap();
         {
             let mut g = sess.lock().unwrap();
-            g.history.push(Message::assistant_shell("ollama", "glm-5.2", now_ms()));
+            g.history
+                .push(Message::assistant_shell("ollama", "glm-5.2", now_ms()));
         }
         let mut rx = sess.lock().unwrap().tx.subscribe();
 
@@ -1904,9 +1901,7 @@ mod tests {
                             .get("event")
                             .and_then(|e| e.get("assistantMessageEvent"))
                         {
-                            if ame.get("type").and_then(|t| t.as_str())
-                                == Some("toolcall_start")
-                            {
+                            if ame.get("type").and_then(|t| t.as_str()) == Some("toolcall_start") {
                                 saw_toolcall = true;
                             }
                         }
@@ -2070,10 +2065,7 @@ mod tests {
         );
 
         // Control operations on the poisoned session must recover and succeed.
-        assert!(
-            abort(&sid),
-            "abort must succeed after session lock poison"
-        );
+        assert!(abort(&sid), "abort must succeed after session lock poison");
         assert!(
             set_thinking(&sid, "xhigh").is_ok(),
             "set_thinking must succeed after session lock poison"
@@ -2119,19 +2111,13 @@ mod tests {
             "create/get must succeed after lock poison"
         );
         assert!(
-            list_summaries().iter().any(|s| {
-                s.get("sessionId").and_then(|v| v.as_str()) == Some(&sid)
-            }),
+            list_summaries()
+                .iter()
+                .any(|s| { s.get("sessionId").and_then(|v| v.as_str()) == Some(&sid) }),
             "list_summaries must include the new session"
         );
 
-        assert!(
-            dispose(&sid),
-            "dispose must succeed after lock poison"
-        );
-        assert!(
-            get(&sid).is_none(),
-            "session must be removed after dispose"
-        );
+        assert!(dispose(&sid), "dispose must succeed after lock poison");
+        assert!(get(&sid).is_none(), "session must be removed after dispose");
     }
 }

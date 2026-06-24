@@ -423,9 +423,8 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
     // One-shot signal from the reader to the fan: "send this close frame and finish".
     // Used when the client initiates a close so the server echoes it cleanly instead of
     // dropping the socket mid-handshake.
-    let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel::<
-        Option<axum::extract::ws::CloseFrame>,
-    >();
+    let (close_tx, mut close_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Option<axum::extract::ws::CloseFrame>>();
 
     // Fan agent events (broadcast) → socket, plus periodic keep-alive pings. The ping keeps the
     // connection alive through proxies that drop idle sockets; browsers auto-pong in response.
@@ -780,12 +779,9 @@ mod tests {
             "provider": "ollama",
             "modelId": "ollama/glm-5.2"
         }));
-        let resp = post_model(
-            axum::extract::Path(sid.clone()),
-            Some(body),
-        )
-        .await
-        .unwrap();
+        let resp = post_model(axum::extract::Path(sid.clone()), Some(body))
+            .await
+            .unwrap();
         assert_eq!(resp.0["model"]["provider"], "ollama");
         assert_eq!(resp.0["model"]["modelId"], "glm-5.2");
 
@@ -1044,7 +1040,11 @@ mod tests {
         let prev = std::env::var("DOTZ_WS_PING_INTERVAL_MS").ok();
 
         std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "0");
-        assert_eq!(ws_ping_interval().as_millis(), 100, "zero must clamp to min");
+        assert_eq!(
+            ws_ping_interval().as_millis(),
+            100,
+            "zero must clamp to min"
+        );
 
         std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "50");
         assert_eq!(

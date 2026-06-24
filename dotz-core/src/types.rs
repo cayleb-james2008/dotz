@@ -238,11 +238,23 @@ mod tests {
     fn provider_defaults_json_matches_low_cost_openrouter_models() {
         let defs = provider_defaults_json();
         let or = defs.get("openrouter").expect("openrouter defaults present");
-        assert_eq!(or.get("executive").and_then(|v| v.as_str()), Some("nex-agi/nex-n2-pro:free"));
-        assert_eq!(or.get("subagent").and_then(|v| v.as_str()), Some("nex-agi/nex-n2-pro:free"));
+        assert_eq!(
+            or.get("executive").and_then(|v| v.as_str()),
+            Some("nex-agi/nex-n2-pro:free")
+        );
+        assert_eq!(
+            or.get("subagent").and_then(|v| v.as_str()),
+            Some("nex-agi/nex-n2-pro:free")
+        );
         let ollama = defs.get("ollama").expect("ollama defaults present");
-        assert_eq!(ollama.get("executive").and_then(|v| v.as_str()), Some("glm-5.2"));
-        assert_eq!(ollama.get("subagent").and_then(|v| v.as_str()), Some("minimax-m3"));
+        assert_eq!(
+            ollama.get("executive").and_then(|v| v.as_str()),
+            Some("glm-5.2")
+        );
+        assert_eq!(
+            ollama.get("subagent").and_then(|v| v.as_str()),
+            Some("minimax-m3")
+        );
     }
 
     #[test]

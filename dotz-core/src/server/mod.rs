@@ -200,7 +200,11 @@ mod tests {
             barrier.clone(),
             json!({ "provider": "openrouter" }),
         );
-        let t2 = spawn(state.clone(), barrier.clone(), json!({ "thinkingLevel": "xhigh" }));
+        let t2 = spawn(
+            state.clone(),
+            barrier.clone(),
+            json!({ "thinkingLevel": "xhigh" }),
+        );
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();
 

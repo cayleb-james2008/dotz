@@ -599,8 +599,7 @@ mod tests {
     #[test]
     fn reload_index_picks_up_newly_created_skill() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let dir =
-            std::env::temp_dir().join(format!("dotz-skills-reload-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("dotz-skills-reload-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // Point DOTZ_PI at an empty tree so the only scanned skills come from our override dir.

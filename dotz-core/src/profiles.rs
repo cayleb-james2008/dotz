@@ -70,7 +70,10 @@ const PLAN_TOOLS: &[&str] = &["read", "grep", "find", "ls", "subagent"];
 
 /// True for one of the six known profile ids.
 pub fn is_valid(id: &str) -> bool {
-    matches!(id, "workflow" | "solo" | "plan" | "frontend" | "backend" | "design")
+    matches!(
+        id,
+        "workflow" | "solo" | "plan" | "frontend" | "backend" | "design"
+    )
 }
 
 /// Resolve a profile by id (default = "workflow"), returning its runtime config.

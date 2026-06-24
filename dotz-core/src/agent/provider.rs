@@ -89,8 +89,8 @@ pub fn resolve_api_key(reference: &str) -> String {
 /// override with `DOTZ_PROVIDER_TIMEOUT_MS` (clamped to [1s, 1h]).
 pub(crate) fn request_timeout() -> Duration {
     const DEFAULT_MS: u64 = 300_000; // 5 minutes
-    const MIN_MS: u64 = 1_000;       // 1 second
-    const MAX_MS: u64 = 3_600_000;   // 1 hour
+    const MIN_MS: u64 = 1_000; // 1 second
+    const MAX_MS: u64 = 3_600_000; // 1 hour
     std::env::var("DOTZ_PROVIDER_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -246,7 +246,8 @@ impl Provider for OpenAiChat {
         let mut stop: Option<String> = None;
         // Providers may stream a tool-call name across multiple chunks. Track started indices so
         // we emit ToolCallStart exactly once per index and preserve the original id.
-        let mut tool_call_started: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut tool_call_started: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
 
         while let Some(ev) = stream.next().await {
             let ev = match ev {
@@ -497,7 +498,9 @@ mod tests {
         let mut final_stop = String::new();
         while let Some(d) = rx.recv().await {
             match d {
-                StreamDelta::ToolCallStart { ref id, ref name, .. } => {
+                StreamDelta::ToolCallStart {
+                    ref id, ref name, ..
+                } => {
                     starts += 1;
                     assert_eq!(id, "call_abc");
                     assert_eq!(name, "bash");
@@ -518,7 +521,10 @@ mod tests {
             starts, 1,
             "only one ToolCallStart should be emitted per index even when name repeats"
         );
-        assert_eq!(arg_chunks, 2, "both argument fragments should still be delivered");
+        assert_eq!(
+            arg_chunks, 2,
+            "both argument fragments should still be delivered"
+        );
         assert_eq!(final_stop, "tool_use");
     }
 
@@ -573,12 +579,10 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<StreamDelta>(4);
 
         let start = tokio::time::Instant::now();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.stream(req, tx),
-        )
-        .await
-        .expect("test wrapper timed out waiting for provider timeout");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.stream(req, tx))
+                .await
+                .expect("test wrapper timed out waiting for provider timeout");
         let elapsed = start.elapsed();
 
         match prev {
@@ -587,7 +591,10 @@ mod tests {
         }
         server.abort();
 
-        assert!(result.is_err(), "hung provider should return an error, got: {result:?}");
+        assert!(
+            result.is_err(),
+            "hung provider should return an error, got: {result:?}"
+        );
         assert!(
             elapsed >= std::time::Duration::from_millis(900),
             "adapter should wait for the configured timeout before returning, elapsed: {elapsed:?}"
