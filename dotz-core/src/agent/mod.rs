@@ -305,34 +305,18 @@ async fn post_abort(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, 
     }
 }
 
-/// reload-context: rebuild the session fresh (new system prompt) keeping project/profile/model/thinking.
+/// reload-context: rebuild the session in place (new system prompt, cleared history) keeping the
+/// same session id so existing WebSocket subscribers stay connected.
 async fn post_reload(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let s = match session::get(&id) {
-        Some(s) => s,
-        None => return Err(not_found()),
-    };
-    let opts = {
-        let g = s.lock().unwrap();
-        session::CreateOpts {
-            cwd: Some(g.cwd.to_string_lossy().to_string()),
-            model: Some(types::ModelRef {
-                provider: g.provider.clone(),
-                model_id: g.model_id.clone(),
-            }),
-            thinking_level: Some(g.thinking_level.clone()),
-            tools: Some(g.tools.active_names()),
-            profile_id: Some(g.profile_id.clone()),
-            project_id: g.project_id.clone(),
-        }
-    };
-    match session::create(opts) {
-        Ok(fresh) => {
-            session::dispose(&id);
-            Ok(Json(fresh))
-        }
+    match session::reload(&id) {
+        Ok(summary) => Ok(Json(summary)),
+        Err(e) if e.contains("busy") => Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": e })),
+        )),
         Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "reload failed", "detail": e })),
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e })),
         )),
     }
 }
