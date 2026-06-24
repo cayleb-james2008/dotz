@@ -224,11 +224,19 @@ fn cargo_package_name(cargo_toml: &str) -> Option<String> {
             in_package = trimmed == "[package]";
             continue;
         }
-        if in_package && trimmed.starts_with("name") {
-            if let Some(v) = trimmed.splitn(2, '=').nth(1) {
-                let v = v.trim().trim_matches(|c| c == '\"' || c == '\'');
-                if !v.is_empty() {
-                    return Some(v.to_string());
+        if in_package {
+            if let Some((key, value)) = trimmed.split_once('=') {
+                if key.trim() == "name" {
+                    let mut v = value.trim();
+                    // Strip a trailing TOML comment so `name = "foo" # comment` does not leak
+                    // the comment into the gate command.
+                    if let Some(idx) = v.find('#') {
+                        v = &v[..idx];
+                    }
+                    let v = v.trim().trim_matches(|c| c == '\"' || c == '\'');
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
                 }
             }
         }
@@ -598,6 +606,29 @@ mod tests {
             "the dotz workspace root should default to the runtime crate gate"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cargo_package_name_rejects_prefixed_keys() {
+        // A key like `nameable` must NOT be mistaken for `name`; only an exact key match counts.
+        let toml = "[package]\nnameable = true\nname = \"real-crate\"\n";
+        assert_eq!(
+            cargo_package_name(toml),
+            Some("real-crate".into()),
+            "prefixed keys must not be parsed as the package name"
+        );
+    }
+
+    #[test]
+    fn cargo_package_name_strips_trailing_comment() {
+        // Trailing TOML comments must be removed before unquoting so they don't leak into the
+        // derived `cargo test -p <name>` gate command.
+        let toml = "[package]\nname = \"dotz-core\" # the core runtime crate\n";
+        assert_eq!(
+            cargo_package_name(toml),
+            Some("dotz-core".into()),
+            "trailing comments must be stripped from the package name"
+        );
     }
 
     #[test]
