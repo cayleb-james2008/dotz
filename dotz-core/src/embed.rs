@@ -13,7 +13,9 @@ pub struct Embedder {
     tokenizer: Tokenizer,
 }
 
-/// assets/models root: DOTZ_MODELS (the models dir) | DOTZ_ASSETS/models | <cwd>/assets/models.
+/// assets/models root: DOTZ_MODELS (the models dir) | DOTZ_ASSETS/models | <cwd>/assets/models |
+/// <workspace>/assets/models derived from the crate manifest dir. The manifest fallback makes
+/// tests and binaries runnable from the `dotz-core` crate dir as well as the workspace root.
 fn models_root() -> PathBuf {
     if let Ok(d) = std::env::var("DOTZ_MODELS") {
         if !d.is_empty() {
@@ -25,6 +27,25 @@ fn models_root() -> PathBuf {
             return PathBuf::from(d).join("models");
         }
     }
+    // Cargo sets CARGO_MANIFEST_DIR to the crate root (dotz-core). Fall back to the workspace
+    // root (one level up) so tests/binaries work regardless of the current working directory.
+    let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_root.parent().unwrap_or(&manifest_root);
+    for candidate in [
+        PathBuf::from("assets").join("models"),
+        manifest_root.join("assets").join("models"),
+        workspace_root.join("assets").join("models"),
+    ] {
+        if candidate
+            .join("Xenova")
+            .join("all-MiniLM-L6-v2")
+            .join("tokenizer.json")
+            .exists()
+        {
+            return candidate;
+        }
+    }
+    // Default to cwd-relative when nothing matches so load() still reports the expected error.
     PathBuf::from("assets").join("models")
 }
 
@@ -87,5 +108,103 @@ impl Embedder {
         texts: &[&str],
     ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
         texts.iter().map(|t| self.embed(t)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    // The ONNX Session + Tokenizer are not cheap to create; share one instance across tests and
+    // serialize on it so parallel test runners do not load the model multiple times.
+    static EMBEDDER: OnceLock<Mutex<Embedder>> = OnceLock::new();
+
+    fn shared() -> std::sync::MutexGuard<'static, Embedder> {
+        EMBEDDER
+            .get_or_init(|| {
+                Mutex::new(
+                    Embedder::load().expect("the bundled all-MiniLM-L6-v2 ONNX model should load"),
+                )
+            })
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let n = a.len().min(b.len());
+        let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for i in 0..n {
+            d += a[i] as f64 * b[i] as f64;
+            na += a[i] as f64 * a[i] as f64;
+            nb += b[i] as f64 * b[i] as f64;
+        }
+        let den = na.sqrt() * nb.sqrt();
+        if den == 0.0 {
+            d
+        } else {
+            d / den
+        }
+    }
+
+    fn l2_norm(v: &[f32]) -> f64 {
+        v.iter().map(|x| *x as f64 * *x as f64).sum::<f64>().sqrt()
+    }
+
+    #[test]
+    fn embedder_loads_and_produces_384_dim_normalized_vectors() {
+        let mut e = shared();
+        let v = e.embed("cargo test -p dotz-core").unwrap();
+        assert_eq!(v.len(), EMBED_DIM, "expected {EMBED_DIM}-dim embeddings");
+        let norm = l2_norm(&v);
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "embeddings must be L2-normalized, got norm {norm}"
+        );
+    }
+
+    #[test]
+    fn identical_texts_have_cosine_one() {
+        let mut e = shared();
+        let a = e.embed("dotz uses ort for local ONNX embeddings").unwrap();
+        let b = e.embed("dotz uses ort for local ONNX embeddings").unwrap();
+        let c = cosine(&a, &b);
+        assert!(
+            (c - 1.0).abs() < 1e-5,
+            "identical texts should have cosine ~1, got {c}"
+        );
+    }
+
+    #[test]
+    fn different_texts_have_lower_similarity() {
+        let mut e = shared();
+        let a = e.embed("machine learning").unwrap();
+        let b = e.embed("freshly baked sourdough bread").unwrap();
+        let c = cosine(&a, &b);
+        assert!(
+            c < 0.95,
+            "unrelated texts should not be near-identical, got cosine {c}"
+        );
+    }
+
+    #[test]
+    fn embed_batch_matches_individual_embeddings() {
+        let mut e = shared();
+        let texts = ["first sentence", "second sentence"];
+        let batch = e.embed_batch(&texts).unwrap();
+        assert_eq!(batch.len(), 2);
+        for (i, text) in texts.iter().enumerate() {
+            let single = e.embed(text).unwrap();
+            assert_eq!(
+                batch[i].len(),
+                single.len(),
+                "batch row {i} must have the same dimension as the single embedding"
+            );
+            let c = cosine(&batch[i], &single);
+            assert!(
+                (c - 1.0).abs() < 1e-5,
+                "batch embedding {i} must match the individual embedding, got cosine {c}"
+            );
+        }
     }
 }
