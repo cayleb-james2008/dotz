@@ -34,27 +34,46 @@ use tokio::sync::broadcast;
 use crate::types;
 
 fn bad(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg.into() })))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg.into() })),
+    )
 }
 fn not_found() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_FOUND, Json(json!({ "error": "no such session" })))
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "no such session" })),
+    )
 }
 
 // ---- REST handlers (server.ts 546-719) ----
 
-async fn create_session(body: Option<Json<Value>>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn create_session(
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
 
     // Validate model shape (must be {provider, modelId} when present).
     let model = match b.get("model") {
         None | Some(Value::Null) => None,
         Some(m) => {
-            let prov = m.get("provider").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let mid = m.get("modelId").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let prov = m
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let mid = m
+                .get("modelId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
             if prov.is_empty() || mid.is_empty() {
                 return Err(bad("model must be { provider, modelId }"));
             }
-            Some(types::ModelRef { provider: prov.to_string(), model_id: mid.to_string() })
+            Some(types::ModelRef {
+                provider: prov.to_string(),
+                model_id: mid.to_string(),
+            })
         }
     };
     // Validate thinkingLevel.
@@ -63,13 +82,18 @@ async fn create_session(body: Option<Json<Value>>) -> Result<Json<Value>, (Statu
         Some(t) => {
             let tv = t.as_str().unwrap_or("");
             if !types::is_valid_thinking(tv) {
-                return Err(bad(format!("thinkingLevel must be one of: {}", types::THINKING_LEVELS.join(", "))));
+                return Err(bad(format!(
+                    "thinkingLevel must be one of: {}",
+                    types::THINKING_LEVELS.join(", ")
+                )));
             }
             Some(tv.to_string())
         }
     };
     let tools = b.get("tools").and_then(|v| v.as_array()).map(|a| {
-        a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()
+        a.iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect::<Vec<_>>()
     });
 
     let opts = session::CreateOpts {
@@ -77,12 +101,21 @@ async fn create_session(body: Option<Json<Value>>) -> Result<Json<Value>, (Statu
         model,
         thinking_level: thinking,
         tools,
-        profile_id: b.get("profileId").and_then(|v| v.as_str()).map(String::from),
-        project_id: b.get("projectId").and_then(|v| v.as_str()).map(String::from),
+        profile_id: b
+            .get("profileId")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        project_id: b
+            .get("projectId")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     };
     match session::create(opts) {
         Ok(summary) => Ok(Json(summary)),
-        Err(e) => Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "session creation failed", "detail": e })))),
+        Err(e) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "session creation failed", "detail": e })),
+        )),
     }
 }
 
@@ -91,7 +124,9 @@ async fn list_sessions() -> Json<Value> {
 }
 
 async fn get_session(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    session::summary_with_stats(&id).map(Json).ok_or_else(not_found)
+    session::summary_with_stats(&id)
+        .map(Json)
+        .ok_or_else(not_found)
 }
 
 async fn delete_session(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -106,10 +141,23 @@ async fn get_models(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, 
     session::models(&id).map(Json).ok_or_else(not_found)
 }
 
-async fn post_model(Path(id): Path<String>, body: Option<Json<Value>>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn post_model(
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
-    let prov = b.get("provider").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let mid = b.get("modelId").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let prov = b
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mid = b
+        .get("modelId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if prov.is_empty() || mid.is_empty() {
         return Err(bad("provider and modelId are required"));
     }
@@ -119,33 +167,53 @@ async fn post_model(Path(id): Path<String>, body: Option<Json<Value>>) -> Result
     // Free-form providers + OpenAI-compatible providers accept any id; anthropic/google resolve to
     // None in provider::resolve, mirroring the catalog-only restriction.
     if provider::resolve(&prov, &mid).is_none() {
-        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": format!("model not found: {prov}/{mid}") }))));
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("model not found: {prov}/{mid}") })),
+        ));
     }
-    session::set_model(&id, &prov, &mid).map(Json).map_err(|_| not_found())
+    session::set_model(&id, &prov, &mid)
+        .map(Json)
+        .map_err(|_| not_found())
 }
 
-async fn post_thinking(Path(id): Path<String>, body: Option<Json<Value>>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn post_thinking(
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let level = b.get("level").and_then(|v| v.as_str()).unwrap_or("");
     if !types::is_valid_thinking(level) {
-        return Err(bad(format!("level must be one of: {}", types::THINKING_LEVELS.join(", "))));
+        return Err(bad(format!(
+            "level must be one of: {}",
+            types::THINKING_LEVELS.join(", ")
+        )));
     }
-    session::set_thinking(&id, level).map(Json).map_err(|_| not_found())
+    session::set_thinking(&id, level)
+        .map(Json)
+        .map_err(|_| not_found())
 }
 
 async fn get_tools(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     session::get_tools(&id).map(Json).ok_or_else(not_found)
 }
 
-async fn post_tools(Path(id): Path<String>, body: Option<Json<Value>>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn post_tools(
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let tools = b.get("tools").and_then(|v| v.as_array());
     let names: Vec<String> = match tools {
-        Some(a) if a.iter().all(|x| x.is_string()) => a.iter().map(|x| x.as_str().unwrap().to_string()).collect(),
+        Some(a) if a.iter().all(|x| x.is_string()) => {
+            a.iter().map(|x| x.as_str().unwrap().to_string()).collect()
+        }
         Some(_) => return Err(bad("tools must be an array of strings")),
         None => Vec::new(),
     };
-    session::set_tools(&id, &names).map(Json).map_err(|_| not_found())
+    session::set_tools(&id, &names)
+        .map(Json)
+        .map_err(|_| not_found())
 }
 
 async fn get_commands(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -174,7 +242,10 @@ async fn post_reload(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode,
         let g = s.lock().unwrap();
         session::CreateOpts {
             cwd: Some(g.cwd.to_string_lossy().to_string()),
-            model: Some(types::ModelRef { provider: g.provider.clone(), model_id: g.model_id.clone() }),
+            model: Some(types::ModelRef {
+                provider: g.provider.clone(),
+                model_id: g.model_id.clone(),
+            }),
             thinking_level: Some(g.thinking_level.clone()),
             tools: Some(g.tools.active_names()),
             profile_id: Some(g.profile_id.clone()),
@@ -186,7 +257,10 @@ async fn post_reload(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode,
             session::dispose(&id);
             Ok(Json(fresh))
         }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "reload failed", "detail": e })))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "reload failed", "detail": e })),
+        )),
     }
 }
 
@@ -195,10 +269,16 @@ async fn post_reload(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode,
 fn require_ws_session(q: &HashMap<String, String>) -> Result<String, (StatusCode, Json<Value>)> {
     let session_id = q.get("sessionId").cloned().unwrap_or_default();
     if session_id.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "sessionId is required" }))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "sessionId is required" })),
+        ));
     }
     if session::get(&session_id).is_none() {
-        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "no such session" }))));
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such session" })),
+        ));
     }
     Ok(session_id)
 }
@@ -226,15 +306,26 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
     let (mut sink, mut stream) = socket.split();
 
     // Session existence was validated before the HTTP upgrade, so subscribe cannot fail here.
-    let mut rx = session::subscribe(&session_id).expect("session validated before WebSocket upgrade");
+    let mut rx =
+        session::subscribe(&session_id).expect("session validated before WebSocket upgrade");
 
     // ready frame.
-    let _ = sink.send(WsMessage::Text(json!({ "kind": "ready", "sessionId": session_id }).to_string().into())).await;
+    let _ = sink
+        .send(WsMessage::Text(
+            json!({ "kind": "ready", "sessionId": session_id })
+                .to_string()
+                .into(),
+        ))
+        .await;
 
     // Fan agent events (broadcast) → socket.
     let fan = tokio::spawn(async move {
         while let Some(frame) = recv_broadcast(&mut rx).await {
-            if sink.send(WsMessage::Text(frame.to_string().into())).await.is_err() {
+            if sink
+                .send(WsMessage::Text(frame.to_string().into()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -252,7 +343,11 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
             Err(_) => continue,
         };
         let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-        let body = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let body = v
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
         match kind {
             // prompt/steer/followUp all drive a turn. (steer/followUp queueing collapses to a turn
             // here — single-agent path; the richer queueing semantics are Phase 4.)
@@ -274,7 +369,10 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
             // Resolve a pending human_gate (app.js sends {kind:"gate.approve"|"gate.reject", gateId, feedback?}).
             "gate.approve" | "gate.reject" => {
                 if let Some(gid) = v.get("gateId").and_then(|g| g.as_str()) {
-                    let fb = v.get("feedback").and_then(|f| f.as_str()).map(|s| s.to_string());
+                    let fb = v
+                        .get("feedback")
+                        .and_then(|f| f.as_str())
+                        .map(|s| s.to_string());
                     extra_tools::resolve_gate(gid, kind == "gate.approve", fb);
                 }
             }
@@ -289,7 +387,10 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
 pub fn router() -> Router<()> {
     Router::new()
         .route("/api/sessions", post(create_session).get(list_sessions))
-        .route("/api/sessions/{id}", get(get_session).delete(delete_session))
+        .route(
+            "/api/sessions/{id}",
+            get(get_session).delete(delete_session),
+        )
         .route("/api/sessions/{id}/models", get(get_models))
         .route("/api/sessions/{id}/model", post(post_model))
         .route("/api/sessions/{id}/thinking", post(post_thinking))
@@ -325,7 +426,10 @@ mod tests {
         }
         // The fan must stay alive across the lag error.
         let first = recv_broadcast(&mut rx).await;
-        assert!(first.is_some(), "recv_broadcast should resume after lag, not close the connection");
+        assert!(
+            first.is_some(),
+            "recv_broadcast should resume after lag, not close the connection"
+        );
 
         // Drain whatever buffered tail remains so the receiver is caught up.
         let mut seen_last = false;
@@ -340,7 +444,10 @@ mod tests {
         // After recovery, new messages are delivered normally.
         let _ = tx.send(json!({ "n": 99 }));
         let next = recv_broadcast(&mut rx).await;
-        assert_eq!(next.and_then(|v| v.get("n").and_then(|n| n.as_i64())), Some(99));
+        assert_eq!(
+            next.and_then(|v| v.get("n").and_then(|n| n.as_i64())),
+            Some(99)
+        );
     }
 
     #[test]

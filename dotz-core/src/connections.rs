@@ -64,7 +64,11 @@ fn run_command(program: &str, args: &[&str], timeout: Duration) -> CmdResult {
         Ok(c) => c,
         // Missing CLI (ENOENT) or any spawn failure => not installed, never propagate an error.
         Err(err) => {
-            return CmdResult { code: Some(127), stdout: String::new(), stderr: err.to_string() }
+            return CmdResult {
+                code: Some(127),
+                stdout: String::new(),
+                stderr: err.to_string(),
+            }
         }
     };
 
@@ -103,14 +107,22 @@ fn run_command(program: &str, args: &[&str], timeout: Duration) -> CmdResult {
             }
             Err(err) => {
                 let _ = child.kill();
-                return CmdResult { code: Some(127), stdout: String::new(), stderr: err.to_string() };
+                return CmdResult {
+                    code: Some(127),
+                    stdout: String::new(),
+                    stderr: err.to_string(),
+                };
             }
         }
     };
 
     let stdout = cap(so_t.join().unwrap_or_default());
     let stderr = cap(se_t.join().unwrap_or_default());
-    CmdResult { code, stdout, stderr }
+    CmdResult {
+        code,
+        stdout,
+        stderr,
+    }
 }
 
 fn cap(s: String) -> String {
@@ -156,7 +168,11 @@ fn parse_github(r: &CmdResult) -> Parsed {
         installed: true,
         logged_in,
         account,
-        hint: if logged_in { None } else { Some("not logged in".to_string()) },
+        hint: if logged_in {
+            None
+        } else {
+            Some("not logged in".to_string())
+        },
     }
 }
 
@@ -171,7 +187,9 @@ fn extract_account(out: &str) -> Option<String> {
         let bytes = out.as_bytes();
         let mut i = after;
         let mut saw_ws = false;
-        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\r' || bytes[i] == b'\n') {
+        while i < bytes.len()
+            && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\r' || bytes[i] == b'\n')
+        {
             saw_ws = true;
             i += 1;
         }
@@ -214,8 +232,16 @@ fn parse_vercel(r: &CmdResult) -> Parsed {
     Parsed {
         installed: true,
         logged_in,
-        account: if logged_in { lines.last().cloned() } else { None },
-        hint: if logged_in { None } else { Some("not logged in".to_string()) },
+        account: if logged_in {
+            lines.last().cloned()
+        } else {
+            None
+        },
+        hint: if logged_in {
+            None
+        } else {
+            Some("not logged in".to_string())
+        },
     }
 }
 
@@ -304,7 +330,9 @@ async fn get_connections() -> Json<Value> {
 async fn disabled() -> (StatusCode, Json<Value>) {
     (
         StatusCode::NOT_IMPLEMENTED,
-        Json(json!({ "error": "connection login/logout disabled in Rust port (safety) — Phase 5" })),
+        Json(
+            json!({ "error": "connection login/logout disabled in Rust port (safety) — Phase 5" }),
+        ),
     )
 }
 
@@ -317,5 +345,8 @@ pub fn router() -> Router<()> {
             "/api/connections/{provider}/login",
             get(disabled).post(disabled),
         )
-        .route("/api/connections/{provider}/logout", axum::routing::post(disabled))
+        .route(
+            "/api/connections/{provider}/logout",
+            axum::routing::post(disabled),
+        )
 }

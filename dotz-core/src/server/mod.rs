@@ -3,12 +3,7 @@ use crate::{
     config::{self, CleanPatch, DotzConfig},
     profiles, types,
 };
-use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use serde_json::{json, Value};
 use std::{
     net::SocketAddr,
@@ -122,11 +117,74 @@ fn bad(msg: String) -> (StatusCode, Json<Value>) {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg })))
 }
 
-pub async fn serve(addr: SocketAddr, web_dir: PathBuf) -> std::io::Result<()> {
-    let state = Arc::new(AppState { config: Mutex::new(config::load()) });
+/// Serve with an explicit graceful-shutdown future. Callers (e.g. the headless `serve` bin) can
+/// stop cleanly on SIGINT/SIGTERM; Tauri uses `serve()` and lets the process die with the window.
+pub async fn serve_with_shutdown(
+    listener: tokio::net::TcpListener,
+    web_dir: PathBuf,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let state = Arc::new(AppState {
+        config: Mutex::new(config::load()),
+    });
     // Only the main server process captures memory autonomously (subagents never do).
     crate::memory::enable_autonomy();
+    eprintln!(
+        "dotz-core listening on http://{}  (web: {})",
+        listener.local_addr()?,
+        web_dir.display()
+    );
+    axum::serve(listener, app(web_dir, state))
+        .with_graceful_shutdown(shutdown)
+        .await
+}
+
+pub async fn serve(addr: SocketAddr, web_dir: PathBuf) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    eprintln!("dotz-core listening on http://{addr}  (web: {})", web_dir.display());
-    axum::serve(listener, app(web_dir, state)).await
+    serve_with_shutdown(listener, web_dir, std::future::pending::<()>()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn health_endpoint_ok_and_graceful_shutdown_works() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(serve_with_shutdown(
+            listener,
+            PathBuf::from("web"),
+            shutdown,
+        ));
+        // Give the server a tick to start accepting.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("200 OK"), "health did not return 200: {text}");
+        assert!(
+            text.contains("\"ok\":true") || text.contains("\"ok\": true"),
+            "health body missing ok:true: {text}"
+        );
+
+        let _ = tx.send(());
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "server exited with error: {:?}",
+            result.err()
+        );
+    }
 }

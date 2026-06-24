@@ -33,7 +33,9 @@ pub fn dotz_dir() -> PathBuf {
             return PathBuf::from(d);
         }
     }
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".dotz")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".dotz")
 }
 
 fn config_file() -> PathBuf {
@@ -42,7 +44,10 @@ fn config_file() -> PathBuf {
 
 /// The bundled subagent extension reads DOTZ_SUBAGENT_MODEL to pin every dispersed subagent's model.
 pub fn apply_env(c: &DotzConfig) {
-    std::env::set_var("DOTZ_SUBAGENT_MODEL", format!("{}/{}", c.provider, c.subagent_model));
+    std::env::set_var(
+        "DOTZ_SUBAGENT_MODEL",
+        format!("{}/{}", c.provider, c.subagent_model),
+    );
 }
 
 /// Load config.json, clamping any invalid present field to its default (mirror loadConfig).

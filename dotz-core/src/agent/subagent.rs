@@ -34,7 +34,10 @@ const CHAIN_PREVIOUS_CAP: usize = 24 * 1024;
 const MAX_ROUNDS: usize = 12;
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 // ---- agent discovery (port of agents.ts) ----
@@ -71,7 +74,10 @@ fn pi_dir() -> PathBuf {
 /// Tolerant of CRLF (normalizes `\r`) — the bundled agents may be checked out with either ending.
 fn parse_frontmatter(content: &str) -> (HashMap<String, String>, String) {
     let mut fm = HashMap::new();
-    let norm = content.strip_prefix('\u{feff}').unwrap_or(content).replace("\r\n", "\n");
+    let norm = content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(content)
+        .replace("\r\n", "\n");
     // Frontmatter must start at the very top with a `---` line.
     let Some(after_open) = norm.strip_prefix("---\n") else {
         return (fm, content.to_string());
@@ -315,11 +321,20 @@ impl SingleResult {
     }
 }
 
-fn unknown_agent_result(agent_name: &str, task: &str, available: &[AgentConfig], step: Option<usize>) -> SingleResult {
+fn unknown_agent_result(
+    agent_name: &str,
+    task: &str,
+    available: &[AgentConfig],
+    step: Option<usize>,
+) -> SingleResult {
     let list = if available.is_empty() {
         "none".to_string()
     } else {
-        available.iter().map(|a| format!("\"{}\"", a.name)).collect::<Vec<_>>().join(", ")
+        available
+            .iter()
+            .map(|a| format!("\"{}\"", a.name))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     SingleResult {
         agent: agent_name.to_string(),
@@ -330,7 +345,9 @@ fn unknown_agent_result(agent_name: &str, task: &str, available: &[AgentConfig],
         usage: SubUsage::default(),
         model: None,
         stop_reason: Some("error".into()),
-        error_message: Some(format!("Unknown agent: \"{agent_name}\". Available agents: {list}.")),
+        error_message: Some(format!(
+            "Unknown agent: \"{agent_name}\". Available agents: {list}."
+        )),
         step,
     }
 }
@@ -356,7 +373,11 @@ async fn run_single_agent(
     let effective_model = model_override
         .map(|s| s.to_string())
         .or_else(|| agent.model.clone())
-        .or_else(|| std::env::var("DOTZ_SUBAGENT_MODEL").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("DOTZ_SUBAGENT_MODEL")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| "ollama/minimax-m3".to_string());
     // Split "provider/model-id" → (provider, model_id). A bare id falls back to ollama.
     let (provider_id, model_id) = match effective_model.split_once('/') {
@@ -410,7 +431,10 @@ async fn run_single_agent(
         agent.system_prompt.clone()
     };
 
-    let ctx = ToolCtx { cwd: PathBuf::from(cwd), tx: None };
+    let ctx = ToolCtx {
+        cwd: PathBuf::from(cwd),
+        tx: None,
+    };
 
     // Conversation history (rich Messages, like the executive session).
     let mut history: Vec<Message> = vec![Message::user(&format!("Task: {task}"), now_ms())];
@@ -476,9 +500,11 @@ async fn run_single_agent(
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolCall { id, name, arguments } => {
-                    Some((id.clone(), name.clone(), arguments.clone()))
-                }
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.clone(), name.clone(), arguments.clone())),
                 _ => None,
             })
             .collect();
@@ -530,7 +556,15 @@ pub async fn run_single_agent_public(
     cwd: &str,
 ) -> SingleResult {
     let discovery = discover_agents(cwd, "user");
-    run_single_agent(&discovery.agents, agent_name, task, model_override, cwd, None).await
+    run_single_agent(
+        &discovery.agents,
+        agent_name,
+        task,
+        model_override,
+        cwd,
+        None,
+    )
+    .await
 }
 
 // ---- streaming accumulator (a no-event subset of session::Accumulator) ----
@@ -582,7 +616,11 @@ fn apply_delta(acc: &mut Acc, delta: StreamDelta, stop_reason: &mut String) {
             }
         },
         StreamDelta::ToolCallStart { index, id, name } => {
-            acc.msg.content.push(ContentBlock::ToolCall { id, name, arguments: json!({}) });
+            acc.msg.content.push(ContentBlock::ToolCall {
+                id,
+                name,
+                arguments: json!({}),
+            });
             let block_idx = acc.msg.content.len() - 1;
             acc.tool_calls.insert(index, (block_idx, String::new()));
         }
@@ -590,7 +628,8 @@ fn apply_delta(acc: &mut Acc, delta: StreamDelta, stop_reason: &mut String) {
             if let Some(entry) = acc.tool_calls.get_mut(&index) {
                 entry.1.push_str(&frag);
                 if let Ok(parsed) = serde_json::from_str::<Value>(&entry.1) {
-                    if let ContentBlock::ToolCall { arguments, .. } = &mut acc.msg.content[entry.0] {
+                    if let ContentBlock::ToolCall { arguments, .. } = &mut acc.msg.content[entry.0]
+                    {
                         *arguments = parsed;
                     }
                 }
@@ -617,7 +656,11 @@ fn to_openai_messages(system_prompt: &str, history: &[Message]) -> Vec<Value> {
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::ToolCall { id, name, arguments } => Some(json!({
+                        ContentBlock::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => Some(json!({
                             "id": id, "type": "function",
                             "function": { "name": name, "arguments": arguments.to_string() }
                         })),
@@ -669,7 +712,10 @@ fn truncate_bytes(s: &str, cap: usize) -> String {
         end -= 1;
     }
     let omitted = s.len() - end;
-    format!("{}\n\n[Output truncated: {omitted} bytes omitted.]", &s[..end])
+    format!(
+        "{}\n\n[Output truncated: {omitted} bytes omitted.]",
+        &s[..end]
+    )
 }
 
 // ---- dispatch: parse params → run the right mode → assemble (text, is_error, details) ----
@@ -750,9 +796,15 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
             .map(|a| format!("{} ({})", a.name, a.source))
             .collect::<Vec<_>>()
             .join(", ");
-        let available = if available.is_empty() { "none".into() } else { available };
+        let available = if available.is_empty() {
+            "none".into()
+        } else {
+            available
+        };
         return Dispatch {
-            text: format!("Invalid parameters. Provide exactly one mode.\nAvailable agents: {available}"),
+            text: format!(
+                "Invalid parameters. Provide exactly one mode.\nAvailable agents: {available}"
+            ),
             is_error: true,
             details: make_details("single", Vec::new()),
         };
@@ -763,7 +815,10 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
         let chain = chain.unwrap();
         if chain.len() > MAX_CHAIN_STEPS {
             return Dispatch {
-                text: format!("Chain too long ({}). Max is {MAX_CHAIN_STEPS}.", chain.len()),
+                text: format!(
+                    "Chain too long ({}). Max is {MAX_CHAIN_STEPS}.",
+                    chain.len()
+                ),
                 is_error: true,
                 details: make_details("chain", Vec::new()),
             };
@@ -777,7 +832,8 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
             let model = step.get("model").and_then(|v| v.as_str());
             // Substitute {previous} (literal replacement — no regex specials).
             let task = task_tmpl.replace("{previous}", &previous);
-            let r = run_single_agent(&agents, agent_name, &task, model, step_cwd, Some(i + 1)).await;
+            let r =
+                run_single_agent(&agents, agent_name, &task, model, step_cwd, Some(i + 1)).await;
             let failed = r.is_failed();
             results.push(r);
             if failed {
@@ -791,8 +847,16 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
             previous = truncate_bytes(&results.last().unwrap().final_output(), CHAIN_PREVIOUS_CAP);
         }
         let last_out = results.last().map(|r| r.final_output()).unwrap_or_default();
-        let text = if last_out.is_empty() { "(no output)".into() } else { last_out };
-        return Dispatch { text, is_error: false, details: make_details("chain", results) };
+        let text = if last_out.is_empty() {
+            "(no output)".into()
+        } else {
+            last_out
+        };
+        return Dispatch {
+            text,
+            is_error: false,
+            details: make_details("chain", results),
+        };
     }
 
     // ---- parallel ----
@@ -800,7 +864,10 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
         let tasks = tasks.unwrap();
         if tasks.len() > MAX_PARALLEL_TASKS {
             return Dispatch {
-                text: format!("Too many parallel tasks ({}). Max is {MAX_PARALLEL_TASKS}.", tasks.len()),
+                text: format!(
+                    "Too many parallel tasks ({}). Max is {MAX_PARALLEL_TASKS}.",
+                    tasks.len()
+                ),
                 is_error: true,
                 details: make_details("parallel", Vec::new()),
             };
@@ -809,15 +876,38 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
         let sem = std::sync::Arc::new(Semaphore::new(MAX_CONCURRENCY));
         let mut set = tokio::task::JoinSet::new();
         for (idx, t) in tasks.iter().enumerate() {
-            let agent_name = t.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let task = t.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let task_cwd = t.get("cwd").and_then(|v| v.as_str()).unwrap_or(cwd).to_string();
-            let model = t.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let agent_name = t
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let task = t
+                .get("task")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let task_cwd = t
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .unwrap_or(cwd)
+                .to_string();
+            let model = t
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let agents = agents.clone();
             let sem = sem.clone();
             set.spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
-                let r = run_single_agent(&agents[..], &agent_name, &task, model.as_deref(), &task_cwd, None).await;
+                let r = run_single_agent(
+                    &agents[..],
+                    &agent_name,
+                    &task,
+                    model.as_deref(),
+                    &task_cwd,
+                    None,
+                )
+                .await;
                 (idx, r)
             });
         }
@@ -853,7 +943,11 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
             results.len(),
             summaries.join("\n\n---\n\n")
         );
-        return Dispatch { text, is_error: false, details: make_details("parallel", results) };
+        return Dispatch {
+            text,
+            is_error: false,
+            details: make_details("parallel", results),
+        };
     }
 
     // ---- single ----
@@ -872,6 +966,14 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
         };
     }
     let out = r.final_output();
-    let text = if out.is_empty() { "(no output)".into() } else { out };
-    Dispatch { text, is_error: false, details: make_details("single", vec![r]) }
+    let text = if out.is_empty() {
+        "(no output)".into()
+    } else {
+        out
+    };
+    Dispatch {
+        text,
+        is_error: false,
+        details: make_details("single", vec![r]),
+    }
 }

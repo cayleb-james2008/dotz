@@ -63,10 +63,17 @@ fn obj_param(props: Value, required: &[&str]) -> Value {
 struct ReadTool;
 #[async_trait]
 impl Tool for ReadTool {
-    fn name(&self) -> &'static str { "read" }
-    fn description(&self) -> &'static str { "Read a file's contents (UTF-8). Returns the full text." }
+    fn name(&self) -> &'static str {
+        "read"
+    }
+    fn description(&self) -> &'static str {
+        "Read a file's contents (UTF-8). Returns the full text."
+    }
     fn parameters(&self) -> Value {
-        obj_param(json!({ "file_path": { "type": "string", "description": "Path to the file" } }), &["file_path"])
+        obj_param(
+            json!({ "file_path": { "type": "string", "description": "Path to the file" } }),
+            &["file_path"],
+        )
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let p = str_arg(args, "file_path").ok_or("file_path is required")?;
@@ -78,8 +85,12 @@ impl Tool for ReadTool {
 struct WriteTool;
 #[async_trait]
 impl Tool for WriteTool {
-    fn name(&self) -> &'static str { "write" }
-    fn description(&self) -> &'static str { "Write (create or overwrite) a file with the given content." }
+    fn name(&self) -> &'static str {
+        "write"
+    }
+    fn description(&self) -> &'static str {
+        "Write (create or overwrite) a file with the given content."
+    }
     fn parameters(&self) -> Value {
         obj_param(
             json!({ "file_path": { "type": "string" }, "content": { "type": "string" } }),
@@ -102,8 +113,12 @@ impl Tool for WriteTool {
 struct EditTool;
 #[async_trait]
 impl Tool for EditTool {
-    fn name(&self) -> &'static str { "edit" }
-    fn description(&self) -> &'static str { "Replace an exact unique string in a file with a new string." }
+    fn name(&self) -> &'static str {
+        "edit"
+    }
+    fn description(&self) -> &'static str {
+        "Replace an exact unique string in a file with a new string."
+    }
     fn parameters(&self) -> Value {
         obj_param(
             json!({
@@ -137,13 +152,19 @@ impl Tool for EditTool {
 struct BashTool;
 #[async_trait]
 impl Tool for BashTool {
-    fn name(&self) -> &'static str { "bash" }
-    fn description(&self) -> &'static str { "Run a shell command in the session cwd. Returns combined stdout+stderr." }
+    fn name(&self) -> &'static str {
+        "bash"
+    }
+    fn description(&self) -> &'static str {
+        "Run a shell command in the session cwd. Returns combined stdout+stderr."
+    }
     fn parameters(&self) -> Value {
         obj_param(json!({ "command": { "type": "string" } }), &["command"])
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let cmd = str_arg(args, "command").ok_or("command is required")?.to_string();
+        let cmd = str_arg(args, "command")
+            .ok_or("command is required")?
+            .to_string();
         let cwd = ctx.cwd.clone();
         // Block on the OS process off the async runtime worker.
         let out = tokio::task::spawn_blocking(move || {
@@ -179,16 +200,26 @@ impl Tool for BashTool {
 struct LsTool;
 #[async_trait]
 impl Tool for LsTool {
-    fn name(&self) -> &'static str { "ls" }
-    fn description(&self) -> &'static str { "List directory entries (one per line; dirs suffixed with /)." }
+    fn name(&self) -> &'static str {
+        "ls"
+    }
+    fn description(&self) -> &'static str {
+        "List directory entries (one per line; dirs suffixed with /)."
+    }
     fn parameters(&self) -> Value {
-        obj_param(json!({ "path": { "type": "string", "description": "Directory (default: cwd)" } }), &[])
+        obj_param(
+            json!({ "path": { "type": "string", "description": "Directory (default: cwd)" } }),
+            &[],
+        )
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let p = str_arg(args, "path").unwrap_or(".");
         let dir = ctx.resolve(p);
         let mut names: Vec<String> = Vec::new();
-        for ent in std::fs::read_dir(&dir).map_err(|e| format!("ls {p}: {e}"))?.flatten() {
+        for ent in std::fs::read_dir(&dir)
+            .map_err(|e| format!("ls {p}: {e}"))?
+            .flatten()
+        {
             let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
             let mut n = ent.file_name().to_string_lossy().to_string();
             if is_dir {
@@ -205,8 +236,12 @@ impl Tool for LsTool {
 struct GrepTool;
 #[async_trait]
 impl Tool for GrepTool {
-    fn name(&self) -> &'static str { "grep" }
-    fn description(&self) -> &'static str { "Search file contents for a substring under a path. Returns matching lines as file:line:text." }
+    fn name(&self) -> &'static str {
+        "grep"
+    }
+    fn description(&self) -> &'static str {
+        "Search file contents for a substring under a path. Returns matching lines as file:line:text."
+    }
     fn parameters(&self) -> Value {
         obj_param(
             json!({ "pattern": { "type": "string" }, "path": { "type": "string", "description": "Root (default: cwd)" } }),
@@ -214,7 +249,9 @@ impl Tool for GrepTool {
         )
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let pat = str_arg(args, "pattern").ok_or("pattern is required")?.to_string();
+        let pat = str_arg(args, "pattern")
+            .ok_or("pattern is required")?
+            .to_string();
         let root = ctx.resolve(str_arg(args, "path").unwrap_or("."));
         let cwd = ctx.cwd.clone();
         let out = tokio::task::spawn_blocking(move || {
@@ -222,23 +259,39 @@ impl Tool for GrepTool {
             let mut stack = vec![root];
             let mut budget = 5000usize; // cap files scanned
             while let Some(dir) = stack.pop() {
-                let rd = match std::fs::read_dir(&dir) { Ok(r) => r, Err(_) => continue };
+                let rd = match std::fs::read_dir(&dir) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
                 for ent in rd.flatten() {
                     let path = ent.path();
-                    let ft = match ent.file_type() { Ok(t) => t, Err(_) => continue };
+                    let ft = match ent.file_type() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
                     let name = ent.file_name().to_string_lossy().to_string();
                     if ft.is_dir() {
-                        if name == ".git" || name == "node_modules" || name == "target" { continue; }
+                        if name == ".git" || name == "node_modules" || name == "target" {
+                            continue;
+                        }
                         stack.push(path);
                     } else if ft.is_file() {
-                        if budget == 0 { break; }
+                        if budget == 0 {
+                            break;
+                        }
                         budget -= 1;
                         if let Ok(content) = std::fs::read_to_string(&path) {
-                            let rel = path.strip_prefix(&cwd).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                            let rel = path
+                                .strip_prefix(&cwd)
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .replace('\\', "/");
                             for (i, line) in content.lines().enumerate() {
                                 if line.contains(&pat) {
                                     hits.push(format!("{rel}:{}:{}", i + 1, line.trim_end()));
-                                    if hits.len() >= 200 { return hits; }
+                                    if hits.len() >= 200 {
+                                        return hits;
+                                    }
                                 }
                             }
                         }
@@ -249,7 +302,11 @@ impl Tool for GrepTool {
         })
         .await
         .map_err(|e| format!("grep: {e}"))?;
-        Ok(if out.is_empty() { "(no matches)".into() } else { out.join("\n") })
+        Ok(if out.is_empty() {
+            "(no matches)".into()
+        } else {
+            out.join("\n")
+        })
     }
 }
 
@@ -257,8 +314,12 @@ impl Tool for GrepTool {
 struct FindTool;
 #[async_trait]
 impl Tool for FindTool {
-    fn name(&self) -> &'static str { "find" }
-    fn description(&self) -> &'static str { "Find files whose name contains a substring under a path. Returns relative paths." }
+    fn name(&self) -> &'static str {
+        "find"
+    }
+    fn description(&self) -> &'static str {
+        "Find files whose name contains a substring under a path. Returns relative paths."
+    }
     fn parameters(&self) -> Value {
         obj_param(
             json!({ "pattern": { "type": "string" }, "path": { "type": "string" } }),
@@ -273,18 +334,32 @@ impl Tool for FindTool {
             let mut hits = Vec::new();
             let mut stack = vec![root];
             while let Some(dir) = stack.pop() {
-                let rd = match std::fs::read_dir(&dir) { Ok(r) => r, Err(_) => continue };
+                let rd = match std::fs::read_dir(&dir) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
                 for ent in rd.flatten() {
                     let path = ent.path();
-                    let ft = match ent.file_type() { Ok(t) => t, Err(_) => continue };
+                    let ft = match ent.file_type() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
                     let name = ent.file_name().to_string_lossy().to_string();
                     if ft.is_dir() {
-                        if name == ".git" || name == "node_modules" || name == "target" { continue; }
+                        if name == ".git" || name == "node_modules" || name == "target" {
+                            continue;
+                        }
                         stack.push(path);
                     } else if pat.is_empty() || name.contains(&pat) {
-                        let rel = path.strip_prefix(&cwd).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                        let rel = path
+                            .strip_prefix(&cwd)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
                         hits.push(rel);
-                        if hits.len() >= 500 { return hits; }
+                        if hits.len() >= 500 {
+                            return hits;
+                        }
                     }
                 }
             }
@@ -292,7 +367,11 @@ impl Tool for FindTool {
         })
         .await
         .map_err(|e| format!("find: {e}"))?;
-        Ok(if out.is_empty() { "(no files)".into() } else { out.join("\n") })
+        Ok(if out.is_empty() {
+            "(no files)".into()
+        } else {
+            out.join("\n")
+        })
     }
 }
 
@@ -300,8 +379,12 @@ impl Tool for FindTool {
 struct SkillTool;
 #[async_trait]
 impl Tool for SkillTool {
-    fn name(&self) -> &'static str { "skill" }
-    fn description(&self) -> &'static str { "Load a skill's full instructions by name (from the skill index in your prompt)." }
+    fn name(&self) -> &'static str {
+        "skill"
+    }
+    fn description(&self) -> &'static str {
+        "Load a skill's full instructions by name (from the skill index in your prompt)."
+    }
     fn parameters(&self) -> Value {
         obj_param(json!({ "name": { "type": "string" } }), &["name"])
     }
@@ -315,8 +398,12 @@ impl Tool for SkillTool {
 struct MemorySearchTool;
 #[async_trait]
 impl Tool for MemorySearchTool {
-    fn name(&self) -> &'static str { "memory_search" }
-    fn description(&self) -> &'static str { "Semantic search of durable memory (project + global). Returns matching facts." }
+    fn name(&self) -> &'static str {
+        "memory_search"
+    }
+    fn description(&self) -> &'static str {
+        "Semantic search of durable memory (project + global). Returns matching facts."
+    }
     fn parameters(&self) -> Value {
         obj_param(json!({ "query": { "type": "string" } }), &["query"])
     }
@@ -331,8 +418,12 @@ impl Tool for MemorySearchTool {
 struct MemoryAddTool;
 #[async_trait]
 impl Tool for MemoryAddTool {
-    fn name(&self) -> &'static str { "memory_add" }
-    fn description(&self) -> &'static str { "Save a durable fact to memory. scope: 'project' (default) or 'global'." }
+    fn name(&self) -> &'static str {
+        "memory_add"
+    }
+    fn description(&self) -> &'static str {
+        "Save a durable fact to memory. scope: 'project' (default) or 'global'."
+    }
     fn parameters(&self) -> Value {
         obj_param(
             json!({ "text": { "type": "string" }, "scope": { "type": "string", "enum": ["project", "global"] } }),
@@ -351,8 +442,12 @@ impl Tool for MemoryAddTool {
 struct MemoryListTool;
 #[async_trait]
 impl Tool for MemoryListTool {
-    fn name(&self) -> &'static str { "memory_list" }
-    fn description(&self) -> &'static str { "List all durable memories (project + global)." }
+    fn name(&self) -> &'static str {
+        "memory_list"
+    }
+    fn description(&self) -> &'static str {
+        "List all durable memories (project + global)."
+    }
     fn parameters(&self) -> Value {
         obj_param(json!({}), &[])
     }
@@ -366,22 +461,34 @@ fn render_mem(items: &[crate::memory::MemoryView]) -> String {
     if items.is_empty() {
         return "(no memories)".into();
     }
-    items.iter().map(|m| format!("- {}", m.memory)).collect::<Vec<_>>().join("\n")
+    items
+        .iter()
+        .map(|m| format!("- {}", m.memory))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The real subagent tool (text path; the DAG-populating `details` are attached in session.rs).
 struct SubagentTool;
 #[async_trait]
 impl Tool for SubagentTool {
-    fn name(&self) -> &'static str { "subagent" }
+    fn name(&self) -> &'static str {
+        "subagent"
+    }
     fn description(&self) -> &'static str {
         "Delegate tasks to specialized subagents with isolated context. Modes: single (agent+task), parallel (tasks[], max 8, concurrency 4), chain (chain[] sequential with {previous} feed-forward, max 16). Omit `model` to use the configured low-cost worker."
     }
-    fn parameters(&self) -> Value { crate::agent::subagent::parameters_schema() }
+    fn parameters(&self) -> Value {
+        crate::agent::subagent::parameters_schema()
+    }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let cwd = ctx.cwd.to_string_lossy().to_string();
         let d = crate::agent::subagent::dispatch(args, &cwd).await;
-        if d.is_error { Err(d.text) } else { Ok(d.text) }
+        if d.is_error {
+            Err(d.text)
+        } else {
+            Ok(d.text)
+        }
     }
 }
 
@@ -389,7 +496,9 @@ impl Tool for SubagentTool {
 struct BrowserStartTool;
 #[async_trait]
 impl Tool for BrowserStartTool {
-    fn name(&self) -> &'static str { "browser_start" }
+    fn name(&self) -> &'static str {
+        "browser_start"
+    }
     fn description(&self) -> &'static str {
         "Start an isolated in-app browser at a URL (origin-allowlisted, disposable profile). Returns the page observation with interactive refs. Args: {url, allowedOrigins?:[string]}."
     }
@@ -397,9 +506,18 @@ impl Tool for BrowserStartTool {
         json!({ "type": "object", "properties": { "url": { "type": "string" }, "allowedOrigins": { "type": "array", "items": { "type": "string" } } }, "required": ["url"] })
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let url = args.get("url").and_then(|v| v.as_str()).ok_or("url is required")?;
-        let origins = args.get("allowedOrigins").and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or("url is required")?;
+        let origins = args
+            .get("allowedOrigins")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            });
         let cwd = ctx.cwd.to_string_lossy().to_string();
         let obs = crate::browser::start(&cwd, url, origins, None, None, None).await?;
         Ok(serde_json::to_string(&obs).unwrap_or_default())
@@ -408,7 +526,9 @@ impl Tool for BrowserStartTool {
 struct BrowserActTool;
 #[async_trait]
 impl Tool for BrowserActTool {
-    fn name(&self) -> &'static str { "browser_act" }
+    fn name(&self) -> &'static str {
+        "browser_act"
+    }
     fn description(&self) -> &'static str {
         "Drive the in-app browser. Args: {sessionId, action, targetRef?, text?, x?, y?, key?, url?, values?, expectedSeq?}. Actions: navigate, observe, back, forward, reload, click, clickAt, type, key, select, scroll, wait."
     }
@@ -423,13 +543,20 @@ impl Tool for BrowserActTool {
 struct BrowserStopTool;
 #[async_trait]
 impl Tool for BrowserStopTool {
-    fn name(&self) -> &'static str { "browser_stop" }
-    fn description(&self) -> &'static str { "Stop an in-app browser session and dispose its profile. Args: {sessionId}." }
+    fn name(&self) -> &'static str {
+        "browser_stop"
+    }
+    fn description(&self) -> &'static str {
+        "Stop an in-app browser session and dispose its profile. Args: {sessionId}."
+    }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": { "sessionId": { "type": "string" } }, "required": ["sessionId"] })
     }
     async fn execute(&self, args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
-        let sid = args.get("sessionId").and_then(|v| v.as_str()).ok_or("sessionId is required")?;
+        let sid = args
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .ok_or("sessionId is required")?;
         let obs = crate::browser::stop(sid).await?;
         Ok(serde_json::to_string(&obs).unwrap_or_default())
     }
@@ -468,9 +595,27 @@ impl ToolRegistry {
         super::extra_tools::register(&mut add);
 
         let active = vec![
-            "read", "write", "edit", "bash", "ls", "grep", "find", "skill", "memory_search",
-            "memory_add", "memory_list", "subagent", "browser_start", "browser_act", "browser_stop",
-            "agents_md", "create_agent", "create_skill", "rsi_baseline", "rsi_compare", "human_gate",
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "ls",
+            "grep",
+            "find",
+            "skill",
+            "memory_search",
+            "memory_add",
+            "memory_list",
+            "subagent",
+            "browser_start",
+            "browser_act",
+            "browser_stop",
+            "agents_md",
+            "create_agent",
+            "create_skill",
+            "rsi_baseline",
+            "rsi_compare",
+            "human_gate",
         ]
         .into_iter()
         .map(String::from)
@@ -491,7 +636,11 @@ impl ToolRegistry {
 
     /// setActiveToolsByName — keep only the names that resolve to a registered tool, preserving order.
     pub fn set_active(&mut self, names: &[String]) {
-        self.active = names.iter().filter(|n| self.tools.contains_key(n.as_str())).cloned().collect();
+        self.active = names
+            .iter()
+            .filter(|n| self.tools.contains_key(n.as_str()))
+            .cloned()
+            .collect();
     }
 
     /// OpenAI tool specs for the ACTIVE tools (sent in the request `tools` array).
@@ -505,7 +654,10 @@ impl ToolRegistry {
 
     /// Run a tool by name. Unknown/inactive tool → Err.
     pub async fn run(&self, name: &str, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let tool = self.tools.get(name).ok_or_else(|| format!("no such tool: {name}"))?;
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| format!("no such tool: {name}"))?;
         tool.execute(args, ctx).await
     }
 }
