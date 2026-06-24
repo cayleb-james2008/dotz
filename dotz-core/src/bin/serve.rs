@@ -12,7 +12,7 @@ async fn main() {
         eprintln!("error: DOTZ_PORT must be a non-zero u16");
         std::process::exit(1);
     }
-    let web_dir = std::env::var("DOTZ_WEB_DIR").unwrap_or_else(|_| "web".into());
+    let web_dir = web_dir();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -27,6 +27,15 @@ async fn main() {
         eprintln!("server error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Resolve the static UI directory from `DOTZ_WEB_DIR`. An empty-but-set env var is treated as
+/// unset so callers don't accidentally serve the current working directory.
+fn web_dir() -> String {
+    std::env::var("DOTZ_WEB_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "web".into())
 }
 
 /// Wait for SIGINT (all platforms) or SIGTERM (Unix) so the axum server can drain open
@@ -52,5 +61,34 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn web_dir_honors_nonempty_env_and_falls_back_on_empty() {
+        let guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("DOTZ_WEB_DIR").ok();
+
+        std::env::set_var("DOTZ_WEB_DIR", "custom-web");
+        assert_eq!(web_dir(), "custom-web");
+
+        std::env::set_var("DOTZ_WEB_DIR", "");
+        assert_eq!(web_dir(), "web");
+
+        std::env::remove_var("DOTZ_WEB_DIR");
+        assert_eq!(web_dir(), "web");
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_WEB_DIR", p),
+            None => std::env::remove_var("DOTZ_WEB_DIR"),
+        }
+        drop(guard);
     }
 }
