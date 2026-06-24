@@ -273,27 +273,36 @@ impl Provider for AnthropicMessages {
 /// Translate OpenAI-shape messages → (system, Anthropic messages[]). The leading system message is
 /// hoisted to the top-level `system`; `tool` messages become a user turn with a `tool_result` block;
 /// assistant `tool_calls` become `tool_use` blocks.
+///
+/// Anthropic requires user/assistant roles to strictly alternate. OpenAI history can contain
+/// multiple consecutive `tool` results after one assistant `tool_calls` message, so this function
+/// merges consecutive turns that map to the same Anthropic role (user/tool → "user").
 fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
     let mut system: Option<String> = None;
     let mut out: Vec<Value> = Vec::new();
 
     for m in messages {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        match role {
-            "system" => {
-                if let Some(c) = m.get("content").and_then(|c| c.as_str()) {
-                    system = Some(c.to_string());
-                }
+        if role == "system" {
+            if let Some(c) = m.get("content").and_then(|c| c.as_str()) {
+                system = Some(c.to_string());
             }
+            continue;
+        }
+
+        let anthropic_role = match role {
+            "user" | "tool" => "user",
+            "assistant" => "assistant",
+            _ => continue,
+        };
+
+        let mut blocks: Vec<Value> = Vec::new();
+        match role {
             "user" => {
                 let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                out.push(json!({
-                    "role": "user",
-                    "content": [{ "type": "text", "text": text }],
-                }));
+                blocks.push(json!({ "type": "text", "text": text }));
             }
             "assistant" => {
-                let mut blocks: Vec<Value> = Vec::new();
                 if let Some(t) = m.get("content").and_then(|c| c.as_str()) {
                     if !t.is_empty() {
                         blocks.push(json!({ "type": "text", "text": t }));
@@ -325,22 +334,31 @@ fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
                 if blocks.is_empty() {
                     blocks.push(json!({ "type": "text", "text": "" }));
                 }
-                out.push(json!({ "role": "assistant", "content": blocks }));
             }
             "tool" => {
                 let tool_use_id = m.get("tool_call_id").and_then(|i| i.as_str()).unwrap_or("");
                 let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                out.push(json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": content,
-                    }],
+                blocks.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": content,
                 }));
             }
             _ => {}
         }
+
+        // Merge consecutive turns that map to the same Anthropic role. Without this, a single
+        // assistant tool_calls turn followed by N tool results would produce N consecutive user
+        // turns, which Anthropic rejects.
+        if let Some(last) = out.last_mut() {
+            if last.get("role").and_then(|r| r.as_str()) == Some(anthropic_role) {
+                if let Some(content) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    content.extend(blocks);
+                    continue;
+                }
+            }
+        }
+        out.push(json!({ "role": anthropic_role, "content": blocks }));
     }
 
     (system, out)
@@ -399,5 +417,138 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..n])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convert_messages_hoists_system_to_top_level() {
+        let messages = vec![
+            json!({ "role": "system", "content": "sys" }),
+            json!({ "role": "user", "content": "hello" }),
+        ];
+        let (system, anthropic) = convert_messages(&messages);
+        assert_eq!(system, Some("sys".to_string()));
+        assert_eq!(anthropic.len(), 1);
+        assert_eq!(anthropic[0]["role"], "user");
+        let content = anthropic[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hello");
+    }
+
+    #[test]
+    fn convert_messages_maps_assistant_tool_calls_to_tool_use() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "bash", "arguments": "{\"command\":\"echo hi\"}" }
+            }]
+        })];
+        let (system, anthropic) = convert_messages(&messages);
+        assert_eq!(system, None);
+        assert_eq!(anthropic.len(), 1);
+        assert_eq!(anthropic[0]["role"], "assistant");
+        let content = anthropic[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["id"], "call_1");
+        assert_eq!(content[0]["name"], "bash");
+        assert_eq!(content[0]["input"]["command"], "echo hi");
+    }
+
+    /// Anthropic rejects consecutive user turns. OpenAI history has one assistant `tool_calls`
+    /// turn followed by N `tool` result turns; those must collapse into a single user turn
+    /// with N `tool_result` blocks.
+    #[test]
+    fn convert_messages_groups_consecutive_tool_results_into_one_user_turn() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    { "id": "call_1", "type": "function", "function": { "name": "bash", "arguments": "{}" } },
+                    { "id": "call_2", "type": "function", "function": { "name": "read", "arguments": "{}" } }
+                ]
+            }),
+            json!({ "role": "tool", "tool_call_id": "call_1", "content": "out1" }),
+            json!({ "role": "tool", "tool_call_id": "call_2", "content": "out2" }),
+        ];
+        let (_, anthropic) = convert_messages(&messages);
+        assert_eq!(anthropic.len(), 2);
+        assert_eq!(anthropic[0]["role"], "assistant");
+        assert_eq!(anthropic[1]["role"], "user");
+        let tool_results = anthropic[1]["content"].as_array().unwrap();
+        assert_eq!(tool_results.len(), 2);
+        assert_eq!(tool_results[0]["type"], "tool_result");
+        assert_eq!(tool_results[0]["tool_use_id"], "call_1");
+        assert_eq!(tool_results[0]["content"], "out1");
+        assert_eq!(tool_results[1]["type"], "tool_result");
+        assert_eq!(tool_results[1]["tool_use_id"], "call_2");
+        assert_eq!(tool_results[1]["content"], "out2");
+    }
+
+    #[test]
+    fn convert_messages_keeps_alternating_roles_when_no_tool_results() {
+        let messages = vec![
+            json!({ "role": "user", "content": "hi" }),
+            json!({ "role": "assistant", "content": "hello" }),
+            json!({ "role": "user", "content": "bye" }),
+        ];
+        let (_, anthropic) = convert_messages(&messages);
+        assert_eq!(anthropic.len(), 3);
+        assert_eq!(anthropic[0]["role"], "user");
+        assert_eq!(anthropic[1]["role"], "assistant");
+        assert_eq!(anthropic[2]["role"], "user");
+    }
+
+    #[test]
+    fn convert_messages_merges_consecutive_user_turns() {
+        let messages = vec![
+            json!({ "role": "user", "content": "part one" }),
+            json!({ "role": "user", "content": "part two" }),
+        ];
+        let (_, anthropic) = convert_messages(&messages);
+        assert_eq!(anthropic.len(), 1);
+        assert_eq!(anthropic[0]["role"], "user");
+        let content = anthropic[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["text"], "part one");
+        assert_eq!(content[1]["text"], "part two");
+    }
+
+    #[test]
+    fn convert_tools_maps_openai_function_to_anthropic_tool() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": { "name": "bash", "description": "run shell", "parameters": { "type": "object" } }
+        })];
+        let anthropic = convert_tools(&tools);
+        assert_eq!(anthropic.len(), 1);
+        assert_eq!(anthropic[0]["name"], "bash");
+        assert_eq!(anthropic[0]["description"], "run shell");
+        assert_eq!(anthropic[0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn map_effort_clamps_xhigh_to_max() {
+        assert_eq!(map_effort("xhigh"), "max");
+        assert_eq!(map_effort("max"), "max");
+        assert_eq!(map_effort("minimal"), "low");
+        assert_eq!(map_effort("unknown"), "high");
+    }
+
+    #[test]
+    fn map_stop_reason_maps_anthropic_stop_reasons() {
+        assert_eq!(map_stop_reason("end_turn"), "stop");
+        assert_eq!(map_stop_reason("stop_sequence"), "stop");
+        assert_eq!(map_stop_reason("max_tokens"), "max_tokens");
+        assert_eq!(map_stop_reason("tool_use"), "tool_use");
+        // Unknown stop reasons are passed through verbatim (case preserved).
+        assert_eq!(map_stop_reason("OTHER"), "OTHER");
     }
 }
