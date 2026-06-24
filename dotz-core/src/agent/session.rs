@@ -105,6 +105,14 @@ fn store() -> &'static Mutex<Store> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Lock the session store, recovering from a poisoned mutex. A panic in another thread while
+/// holding the store lock must not permanently break session creation/list/disposal.
+fn store_guard() -> std::sync::MutexGuard<'static, Store> {
+    store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Options for creating a session (mirrors CreateOpts).
 #[derive(Default)]
 pub struct CreateOpts {
@@ -240,32 +248,27 @@ pub fn create(opts: CreateOpts) -> Result<Value, String> {
         turn_active: AtomicBool::new(false),
     };
     let summary = session.summary();
-    store()
-        .lock()
-        .unwrap()
-        .insert(id.clone(), std::sync::Arc::new(Mutex::new(session)));
+    store_guard().insert(id.clone(), std::sync::Arc::new(Mutex::new(session)));
     Ok(summary)
 }
 
 pub fn get(id: &str) -> Option<std::sync::Arc<Mutex<AgentSession>>> {
-    store().lock().unwrap().get(id).cloned()
+    store_guard().get(id).cloned()
 }
 
 pub fn list_summaries() -> Vec<Value> {
-    store()
-        .lock()
-        .unwrap()
+    store_guard()
         .values()
         .map(|s| s.lock().unwrap().summary())
         .collect()
 }
 
 pub fn count() -> usize {
-    store().lock().unwrap().len()
+    store_guard().len()
 }
 
 pub fn dispose(id: &str) -> bool {
-    if let Some(s) = store().lock().unwrap().remove(id) {
+    if let Some(s) = store_guard().remove(id) {
         s.lock().unwrap().cancel.cancel();
         true
     } else {
@@ -1671,5 +1674,47 @@ mod tests {
             None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
         }
         let _ = server_tx.send(()).await;
+    }
+
+    /// A panic while holding the session-store mutex must not permanently kill the agent runtime.
+    /// With poison recovery, create/get/list/dispose keep working even after a previous owner
+    /// panicked with the lock held.
+    #[test]
+    fn session_store_recovers_from_poisoned_lock() {
+        // Poison the global session-store mutex by panicking while holding the lock.
+        let poison_thread = std::thread::spawn(|| {
+            let _guard = store().lock().unwrap();
+            panic!("intentional poison");
+        });
+        assert!(
+            poison_thread.join().is_err(),
+            "panic must leave the store lock poisoned"
+        );
+
+        // The global store may contain sessions from other concurrently-running tests, so
+        // verify relative behavior (create adds our session; dispose removes it) rather than
+        // an absolute count.
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        assert!(
+            get(&sid).is_some(),
+            "create/get must succeed after lock poison"
+        );
+        assert!(
+            list_summaries().iter().any(|s| {
+                s.get("sessionId").and_then(|v| v.as_str()) == Some(&sid)
+            }),
+            "list_summaries must include the new session"
+        );
+
+        assert!(
+            dispose(&sid),
+            "dispose must succeed after lock poison"
+        );
+        assert!(
+            get(&sid).is_none(),
+            "session must be removed after dispose"
+        );
     }
 }
