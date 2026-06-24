@@ -527,7 +527,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir1);
         let _ = std::fs::remove_dir_all(&dir2);
 
-        assert_eq!(extra.len(), 2, "both existing override dirs should be parsed");
+        assert_eq!(
+            extra.len(),
+            2,
+            "both existing override dirs should be parsed"
+        );
         assert_eq!(extra[0].0, dir1);
         assert_eq!(extra[1].0, dir2);
         assert!(extra.iter().all(|(_, source)| *source == "dotz"));

@@ -88,8 +88,10 @@ pub fn save(c: &DotzConfig) -> std::io::Result<()> {
 }
 
 /// Apply an already-validated patch, persist, set env, return the new config (mirror updateConfig).
-/// Validation (400s) happens in the POST handler before this is called.
-pub fn update(current: &DotzConfig, clean: &CleanPatch) -> DotzConfig {
+/// Validation (400s) happens in the POST handler before this is called. Persist failures are
+/// propagated so the REST handler can surface a 500 instead of silently accepting a config that
+/// will be lost on restart.
+pub fn update(current: &DotzConfig, clean: &CleanPatch) -> std::io::Result<DotzConfig> {
     let mut next = current.clone();
     if let Some(p) = &clean.provider {
         next.provider = p.clone();
@@ -103,9 +105,113 @@ pub fn update(current: &DotzConfig, clean: &CleanPatch) -> DotzConfig {
     if let Some(t) = &clean.thinking_level {
         next.thinking_level = t.clone();
     }
+    save(&next)?;
     apply_env(&next);
-    let _ = save(&next);
-    next
+    Ok(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_tmp_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-config-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        let result = f(&dir);
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(guard);
+        result
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        with_tmp_dir(|dir| {
+            let cfg = DotzConfig {
+                provider: "openrouter".into(),
+                executive_model: "nex-agi/nex-n2-pro".into(),
+                subagent_model: "minimax-m3".into(),
+                thinking_level: "medium".into(),
+            };
+            save(&cfg).unwrap();
+            assert!(dir.join("config.json").exists());
+
+            let loaded = load();
+            assert_eq!(loaded.provider, "openrouter");
+            assert_eq!(loaded.executive_model, "nex-agi/nex-n2-pro");
+            assert_eq!(loaded.subagent_model, "minimax-m3");
+            assert_eq!(loaded.thinking_level, "medium");
+        });
+    }
+
+    #[test]
+    fn update_persists_to_disk_and_sets_env() {
+        with_tmp_dir(|dir| {
+            let base = load();
+            let patch = CleanPatch {
+                provider: Some("openrouter".into()),
+                executive_model: Some("anthropic/claude-sonnet-4".into()),
+                subagent_model: Some("openrouter/nvidia/nemotron-3-ultra-550b-a55b:free".into()),
+                thinking_level: Some("xhigh".into()),
+            };
+            let next = update(&base, &patch).unwrap();
+            assert_eq!(next.provider, "openrouter");
+            assert_eq!(next.thinking_level, "xhigh");
+
+            let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
+            assert!(raw.contains("openrouter"));
+            assert!(raw.contains("xhigh"));
+
+            let reloaded = load();
+            assert_eq!(reloaded.provider, "openrouter");
+            assert_eq!(reloaded.thinking_level, "xhigh");
+
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "openrouter/openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+            );
+        });
+    }
+
+    #[test]
+    fn update_propagates_save_failure() {
+        with_tmp_dir(|dir| {
+            // Make the "config dir" path exist as a file so create_dir_all fails.
+            let fake_dir = dir.join("fake-config-dir");
+            std::fs::write(&fake_dir, "not a directory").unwrap();
+            std::env::set_var("DOTZ_CONFIG_DIR", &fake_dir);
+            assert!(fake_dir.is_file(), "fake_dir must be a file for this test");
+
+            let base = DotzConfig::default();
+            let patch = CleanPatch {
+                provider: Some("openrouter".into()),
+                ..Default::default()
+            };
+            let env_before = std::env::var("DOTZ_SUBAGENT_MODEL").unwrap_or_default();
+            let result = update(&base, &patch);
+            assert!(
+                result.is_err(),
+                "update must fail when config dir is a file, got: {:?}",
+                result
+            );
+
+            // DOTZ_SUBAGENT_MODEL must NOT change when persistence failed.
+            let env_after = std::env::var("DOTZ_SUBAGENT_MODEL").unwrap_or_default();
+            assert_eq!(
+                env_after, env_before,
+                "env must not update when config save fails: before={env_before}, after={env_after}"
+            );
+        });
+    }
 }
 
 /// A validated config patch (built by the POST handler).

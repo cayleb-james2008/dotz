@@ -729,7 +729,8 @@ mod tests {
         let guard = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let file = std::env::temp_dir().join(format!("dotz-workflows-test-{}.json", Uuid::new_v4()));
+        let file =
+            std::env::temp_dir().join(format!("dotz-workflows-test-{}.json", Uuid::new_v4()));
         std::env::set_var("DOTZ_WORKFLOWS_FILE", file.to_string_lossy().to_string());
         let result = f();
         let _ = std::fs::remove_file(&file);
@@ -765,10 +766,7 @@ mod tests {
                 None,
                 "numeric".into(),
                 None,
-                &[
-                    step("a", "A", None),
-                    step("b", "B", Some(vec![json!(0)])),
-                ],
+                &[step("a", "A", None), step("b", "B", Some(vec![json!(0)]))],
             )
             .unwrap();
             let string = create(
@@ -776,10 +774,7 @@ mod tests {
                 None,
                 "string".into(),
                 None,
-                &[
-                    step("a", "A", None),
-                    step("b", "B", Some(vec![json!("0")])),
-                ],
+                &[step("a", "A", None), step("b", "B", Some(vec![json!("0")]))],
             )
             .unwrap();
             assert_eq!(
@@ -798,10 +793,7 @@ mod tests {
     #[test]
     fn out_of_range_numeric_parent_is_skipped() {
         with_tmp_workflows_file(|| {
-            let inputs = vec![
-                step("a", "A", None),
-                step("b", "B", Some(vec![json!(99)])),
-            ];
+            let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(99)]))];
             let run = create(None, None, "test".into(), None, &inputs).unwrap();
             assert!(run.steps[1].parents.is_empty());
             assert_eq!(run.steps[1].status, "ready");
@@ -851,10 +843,7 @@ mod tests {
     #[test]
     fn abort_sweeps_runnable_steps_to_skipped_with_ended_at() {
         with_tmp_workflows_file(|| {
-            let inputs = vec![
-                step("a", "A", None),
-                step("b", "B", Some(vec![json!(0)])),
-            ];
+            let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(0)]))];
             let run = create(None, None, "abort-sweep".into(), None, &inputs).unwrap();
             let run = start(&run.id).unwrap();
 
@@ -892,7 +881,10 @@ mod tests {
             assert_eq!(updated.status, "done");
             let s = &updated.steps[0];
             assert_eq!(s.status, "skipped");
-            assert!(s.ended_at.is_some(), "explicitly skipped step must have endedAt");
+            assert!(
+                s.ended_at.is_some(),
+                "explicitly skipped step must have endedAt"
+            );
         });
     }
 
@@ -904,7 +896,10 @@ mod tests {
                 step("b", "B", Some(vec![json!(0)])),
             ];
             assert!(
-                matches!(create(None, None, "cycle".into(), None, &inputs), Err(CycleError)),
+                matches!(
+                    create(None, None, "cycle".into(), None, &inputs),
+                    Err(CycleError)
+                ),
                 "a dependency cycle must be rejected"
             );
         });
