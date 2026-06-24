@@ -1063,6 +1063,22 @@ button:not(:disabled):active, .qchip:active, .knob-btn:active,
   @keyframes floaty { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
 }
 
+/* templates panel */
+.templates-body { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+.templates-toolbar { display: flex; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--glass-border); }
+.templates-toolbar .pf-input { flex: 1; }
+.templates-split { display: flex; flex: 1; min-height: 0; }
+.templates-list { width: 42%; min-width: 220px; overflow-y: auto; border-right: 1px solid var(--glass-border); padding: 8px; }
+.templates-detail { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 12px; gap: 10px; overflow-y: auto; }
+.templates-detail-head { display: flex; justify-content: space-between; align-items: center; }
+.templates-detail-meta { display: flex; gap: 8px; }
+.templates-detail-meta .pf-input { flex: 1; }
+.templates-editor { flex: 1; min-height: 140px; background: rgba(13,13,18,0.5); border: 1px solid var(--glass-border); border-radius: 8px; padding: 10px; color: var(--fg); font-family: var(--font-mono); font-size: 12px; resize: none; }
+.templates-editor:focus { outline: none; border-color: var(--glass-border-bright); box-shadow: 0 0 0 1px var(--glow-lav); }
+.templates-detail-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.templates-run-args { display: flex; gap: 8px; padding-top: 4px; }
+.templates-run-args .pf-input { flex: 1; }
+
 /* slimmer, glassy scrollbars */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: rgba(140,157,255,0.22); border: 2px solid transparent; background-clip: padding-box; border-radius: 6px; }
