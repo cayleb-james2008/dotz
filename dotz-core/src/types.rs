@@ -101,6 +101,7 @@ pub fn low_cost_models() -> Vec<ModelRef> {
 
 fn resolve_subagent_model(override_value: Option<&str>) -> String {
     override_value
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
@@ -211,6 +212,12 @@ mod tests {
     fn resolve_subagent_model_falls_back_to_default() {
         assert_eq!(resolve_subagent_model(None), "ollama/minimax-m3");
         assert_eq!(resolve_subagent_model(Some("")), "ollama/minimax-m3");
+    }
+
+    #[test]
+    fn resolve_subagent_model_ignores_whitespace_only_override() {
+        assert_eq!(resolve_subagent_model(Some("   ")), "ollama/minimax-m3");
+        assert_eq!(resolve_subagent_model(Some("\t\n")), "ollama/minimax-m3");
     }
 
     #[test]
