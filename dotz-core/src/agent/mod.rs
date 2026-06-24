@@ -420,6 +420,13 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
     let done = tokio_util::sync::CancellationToken::new();
     let done2 = done.clone();
 
+    // One-shot signal from the reader to the fan: "send this close frame and finish".
+    // Used when the client initiates a close so the server echoes it cleanly instead of
+    // dropping the socket mid-handshake.
+    let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel::<
+        Option<axum::extract::ws::CloseFrame>,
+    >();
+
     // Fan agent events (broadcast) → socket, plus periodic keep-alive pings. The ping keeps the
     // connection alive through proxies that drop idle sockets; browsers auto-pong in response.
     let ping_interval = ws_ping_interval();
@@ -427,29 +434,38 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
         let start = tokio::time::Instant::now() + ping_interval;
         let mut ping_tick = tokio::time::interval_at(start, ping_interval);
         ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
+        let close_frame = loop {
             tokio::select! {
                 biased;
-                _ = done2.cancelled() => break,
+                _ = done2.cancelled() => break Some(None),
+                frame = close_rx.recv() => break Some(frame.unwrap_or(None)),
                 _ = ping_tick.tick() => {
                     if sink.send(WsMessage::Ping(Bytes::new())).await.is_err() {
-                        break;
+                        break Some(None);
                     }
                 }
                 frame = recv_broadcast(&mut rx) => {
                     match frame {
                         Some(f) => {
                             if sink.send(WsMessage::Text(f.to_string().into())).await.is_err() {
-                                break;
+                                break Some(None);
                             }
                         }
-                        None => break,
+                        None => break Some(Some(axum::extract::ws::CloseFrame {
+                            code: axum::extract::ws::close_code::AWAY,
+                            reason: "session disposed".into(),
+                        })),
                     }
                 }
             }
+        };
+        // Write a close frame whenever we can. A clean handshake lets proxies/CDNs and the
+        // tungstenite client finish the close sequence instead of treating the connection as
+        // unexpectedly dropped.
+        if let Some(frame) = close_frame {
+            let _ = sink.send(WsMessage::Close(frame)).await;
         }
-        // Broadcast closed means the session was disposed, or the socket send failed. Wake the
-        // reader so the socket drops promptly.
+        // Wake the reader so the socket drops promptly after the close frame is sent (or failed).
         done2.cancel();
     });
 
@@ -464,7 +480,10 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                 };
                 let text = match msg {
                     WsMessage::Text(t) => t.to_string(),
-                    WsMessage::Close(_) => break,
+                    WsMessage::Close(frame) => {
+                        let _ = close_tx.send(frame);
+                        break;
+                    }
                     _ => continue,
                 };
                 let v: Value = match serde_json::from_str(&text) {
@@ -485,8 +504,6 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                             continue;
                         }
                         if let Some(sess) = session::get(&session_id) {
-                            let sid = session_id.clone();
-                            let _ = sid;
                             tokio::spawn(async move {
                                 session::run_turn(sess, body).await;
                             });
@@ -512,7 +529,22 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
         }
     }
 
-    fan.abort();
+    // Give the fan a bounded window to emit the close frame before the socket is dropped.
+    // In the session-disposed path the fan already initiated the close; in the client-close path
+    // we just asked it to via close_tx. A hard abort only happens if the close frame can't drain.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fan).await;
+
+    // Drain any remaining inbound frames (e.g., the client's close-ack) for a short window so
+    // tungstenite can complete the close handshake instead of seeing a TCP reset.
+    let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    while tokio::time::Instant::now() < drain_deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await {
+            Ok(Some(Ok(WsMessage::Close(_)))) => break,
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
 }
 
 /// The sessions Router<()> + /ws handler, to merge into server::app().
@@ -752,6 +784,7 @@ mod tests {
         use futures_util::StreamExt;
         use std::time::Duration;
         use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::protocol::Message;
 
         let _guard = WS_TEST_LOCK.lock().await;
 
@@ -797,6 +830,9 @@ mod tests {
         let close = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
         match close {
             Ok(None) | Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(Message::Close(_)))) => {
+                // Server initiated a clean close handshake after disposal; that's the new behavior.
+            }
             other => panic!("expected WS to close after session disposal, got {other:?}"),
         }
 
@@ -882,6 +918,80 @@ mod tests {
         assert!(
             found_ping,
             "expected a WebSocket ping frame from the server"
+        );
+    }
+
+    /// When the client initiates the WebSocket close handshake, the server must echo a Close
+    /// frame instead of just dropping the TCP connection. An unclean close causes proxies and
+    /// the tungstenite client to treat the session as unexpectedly terminated.
+    #[tokio::test]
+    async fn websocket_echoes_close_frame_when_client_closes() {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        let _guard = WS_TEST_LOCK.lock().await;
+
+        // Disable pings so the only frame we see after the ready is the close echo.
+        let prev_interval = std::env::var("DOTZ_WS_PING_INTERVAL_MS").ok();
+        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "3600000");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(crate::server::serve_with_shutdown(
+            listener,
+            std::path::PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/sessions"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let summary = resp.json::<Value>().await.unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let url = format!("ws://127.0.0.1:{port}/ws?sessionId={sid}");
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(
+            ready.to_text().unwrap().contains("\"ready\""),
+            "first WS frame should be ready: {ready:?}"
+        );
+
+        // Initiate the close handshake from the client.
+        ws.send(Message::Close(None)).await.unwrap();
+
+        // The server must respond with a Close frame to complete the handshake cleanly.
+        let server_close = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for server close frame")
+            .expect("websocket stream ended without server close frame")
+            .expect("websocket error while waiting for close frame");
+        assert!(
+            matches!(server_close, Message::Close(_)),
+            "server should echo a Close frame, got: {server_close:?}"
+        );
+
+        match prev_interval {
+            Some(p) => std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p),
+            None => std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS"),
+        }
+
+        let _ = tx.send(());
+        assert!(
+            handle.await.unwrap().is_ok(),
+            "server should shut down cleanly"
         );
     }
 
