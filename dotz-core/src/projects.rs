@@ -6,6 +6,7 @@
 //! Self-contained: owns its state via a module-level OnceLock<Mutex<Vec<Project>>> cache (mirrors the
 //! Node module-singleton `projectStore`). The cache is the source of truth in-process; every mutating
 //! op also writes the full array back to disk. No AppState fields, no axum State.
+use crate::profiles;
 use crate::types::{self, ModelRef};
 use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
 use serde::{Deserialize, Serialize};
@@ -276,6 +277,16 @@ async fn create_project(
         .filter(|s| !s.is_empty())
         .unwrap_or("workflow")
         .to_string();
+    if !profiles::is_valid(&profile_id) {
+        return Err(bad(format!(
+            "profileId must be one of: {}",
+            profiles::summaries()
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     let thinking_level = thinking_input
         .filter(|s| !s.is_empty())
         .unwrap_or("high")
@@ -370,6 +381,18 @@ async fn patch_project(
                 t
             }
         });
+        if let Some(ref id) = new_profile_id {
+            if !profiles::is_valid(id) {
+                return Err(bad(format!(
+                    "profileId must be one of: {}",
+                    profiles::summaries()
+                        .iter()
+                        .map(|s| s.id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
     }
     if let Some(v) = raw.get("model") {
         match parse_valid_model(v) {
@@ -696,11 +719,11 @@ mod tests {
             let create_body = Json(json!({
                 "name": "demo",
                 "cwd": std::env::current_dir().unwrap().to_string_lossy(),
-                "profileId": "custom"
+                "profileId": "frontend"
             }));
             let created = create_project(Some(create_body)).await.unwrap().0;
             let id = created["id"].as_str().unwrap().to_string();
-            assert_eq!(created["profileId"], "custom");
+            assert_eq!(created["profileId"], "frontend");
 
             let patch_body = Json(json!({ "profileId": "" }));
             let patched = patch_project(Path(id), Some(patch_body)).await.unwrap().0;
@@ -727,6 +750,53 @@ mod tests {
             assert_eq!(patched["name"], "renamed");
             assert_eq!(patched["appUrl"], "http://localhost:3000");
             assert_eq!(patched["gateCommand"], "npm test");
+        });
+    }
+
+    /// create_project must reject a non-empty, unknown profileId instead of storing it and
+    /// causing later session creation to fail. Empty/missing profileId still defaults to workflow.
+    #[test]
+    fn create_project_rejects_invalid_profile_id() {
+        let _g = with_tmp_projects_file();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let body = Json(json!({
+                "name": "bad-profile",
+                "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+                "profileId": "not-a-profile"
+            }));
+            let err = create_project(Some(body)).await.unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert!(
+                err.1 .0["error"].as_str().unwrap().contains("profileId must be one of:"),
+                "error should list valid profileIds, got: {:?}",
+                err.1 .0
+            );
+        });
+    }
+
+    /// patch_project must reject an invalid profileId update, preserving the trust boundary that
+    /// only known profiles can be persisted.
+    #[test]
+    fn patch_project_rejects_invalid_profile_id() {
+        let _g = with_tmp_projects_file();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let create_body = Json(json!({
+                "name": "demo",
+                "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+            }));
+            let created = create_project(Some(create_body)).await.unwrap().0;
+            let id = created["id"].as_str().unwrap().to_string();
+
+            let patch_body = Json(json!({ "profileId": "bogus" }));
+            let err = patch_project(Path(id), Some(patch_body)).await.unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert!(
+                err.1 .0["error"].as_str().unwrap().contains("profileId must be one of:"),
+                "error should list valid profileIds, got: {:?}",
+                err.1 .0
+            );
         });
     }
 
