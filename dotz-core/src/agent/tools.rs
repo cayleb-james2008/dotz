@@ -907,8 +907,7 @@ mod tests {
     /// agent's read/write/edit/ls/grep/find tools operate only inside the selected project.
     #[test]
     fn file_tools_reject_paths_escaping_cwd() {
-        let base =
-            std::env::temp_dir().join(format!("dotz-toolctx-test-{}", uuid::Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("dotz-toolctx-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
         let sibling =
             std::env::temp_dir().join(format!("dotz-toolctx-sibling-{}", uuid::Uuid::new_v4()));
@@ -927,10 +926,9 @@ mod tests {
         // `..` traversal and absolute paths outside the cwd are rejected.
         assert!(ctx.resolve_in_cwd("../secret.txt").is_err());
         assert!(ctx.resolve_in_cwd("sub/../../secret.txt").is_err());
-        assert!(
-            ctx.resolve_in_cwd(sibling.join("file.txt").to_str().unwrap())
-                .is_err()
-        );
+        assert!(ctx
+            .resolve_in_cwd(sibling.join("file.txt").to_str().unwrap())
+            .is_err());
         assert!(ctx.resolve_in_cwd("/etc/passwd").is_err());
 
         let _ = std::fs::remove_dir_all(&base);
@@ -946,11 +944,7 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
 
         let mut registry = ToolRegistry::new();
-        registry.set_active(&[
-            "read".to_string(),
-            "write".to_string(),
-            "edit".to_string(),
-        ]);
+        registry.set_active(&["read".to_string(), "write".to_string(), "edit".to_string()]);
         let ctx = ToolCtx {
             cwd: base.clone(),
             tx: None,
@@ -958,7 +952,11 @@ mod tests {
 
         // write + read round-trip.
         let out = registry
-            .run("write", &json!({"file_path": "note.txt", "content": "hello"}), &ctx)
+            .run(
+                "write",
+                &json!({"file_path": "note.txt", "content": "hello"}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(out.contains("wrote"));

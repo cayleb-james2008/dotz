@@ -1373,7 +1373,9 @@ mod tests {
             let body_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
             while tokio::time::Instant::now() < body_deadline {
                 let mut tmp = [0u8; 1024];
-                match tokio::time::timeout(Duration::from_millis(50), read_half.read(&mut tmp)).await {
+                match tokio::time::timeout(Duration::from_millis(50), read_half.read(&mut tmp))
+                    .await
+                {
                     Ok(Ok(0)) | Ok(Err(_)) => break,
                     Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
                     Err(_) => break,
