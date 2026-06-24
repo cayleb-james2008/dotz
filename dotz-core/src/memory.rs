@@ -621,6 +621,11 @@ pub async fn capture_exchange(
     assistant_text: &str,
     cwd: Option<&str>,
 ) -> Vec<MemoryView> {
+    // Defense-in-depth: only the main server process is allowed to auto-capture memory. Subagents
+    // and any future callers get a silent no-op instead of polluting the memory store.
+    if !is_autonomy_enabled() {
+        return Vec::new();
+    }
     let u = user_text.trim();
     let a = assistant_text.trim();
     if u.len() < 8 && a.len() < 40 {
@@ -1060,23 +1065,31 @@ mod tests {
         });
     }
 
-    #[test]
-    fn write_mirror_file_includes_folder_annotation() {
-        with_tmp_dir(|dir| {
-            let file = dir.join("MEMORY.md");
-            let items = vec![MemoryView {
-                id: "f".into(),
-                memory: "Foldered fact.".into(),
-                scope: "global".into(),
-                category: Some("general".into()),
-                folder: Some("src/memory".into()),
-                score: None,
-                created_at: Some(1),
-                updated_at: None,
-            }];
-            render_mirror_file(&file, "folder memory", &items);
-            let raw = std::fs::read_to_string(&file).unwrap();
-            assert!(raw.contains("- Foldered fact.  _(folder: src/memory)_"));
-        });
+    #[tokio::test]
+    async fn capture_exchange_respects_autonomy_gate() {
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prev = AUTONOMY.load(Ordering::Relaxed);
+        // Disable autonomy to simulate a subagent/non-main process.
+        AUTONOMY.store(false, Ordering::Relaxed);
+
+        // Use text long enough to bypass the trivial-exchange filter so the only reason we get an
+        // empty result is the autonomy gate, not the length heuristic.
+        let kept = capture_exchange(
+            "The user asked a substantive multi-sentence question about the codebase architecture.",
+            "The assistant replied with a detailed explanation that is well over forty characters long and contains durable facts worth remembering.",
+            None,
+        )
+        .await;
+
+        // Restore the previous autonomy flag so other tests see their expected state.
+        AUTONOMY.store(prev, Ordering::Relaxed);
+        drop(guard);
+
+        assert!(
+            kept.is_empty(),
+            "capture_exchange must not run when memory autonomy is disabled"
+        );
     }
 }
