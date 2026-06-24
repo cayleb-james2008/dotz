@@ -117,10 +117,25 @@ fn db() -> &'static Mutex<Connection> {
     })
 }
 
+/// Lock the DB mutex, recovering from a poisoned lock. A panic while holding the DB lock (e.g.
+/// inside a memory tool callback or autonomous capture) must not permanently brick the memory
+/// store.
+fn db_guard() -> std::sync::MutexGuard<'static, Connection> {
+    db().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 static EMBEDDER: OnceLock<Mutex<Option<Embedder>>> = OnceLock::new();
+fn embedder() -> &'static Mutex<Option<Embedder>> {
+    EMBEDDER.get_or_init(|| Mutex::new(None))
+}
+/// Lock the embedder mutex, recovering from a poisoned lock. A panic during embedder load or
+/// inference must not permanently brick all future memory operations.
+fn embedder_guard() -> std::sync::MutexGuard<'static, Option<Embedder>> {
+    embedder().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn embed_text(text: &str) -> Result<Vec<f32>, String> {
-    let m = EMBEDDER.get_or_init(|| Mutex::new(None));
-    let mut g = m.lock().unwrap();
+    let mut g = embedder_guard();
     if g.is_none() {
         *g = Some(Embedder::load().map_err(|e| format!("embedder load: {e}"))?);
     }
@@ -210,7 +225,7 @@ fn add(
     let id = uuid::Uuid::new_v4().to_string();
     let ts = now_ms();
     {
-        let conn = db().lock().unwrap();
+        let conn = db_guard();
         conn.execute(
             "INSERT INTO memories (id,user_id,scope,memory,category,folder,embedding,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL)",
             rusqlite::params![id, user_id, scope, text, category, folder, enc_emb(&emb), ts],
@@ -231,7 +246,7 @@ fn add(
 }
 
 fn list(cwd: Option<&str>) -> Vec<MemoryView> {
-    let conn = db().lock().unwrap();
+    let conn = db_guard();
     let mut out: Vec<MemoryView> = rows_for_user(&conn, GLOBAL_USER, None)
         .iter()
         .map(|r| row_to_view(r, None))
@@ -272,7 +287,7 @@ fn search(
     let q = embed_text(query)?;
     let mut collected: Vec<MemoryView> = Vec::new();
     {
-        let conn = db().lock().unwrap();
+        let conn = db_guard();
         for sc in scopes {
             let u = scope_user(sc, cwd);
             // top (topK*2) by cosine above threshold per scope, mirroring mem.search(topK*2).
@@ -332,7 +347,7 @@ fn consolidate(cwd: Option<&str>) -> (i64, i64) {
     let (mut removed, mut kept) = (0i64, 0i64);
     for (sc, user_id) in &scopes {
         let rows = {
-            let conn = db().lock().unwrap();
+            let conn = db_guard();
             rows_for_user(&conn, user_id, None)
         };
         if rows.len() > 1 {
@@ -360,7 +375,7 @@ fn consolidate(cwd: Option<&str>) -> (i64, i64) {
                 }
             }
             {
-                let conn = db().lock().unwrap();
+                let conn = db_guard();
                 for id in &dropped {
                     if conn
                         .execute("DELETE FROM memories WHERE id=?1", rusqlite::params![id])
@@ -405,7 +420,7 @@ fn update(id: &str, text: &str, cwd: Option<&str>) -> Option<MemoryView> {
     let emb = embed_text(text).ok()?;
     let ts = now_ms();
     let row = {
-        let conn = db().lock().unwrap();
+        let conn = db_guard();
         let n = conn
             .execute(
                 "UPDATE memories SET memory=?1, embedding=?2, updated_at=?3 WHERE id=?4",
@@ -424,7 +439,7 @@ fn update(id: &str, text: &str, cwd: Option<&str>) -> Option<MemoryView> {
 fn remove(id: &str, cwd: Option<&str>) -> bool {
     // Mirror memory.ts: delete is best-effort; success unless the statement errors (missing id => still ok).
     let ok = {
-        let conn = db().lock().unwrap();
+        let conn = db_guard();
         conn.execute("DELETE FROM memories WHERE id=?1", rusqlite::params![id])
             .is_ok()
     };
@@ -436,7 +451,7 @@ fn remove(id: &str, cwd: Option<&str>) -> bool {
 
 // ---- MEMORY.md mirror (git-committable source of truth) ----
 fn mirror_items(user_id: &str) -> Vec<MemoryView> {
-    let conn = db().lock().unwrap();
+    let conn = db_guard();
     rows_for_user(&conn, user_id, None)
         .iter()
         .map(|r| row_to_view(r, None))
@@ -640,7 +655,7 @@ pub async fn capture_exchange(
     // Same-scope neighbors for dedup (embeddings already in the row).
     let user_id = scope_user(scope, cwd);
     let neighbors: Vec<Row> = {
-        let conn = db().lock().unwrap();
+        let conn = db_guard();
         rows_for_user(&conn, &user_id, None)
     };
 
@@ -1102,6 +1117,62 @@ mod tests {
         assert!(
             kept.is_empty(),
             "capture_exchange must not run when memory autonomy is disabled"
+        );
+    }
+
+    /// A panic while holding the DB mutex must not permanently brick the memory store. With
+    /// poison recovery, subsequent DB reads/writes keep working after a previous lock owner
+    /// panicked mid-operation.
+    #[test]
+    fn db_guard_recovers_from_poisoned_mutex() {
+        with_tmp_dir(|dir| {
+            let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+            std::env::set_var("DOTZ_CONFIG_DIR", dir);
+            // Force initialization if not already done, so this test runs in an isolated
+            // location when it is the first caller.
+            drop(db().lock().unwrap());
+
+            let db_ref = db();
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = db_ref.lock().unwrap();
+                panic!("intentional db mutex poison");
+            }));
+            assert!(poisoned.is_err(), "db mutex should be poisoned");
+
+            // db_guard must recover and return a usable connection. The table may already
+            // contain rows if another test or a previous run initialized the process-global DB
+            // before this test; the invariant here is that the connection remains usable.
+            let guard = db_guard();
+            let _: i64 = guard
+                .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .unwrap();
+
+            match prev {
+                Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+                None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            }
+        });
+    }
+
+    /// A panic while holding the embedder mutex must not permanently brick future memory
+    /// operations. With poison recovery, the guard returns the underlying Option<Embedder>
+    /// instead of panicking.
+    #[test]
+    fn embedder_guard_recovers_from_poisoned_mutex() {
+        // Ensure the embedder mutex is initialized.
+        drop(embedder().lock().unwrap());
+
+        let m = embedder();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = m.lock().unwrap();
+            panic!("intentional embedder mutex poison");
+        }));
+        assert!(poisoned.is_err(), "embedder mutex should be poisoned");
+
+        let guard = embedder_guard();
+        assert!(
+            guard.is_none(),
+            "embedder should be lazily unloaded in tests"
         );
     }
 }
