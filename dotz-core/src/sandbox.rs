@@ -440,8 +440,10 @@ async fn run_port(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Js
 }
 
 /// Extract candidate ports from server-listener banners, mirroring the PortDetector regex intent in
-/// sandbox.ts: a listener keyword near a port-with-prefix on the same line. Avoids bare ":<port>"
-/// and the generic word "server" so client-talk lines can't hijack the preview.
+/// sandbox.ts. A port-with-prefix is a candidate only when a listener keyword ("ready", "local",
+/// etc.) appears on the same line or within the previous two lines — dev servers like Vite and
+/// Next.js print the keyword on one line and the `localhost:` URL on the next. Avoids bare
+/// ":<port>" and the generic word "server" so client-talk lines can't hijack the preview.
 fn scan_ports(text: &str) -> Vec<u16> {
     const KEYWORDS: [&str; 6] = [
         "listening",
@@ -452,10 +454,19 @@ fn scan_ports(text: &str) -> Vec<u16> {
         "local",
     ];
     const PREFIXES: [&str; 4] = ["port ", "localhost:", "127.0.0.1:", "0.0.0.0:"];
+    const CONTEXT_LINES: usize = 2;
+
+    let lines: Vec<String> = text.lines().map(|l| l.to_ascii_lowercase()).collect();
     let mut out: Vec<u16> = Vec::new();
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        if !KEYWORDS.iter().any(|k| lower.contains(k)) {
+    for (i, lower) in lines.iter().enumerate() {
+        // A listener keyword on the current line or within the previous two lines puts this line
+        // in context for port detection.
+        let keyword_nearby = lines
+            .iter()
+            .skip(i.saturating_sub(CONTEXT_LINES))
+            .take(i.min(CONTEXT_LINES) + 1)
+            .any(|l| KEYWORDS.iter().any(|k| l.contains(k)));
+        if !keyword_nearby {
             continue;
         }
         for pfx in PREFIXES {
@@ -546,5 +557,66 @@ mod tests {
             baseline,
             "run_count should return to baseline after removal"
         );
+    }
+
+    /// Dev servers (Vite, Next.js, etc.) often print the listener keyword on one line and the
+    /// `localhost:` URL on the next. scan_ports must look back a couple of lines so the port
+    /// isn't missed.
+    #[test]
+    fn scan_ports_finds_port_on_line_after_keyword() {
+        let output = "VITE v5.0.0  ready in 300 ms\n\n  ->  Local:   http://localhost:5173/\n";
+        let ports = scan_ports(output);
+        assert_eq!(ports, vec![5173]);
+    }
+
+    #[test]
+    fn scan_ports_finds_port_on_same_line_as_keyword() {
+        let output = "Server listening at http://127.0.0.1:3000\n";
+        let ports = scan_ports(output);
+        assert_eq!(ports, vec![3000]);
+    }
+
+    #[test]
+    fn scan_ports_ignores_port_without_listener_keyword() {
+        // A URL-like port without a listener keyword nearby must not be detected.
+        let output = "random line\nanother line\nhttp://127.0.0.1:8080\n";
+        let ports = scan_ports(output);
+        assert!(
+            ports.is_empty(),
+            "ports without a listener keyword should be ignored"
+        );
+    }
+
+    #[test]
+    fn scan_ports_ignores_bare_colon_port_even_with_keyword() {
+        // A bare `:9000` (no recognized prefix) must not hijack the preview even when a keyword
+        // puts the line in context.
+        let output = "ready\nsome client said :9000\n";
+        let ports = scan_ports(output);
+        assert!(
+            ports.is_empty(),
+            "bare :port without a recognized prefix should be ignored"
+        );
+    }
+
+    #[test]
+    fn scan_ports_ignores_out_of_range_ports() {
+        let output = "ready\nlocal: http://localhost:80\nlocal: http://localhost:70000\n";
+        let ports = scan_ports(output);
+        assert!(ports.is_empty(), "ports outside 1025-65535 should be ignored");
+    }
+
+    #[test]
+    fn scan_ports_dedupes_duplicate_ports() {
+        let output = "ready\nLocal: http://localhost:3000\nAlso at 127.0.0.1:3000\n";
+        let ports = scan_ports(output);
+        assert_eq!(ports, vec![3000]);
+    }
+
+    #[test]
+    fn scan_ports_finds_multiple_distinct_ports() {
+        let output = "ready\nLocal: http://localhost:3000\nAdmin: http://127.0.0.1:4000\n";
+        let ports = scan_ports(output);
+        assert_eq!(ports, vec![3000, 4000]);
     }
 }
