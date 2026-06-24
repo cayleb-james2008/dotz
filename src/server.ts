@@ -29,6 +29,7 @@ import { sandbox, SANDBOX_LANGUAGES, type SandboxEvent } from "./sandbox";
 import { skillLoader } from "./skills";
 import { workflowStore, WorkflowCycleError } from "./workflows";
 import { workflowBridge } from "./workflow-bridge";
+import { templateStore, type TemplateInput } from "./templates";
 import { resolveHumanGate, onGateRequest, onPanelOpenRequest } from "../.pi/extensions/dotz-tools/index";
 import { browserController, type BrowserActInput, type BrowserStartInput } from "./browser";
 import { connectionsController } from "./connections";
@@ -375,6 +376,89 @@ export async function buildServer(): Promise<{ app: FastifyInstance; pi: PiSessi
     const body = await skillLoader.loadBody(name);
     if (!body) { reply.code(404).send({ error: "no such skill" }); return; }
     return { name, body };
+  });
+
+  // ---- templates (user-editable workflow presets) ----
+  // Bundled presets ship in `.pi/prompts/`; operators can create/fork/edit/delete custom templates
+  // under `~/.dotz/ai-agents/templates/`. User templates shadow bundled presets by id, and the user
+  // directory is also passed to the agent's resource loader so custom templates surface as slash
+  // commands in new sessions.
+  app.get("/api/templates", async () => ({ templates: await templateStore.list() }));
+  app.get("/api/templates/:id", async (req, reply) => {
+    const t = await templateStore.get((req.params as { id: string }).id);
+    if (!t) { reply.code(404).send({ error: "no such template" }); return; }
+    return t;
+  });
+  app.post("/api/templates", async (req, reply) => {
+    const body = (req.body ?? {}) as { name?: string; description?: string; body?: string; tags?: unknown };
+    if (!isNonEmptyStr(body.name)) { reply.code(400).send({ error: "name is required" }); return; }
+    if (typeof body.body !== "string" || !body.body.trim()) { reply.code(400).send({ error: "body is required" }); return; }
+    if (body.tags !== undefined && (!Array.isArray(body.tags) || !body.tags.every((t) => typeof t === "string"))) {
+      reply.code(400).send({ error: "tags must be an array of strings" }); return;
+    }
+    try {
+      const t = await templateStore.create({
+        name: body.name.trim(),
+        description: body.description,
+        body: body.body.trim(),
+        tags: body.tags as string[] | undefined,
+      });
+      return { template: t };
+    } catch (err) {
+      // A duplicate id or invalid write surfaces as a 409 rather than an unhandled 500.
+      reply.code(409).send({ error: (err as Error).message }); return;
+    }
+  });
+  app.patch("/api/templates/:id", async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const patch: Partial<TemplateInput> = {};
+    if (body.name !== undefined) {
+      if (!isNonEmptyStr(body.name)) { reply.code(400).send({ error: "name must be a non-empty string" }); return; }
+      patch.name = body.name.trim();
+    }
+    if (body.description !== undefined) patch.description = typeof body.description === "string" ? body.description : undefined;
+    if (body.body !== undefined) {
+      if (typeof body.body !== "string" || !body.body.trim()) { reply.code(400).send({ error: "body must be a non-empty string" }); return; }
+      patch.body = body.body.trim();
+    }
+    if (body.tags !== undefined) {
+      if (!Array.isArray(body.tags) || !body.tags.every((t) => typeof t === "string")) { reply.code(400).send({ error: "tags must be an array of strings" }); return; }
+      patch.tags = body.tags as string[];
+    }
+    try {
+      const t = await templateStore.update(id, patch);
+      if (!t) { reply.code(404).send({ error: "no such template" }); return; }
+      return { template: t };
+    } catch (err) {
+      reply.code(400).send({ error: (err as Error).message }); return;
+    }
+  });
+  app.delete("/api/templates/:id", async (req, reply) => {
+    const ok = await templateStore.remove((req.params as { id: string }).id);
+    if (!ok) { reply.code(404).send({ error: "no such template" }); return; }
+    return { ok: true };
+  });
+  app.post("/api/templates/:id/fork", async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { name?: string };
+    const t = await templateStore.fork(id, body.name);
+    if (!t) { reply.code(404).send({ error: "no such bundled template" }); return; }
+    return { template: t };
+  });
+  app.post("/api/templates/:id/run", async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { sessionId?: string; args?: string };
+    if (!isNonEmptyStr(body.sessionId)) { reply.code(400).send({ error: "sessionId is required" }); return; }
+    const entry = pi.get(body.sessionId);
+    if (!entry) { reply.code(404).send({ error: "no such session" }); return; }
+    try {
+      const ok = await templateStore.run(id, entry.session, typeof body.args === "string" ? body.args : "");
+      if (!ok) { reply.code(404).send({ error: "no such template" }); return; }
+      return { ok: true };
+    } catch (err) {
+      reply.code(400).send({ error: (err as Error).message }); return;
+    }
   });
 
   // ---- design (native Open Design): vendored design systems for the DESIGN panel ----

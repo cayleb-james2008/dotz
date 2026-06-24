@@ -94,6 +94,25 @@ Reads or overwrites the project's root `AGENTS.md` doctrine file. `content` is t
 body (plain Markdown). The UI's DOCTRINE panel edits this directly; changes take effect on the
 next session context reload because AGENTS.md is read at session-build time.
 
+### Workflow templates (user-editable presets)
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/api/templates` | — | `{ templates: TemplateMeta[] }` |
+| GET | `/api/templates/:id` | — | `Template` |
+| POST | `/api/templates` | `{ name, body, description?, tags? }` | `{ template: Template }` |
+| PATCH | `/api/templates/:id` | partial `{ name?, body?, description?, tags? }` | `{ template: Template }` |
+| DELETE | `/api/templates/:id` | — | `{ ok }` |
+| POST | `/api/templates/:id/fork` | `{ name? }` | `{ template: Template }` |
+| POST | `/api/templates/:id/run` | `{ sessionId, args? }` | `{ ok }` |
+
+`Template = { id, name, description, body, source:"bundled"|"user", origin?, tags?, createdAt, updatedAt }`.
+`TemplateMeta = { id, name, description, source, origin?, tags?, hasArgs, updatedAt }`.
+Bundled presets ship in `.pi/prompts/` (the 6 workflow slash commands). User templates live under
+`~/.dotz/ai-agents/templates/` and shadow bundled presets by id. Fork copies a bundled preset to
+ the user store so it can be edited. `run` expands `$@` with `args` and sends the result as a
+prompt to the live session — equivalent to typing the slash command in the composer.
+
 ### Sandbox (visual web preview + agent cursor)
 
 | Method | Path | Body | Returns |
