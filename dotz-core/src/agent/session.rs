@@ -525,7 +525,11 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
                 return;
             }
             Err(e) => {
-                finish_error(&session, &format!("stream task panicked: {e}"), tool_results);
+                finish_error(
+                    &session,
+                    &format!("stream task panicked: {e}"),
+                    tool_results,
+                );
                 return;
             }
         }
@@ -969,9 +973,14 @@ mod tests {
         let summary = create(CreateOpts::default()).unwrap();
         let sid = summary["sessionId"].as_str().unwrap().to_string();
         let sess = get(&sid).unwrap();
-        sess.lock().unwrap().turn_active.store(true, Ordering::SeqCst);
+        sess.lock()
+            .unwrap()
+            .turn_active
+            .store(true, Ordering::SeqCst);
         {
-            let _guard = TurnGuard { session: sess.clone() };
+            let _guard = TurnGuard {
+                session: sess.clone(),
+            };
         }
         assert!(
             !sess.lock().unwrap().turn_active.load(Ordering::SeqCst),
@@ -986,7 +995,10 @@ mod tests {
         let sid = summary["sessionId"].as_str().unwrap().to_string();
         let sess = get(&sid).unwrap();
         // Simulate an in-flight turn.
-        sess.lock().unwrap().turn_active.store(true, Ordering::SeqCst);
+        sess.lock()
+            .unwrap()
+            .turn_active
+            .store(true, Ordering::SeqCst);
 
         run_turn(sess.clone(), "second prompt while busy".into()).await;
 
@@ -1098,14 +1110,9 @@ mod tests {
             cwd: std::env::temp_dir(),
             tx: Some(sess.lock().unwrap().tx.clone()),
         };
-        let err = run_tool(
-            &sess,
-            "bash",
-            &json!({ "command": "echo hi" }),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
+        let err = run_tool(&sess, "bash", &json!({ "command": "echo hi" }), &ctx)
+            .await
+            .unwrap_err();
 
         dispose(&sid);
         assert!(
