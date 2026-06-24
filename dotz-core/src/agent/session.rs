@@ -12,7 +12,8 @@ use crate::{config, memory, profiles, projects, skills, types};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -42,6 +43,10 @@ pub struct AgentSession {
     pub tools: ToolRegistry,
     pub tx: broadcast::Sender<Value>,
     pub cancel: CancellationToken,
+    /// Guards against concurrent turns on the same session. `run_turn` swaps this on and the
+    /// `TurnGuard` clears it when the turn finishes or panics, preventing interleaved history
+    /// and cancellation-token replacement.
+    pub turn_active: AtomicBool,
 }
 
 impl AgentSession {
@@ -232,6 +237,7 @@ pub fn create(opts: CreateOpts) -> Result<Value, String> {
         tools,
         tx,
         cancel: CancellationToken::new(),
+        turn_active: AtomicBool::new(false),
     };
     let summary = session.summary();
     store()
@@ -368,9 +374,35 @@ impl Accumulator {
     }
 }
 
+/// RAII guard that clears `AgentSession::turn_active` when the turn finishes, even on panic.
+struct TurnGuard {
+    session: Arc<Mutex<AgentSession>>,
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.session
+            .lock()
+            .unwrap()
+            .turn_active
+            .store(false, Ordering::SeqCst);
+    }
+}
+
 /// Run one prompt to completion: assemble, append user msg, loop (stream → maybe tools → repeat).
 /// This is the public entry the WS `prompt` handler calls. It blocks until the turn finishes.
-pub async fn run_turn(session: std::sync::Arc<Mutex<AgentSession>>, prompt: String) {
+pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
+    // Reject concurrent turns on the same session to keep history and the cancellation token sane.
+    let _guard = {
+        let s = session.lock().unwrap();
+        if s.turn_active.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        TurnGuard {
+            session: session.clone(),
+        }
+    };
+
     // Snapshot the immutable bits + append the user message under the lock; release before awaiting.
     let (sess_id, system_prompt, provider_id, model_id, thinking, cwd, tools_specs) = {
         let mut s = session.lock().unwrap();
@@ -916,6 +948,45 @@ pub fn models(id: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_guard_clears_flag_on_drop() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        sess.lock().unwrap().turn_active.store(true, Ordering::SeqCst);
+        {
+            let _guard = TurnGuard { session: sess.clone() };
+        }
+        assert!(
+            !sess.lock().unwrap().turn_active.load(Ordering::SeqCst),
+            "TurnGuard must clear turn_active on drop"
+        );
+        dispose(&sid);
+    }
+
+    #[tokio::test]
+    async fn run_turn_rejects_concurrent_prompt() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        // Simulate an in-flight turn.
+        sess.lock().unwrap().turn_active.store(true, Ordering::SeqCst);
+
+        run_turn(sess.clone(), "second prompt while busy".into()).await;
+
+        let g = sess.lock().unwrap();
+        assert!(
+            g.history.is_empty(),
+            "concurrent run_turn should not append to history"
+        );
+        assert!(
+            g.turn_active.load(Ordering::SeqCst),
+            "active flag should remain set (the rejected turn did not create a guard)"
+        );
+        drop(g);
+        dispose(&sid);
+    }
 
     #[test]
     fn finish_error_emits_message_start_before_message_end() {
