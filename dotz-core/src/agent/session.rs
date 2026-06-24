@@ -396,6 +396,13 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     let _guard = {
         let s = session.lock().unwrap();
         if s.turn_active.swap(true, Ordering::SeqCst) {
+            // Tell the operator (and any UI subscriber) why the prompt vanished instead of
+            // silently dropping it. A busy session means an earlier turn is still streaming.
+            let _ = s.tx.send(serde_json::json!({
+                "kind": "error",
+                "sessionId": s.id,
+                "error": "A turn is already in progress. Wait for it to finish or send abort."
+            }));
             return;
         }
         TurnGuard {
@@ -1081,6 +1088,49 @@ mod tests {
             "active flag should remain set (the rejected turn did not create a guard)"
         );
         drop(g);
+        dispose(&sid);
+    }
+
+    /// A prompt sent while the session is busy must not vanish silently; the operator needs a
+    /// clear UI notice so they know to wait or abort.
+    #[tokio::test]
+    async fn run_turn_emits_busy_error_when_rejecting_concurrent_prompt() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        sess.lock()
+            .unwrap()
+            .turn_active
+            .store(true, Ordering::SeqCst);
+
+        run_turn(sess.clone(), "second prompt while busy".into()).await;
+
+        let mut found = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.get("kind").and_then(|k| k.as_str()) == Some("error") {
+                assert_eq!(
+                    frame.get("sessionId").and_then(|s| s.as_str()),
+                    Some(sid.as_str())
+                );
+                let err = frame.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                assert!(
+                    err.contains("already in progress"),
+                    "busy error should explain why the prompt was rejected: {err}"
+                );
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "concurrent run_turn should emit a busy error frame to the UI"
+        );
+
+        sess.lock()
+            .unwrap()
+            .turn_active
+            .store(false, Ordering::SeqCst);
         dispose(&sid);
     }
 
