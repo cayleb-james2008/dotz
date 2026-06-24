@@ -379,9 +379,21 @@ fn build_index() -> BTreeMap<String, Skill> {
 
 /// Module-owned cache of the deduped index, built once on first access (idempotent — mirrors the
 /// Node `SkillLoader.load()` one-shot guard).
+static CACHE: OnceLock<Mutex<BTreeMap<String, Skill>>> = OnceLock::new();
+
 fn index() -> &'static Mutex<BTreeMap<String, Skill>> {
-    static CACHE: OnceLock<Mutex<BTreeMap<String, Skill>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(build_index()))
+}
+
+/// Force a rebuild of the cached skill index so newly-created or removed skills are visible
+/// immediately. Callers (e.g. `create_skill`) can invoke this after mutating the on-disk skill pool.
+pub fn reload_index() {
+    if let Some(mutex) = CACHE.get() {
+        let mut guard = mutex.lock().unwrap();
+        *guard = build_index();
+    } else {
+        let _ = index();
+    }
 }
 
 /// GET /api/skills — `{ "skills": [{ name, description, source, tags?, isUmbrella }] }`, sorted by
@@ -508,12 +520,18 @@ pub fn router() -> Router<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::Instant;
+
+    /// Serialize tests that mutate the process-global `DOTZ_PI` / `DOTZ_SKILLS_PATHS` env vars
+    /// so concurrent index builds don't see each other's isolated directories.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// DOTZ_SKILLS_PATHS must be parsed with the OS path-list separator so a multi-dir override
     /// works on both Windows (`;`) and Unix (`:`) without hand-rolling the delimiter.
     #[test]
     fn extra_skills_paths_uses_os_path_delimiter() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let dir1 = std::env::temp_dir().join(format!("dotz-skills-a-{}", uuid::Uuid::new_v4()));
         let dir2 = std::env::temp_dir().join(format!("dotz-skills-b-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir1).unwrap();
@@ -543,6 +561,7 @@ mod tests {
     /// also see the sequential-vs-parallel timing over the real on-disk skill pool.
     #[test]
     fn parallel_index_matches_sequential() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let t0 = Instant::now();
         let mut seq: BTreeMap<String, PathBuf> = BTreeMap::new();
         for (dir, source) in scan_roots() {
@@ -573,5 +592,73 @@ mod tests {
             "skills index over {} skills: sequential {seq_ms:.1}ms, parallel {par_ms:.1}ms",
             par.len()
         );
+    }
+
+    /// `reload_index()` must rebuild the cached skill index after a new SKILL.md is written to a
+    /// scan root. Without it, `load_body` stays stale until the process restarts.
+    #[test]
+    fn reload_index_picks_up_newly_created_skill() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("dotz-skills-reload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Point DOTZ_PI at an empty tree so the only scanned skills come from our override dir.
+        let pi = std::env::temp_dir().join(format!("dotz-pi-reload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&pi.join("design-systems")).unwrap();
+
+        let prev_pi = std::env::var("DOTZ_PI").ok();
+        let prev_paths = std::env::var("DOTZ_SKILLS_PATHS").ok();
+        std::env::set_var("DOTZ_PI", &pi);
+        std::env::set_var("DOTZ_SKILLS_PATHS", &dir);
+
+        // Create the first skill and prime the cache.
+        let alpha = dir.join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::write(
+            alpha.join("SKILL.md"),
+            "---\nname: alpha-skill\ndescription: Alpha\n---\nbody alpha\n",
+        )
+        .unwrap();
+
+        // The cache may already be initialized by earlier tests; force a rebuild with our
+        // isolated environment before asserting on the new skill.
+        reload_index();
+
+        assert_eq!(load_body("alpha-skill").as_deref(), Some("body alpha\n"));
+
+        // Add a second skill after the cache is already built.
+        let beta = dir.join("beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(
+            beta.join("SKILL.md"),
+            "---\nname: beta-skill\ndescription: Beta\n---\nbody beta\n",
+        )
+        .unwrap();
+
+        assert!(
+            load_body("beta-skill").is_none(),
+            "stale index must not see a skill created after the first load"
+        );
+
+        reload_index();
+
+        assert_eq!(
+            load_body("beta-skill").as_deref(),
+            Some("body beta\n"),
+            "reload_index must surface the newly-created skill"
+        );
+
+        // Cleanup.
+        match prev_pi {
+            Some(p) => std::env::set_var("DOTZ_PI", p),
+            None => std::env::remove_var("DOTZ_PI"),
+        }
+        match prev_paths {
+            Some(p) => std::env::set_var("DOTZ_SKILLS_PATHS", p),
+            None => std::env::remove_var("DOTZ_SKILLS_PATHS"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&pi);
     }
 }

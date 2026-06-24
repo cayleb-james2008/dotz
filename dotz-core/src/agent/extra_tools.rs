@@ -177,8 +177,11 @@ impl Tool for CreateSkillTool {
             body
         );
         std::fs::write(&file, content).map_err(|e| e.to_string())?;
+        // Rebuild the skill index so the new skill is immediately visible to list_skills,
+        // get_skill, and the `skill` tool — without this the cache would stay stale until restart.
+        crate::skills::reload_index();
         Ok(format!(
-            "created skill \"{name}\" at {} (available on next index reload)",
+            "created skill \"{name}\" at {} (available immediately)",
             file.display()
         ))
     }
