@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use tokio::sync::broadcast;
 
-use crate::types;
+use crate::{skills, types};
 
 fn bad(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     (
@@ -220,8 +220,76 @@ async fn get_commands(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode
     if session::get(&id).is_none() {
         return Err(not_found());
     }
-    // Commands are sourced from skills (skill:<name>) — extensions/prompt templates are Phase 4.
-    Ok(Json(json!({ "commands": [] })))
+    Ok(Json(json!({ "commands": commands() })))
+}
+
+/// Build the composer slash-palette: bundled workflow presets (`.pi/prompts/*.md`) plus discovered
+/// skills. Presets come first so workflow presets win on name collisions in the UI deduper.
+pub fn commands() -> Vec<Value> {
+    let mut out = prompt_commands_from_dir(&skills::pi_dir().join("prompts"));
+    out.extend(skills::command_views());
+    out
+}
+
+/// Load workflow-preset commands from a prompts directory. Each `*.md` file becomes a command
+/// named by its filename stem, described by the `description:` frontmatter line.
+fn prompt_commands_from_dir(dir: &std::path::Path) -> Vec<Value> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return out,
+    };
+    let mut items: Vec<(String, String)> = Vec::new();
+    for ent in entries.flatten() {
+        let path = ent.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let desc = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| parse_prompt_description(&raw))
+            .unwrap_or_default();
+        items.push((name, desc));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, desc) in items {
+        out.push(json!({
+            "name": name,
+            "description": desc,
+            "kind": "preset",
+        }));
+    }
+    out
+}
+
+/// Extract the `description:` value from a leading `--- ... ---` frontmatter block. Mirrors the
+/// simple `key: value` subset used by the bundled `.pi/prompts/*.md` files.
+fn parse_prompt_description(raw: &str) -> Option<String> {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let after_open = raw.strip_prefix("---\n").or_else(|| raw.strip_prefix("---\r\n"))?;
+    let close_idx = after_open.find("\n---")?;
+    let fm = &after_open[..close_idx];
+    for line in fm.lines() {
+        let mut parts = line.splitn(2, ':');
+        let key = parts.next()?.trim();
+        if key == "description" {
+            let val = parts.next()?.trim();
+            let val = val
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            return Some(val);
+        }
+    }
+    None
 }
 
 async fn post_abort(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -474,5 +542,63 @@ mod tests {
         q.insert("sessionId".to_string(), sid.clone());
         assert_eq!(require_ws_session(&q).unwrap(), sid);
         session::dispose(&sid);
+    }
+
+    #[test]
+    fn prompt_commands_from_dir_reads_frontmatter_description() {
+        let dir = std::env::temp_dir().join(format!("dotz-prompts-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("scout-and-plan.md"),
+            "---\ndescription: Scout maps, planner plans\n---\nDo stuff.\n",
+        )
+        .unwrap();
+        // Bare file (no frontmatter) yields empty description but still appears.
+        std::fs::write(dir.join("plain.md"), "# Plain\n").unwrap();
+        // Non-markdown file is ignored.
+        std::fs::write(dir.join("ignored.txt"), "---\ndescription: Bad\n---\n").unwrap();
+
+        let cmds = prompt_commands_from_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let by_name: HashMap<String, String> = cmds
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v.get("name")?.as_str()?.to_string(),
+                    v.get("description")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        assert!(by_name.contains_key("plain"), "bare markdown should appear");
+        assert!(
+            !by_name.contains_key("ignored"),
+            "non-markdown should be ignored"
+        );
+        assert_eq!(
+            by_name.get("scout-and-plan").cloned().unwrap_or_default(),
+            "Scout maps, planner plans"
+        );
+    }
+
+    #[test]
+    fn commands_includes_bundled_workflow_presets() {
+        let cmds = commands();
+        let names: std::collections::HashSet<String> = cmds
+            .iter()
+            .filter_map(|v| v.get("name")?.as_str().map(String::from))
+            .collect();
+        for preset in ["scout-and-plan", "implement", "implement-and-review", "self-improve"] {
+            assert!(
+                names.contains(preset),
+                "commands() should include bundled preset /{preset}"
+            );
+        }
+        // Every entry must have the expected shape.
+        for v in &cmds {
+            assert!(v.get("name").and_then(|x| x.as_str()).is_some());
+            assert!(v.get("description").is_some());
+            assert!(v.get("kind").and_then(|x| x.as_str()).is_some());
+        }
     }
 }
