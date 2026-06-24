@@ -41,7 +41,9 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
 }
 
 async fn health(State(_s): State<Shared>) -> Json<Value> {
-    Json(json!({ "ok": true, "sessions": crate::agent::session_count(), "sandboxRuns": crate::sandbox::run_count() }))
+    Json(
+        json!({ "ok": true, "sessions": crate::agent::session_count(), "sandboxRuns": crate::sandbox::run_count() }),
+    )
 }
 
 async fn providers() -> Json<Value> {
@@ -104,8 +106,15 @@ async fn post_config(
     }
 
     let next = {
+        let guard = s.config.lock().unwrap();
+        let n = config::update(&guard, &clean).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to persist config: {e}") })),
+            )
+        })?;
+        drop(guard);
         let mut guard = s.config.lock().unwrap();
-        let n = config::update(&guard, &clean);
         *guard = n.clone();
         n
     };

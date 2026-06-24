@@ -532,11 +532,19 @@ mod tests {
                 },
             );
         }
-        assert_eq!(run_count(), baseline + 1, "run_count should include the inserted entry");
+        assert_eq!(
+            run_count(),
+            baseline + 1,
+            "run_count should include the inserted entry"
+        );
         {
             let mut store = runs().lock().unwrap();
             store.remove(&id);
         }
-        assert_eq!(run_count(), baseline, "run_count should return to baseline after removal");
+        assert_eq!(
+            run_count(),
+            baseline,
+            "run_count should return to baseline after removal"
+        );
     }
 }

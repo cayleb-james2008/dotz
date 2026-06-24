@@ -280,7 +280,9 @@ fn prompt_commands_from_dir(dir: &std::path::Path) -> Vec<Value> {
 /// simple `key: value` subset used by the bundled `.pi/prompts/*.md` files.
 fn parse_prompt_description(raw: &str) -> Option<String> {
     let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
-    let after_open = raw.strip_prefix("---\n").or_else(|| raw.strip_prefix("---\r\n"))?;
+    let after_open = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))?;
     let close_idx = after_open.find("\n---")?;
     let fm = &after_open[..close_idx];
     for line in fm.lines() {
@@ -288,10 +290,7 @@ fn parse_prompt_description(raw: &str) -> Option<String> {
         let key = parts.next()?.trim();
         if key == "description" {
             let val = parts.next()?.trim();
-            let val = val
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_string();
+            let val = val.trim_matches('"').trim_matches('\'').to_string();
             return Some(val);
         }
     }
@@ -637,7 +636,12 @@ mod tests {
             .iter()
             .filter_map(|v| v.get("name")?.as_str().map(String::from))
             .collect();
-        for preset in ["scout-and-plan", "implement", "implement-and-review", "self-improve"] {
+        for preset in [
+            "scout-and-plan",
+            "implement",
+            "implement-and-review",
+            "self-improve",
+        ] {
             assert!(
                 names.contains(preset),
                 "commands() should include bundled preset /{preset}"
