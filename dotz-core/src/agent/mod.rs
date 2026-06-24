@@ -70,6 +70,12 @@ async fn create_session(
             if prov.is_empty() || mid.is_empty() {
                 return Err(bad("model must be { provider, modelId }"));
             }
+            if !types::is_known_provider(prov) {
+                return Err(bad(format!(
+                    "provider must be one of: {}",
+                    types::provider_ids().join(", ")
+                )));
+            }
             Some(types::ModelRef {
                 provider: prov.to_string(),
                 model_id: mid.to_string(),
@@ -626,5 +632,34 @@ mod tests {
             assert!(v.get("description").is_some());
             assert!(v.get("kind").and_then(|x| x.as_str()).is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_unknown_provider() {
+        let body = Json(json!({
+            "model": { "provider": "not-a-provider", "modelId": "anything" }
+        }));
+        let err = create_session(Some(body)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let msg = err.1 .0["error"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("provider must be one of"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("ollama"),
+            "provider list should include ollama: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_accepts_known_provider() {
+        let body = Json(json!({
+            "model": { "provider": "ollama", "modelId": "glm-5.2" }
+        }));
+        let resp = create_session(Some(body)).await.unwrap();
+        let sid = resp.0["sessionId"].as_str().unwrap().to_string();
+        assert!(!sid.is_empty(), "create_session should return a session id");
+        session::dispose(&sid);
     }
 }
