@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-use crate::{skills, types};
+use crate::{profiles, skills, types};
 
 fn bad(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     (
@@ -104,15 +104,31 @@ async fn create_session(
             .collect::<Vec<_>>()
     });
 
+    // Validate profileId.
+    let profile_id = match b.get("profileId") {
+        None | Some(Value::Null) => None,
+        Some(p) => {
+            let ps = p.as_str().unwrap_or("").trim();
+            if !profiles::is_valid(ps) {
+                return Err(bad(format!(
+                    "profileId must be one of: {}",
+                    profiles::summaries()
+                        .iter()
+                        .map(|s| s.id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            Some(ps.to_string())
+        }
+    };
+
     let opts = session::CreateOpts {
         cwd: b.get("cwd").and_then(|v| v.as_str()).map(String::from),
         model,
         thinking_level: thinking,
         tools,
-        profile_id: b
-            .get("profileId")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        profile_id,
         project_id: b
             .get("projectId")
             .and_then(|v| v.as_str())
@@ -694,6 +710,31 @@ mod tests {
         let resp = create_session(Some(body)).await.unwrap();
         let sid = resp.0["sessionId"].as_str().unwrap().to_string();
         assert!(!sid.is_empty(), "create_session should return a session id");
+        session::dispose(&sid);
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_unknown_profile() {
+        let body = Json(json!({ "profileId": "not-a-profile" }));
+        let err = create_session(Some(body)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let msg = err.1 .0["error"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("profileId must be one of"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("workflow"),
+            "profile list should include workflow: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_accepts_known_profile() {
+        let body = Json(json!({ "profileId": "solo" }));
+        let resp = create_session(Some(body)).await.unwrap();
+        let sid = resp.0["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(resp.0["profileId"], "solo");
         session::dispose(&sid);
     }
 
