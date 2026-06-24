@@ -399,7 +399,9 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
             if step.status == "running" && step.started_at.is_none() {
                 step.started_at = Some(now);
             }
-            if (step.status == "done" || step.status == "error") && step.ended_at.is_none() {
+            if (step.status == "done" || step.status == "error" || step.status == "skipped")
+                && step.ended_at.is_none()
+            {
                 step.ended_at = Some(now);
             }
         }
@@ -454,6 +456,9 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
                 for s in run.steps.iter_mut() {
                     if s.status == "pending" || s.status == "ready" || s.status == "running" {
                         s.status = "skipped".to_string();
+                        if s.ended_at.is_none() {
+                            s.ended_at = Some(now);
+                        }
                     }
                 }
             }
@@ -478,6 +483,9 @@ fn abort(id: &str) -> Option<WorkflowRun> {
         for step in run.steps.iter_mut() {
             if step.status == "running" || step.status == "ready" || step.status == "pending" {
                 step.status = "skipped".to_string();
+                if step.ended_at.is_none() {
+                    step.ended_at = Some(now);
+                }
             }
         }
         run.clone()
@@ -797,6 +805,94 @@ mod tests {
             let run = create(None, None, "test".into(), None, &inputs).unwrap();
             assert!(run.steps[1].parents.is_empty());
             assert_eq!(run.steps[1].status, "ready");
+        });
+    }
+
+    #[test]
+    fn error_transition_sweeps_runnable_steps_to_skipped_with_ended_at() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(0)])),
+                step("c", "C", Some(vec![json!(0)])),
+            ];
+            let run = create(None, None, "error-sweep".into(), None, &inputs).unwrap();
+            let run = start(&run.id).unwrap();
+            let parent_id = run.steps[0].id.clone();
+
+            let updated = step_state(
+                &run.id,
+                &parent_id,
+                StepPatch {
+                    status: Some("error".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(updated.status, "error");
+            let parent = updated.steps.iter().find(|s| s.id == parent_id).unwrap();
+            assert_eq!(parent.status, "error");
+            assert!(parent.ended_at.is_some(), "errored step must have endedAt");
+
+            for s in &updated.steps {
+                if s.id != parent_id {
+                    assert_eq!(s.status, "skipped", "child of errored step must be skipped");
+                    assert!(
+                        s.ended_at.is_some(),
+                        "auto-skipped step must have endedAt: {:?}",
+                        s
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn abort_sweeps_runnable_steps_to_skipped_with_ended_at() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(0)])),
+            ];
+            let run = create(None, None, "abort-sweep".into(), None, &inputs).unwrap();
+            let run = start(&run.id).unwrap();
+
+            let updated = abort(&run.id).unwrap();
+            assert_eq!(updated.status, "aborted");
+            for s in &updated.steps {
+                assert_eq!(s.status, "skipped");
+                assert!(
+                    s.ended_at.is_some(),
+                    "aborted step must have endedAt: {:?}",
+                    s
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn explicit_skipped_patch_sets_ended_at() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "skip".into(), None, &inputs).unwrap();
+            let run = start(&run.id).unwrap();
+            let step_id = run.steps[0].id.clone();
+
+            let updated = step_state(
+                &run.id,
+                &step_id,
+                StepPatch {
+                    status: Some("skipped".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(updated.status, "done");
+            let s = &updated.steps[0];
+            assert_eq!(s.status, "skipped");
+            assert!(s.ended_at.is_some(), "explicitly skipped step must have endedAt");
         });
     }
 
