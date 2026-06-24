@@ -385,22 +385,25 @@ fn index() -> &'static Mutex<BTreeMap<String, Skill>> {
     CACHE.get_or_init(|| Mutex::new(build_index()))
 }
 
+/// Lock the skill index, recovering from a poisoned mutex. A panic while building the index
+/// (e.g. inside `parse_skill_file` or `build_index`) must not permanently brick the skills REST
+/// endpoints or system-prompt injection.
+fn index_guard() -> std::sync::MutexGuard<'static, BTreeMap<String, Skill>> {
+    index().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Force a rebuild of the cached skill index so newly-created or removed skills are visible
 /// immediately. Callers (e.g. `create_skill`) can invoke this after mutating the on-disk skill pool.
 pub fn reload_index() {
-    if let Some(mutex) = CACHE.get() {
-        let mut guard = mutex.lock().unwrap();
-        *guard = build_index();
-    } else {
-        let _ = index();
-    }
+    let mut guard = index_guard();
+    *guard = build_index();
 }
 
 /// GET /api/skills — `{ "skills": [{ name, description, source, tags?, isUmbrella }] }`, sorted by
 /// name (the BTreeMap iterates in key order, which matches the JS `localeCompare` for these ASCII
 /// names). `tags` omitted when absent; `isUmbrella` always present.
 async fn list_skills() -> Json<serde_json::Value> {
-    let guard = index().lock().unwrap();
+    let guard = index_guard();
     let skills: Vec<SkillView> = guard
         .values()
         .map(|s| SkillView {
@@ -419,7 +422,7 @@ async fn list_skills() -> Json<serde_json::Value> {
 /// the body can't be loaded — mirrors server.ts (a falsy body → 404).
 async fn get_skill(Path(name): Path<String>) -> Response {
     let path = {
-        let guard = index().lock().unwrap();
+        let guard = index_guard();
         guard.get(&name).map(|s| s.path.clone())
     };
     let Some(path) = path else {
@@ -451,7 +454,7 @@ const INDEX_CAP: usize = 80;
 /// Skill rows formatted for the composer slash-palette (`GET /api/sessions/:id/commands`).
 /// Each row is `{ name, description, kind: "skill" }` so the UI can mix presets and skills.
 pub fn command_views() -> Vec<serde_json::Value> {
-    let guard = index().lock().unwrap();
+    let guard = index_guard();
     guard
         .values()
         .map(|s| {
@@ -468,7 +471,7 @@ pub fn command_views() -> Vec<serde_json::Value> {
 /// to skillLoader.renderIndex(): capped at `INDEX_CAP` rows, each description clipped to 160 chars,
 /// with an overflow footer + count in the heading. Empty string when no skills.
 pub fn render_index() -> String {
-    let guard = index().lock().unwrap();
+    let guard = index_guard();
     let total = guard.len();
     if total == 0 {
         return String::new();
@@ -502,7 +505,7 @@ pub fn render_index() -> String {
 /// None when the skill is unknown or the file can't be read. Mirrors skillLoader.loadBody().
 pub fn load_body(name: &str) -> Option<String> {
     let path = {
-        let guard = index().lock().unwrap();
+        let guard = index_guard();
         guard.get(name).map(|s| s.path.clone())
     }?;
     let raw = std::fs::read_to_string(&path).ok()?;
@@ -659,5 +662,31 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&pi);
+    }
+
+    /// A panic while holding the skill-index mutex (e.g. inside `build_index` or a parallel parse)
+    /// must not permanently brick the skills REST endpoints or system-prompt injection. With poison
+    /// recovery, lookups, list, and reload keep working after a previous lock owner panicked.
+    #[test]
+    fn index_guard_recovers_from_poisoned_mutex() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Ensure the cache is initialized.
+        drop(index().lock().unwrap());
+
+        let m = index();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = m.lock().unwrap();
+            panic!("intentional skills index mutex poison");
+        }));
+        assert!(poisoned.is_err(), "skills index mutex should be poisoned");
+
+        // index_guard must recover and return a usable guard.
+        {
+            let guard = index_guard();
+            let _ = guard.len();
+        }
+
+        // reload_index must also recover and complete without panicking.
+        reload_index();
     }
 }
