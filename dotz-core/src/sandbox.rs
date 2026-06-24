@@ -603,7 +603,10 @@ mod tests {
     fn scan_ports_ignores_out_of_range_ports() {
         let output = "ready\nlocal: http://localhost:80\nlocal: http://localhost:70000\n";
         let ports = scan_ports(output);
-        assert!(ports.is_empty(), "ports outside 1025-65535 should be ignored");
+        assert!(
+            ports.is_empty(),
+            "ports outside 1025-65535 should be ignored"
+        );
     }
 
     #[test]

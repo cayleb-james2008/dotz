@@ -104,7 +104,9 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tauri::Builder::default()
+    let addr = SocketAddr::from(([127, 0, 0, 1], PORT));
+
+    let builder = tauri::Builder::default()
         // single-instance first (Tauri 2 requirement): relaunching focuses the running window.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
@@ -115,7 +117,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![bridge])
-        .setup(|app| {
+        .setup(move |app| {
             // Resolve bundled resources (web/, .pi/, assets/) so the embedded server can serve them.
             // Dev override: DOTZ_WEB_DIR / DOTZ_PI / DOTZ_ASSETS point at the worktree.
             let res = app
@@ -139,12 +141,23 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .join("agent-browser-win32-x64.exe"),
                 );
             }
-            let addr = SocketAddr::from(([127, 0, 0, 1], PORT));
+
+            // Graceful shutdown: notify the server task when the Tauri event loop exits so axum
+            // can drain open connections instead of dropping them on process exit.
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
+            let shutdown = async move {
+                let _ = shutdown_rx.changed().await;
+            };
+
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = dotz_core::server::serve(addr, web_dir).await {
+                if let Err(e) =
+                    dotz_core::server::serve_with_shutdown_addr(addr, web_dir, shutdown).await
+                {
                     eprintln!("dotz-core server error: {e}");
                 }
             });
+            app.manage(shutdown_tx);
+
             // Wait until the server accepts connections, then open the window on it.
             let mut ready = false;
             for _ in 0..100 {
@@ -174,7 +187,15 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .initialization_script(SHIM)
                 .build()?;
             Ok(())
-        })
-        .run(tauri::generate_context!())?;
+        });
+
+    let app = builder.build(tauri::generate_context!())?;
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(tx) = app_handle.try_state::<tokio::sync::watch::Sender<()>>() {
+                let _ = tx.send(());
+            }
+        }
+    });
     Ok(())
 }
