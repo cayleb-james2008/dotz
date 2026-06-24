@@ -123,12 +123,15 @@ fn is_non_empty_str(v: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
-/// `m` is a valid ModelRef: an object with non-empty string `provider` and `modelId`.
+/// `m` is a valid ModelRef: an object with a known `provider` and non-empty `modelId`.
 fn parse_valid_model(v: &Value) -> Option<ModelRef> {
     let obj = v.as_object()?;
     let provider = obj.get("provider")?.as_str()?;
     let model_id = obj.get("modelId")?.as_str()?;
     if provider.trim().is_empty() || model_id.trim().is_empty() {
+        return None;
+    }
+    if !types::is_known_provider(provider.trim()) {
         return None;
     }
     Some(ModelRef {
@@ -239,7 +242,10 @@ async fn create_project(
     let model = match body.get("model") {
         Some(m) => match parse_valid_model(m) {
             Some(mr) => Some(mr),
-            None => return Err(bad("model must be { provider, modelId }")),
+            None => return Err(bad(format!(
+                "model must be a known provider and non-empty modelId (providers: {})",
+                types::provider_ids().join(", ")
+            ))),
         },
         None => None,
     };
@@ -397,7 +403,10 @@ async fn patch_project(
     if let Some(v) = raw.get("model") {
         match parse_valid_model(v) {
             Some(mr) => new_model = Some(mr),
-            None => return Err(bad("model must be { provider, modelId }")),
+            None => return Err(bad(format!(
+                "model must be a known provider and non-empty modelId (providers: {})",
+                types::provider_ids().join(", ")
+            ))),
         }
     }
     if let Some(v) = raw.get("thinkingLevel") {
@@ -798,6 +807,69 @@ mod tests {
                 err.1 .0
             );
         });
+    }
+
+    /// create_project must reject a model with an unknown provider instead of persisting it and
+    /// causing a runtime failure when the session tries to resolve the provider.
+    #[tokio::test]
+    async fn create_project_rejects_unknown_provider() {
+        let _g = with_tmp_projects_file();
+        let dir = std::env::temp_dir().join(format!(
+            "dotz-project-provider-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let body = Json(json!({
+            "name": "bad-provider",
+            "cwd": dir.to_string_lossy(),
+            "model": { "provider": "not-a-provider", "modelId": "anything" }
+        }));
+        let err = create_project(Some(body)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let msg = err.1 .0["error"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("model must be a known provider"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("ollama"),
+            "provider list should include ollama: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// patch_project must reject a model update with an unknown provider, preserving the same
+    /// trust boundary as create_project.
+    #[tokio::test]
+    async fn patch_project_rejects_unknown_provider() {
+        let _g = with_tmp_projects_file();
+        let dir = std::env::temp_dir().join(format!(
+            "dotz-patch-provider-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let create_body = Json(json!({
+            "name": "demo",
+            "cwd": dir.to_string_lossy(),
+        }));
+        let created = create_project(Some(create_body)).await.unwrap().0;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let patch_body = Json(json!({
+            "model": { "provider": "fake-provider", "modelId": "x" }
+        }));
+        let err = patch_project(Path(id), Some(patch_body)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let msg = err.1 .0["error"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("model must be a known provider"),
+            "unexpected error: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A panic while holding the project-store mutex (e.g. inside a serde callback) poisons it.
