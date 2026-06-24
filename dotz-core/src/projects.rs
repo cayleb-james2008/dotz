@@ -69,6 +69,11 @@ pub fn find(id: &str) -> Option<Project> {
 }
 
 fn projects_file() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("DOTZ_PROJECTS_FILE") {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
     crate::config::dotz_dir().join("projects.json")
 }
 
@@ -347,7 +352,15 @@ async fn patch_project(
             Some(s) => s,
             None => return Err(bad("profileId must be a string")),
         };
-        new_profile_id = Some(s.to_string());
+        // Mirror create_project: an empty profileId falls back to the default "workflow".
+        new_profile_id = Some({
+            let t = s.trim().to_string();
+            if t.is_empty() {
+                "workflow".to_string()
+            } else {
+                t
+            }
+        });
     }
     if let Some(v) = raw.get("model") {
         match parse_valid_model(v) {
@@ -373,14 +386,16 @@ async fn patch_project(
             Some(s) => s,
             None => return Err(bad("appUrl must be a string")),
         };
-        new_app_url = Some(s.to_string());
+        // Mirror create_project: empty/whitespace appUrl removes the field.
+        new_app_url = Some(s.trim().to_string()).filter(|s| !s.is_empty());
     }
     if let Some(v) = raw.get("gateCommand") {
         let s = match v.as_str() {
             Some(s) => s,
             None => return Err(bad("gateCommand must be a string")),
         };
-        new_gate_command = Some(s.to_string());
+        // Mirror create_project: empty/whitespace gateCommand removes the field.
+        new_gate_command = Some(s.trim().to_string()).filter(|s| !s.is_empty());
     }
 
     let mut guard = store().lock().unwrap();
@@ -405,11 +420,11 @@ async fn patch_project(
         if let Some(v) = new_thinking {
             p.thinking_level = v;
         }
-        if let Some(v) = new_app_url {
-            p.app_url = Some(v);
+        if raw.get("appUrl").is_some() {
+            p.app_url = new_app_url;
         }
-        if let Some(v) = new_gate_command {
-            p.gate_command = Some(v);
+        if raw.get("gateCommand").is_some() {
+            p.gate_command = new_gate_command;
         }
         p.updated_at = now_millis();
     }
@@ -453,4 +468,124 @@ pub fn router() -> Router<()> {
             get(get_project).patch(patch_project).delete(delete_project),
         )
         .route("/api/projects/{id}/files", get(project_files))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Serialize projects tests: they share the module-level in-memory store.
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    struct TmpFileGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        file: std::path::PathBuf,
+        prev: Option<String>,
+    }
+
+    impl Drop for TmpFileGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(p) => std::env::set_var("DOTZ_PROJECTS_FILE", p),
+                None => std::env::remove_var("DOTZ_PROJECTS_FILE"),
+            }
+            let _ = std::fs::remove_file(&self.file);
+        }
+    }
+
+    /// Point DOTZ_PROJECTS_FILE at an isolated temp file, reset the in-memory store, and return a
+    /// guard that restores the previous env + removes the temp file when dropped.
+    fn with_tmp_projects_file() -> TmpFileGuard {
+        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let file =
+            std::env::temp_dir().join(format!("dotz-projects-test-{}.json", uuid::Uuid::new_v4()));
+        let prev = std::env::var("DOTZ_PROJECTS_FILE").ok();
+        std::env::set_var("DOTZ_PROJECTS_FILE", &file);
+        {
+            let mut store_guard = store().lock().unwrap();
+            *store_guard = Vec::new();
+        }
+        TmpFileGuard {
+            _lock: guard,
+            file,
+            prev,
+        }
+    }
+
+    #[test]
+    fn patch_project_clears_empty_optional_strings() {
+        let _g = with_tmp_projects_file();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let create_body = Json(json!({
+                "name": "demo",
+                "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+                "appUrl": "http://localhost:3000",
+                "gateCommand": "npm test"
+            }));
+            let created = create_project(Some(create_body)).await.unwrap().0;
+            let id = created["id"].as_str().unwrap().to_string();
+            assert!(created["appUrl"].as_str().is_some());
+            assert!(created["gateCommand"].as_str().is_some());
+
+            let patch_body = Json(json!({
+                "appUrl": "",
+                "gateCommand": "   "
+            }));
+            let patched = patch_project(Path(id), Some(patch_body)).await.unwrap().0;
+            assert!(
+                patched["appUrl"].is_null(),
+                "empty appUrl should be removed, got: {:?}",
+                patched["appUrl"]
+            );
+            assert!(
+                patched["gateCommand"].is_null(),
+                "whitespace-only gateCommand should be removed, got: {:?}",
+                patched["gateCommand"]
+            );
+        });
+    }
+
+    #[test]
+    fn patch_project_defaults_empty_profile_id() {
+        let _g = with_tmp_projects_file();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let create_body = Json(json!({
+                "name": "demo",
+                "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+                "profileId": "custom"
+            }));
+            let created = create_project(Some(create_body)).await.unwrap().0;
+            let id = created["id"].as_str().unwrap().to_string();
+            assert_eq!(created["profileId"], "custom");
+
+            let patch_body = Json(json!({ "profileId": "" }));
+            let patched = patch_project(Path(id), Some(patch_body)).await.unwrap().0;
+            assert_eq!(patched["profileId"], "workflow");
+        });
+    }
+
+    #[test]
+    fn patch_project_preserves_untouched_optional_fields() {
+        let _g = with_tmp_projects_file();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let create_body = Json(json!({
+                "name": "demo",
+                "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+                "appUrl": "http://localhost:3000",
+                "gateCommand": "npm test"
+            }));
+            let created = create_project(Some(create_body)).await.unwrap().0;
+            let id = created["id"].as_str().unwrap().to_string();
+
+            let patch_body = Json(json!({ "name": "renamed" }));
+            let patched = patch_project(Path(id), Some(patch_body)).await.unwrap().0;
+            assert_eq!(patched["name"], "renamed");
+            assert_eq!(patched["appUrl"], "http://localhost:3000");
+            assert_eq!(patched["gateCommand"], "npm test");
+        });
+    }
 }
