@@ -43,11 +43,17 @@ fn config_file() -> PathBuf {
 }
 
 /// The bundled subagent extension reads DOTZ_SUBAGENT_MODEL to pin every dispersed subagent's model.
+/// Normalizes the subagent model so a persisted value that already includes the provider prefix
+/// (e.g. "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free") does not produce a doubled prefix
+/// like "openrouter/openrouter/...".
 pub fn apply_env(c: &DotzConfig) {
-    std::env::set_var(
-        "DOTZ_SUBAGENT_MODEL",
-        format!("{}/{}", c.provider, c.subagent_model),
-    );
+    let prefix = format!("{}/", c.provider);
+    let model = if let Some(rest) = c.subagent_model.strip_prefix(&prefix) {
+        rest.to_string()
+    } else {
+        c.subagent_model.clone()
+    };
+    std::env::set_var("DOTZ_SUBAGENT_MODEL", format!("{}/{}", c.provider, model));
 }
 
 /// Load config.json, clamping any invalid present field to its default (mirror loadConfig).
@@ -177,7 +183,7 @@ mod tests {
 
             assert_eq!(
                 std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
-                "openrouter/openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+                "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
             );
         });
     }
@@ -209,6 +215,35 @@ mod tests {
             assert_eq!(
                 env_after, env_before,
                 "env must not update when config save fails: before={env_before}, after={env_after}"
+            );
+        });
+    }
+
+    #[test]
+    fn apply_env_strips_matching_provider_prefix() {
+        with_tmp_dir(|_| {
+            let cfg = DotzConfig {
+                provider: "openrouter".into(),
+                executive_model: "nex-agi/nex-n2-pro".into(),
+                subagent_model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free".into(),
+                thinking_level: "medium".into(),
+            };
+            apply_env(&cfg);
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+            );
+
+            // A model id without the provider prefix is left unchanged.
+            let cfg2 = DotzConfig {
+                provider: "ollama".into(),
+                subagent_model: "minimax-m3".into(),
+                ..cfg
+            };
+            apply_env(&cfg2);
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "ollama/minimax-m3"
             );
         });
     }
