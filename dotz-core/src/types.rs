@@ -78,12 +78,19 @@ pub fn low_cost_models() -> Vec<ModelRef> {
     ]
 }
 
+fn resolve_subagent_model(override_value: Option<&str>) -> String {
+    override_value
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            let (_, s) = provider_default(DEFAULT_PROVIDER).unwrap();
+            format!("{DEFAULT_PROVIDER}/{s}")
+        })
+}
+
 /// Render the subagent-model directive for system-prompt injection (port of renderLowCostModels).
 pub fn render_low_cost_models() -> String {
-    let sub = std::env::var("DOTZ_SUBAGENT_MODEL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
-        let (_, s) = provider_default(DEFAULT_PROVIDER).unwrap();
-        format!("{DEFAULT_PROVIDER}/{s}")
-    });
+    let sub = resolve_subagent_model(std::env::var("DOTZ_SUBAGENT_MODEL").ok().as_deref());
     let list = low_cost_models()
         .iter()
         .map(|m| format!("{}/{}", m.provider, m.model_id))
@@ -101,5 +108,78 @@ pub fn provider_default(id: &str) -> Option<(&'static str, &'static str)> {
         "openrouter" => Some(("nex-agi/nex-n2-pro", "nex-agi/nex-n2-pro")),
         "local" => Some(("qwen2.5-coder", "qwen2.5-coder")),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_levels_and_validation() {
+        for level in THINKING_LEVELS {
+            assert!(is_valid_thinking(level));
+        }
+        assert!(!is_valid_thinking(""));
+        assert!(!is_valid_thinking("max"));
+    }
+
+    #[test]
+    fn default_model_points_to_ollama() {
+        let m = default_model();
+        assert_eq!(m.provider, "ollama");
+        assert_eq!(m.model_id, "glm-5.2");
+    }
+
+    #[test]
+    fn providers_list_is_stable() {
+        let p = providers();
+        assert_eq!(p.len(), 11);
+        assert!(p.iter().any(|pm| pm.id == "ollama" && pm.free_form));
+        assert!(p.iter().any(|pm| pm.id == "anthropic" && !pm.free_form));
+    }
+
+    #[test]
+    fn known_provider_detection() {
+        assert!(is_known_provider("openrouter"));
+        assert!(is_known_provider("ollama"));
+        assert!(!is_known_provider("fake-provider"));
+    }
+
+    #[test]
+    fn provider_ids_match_providers() {
+        let ids = provider_ids();
+        assert_eq!(ids.len(), providers().len());
+        assert!(ids.contains(&"ollama"));
+    }
+
+    #[test]
+    fn provider_default_returns_expected_pairs() {
+        assert_eq!(provider_default("ollama"), Some(("glm-5.2", "minimax-m3")));
+        assert_eq!(provider_default("openrouter"), Some(("nex-agi/nex-n2-pro", "nex-agi/nex-n2-pro")));
+        assert_eq!(provider_default("local"), Some(("qwen2.5-coder", "qwen2.5-coder")));
+        assert_eq!(provider_default("unknown"), None);
+    }
+
+    #[test]
+    fn resolve_subagent_model_uses_override_when_present() {
+        assert_eq!(
+            resolve_subagent_model(Some("openrouter/nvidia/nemotron-3-ultra-550b-a55b:free")),
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
+    }
+
+    #[test]
+    fn resolve_subagent_model_falls_back_to_default() {
+        assert_eq!(resolve_subagent_model(None), "ollama/minimax-m3");
+        assert_eq!(resolve_subagent_model(Some("")), "ollama/minimax-m3");
+    }
+
+    #[test]
+    fn render_low_cost_models_contains_default_and_low_cost_list() {
+        let rendered = render_low_cost_models();
+        assert!(rendered.contains("ollama/minimax-m3"));
+        assert!(rendered.contains("Do NOT pass a `model` override"));
+        assert!(rendered.contains("minimax-m3"));
     }
 }
