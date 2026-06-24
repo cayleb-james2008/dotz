@@ -148,11 +148,11 @@ The signed build needs the updater signing key in the environment — see
 
 ## Cross-device auto-update
 
-The installed app self-updates via `tauri-plugin-updater`: it checks the **public** releases repo
-(`cayleb-james2008/dotz-releases`) for a minisign-signed `latest.json`, verifies it against the
-bundled pubkey, and installs + relaunches in place. The **source repo stays private**; only the
-signed installer + `latest.json` are published publicly. Full topology and the release commands are
-in [src-tauri/DEPLOY.md](src-tauri/DEPLOY.md).
+The installed app self-updates via `tauri-plugin-updater`: it checks this repo's
+[latest release](https://github.com/cayleb-james2008/dotz/releases/latest) for a minisign-signed
+`latest.json`, verifies it against the bundled pubkey, and installs + relaunches in place. Source and
+signed releases live in this one public repo. Full topology and the release commands are in
+[src-tauri/DEPLOY.md](src-tauri/DEPLOY.md).
 
 ## Notes & caveats
 
