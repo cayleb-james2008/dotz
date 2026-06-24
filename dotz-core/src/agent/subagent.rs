@@ -637,6 +637,9 @@ struct Acc {
     text_idx: Option<usize>,
     /// provider tool-call index → (block index, arg-json buffer).
     tool_calls: HashMap<usize, (usize, String)>,
+    /// Indices for which a ToolCallStart has already been emitted. Some providers stream the name
+    /// across multiple chunks; without this guard the same call gets multiple content blocks.
+    tool_call_started: std::collections::HashSet<usize>,
 }
 
 impl Acc {
@@ -646,6 +649,7 @@ impl Acc {
             thinking_idx: None,
             text_idx: None,
             tool_calls: HashMap::new(),
+            tool_call_started: std::collections::HashSet::new(),
         }
     }
 }
@@ -678,13 +682,18 @@ fn apply_delta(acc: &mut Acc, delta: StreamDelta, stop_reason: &mut String) {
             }
         },
         StreamDelta::ToolCallStart { index, id, name } => {
-            acc.msg.content.push(ContentBlock::ToolCall {
-                id,
-                name,
-                arguments: json!({}),
-            });
-            let block_idx = acc.msg.content.len() - 1;
-            acc.tool_calls.insert(index, (block_idx, String::new()));
+            // Only create a content block the first time we see a given provider index.
+            // The provider may repeat the name in later argument chunks; re-using the same index
+            // must append arguments to the existing block, not spawn a duplicate tool call.
+            if acc.tool_call_started.insert(index) {
+                acc.msg.content.push(ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments: json!({}),
+                });
+                let block_idx = acc.msg.content.len() - 1;
+                acc.tool_calls.insert(index, (block_idx, String::new()));
+            }
         }
         StreamDelta::ToolCallArgs { index, json: frag } => {
             if let Some(entry) = acc.tool_calls.get_mut(&index) {
@@ -1043,6 +1052,59 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_accumulator_dedupes_repeated_tool_call_start() {
+        let mut acc = Acc::new("local", "test", 0);
+        // Some providers stream the tool-call name across multiple chunks. The first chunk
+        // establishes the call; the second chunk repeats the same index and must NOT create a
+        // second ToolCall content block.
+        apply_delta(
+            &mut acc,
+            StreamDelta::ToolCallStart {
+                index: 0,
+                id: "call_abc".into(),
+                name: "bash".into(),
+            },
+            &mut String::new(),
+        );
+        apply_delta(
+            &mut acc,
+            StreamDelta::ToolCallStart {
+                index: 0,
+                id: "call_abc".into(),
+                name: "bash".into(),
+            },
+            &mut String::new(),
+        );
+        apply_delta(
+            &mut acc,
+            StreamDelta::ToolCallArgs {
+                index: 0,
+                json: "{\"command\":\"echo hi\"}".into(),
+            },
+            &mut String::new(),
+        );
+
+        let tool_blocks: Vec<_> = acc
+            .msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolCall { id, name, arguments } => Some((id.clone(), name.clone(), arguments.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_blocks.len(),
+            1,
+            "repeated ToolCallStart for the same index must not create duplicate blocks"
+        );
+        let (id, name, args) = &tool_blocks[0];
+        assert_eq!(id, "call_abc");
+        assert_eq!(name, "bash");
+        assert_eq!(args["command"], "echo hi");
+    }
 
     #[test]
     fn subagent_registry_excludes_recursion_by_default() {
