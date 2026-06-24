@@ -22,6 +22,7 @@
     "test:sandbox": "node --test --import tsx scripts/verify-sandbox.mjs",
     "test:agents-md": "node --import tsx scripts/verify-agents-md.mjs",
     "test:metrics": "node --test --import tsx scripts/verify-metrics.ts",
+    "test:templates": "node --test --import tsx scripts/verify-templates.ts",
     "electron": "npm run build && electron .",
     "clean:release": "node -e \"require('node:fs').rmSync('release',{recursive:true,force:true})\"",
     "dist": "npm run clean:release && npm run check && npm run fetch-model && npm run build && electron-builder --win portable",
