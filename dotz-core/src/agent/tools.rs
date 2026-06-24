@@ -30,6 +30,42 @@ impl ToolCtx {
             self.cwd.join(pp)
         }
     }
+
+    /// Resolve a path and ensure it stays inside the session cwd. Blocks `..` traversal and
+    /// absolute paths outside the project root — a trust-boundary guard for the file tools.
+    /// # ponytail: follows `..` literally, not symlinks; good enough for the agent-tool sandbox.
+    fn resolve_in_cwd(&self, p: &str) -> Result<PathBuf, String> {
+        let raw = self.resolve(p);
+        let normalized = normalize_path(&raw);
+        let cwd_abs = if self.cwd.is_absolute() {
+            self.cwd.clone()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(&self.cwd)
+        };
+        let cwd_norm = normalize_path(&cwd_abs);
+        if !normalized.starts_with(&cwd_norm) {
+            return Err(format!("path escapes the project directory: {p}"));
+        }
+        Ok(normalized)
+    }
+}
+
+/// Remove `.` and `..` components from a path without touching the filesystem. Symlinks are not
+/// followed, which matches the intentionally lightweight sandbox boundary.
+fn normalize_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(Path::new(c.as_os_str())),
+        }
+    }
+    out
 }
 
 /// A tool the agent can invoke. `execute` returns Ok(text-result) or Err(error-text).
@@ -80,7 +116,8 @@ impl Tool for ReadTool {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let p = str_arg(args, "file_path").ok_or("file_path is required")?;
-        std::fs::read_to_string(ctx.resolve(p)).map_err(|e| format!("read {p}: {e}"))
+        let path = ctx.resolve_in_cwd(p)?;
+        std::fs::read_to_string(path).map_err(|e| format!("read {p}: {e}"))
     }
 }
 
@@ -103,7 +140,7 @@ impl Tool for WriteTool {
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let p = str_arg(args, "file_path").ok_or("file_path is required")?;
         let content = str_arg(args, "content").unwrap_or("");
-        let path = ctx.resolve(p);
+        let path = ctx.resolve_in_cwd(p)?;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -136,7 +173,7 @@ impl Tool for EditTool {
         let p = str_arg(args, "file_path").ok_or("file_path is required")?;
         let old = str_arg(args, "old_string").ok_or("old_string is required")?;
         let new = str_arg(args, "new_string").unwrap_or("");
-        let path = ctx.resolve(p);
+        let path = ctx.resolve_in_cwd(p)?;
         let content = std::fs::read_to_string(&path).map_err(|e| format!("read {p}: {e}"))?;
         let count = content.matches(old).count();
         if count == 0 {
@@ -271,7 +308,7 @@ impl Tool for LsTool {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let p = str_arg(args, "path").unwrap_or(".");
-        let dir = ctx.resolve(p);
+        let dir = ctx.resolve_in_cwd(p)?;
         let mut names: Vec<String> = Vec::new();
         for ent in std::fs::read_dir(&dir)
             .map_err(|e| format!("ls {p}: {e}"))?
@@ -309,7 +346,7 @@ impl Tool for GrepTool {
         let pat = str_arg(args, "pattern")
             .ok_or("pattern is required")?
             .to_string();
-        let root = ctx.resolve(str_arg(args, "path").unwrap_or("."));
+        let root = ctx.resolve_in_cwd(str_arg(args, "path").unwrap_or("."))?;
         let cwd = ctx.cwd.clone();
         let out = tokio::task::spawn_blocking(move || {
             let mut hits = Vec::new();
@@ -385,7 +422,7 @@ impl Tool for FindTool {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let pat = str_arg(args, "pattern").unwrap_or("").to_string();
-        let root = ctx.resolve(str_arg(args, "path").unwrap_or("."));
+        let root = ctx.resolve_in_cwd(str_arg(args, "path").unwrap_or("."))?;
         let cwd = ctx.cwd.clone();
         let out = tokio::task::spawn_blocking(move || {
             let mut hits = Vec::new();
@@ -863,5 +900,89 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "bash timeout should return promptly, elapsed: {elapsed:?}"
         );
+    }
+
+    /// The file-tool sandbox must reject paths that escape the session cwd, whether via `..`
+    /// traversal or an absolute path outside the project root. This is a trust-boundary guard: the
+    /// agent's read/write/edit/ls/grep/find tools operate only inside the selected project.
+    #[test]
+    fn file_tools_reject_paths_escaping_cwd() {
+        let base =
+            std::env::temp_dir().join(format!("dotz-toolctx-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let sibling =
+            std::env::temp_dir().join(format!("dotz-toolctx-sibling-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let ctx = ToolCtx {
+            cwd: base.clone(),
+            tx: None,
+        };
+
+        // Relative paths inside the cwd are fine.
+        assert!(ctx.resolve_in_cwd("src/main.rs").is_ok());
+        assert!(ctx.resolve_in_cwd(".").is_ok());
+        assert!(ctx.resolve_in_cwd("sub/../file.txt").is_ok());
+
+        // `..` traversal and absolute paths outside the cwd are rejected.
+        assert!(ctx.resolve_in_cwd("../secret.txt").is_err());
+        assert!(ctx.resolve_in_cwd("sub/../../secret.txt").is_err());
+        assert!(
+            ctx.resolve_in_cwd(sibling.join("file.txt").to_str().unwrap())
+                .is_err()
+        );
+        assert!(ctx.resolve_in_cwd("/etc/passwd").is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&sibling);
+    }
+
+    /// A path inside the cwd, including via an absolute path that points back at the cwd, is
+    /// allowed by the sandbox. The tool should then actually read/write it successfully.
+    #[tokio::test]
+    async fn file_tools_allow_paths_inside_cwd() {
+        let base =
+            std::env::temp_dir().join(format!("dotz-toolctx-inside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&[
+            "read".to_string(),
+            "write".to_string(),
+            "edit".to_string(),
+        ]);
+        let ctx = ToolCtx {
+            cwd: base.clone(),
+            tx: None,
+        };
+
+        // write + read round-trip.
+        let out = registry
+            .run("write", &json!({"file_path": "note.txt", "content": "hello"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("wrote"));
+        let text = registry
+            .run("read", &json!({"file_path": "note.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert!(text.contains("hello"));
+
+        // edit inside cwd works.
+        let edited = registry
+            .run(
+                "edit",
+                &json!({
+                    "file_path": "note.txt",
+                    "old_string": "hello",
+                    "new_string": "world"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(edited.contains("edited"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
