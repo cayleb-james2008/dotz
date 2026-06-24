@@ -5,8 +5,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 
 const RESOURCE_NAME: &str = r"^[a-z][a-z0-9-]{1,63}$";
@@ -247,36 +249,107 @@ fn workspace_has_dotz_core(cargo_toml: &str) -> bool {
     false
 }
 
+/// Configurable wall-clock timeout for `rsi_baseline` / `rsi_compare` gate runs. A hung test
+/// suite (waiting for network, an interactive prompt, or a deadlock) otherwise blocks the RSI
+/// loop forever. Defaults to 10 minutes; override with `DOTZ_GATE_TIMEOUT_MS` (clamped to [1s, 1h]).
+fn gate_timeout() -> Duration {
+    const DEFAULT_MS: u64 = 600_000; // 10 minutes
+    const MIN_MS: u64 = 1_000;       // 1 second — zero would time out before any gate starts
+    const MAX_MS: u64 = 3_600_000;   // 1 hour
+    std::env::var("DOTZ_GATE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|ms| ms.clamp(MIN_MS, MAX_MS))
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_MS))
+}
+
 async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
     let cwd = cwd.to_path_buf();
     let command = command
         .map(|s| s.to_string())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| default_gate_command(&cwd));
-    tokio::task::spawn_blocking(move || {
-        let (program, args): (&str, Vec<String>) = if cfg!(windows) {
-            ("cmd", vec!["/C".into(), command.clone()])
-        } else {
-            ("sh", vec!["-c".into(), command.clone()])
-        };
-        let out = std::process::Command::new(program).args(&args).current_dir(&cwd).output();
-        match out {
-            Ok(o) => {
-                let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-                let (passed, failed) = parse_counts(&text);
-                json!({
-                    "exitCode": o.status.code(),
-                    "ok": o.status.success(),
-                    "passed": passed,
-                    "failed": failed,
-                    "tail": text.chars().rev().take(800).collect::<String>().chars().rev().collect::<String>(),
-                })
-            }
-            Err(e) => json!({ "error": format!("gate run failed: {e}"), "ok": false, "passed": 0, "failed": 0 }),
+    let timeout = gate_timeout();
+
+    let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+        ("cmd", vec!["/C".into(), command.clone()])
+    } else {
+        ("sh", vec!["-c".into(), command.clone()])
+    };
+
+    let mut child = match tokio::process::Command::new(program)
+        .args(&args)
+        .current_dir(&cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return json!({
+                "error": format!("gate run failed: {e}"),
+                "ok": false,
+                "passed": 0,
+                "failed": 0,
+            });
         }
-    })
-    .await
-    .unwrap_or_else(|e| json!({ "error": format!("gate task panicked: {e}"), "ok": false }))
+    };
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+
+    let run_fut = async {
+        let (status, _, _) = tokio::join!(
+            child.wait(),
+            async {
+                if let Some(s) = stdout.as_mut() {
+                    let _ = s.read_to_end(&mut stdout_buf).await;
+                }
+            },
+            async {
+                if let Some(s) = stderr.as_mut() {
+                    let _ = s.read_to_end(&mut stderr_buf).await;
+                }
+            },
+        );
+        status
+    };
+
+    match tokio::time::timeout(timeout, run_fut).await {
+        Ok(Ok(status)) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&stdout_buf),
+                String::from_utf8_lossy(&stderr_buf)
+            );
+            let (passed, failed) = parse_counts(&text);
+            json!({
+                "exitCode": status.code(),
+                "ok": status.success(),
+                "passed": passed,
+                "failed": failed,
+                "tail": text.chars().rev().take(800).collect::<String>().chars().rev().collect::<String>(),
+            })
+        }
+        Ok(Err(e)) => json!({
+            "error": format!("gate run failed: {e}"),
+            "ok": false,
+            "passed": 0,
+            "failed": 0,
+        }),
+        Err(_) => {
+            let _ = child.start_kill();
+            json!({
+                "error": format!("[timeout] killed after {}ms", timeout.as_millis()),
+                "ok": false,
+                "passed": 0,
+                "failed": 0,
+            })
+        }
+    }
 }
 
 /// Parse common test-runner output for pass/fail counts (node:test, vitest, jest, pytest).
@@ -451,6 +524,9 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Serialize tests that mutate the process-global `DOTZ_GATE_TIMEOUT_MS` env var.
+    static GATE_TIMEOUT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn tmp_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("dotz-gate-test-{}", uuid::Uuid::new_v4()));
         let _ = fs::create_dir_all(&dir);
@@ -531,6 +607,83 @@ mod tests {
     fn parse_counts_reads_number_before_keyword() {
         assert_eq!(parse_counts("5 passed, 1 failed"), (5, 1));
         assert_eq!(parse_counts("8 passed / 0 failed"), (8, 0));
+    }
+
+    #[test]
+    fn gate_timeout_clamps_invalid_values() {
+        let _guard = GATE_TIMEOUT_TEST_LOCK.lock().unwrap();
+        let prev = std::env::var("DOTZ_GATE_TIMEOUT_MS").ok();
+
+        std::env::remove_var("DOTZ_GATE_TIMEOUT_MS");
+        assert_eq!(
+            gate_timeout().as_secs(),
+            600,
+            "default gate timeout is 10 minutes"
+        );
+
+        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "500");
+        assert_eq!(
+            gate_timeout().as_millis(),
+            1_000,
+            "below-minimum value clamps to 1s"
+        );
+
+        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "30000");
+        assert_eq!(gate_timeout().as_millis(), 30_000, "valid value preserved");
+
+        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "100000000");
+        assert_eq!(
+            gate_timeout().as_millis(),
+            3_600_000,
+            "above-maximum value clamps to 1h"
+        );
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_GATE_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_GATE_TIMEOUT_MS"),
+        }
+    }
+
+    /// A hung gate command must not block the RSI loop forever. `run_gate` honors
+    /// `DOTZ_GATE_TIMEOUT_MS`, kills the child process, and returns a clear timeout error.
+    #[tokio::test]
+    async fn run_gate_times_out_on_hung_command() {
+        let _guard = GATE_TIMEOUT_TEST_LOCK.lock().unwrap();
+        let prev = std::env::var("DOTZ_GATE_TIMEOUT_MS").ok();
+        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "1000");
+
+        let dir = tmp_dir();
+        // ~2s of wall-clock time; the 1s timeout must fire first and kill the child.
+        let command = if cfg!(windows) {
+            "ping -n 3 127.0.0.1"
+        } else {
+            "sleep 2"
+        };
+
+        let start = std::time::Instant::now();
+        let result = run_gate(&dir, Some(command)).await;
+        let elapsed = start.elapsed();
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_GATE_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_GATE_TIMEOUT_MS"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            result.get("ok").and_then(|v| v.as_bool()),
+            Some(false),
+            "timed-out gate must report ok:false: {result}"
+        );
+        let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            error.contains("[timeout]"),
+            "timed-out gate must report a timeout error, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "gate timeout should return promptly, elapsed: {elapsed:?}"
+        );
     }
 
     #[test]
