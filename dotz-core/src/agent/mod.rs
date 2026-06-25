@@ -468,6 +468,10 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
         }
     };
 
+    // Workflow events are broadcast globally (every socket receives every workflow update). The
+    // UI filters by runId/sessionId/projectId, so a session-specific subscription is not needed.
+    let mut wf_rx = crate::workflows::subscribe_events();
+
     // ready frame.
     let _ = sink
         .send(WsMessage::Text(
@@ -530,6 +534,18 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                             code: axum::extract::ws::close_code::AWAY,
                             reason: "session disposed".into(),
                         })),
+                    }
+                }
+                frame = recv_broadcast(&mut wf_rx) => {
+                    match frame {
+                        Some(f) => {
+                            if sink.send(WsMessage::Text(f.to_string().into())).await.is_err() {
+                                break Some(None);
+                            }
+                        }
+                        // The global workflow channel never closes; a lag-only path just means
+                        // this socket skipped some frames and will resume from the newest one.
+                        None => break Some(None),
                     }
                 }
             }
@@ -1687,4 +1703,152 @@ mod tests {
             "server should shut down cleanly"
         );
     }
+
+    /// Workflow events are broadcast globally to every WebSocket. Creating a workflow via REST
+    /// must deliver a `workflow_start` frame, and a step update must deliver `step_state`, so the
+    /// UI graph panel stays live without polling.
+    #[tokio::test]
+    async fn websocket_receives_global_workflow_events() {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        let _guard = WS_TEST_LOCK.lock().await;
+
+        // Isolate the workflow history file so this test does not pollute the real store.
+        let workflows_file =
+            std::env::temp_dir().join(format!("dotz-ws-workflows-test-{}.json", uuid::Uuid::new_v4()));
+        let prev_workflows_file = std::env::var("DOTZ_WORKFLOWS_FILE").ok();
+        std::env::set_var(
+            "DOTZ_WORKFLOWS_FILE",
+            workflows_file.to_string_lossy().to_string(),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(crate::server::serve_with_shutdown(
+            listener,
+            std::path::PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/sessions"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let summary = resp.json::<Value>().await.unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let url = format!("ws://127.0.0.1:{port}/ws?sessionId={sid}");
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(
+            ready.to_text().unwrap().contains("\"ready\""),
+            "first WS frame should be ready: {ready:?}"
+        );
+
+        // Create a workflow via REST. The create handler calls start(), which emits workflow_start.
+        let wf_resp = client
+            .post(format!("http://127.0.0.1:{port}/api/workflows"))
+            .json(&json!({
+                "label": "ws-test",
+                "steps": [
+                    { "agent": "a", "task": "A" },
+                    { "agent": "b", "task": "B", "parents": [0] }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(wf_resp.status().is_success());
+        let wf = wf_resp.json::<Value>().await.unwrap();
+        let run_id = wf["id"].as_str().unwrap().to_string();
+        let step_id = wf["steps"][0]["id"].as_str().unwrap().to_string();
+
+        let mut seen_start = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let frame: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if frame.get("kind").and_then(|k| k.as_str()) == Some("workflow") {
+                        assert_eq!(frame["runId"], run_id);
+                        let event = frame.get("event").cloned().unwrap_or_default();
+                        if event.get("type").and_then(|t| t.as_str()) == Some("workflow_start") {
+                            assert_eq!(event["run"]["status"], "running");
+                            seen_start = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            seen_start,
+            "websocket should receive workflow_start for the new run"
+        );
+
+        // Update the first step to done.
+        let step_resp = client
+            .post(format!("http://127.0.0.1:{port}/api/workflows/{run_id}/step"))
+            .json(&json!({ "stepId": step_id, "status": "done", "output": "ok" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(step_resp.status().is_success());
+
+        let mut seen_step_state = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let frame: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if frame.get("kind").and_then(|k| k.as_str()) == Some("workflow") {
+                        assert_eq!(frame["runId"], run_id);
+                        let event = frame.get("event").cloned().unwrap_or_default();
+                        if event.get("type").and_then(|t| t.as_str()) == Some("step_state") {
+                            assert_eq!(event["stepId"], step_id);
+                            assert_eq!(event["status"], "done");
+                            assert_eq!(event["output"], "ok");
+                            seen_step_state = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            seen_step_state,
+            "websocket should receive step_state after a step update"
+        );
+
+        session::dispose(&sid);
+        match prev_workflows_file {
+            Some(p) => std::env::set_var("DOTZ_WORKFLOWS_FILE", p),
+            None => std::env::remove_var("DOTZ_WORKFLOWS_FILE"),
+        }
+        let _ = std::fs::remove_file(&workflows_file);
+        let _ = tx.send(());
+        assert!(
+            handle.await.unwrap().is_ok(),
+            "server should shut down cleanly"
+        );
+    }
 }
+
