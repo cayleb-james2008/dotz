@@ -313,6 +313,12 @@ pub fn subscribe(id: &str) -> Option<broadcast::Receiver<Value>> {
     get(id).map(|s| session_guard(&s).tx.subscribe())
 }
 
+/// Return the session's broadcast sender, recovering from a poisoned mutex. The WebSocket loop
+/// needs to reach the sender even if a tool/provider task panicked while holding the session lock.
+pub fn tx(id: &str) -> Option<broadcast::Sender<Value>> {
+    get(id).map(|s| session_guard(&s).tx.clone())
+}
+
 fn emit(sess: &AgentSession, ev: &AgentEvent) {
     let _ = sess.tx.send(ws_frame(&sess.id, ev));
 }
@@ -1244,6 +1250,39 @@ mod tests {
         assert_eq!(tokens["output"].as_u64().unwrap(), 20);
         assert_eq!(tokens["totalTokens"].as_u64().unwrap(), 50);
         assert!((stats["cost"].as_f64().unwrap() - 0.65).abs() < f64::EPSILON);
+        dispose(&sid);
+    }
+
+    /// `session::tx` is the path the WebSocket loop uses to broadcast sandbox events. It must
+    /// recover from a poisoned session mutex so a panicked tool/provider task does not kill the
+    /// WebSocket fan-out for that session.
+    #[test]
+    fn tx_recovers_from_poisoned_session_mutex() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+
+        let before = tx(&sid);
+        assert!(before.is_some(), "tx must return a sender for an active session");
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sess.lock().unwrap();
+            panic!("intentional session mutex poison");
+        }));
+        assert!(poisoned.is_err(), "mutex should be poisoned");
+
+        let after = tx(&sid);
+        assert!(
+            after.is_some(),
+            "tx must recover from a poisoned session mutex"
+        );
+        // The same broadcast channel should still be reachable.
+        assert_eq!(
+            before.unwrap().receiver_count(),
+            after.unwrap().receiver_count(),
+            "poison recovery must return the same sender"
+        );
+
         dispose(&sid);
     }
 
