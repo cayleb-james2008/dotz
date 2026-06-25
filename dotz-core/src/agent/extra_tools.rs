@@ -47,13 +47,15 @@ impl Tool for AgentsMdTool {
             .and_then(|v| v.as_str())
             .unwrap_or("read")
         {
-            "read" => Ok(std::fs::read_to_string(&file).unwrap_or_default()),
+            "read" => Ok(tokio::fs::read_to_string(&file).await.unwrap_or_default()),
             "write" => {
                 let content = args
                     .get("content")
                     .and_then(|v| v.as_str())
                     .ok_or("content is required for write")?;
-                std::fs::write(&file, content).map_err(|e| e.to_string())?;
+                tokio::fs::write(&file, content)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(format!(
                     "wrote {} ({} bytes)",
                     file.display(),
@@ -103,9 +105,14 @@ impl Tool for CreateAgentTool {
             .join(".pi")
             .join("agent")
             .join("agents");
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| e.to_string())?;
         let file = dir.join(format!("{name}.md"));
-        if file.exists() {
+        if tokio::fs::try_exists(&file)
+            .await
+            .map_err(|e| e.to_string())?
+        {
             return Err(format!("agent \"{name}\" already exists"));
         }
         let body = if desc.is_empty() {
@@ -113,7 +120,9 @@ impl Tool for CreateAgentTool {
         } else {
             format!("# {name}\n\n> {desc}\n\n{prompt}\n")
         };
-        std::fs::write(&file, body).map_err(|e| e.to_string())?;
+        tokio::fs::write(&file, body)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(format!("created agent \"{name}\" at {}", file.display()))
     }
 }
@@ -165,10 +174,15 @@ impl Tool for CreateSkillTool {
             .join("skills")
             .join(name);
         let file = dir.join("SKILL.md");
-        if file.exists() {
+        if tokio::fs::try_exists(&file)
+            .await
+            .map_err(|e| e.to_string())?
+        {
             return Err(format!("skill \"{name}\" already exists"));
         }
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| e.to_string())?;
         // Frontmatter with JSON-quoted values (mirrors createUserSkill in skills.ts).
         let content = format!(
             "---\nname: {}\ndescription: {}\n---\n\n{}\n",
@@ -176,10 +190,16 @@ impl Tool for CreateSkillTool {
             serde_json::to_string(&description).unwrap_or_default(),
             body
         );
-        std::fs::write(&file, content).map_err(|e| e.to_string())?;
+        tokio::fs::write(&file, content)
+            .await
+            .map_err(|e| e.to_string())?;
         // Rebuild the skill index so the new skill is immediately visible to list_skills,
         // get_skill, and the `skill` tool — without this the cache would stay stale until restart.
-        crate::skills::reload_index();
+        // The scan walks the filesystem; run it on the blocking pool so it does not stall the
+        // async runtime during an agent turn.
+        tokio::task::spawn_blocking(crate::skills::reload_index)
+            .await
+            .map_err(|e| format!("reload index: {e}"))?;
         Ok(format!(
             "created skill \"{name}\" at {} (available immediately)",
             file.display()
@@ -898,5 +918,100 @@ mod tests {
         resolve_gate("recover-gate", false, Some("needs work".to_string()));
         let result = rx.try_recv().expect("gate resolution should deliver after poison recovery");
         assert_eq!(result, (false, Some("needs work".to_string())));
+    }
+
+    /// Serialize tests that mutate process-global env vars used by the file-persisting tools
+    /// (`DOTZ_CONFIG_DIR`). An async-aware mutex is required because the tests hold the lock
+    /// across `.await` points.
+    static TOOL_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// `agents_md` must read and write the project AGENTS.md asynchronously without blocking the
+    /// tokio runtime. This covers the conversion from `std::fs` to `tokio::fs` in the doctrine tool.
+    #[tokio::test]
+    async fn agents_md_tool_reads_and_writes_async() {
+        let dir = tmp_dir();
+        let ctx = ToolCtx {
+            cwd: dir.clone(),
+            tx: None,
+        };
+        let tool = AgentsMdTool;
+
+        let write_result = tool
+            .execute(
+                &json!({ "action": "write", "content": "# Doctrine\n\nBe concise." }),
+                &ctx,
+            )
+            .await;
+        assert!(
+            write_result.is_ok(),
+            "agents_md write should succeed: {:?}",
+            write_result
+        );
+        assert!(
+            dir.join("AGENTS.md").exists(),
+            "AGENTS.md should exist after write"
+        );
+
+        let read_result = tool.execute(&json!({ "action": "read" }), &ctx).await;
+        assert_eq!(
+            read_result.unwrap(),
+            "# Doctrine\n\nBe concise.",
+            "agents_md read should return the written doctrine"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `create_skill` must persist a user skill file asynchronously and rebuild the skill index
+    /// on the blocking pool. This covers the `tokio::fs` conversion and the `spawn_blocking`
+    /// reload in the skill-creation tool.
+    #[tokio::test]
+    async fn create_skill_tool_persists_async_and_reloads_index() {
+        let _guard = TOOL_ENV_TEST_LOCK.lock().await;
+        let prev_config =
+            std::env::var("DOTZ_CONFIG_DIR").ok().map(std::path::PathBuf::from);
+        let tmp = tmp_dir();
+        std::env::set_var("DOTZ_CONFIG_DIR", &tmp);
+
+        let tool = CreateSkillTool;
+        let ctx = ToolCtx {
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            tx: None,
+        };
+        let name = format!(
+            "testskill{}",
+            uuid::Uuid::new_v4().to_string().replace("-", "")
+        );
+        let result = tool
+            .execute(
+                &json!({
+                    "name": name,
+                    "description": "A test skill",
+                    "body": "Use this skill to verify async create_skill."
+                }),
+                &ctx,
+            )
+            .await;
+
+        let file = tmp
+            .join("ai-agents")
+            .join("skills")
+            .join(&name)
+            .join("SKILL.md");
+        assert!(result.is_ok(), "create_skill should succeed: {:?}", result);
+        assert!(
+            file.exists(),
+            "create_skill should write the skill file at {}",
+            file.display()
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+        // Restore DOTZ_CONFIG_DIR before rebuilding the index so other tests are not exposed
+        // to the deleted temp directory, then clear the test skill from the global index.
+        match &prev_config {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        crate::skills::reload_index();
     }
 }
