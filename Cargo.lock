@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "dotz-tauri"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "dotz-core",
  "serde_json",

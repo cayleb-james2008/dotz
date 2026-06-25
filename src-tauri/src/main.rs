@@ -12,13 +12,15 @@ const PORT: u16 = 4317;
 
 // Injected into the WebView2 window: recreates the `window.dotz` bridge the UI (web/app.js) expects,
 // mapping to Tauri commands. app.js feature-detects each field, so anything that errors degrades gracefully.
-const SHIM: &str = r#"
+// `version` is substituted at runtime from `app.package_info().version` (sourced from tauri.conf.json at
+// build time) so the UI never shows a stale hardcoded version string.
+const SHIM_TEMPLATE: &str = r#"
 (function () {
   const invoke = (m, a) => window.__TAURI__.core.invoke('bridge', { method: m, args: a || [] });
   let statusCb = null;
   window.dotz = {
     electron: true,
-    version: "0.2.0",
+    version: "__DOTZ_VERSION__",
     pickDirectory: () => invoke('pick_directory'),
     update: {
       check: async () => {
@@ -28,18 +30,27 @@ const SHIM: &str = r#"
             if (r && r.available) statusCb('available', { behind: 1, localSha: r.current || '', remoteSha: r.version || '', dirty: false });
             else statusCb('not-available', { localSha: (r && r.current) || '' });
           }
-        } catch (e) { if (statusCb) statusCb('failed', { error: String(e) }); }
+        } catch (e) { if (statusCb) statusCb('failed', { message: String(e) }); }
       },
       apply: async () => {
         if (statusCb) statusCb('applying');
-        try { const r = await invoke('apply_update'); if (r && r.ok === false && statusCb) statusCb('failed', r); }
-        catch (e) { if (statusCb) statusCb('failed', { error: String(e) }); }
+        try {
+          const r = await invoke('apply_update');
+          if (!statusCb) return;
+          if (r && r.ok === false) statusCb('failed', r);
+          else if (r && r.ok === true && r.available === false) statusCb('not-available', { localSha: '' });
+        } catch (e) { if (statusCb) statusCb('failed', { message: String(e) }); }
       },
       onStatus: (cb) => { statusCb = cb; return () => { statusCb = null; }; },
     },
   };
 })();
 "#;
+
+/// Build the `window.dotz` injection script with the real package version substituted in.
+fn shim(version: &str) -> String {
+    SHIM_TEMPLATE.replace("__DOTZ_VERSION__", version)
+}
 
 #[tauri::command]
 async fn bridge(app: tauri::AppHandle, method: String, _args: Vec<Value>) -> Result<Value, String> {
@@ -80,19 +91,20 @@ async fn update_status(app: &tauri::AppHandle) -> Value {
 
 async fn apply_update(app: &tauri::AppHandle) -> Value {
     use tauri_plugin_updater::UpdaterExt;
+    let cur = app.package_info().version.to_string();
     let updater = match app.updater() {
         Ok(u) => u,
-        Err(e) => return json!({"ok": false, "error": e.to_string()}),
+        Err(e) => return json!({"ok": false, "message": e.to_string()}),
     };
     match updater.check().await {
         Ok(Some(u)) => match u.download_and_install(|_, _| {}, || {}).await {
             Ok(()) => {
                 app.restart();
             }
-            Err(e) => json!({"ok": false, "error": e.to_string()}),
+            Err(e) => json!({"ok": false, "message": e.to_string()}),
         },
-        Ok(None) => json!({"ok": true, "available": false}),
-        Err(e) => json!({"ok": false, "error": e.to_string()}),
+        Ok(None) => json!({"ok": true, "available": false, "current": cur}),
+        Err(e) => json!({"ok": false, "message": e.to_string()}),
     }
 }
 
@@ -188,7 +200,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .title("dotz · ultra code")
                 .inner_size(1480.0, 920.0)
                 .min_inner_size(1000.0, 700.0)
-                .initialization_script(SHIM)
+                .initialization_script(&shim(&app.package_info().version.to_string()))
                 .build()?;
             Ok(())
         });

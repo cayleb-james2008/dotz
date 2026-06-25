@@ -69,6 +69,15 @@ pub struct WorkflowStep {
     pub started_at: Option<i64>,
     #[serde(rename = "endedAt", skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<i64>,
+    /// When true, a "done" transition with review findings auto-spawns a repair child + a
+    /// re-review grandchild, keeping the run running until the re-review passes or the retry
+    /// cap is hit. This makes "verified result" the default landing state for review steps.
+    #[serde(rename = "autoRepair", default)]
+    pub auto_repair: bool,
+    /// The review-round index this step was spawned in (0 = original, 1 = first repair, …).
+    /// Surfaced so the UI can render "repair round 2/3" on the step badge.
+    #[serde(rename = "repairRound", default)]
+    pub repair_round: u32,
 }
 
 /// A workflow run — a DAG of steps, observable by the UI.
@@ -93,6 +102,12 @@ pub struct WorkflowRun {
     pub started_at: Option<i64>,
     #[serde(rename = "endedAt", skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<i64>,
+    /// Max repair rounds for auto-repair review cycles (default 3). 0 disables auto-repair.
+    #[serde(rename = "maxRepairRounds", default)]
+    pub max_repair_rounds: u32,
+    /// Current repair-round counter, incremented each time a review step spawns a repair pair.
+    #[serde(rename = "repairRounds", default)]
+    pub repair_rounds: u32,
 }
 
 // ---- create input (POST body steps) ----
@@ -111,6 +126,9 @@ struct CreateStepInput {
     tool_call_ids: Option<Vec<String>>,
     #[serde(default)]
     thinking: Option<String>,
+    /// When true, a "done" transition with review findings auto-spawns a repair cycle.
+    #[serde(rename = "autoRepair", default)]
+    auto_repair: bool,
 }
 
 // ---- module-level store (OnceLock<Mutex<..>>; mirrors the Node module-singleton) ----
@@ -202,6 +220,47 @@ fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// Heuristic: does a review step's output contain actionable findings?
+/// Matches the reviewer agent's output format (## Critical / ## Warnings sections) and a
+/// generic "issues found" pattern. A review that reports no issues (e.g. "No critical issues
+/// found" or an empty/clean summary) must NOT trigger a repair cycle.
+fn review_has_findings(output: Option<&str>) -> bool {
+    let text = match output {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return false,
+    };
+    let lower = text.to_lowercase();
+
+    // Explicit "no issues" verdict — never trigger repair.
+    if lower.contains("no critical issues")
+        || lower.contains("no issues found")
+        || lower.contains("no findings")
+        || lower.contains("looks good")
+        || lower.contains("lgtm")
+    {
+        return false;
+    }
+
+    // Actionable findings: the reviewer agent emits "## Critical" and "## Warnings" sections.
+    // If either section header is present AND is followed by a non-empty bullet, there are
+    // findings to fix.
+    let section_has_findings = |section: &str| -> bool {
+        let Some(idx) = lower.find(section) else {
+            return false;
+        };
+        let after = &lower[idx + section.len()..];
+        // Look for a bullet ("- " or "* ") or a numbered list ("1. ") within the next
+        // 1000 chars — that's the findings list under the header.
+        let window = after.chars().take(1000).collect::<String>();
+        window.contains("- ") || window.contains("* ") || window.contains("1. ")
+    };
+
+    section_has_findings("## critical")
+        || section_has_findings("## warnings")
+        || section_has_findings("## must fix")
+        || section_has_findings("## should fix")
+}
+
 // ---- disk history (<dotz_dir>/ai-agents/workflows.json) ----
 
 fn workflows_file() -> PathBuf {
@@ -273,6 +332,7 @@ fn create(
     session_id: Option<String>,
     label: String,
     origin: Option<String>,
+    max_repair_rounds: u32,
     inputs: &[CreateStepInput],
 ) -> Result<WorkflowRun, CycleError> {
     let now = now_ms();
@@ -299,6 +359,8 @@ fn create(
             thinking: s.thinking.clone(),
             started_at: None,
             ended_at: None,
+            auto_repair: s.auto_repair,
+            repair_round: 0,
         })
         .collect();
 
@@ -410,6 +472,8 @@ fn create(
         updated_at: now,
         started_at: None,
         ended_at: None,
+        max_repair_rounds,
+        repair_rounds: 0,
     };
 
     {
@@ -509,6 +573,88 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
                     run.steps[ci].status = "ready".to_string();
                     changed.insert(child_id);
                 }
+            }
+        }
+
+        // Auto-repair cycle: when a review step (auto_repair: true) finishes with findings,
+        // spawn a repair child (worker) and a re-review grandchild (reviewer) and keep the
+        // run running until the re-review passes or the retry cap is hit. This makes
+        // "verified result" the default landing state, not the exception.
+        if step_status == "done" {
+            let step = &run.steps[step_idx];
+            if step.auto_repair
+                && run.status != "aborted"
+                && run.status != "error"
+                && run.status != "done"
+                && review_has_findings(step.output.as_deref())
+                && run.repair_rounds < run.max_repair_rounds
+            {
+                let next_round = run.repair_rounds + 1;
+                run.repair_rounds = next_round;
+                let review_step_id = step.id.clone();
+
+                // The reviewer's task includes the original findings so the worker can fix them.
+                let findings = step.output.clone().unwrap_or_default();
+                let repair_task = format!(
+                    "[Auto-repair round {next_round}] The review step '{}' found the following issues that must be fixed. Apply the minimal correct fix; do NOT rewrite unrelated code; do NOT introduce new features. Review findings:\n\n{findings}",
+                    review_step_id
+                );
+                let re_review_task = format!(
+                    "[Re-review round {next_round}] Re-audit the implementation after the repair step applied fixes for the original review findings. Verify the Critical and Warnings issues are resolved and no regressions were introduced. Output the standard review report.\n\nOriginal findings for reference:\n{findings}"
+                );
+
+                let repair_step = WorkflowStep {
+                    id: new_id(),
+                    agent: "worker".to_string(),
+                    task: repair_task,
+                    status: "ready".to_string(),
+                    parents: vec![review_step_id.clone()],
+                    children: Vec::new(),
+                    output: None,
+                    error: None,
+                    usage: None,
+                    sandbox_run_id: None,
+                    browser_session_id: None,
+                    tool_call_ids: None,
+                    thinking: None,
+                    started_at: None,
+                    ended_at: None,
+                    auto_repair: false,
+                    repair_round: next_round,
+                };
+                let re_review_step = WorkflowStep {
+                    id: new_id(),
+                    agent: "reviewer".to_string(),
+                    task: re_review_task,
+                    status: "pending".to_string(),
+                    parents: vec![repair_step.id.clone()],
+                    children: Vec::new(),
+                    output: None,
+                    error: None,
+                    usage: None,
+                    sandbox_run_id: None,
+                    browser_session_id: None,
+                    tool_call_ids: None,
+                    thinking: None,
+                    started_at: None,
+                    ended_at: None,
+                    auto_repair: true,
+                    repair_round: next_round,
+                };
+
+                // Wire the review step → repair → re-review chain.
+                if let Some(review) = run.steps.iter_mut().find(|s| s.id == review_step_id) {
+                    review.children.push(repair_step.id.clone());
+                    changed.insert(review_step_id);
+                }
+                // The new steps must be in `changed` so the broadcast loop emits step_state
+                // events for them — otherwise the UI graph panel won't show the spawned nodes.
+                changed.insert(repair_step.id.clone());
+                changed.insert(re_review_step.id.clone());
+                run.steps.push(repair_step);
+                run.steps.push(re_review_step);
+                // The run stays running — the re-review must pass (or the cap must be hit).
+                run.status = "running".to_string();
             }
         }
 
@@ -730,8 +876,14 @@ async fn create_handler(
         .get("origin")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let max_repair_rounds = body
+        .get("maxRepairRounds")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(3)
+        .clamp(0, 10);
 
-    let run = match create(project_id, session_id, label, origin, &inputs) {
+    let run = match create(project_id, session_id, label, origin, max_repair_rounds, &inputs) {
         Ok(run) => run,
         Err(CycleError) => return Err(bad("workflow steps form a cycle")),
     };
@@ -854,6 +1006,24 @@ mod tests {
             browser_session_id: None,
             tool_call_ids: None,
             thinking: None,
+            auto_repair: false,
+        }
+    }
+
+    fn step_with_auto_repair(
+        agent: &str,
+        task: &str,
+        parents: Option<Vec<Value>>,
+    ) -> CreateStepInput {
+        CreateStepInput {
+            agent: agent.into(),
+            task: task.into(),
+            parents,
+            sandbox_run_id: None,
+            browser_session_id: None,
+            tool_call_ids: None,
+            thinking: None,
+            auto_repair: true,
         }
     }
 
@@ -878,7 +1048,7 @@ mod tests {
                 step("b", "B", Some(vec![json!(0)])),
                 step("c", "C", Some(vec![json!(1)])),
             ];
-            let run = create(None, None, "test".into(), None, &inputs).unwrap();
+            let run = create(None, None, "test".into(), None, 3, &inputs).unwrap();
             let ids: Vec<_> = run.steps.iter().map(|s| s.id.clone()).collect();
 
             assert!(run.steps[0].parents.is_empty());
@@ -898,6 +1068,7 @@ mod tests {
                 None,
                 "numeric".into(),
                 None,
+                3,
                 &[step("a", "A", None), step("b", "B", Some(vec![json!(0)]))],
             )
             .unwrap();
@@ -906,6 +1077,7 @@ mod tests {
                 None,
                 "string".into(),
                 None,
+                3,
                 &[step("a", "A", None), step("b", "B", Some(vec![json!("0")]))],
             )
             .unwrap();
@@ -926,7 +1098,7 @@ mod tests {
     fn out_of_range_numeric_parent_is_skipped() {
         with_tmp_workflows_file(|| {
             let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(99)]))];
-            let run = create(None, None, "test".into(), None, &inputs).unwrap();
+            let run = create(None, None, "test".into(), None, 3, &inputs).unwrap();
             assert!(run.steps[1].parents.is_empty());
             assert_eq!(run.steps[1].status, "ready");
         });
@@ -943,7 +1115,7 @@ mod tests {
                 step("a", "A", None),
                 step("b", "B", Some(vec![json!("99")])),
             ];
-            let run = create(None, None, "test".into(), None, &inputs).unwrap();
+            let run = create(None, None, "test".into(), None, 3, &inputs).unwrap();
             assert!(run.steps[1].parents.is_empty());
             assert_eq!(run.steps[1].status, "ready");
         });
@@ -963,7 +1135,7 @@ mod tests {
                     Some(vec![json!("0"), json!("no-such"), json!("0"), json!("99")]),
                 ),
             ];
-            let run = create(None, None, "test".into(), None, &inputs).unwrap();
+            let run = create(None, None, "test".into(), None, 3, &inputs).unwrap();
             let ids: Vec<_> = run.steps.iter().map(|s| s.id.clone()).collect();
             assert_eq!(run.steps[2].parents, vec![ids[0].clone()]);
             assert_eq!(run.steps[2].status, "pending");
@@ -978,7 +1150,7 @@ mod tests {
                 step("b", "B", Some(vec![json!(0)])),
                 step("c", "C", Some(vec![json!(0)])),
             ];
-            let run = create(None, None, "error-sweep".into(), None, &inputs).unwrap();
+            let run = create(None, None, "error-sweep".into(), None, 3, &inputs).unwrap();
             let run = start(&run.id).unwrap();
             let parent_id = run.steps[0].id.clone();
 
@@ -1014,7 +1186,7 @@ mod tests {
     fn abort_sweeps_runnable_steps_to_skipped_with_ended_at() {
         with_tmp_workflows_file(|| {
             let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(0)]))];
-            let run = create(None, None, "abort-sweep".into(), None, &inputs).unwrap();
+            let run = create(None, None, "abort-sweep".into(), None, 3, &inputs).unwrap();
             let run = start(&run.id).unwrap();
 
             let updated = abort(&run.id).unwrap();
@@ -1034,7 +1206,7 @@ mod tests {
     fn explicit_skipped_patch_sets_ended_at() {
         with_tmp_workflows_file(|| {
             let inputs = vec![step("a", "A", None)];
-            let run = create(None, None, "skip".into(), None, &inputs).unwrap();
+            let run = create(None, None, "skip".into(), None, 3, &inputs).unwrap();
             let run = start(&run.id).unwrap();
             let step_id = run.steps[0].id.clone();
 
@@ -1066,7 +1238,7 @@ mod tests {
                 step("b", "B", Some(vec![json!(0)])),
                 step("c", "C", Some(vec![json!(1)])),
             ];
-            let run = create(None, None, "skip-cascade".into(), None, &inputs).unwrap();
+            let run = create(None, None, "skip-cascade".into(), None, 3, &inputs).unwrap();
             let run = start(&run.id).unwrap();
             let parent_id = run.steps[0].id.clone();
 
@@ -1110,7 +1282,7 @@ mod tests {
     fn skipped_leaf_finishes_run() {
         with_tmp_workflows_file(|| {
             let inputs = vec![step("a", "A", None)];
-            let run = create(None, None, "skip-leaf".into(), None, &inputs).unwrap();
+            let run = create(None, None, "skip-leaf".into(), None, 3, &inputs).unwrap();
             let run = start(&run.id).unwrap();
             let step_id = run.steps[0].id.clone();
 
@@ -1139,7 +1311,7 @@ mod tests {
             ];
             assert!(
                 matches!(
-                    create(None, None, "cycle".into(), None, &inputs),
+                    create(None, None, "cycle".into(), None, 3, &inputs),
                     Err(CycleError)
                 ),
                 "a dependency cycle must be rejected"
@@ -1154,7 +1326,7 @@ mod tests {
                 step("a", "A", None),
                 step("b", "B", Some(vec![json!(0), json!(0)])),
             ];
-            let run = create(None, None, "dup".into(), None, &inputs).unwrap();
+            let run = create(None, None, "dup".into(), None, 3, &inputs).unwrap();
             assert_eq!(run.steps[1].parents.len(), 1);
         });
     }
@@ -1166,7 +1338,7 @@ mod tests {
                 step("a", "A", None),
                 step("b", "B", Some(vec![json!("no-such-id")])),
             ];
-            let run = create(None, None, "test".into(), None, &inputs).unwrap();
+            let run = create(None, None, "test".into(), None, 3, &inputs).unwrap();
             assert!(run.steps[1].parents.is_empty());
             assert_eq!(run.steps[1].status, "ready");
         });
@@ -1178,7 +1350,7 @@ mod tests {
     fn active_count_returns_store_size() {
         with_tmp_workflows_file(|| {
             let baseline = active_count();
-            let run = create(None, None, "count".into(), None, &[step("a", "A", None)]).unwrap();
+            let run = create(None, None, "count".into(), None, 3, &[step("a", "A", None)]).unwrap();
             assert_eq!(active_count(), baseline + 1, "active_count should include the new run");
 
             // Abort marks the run terminal but keeps it in the active map (eviction only happens
@@ -1228,7 +1400,7 @@ mod tests {
                 step("a", "A", None),
                 step("b", "B", Some(vec![json!(0)])),
             ];
-            let run = create(None, None, "events".into(), None, &inputs).unwrap();
+            let run = create(None, None, "events".into(), None, 3, &inputs).unwrap();
             let child_id = run.steps[1].id.clone();
 
             // start() emits workflow_start.
@@ -1311,7 +1483,7 @@ mod tests {
             let mut rx = subscribe_events();
 
             let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(0)]))];
-            let run = create(None, None, "abort-events".into(), None, &inputs).unwrap();
+            let run = create(None, None, "abort-events".into(), None, 3, &inputs).unwrap();
             let _ = start(&run.id).unwrap();
             // Drain the workflow_start event.
             let _ = rx.try_recv();
@@ -1331,6 +1503,382 @@ mod tests {
             }
             assert_eq!(swept, updated.steps.len(), "every swept step should emit step_state");
             assert!(seen_end, "abort should emit workflow_end");
+        });
+    }
+
+    // ---- auto-repair cycle tests ----
+
+    /// When a review step with auto_repair:true finishes with findings, the engine must spawn
+    /// a repair child (worker) and a re-review grandchild (reviewer), keeping the run running.
+    #[test]
+    fn auto_repair_spawns_worker_and_reviewer_children_on_findings() {
+        with_tmp_workflows_file(|| {
+            let review_step = step_with_auto_repair(
+                "reviewer",
+                "Review the implementation",
+                None,
+            );
+            let inputs = vec![review_step];
+            let run = create(None, None, "auto-repair".into(), None, 3, &inputs).unwrap();
+            let run = start(&run.id).unwrap();
+            let review_id = run.steps[0].id.clone();
+            assert_eq!(run.steps.len(), 1);
+            assert_eq!(run.repair_rounds, 0);
+
+            // Mark the review step done with findings.
+            let updated = step_state(
+                &run.id,
+                &review_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some(
+                        "## Critical\n- `src/foo.ts:42` - off-by-one error\n\n## Warnings\n- `src/foo.ts:100` - magic number\n\n## Summary\nNeeds fixes.".into(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            // The run must still be running (not done), with 3 steps: review + repair + re-review.
+            assert_eq!(updated.status, "running", "run should stay running when repair is pending");
+            assert_eq!(updated.steps.len(), 3, "review + repair + re-review steps");
+            assert_eq!(updated.repair_rounds, 1);
+
+            let repair = updated
+                .steps
+                .iter()
+                .find(|s| s.agent == "worker")
+                .expect("repair step must be present");
+            let re_review = updated
+                .steps
+                .iter()
+                .find(|s| s.agent == "reviewer" && s.id != review_id)
+                .expect("re-review step must be present");
+
+            // Wiring: review → repair → re-review.
+            assert_eq!(repair.parents, vec![review_id.clone()]);
+            assert_eq!(re_review.parents, vec![repair.id.clone()]);
+            let orig_review = updated.steps.iter().find(|s| s.id == review_id).unwrap();
+            assert_eq!(orig_review.children, vec![repair.id.clone()]);
+
+            // The repair step is ready to run; the re-review is pending on the repair.
+            assert_eq!(repair.status, "ready");
+            assert_eq!(re_review.status, "pending");
+
+            // The repair task must reference the findings.
+            assert!(repair.task.contains("Auto-repair round 1"));
+            assert!(repair.task.contains("off-by-one error"));
+            assert!(re_review.task.contains("Re-review round 1"));
+
+            // The re-review step must itself have auto_repair:true so the cycle can repeat.
+            assert!(re_review.auto_repair);
+            assert_eq!(re_review.repair_round, 1);
+        });
+    }
+
+    /// A review step with auto_repair:true that reports NO findings must NOT spawn a repair
+    /// cycle — the run should finish normally.
+    #[test]
+    fn auto_repair_does_not_trigger_on_clean_review() {
+        with_tmp_workflows_file(|| {
+            let review_step = step_with_auto_repair(
+                "reviewer",
+                "Review the implementation",
+                None,
+            );
+            let inputs = vec![review_step];
+            let run = create(None, None, "clean-review".into(), None, 3, &inputs).unwrap();
+            let run = start(&run.id).unwrap();
+            let review_id = run.steps[0].id.clone();
+
+            let updated = step_state(
+                &run.id,
+                &review_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("No critical issues found. Looks good.".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            // Clean review → run finishes, no extra steps.
+            assert_eq!(updated.status, "done");
+            assert_eq!(updated.steps.len(), 1);
+            assert_eq!(updated.repair_rounds, 0);
+        });
+    }
+
+    /// The auto-repair cycle is bounded by max_repair_rounds. After the cap is hit, the run
+    /// finishes even if the latest review still reports findings.
+    #[test]
+    fn auto_repair_respects_max_rounds_cap() {
+        with_tmp_workflows_file(|| {
+            // max_repair_rounds = 1: one repair attempt, then the re-review's findings must
+            // NOT spawn another cycle.
+            let review_step = step_with_auto_repair(
+                "reviewer",
+                "Review the implementation",
+                None,
+            );
+            let inputs = vec![review_step];
+            let run = create(None, None, "capped-repair".into(), None, 1, &inputs).unwrap();
+            let run = start(&run.id).unwrap();
+            let review_id = run.steps[0].id.clone();
+
+            // Round 1: review finds issues → spawns repair + re-review.
+            let updated = step_state(
+                &run.id,
+                &review_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("## Critical\n- bug\n".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(updated.repair_rounds, 1);
+            assert_eq!(updated.steps.len(), 3);
+
+            // The repair step is ready; run it.
+            let repair_id = updated
+                .steps
+                .iter()
+                .find(|s| s.agent == "worker")
+                .unwrap()
+                .id
+                .clone();
+            let updated = step_state(
+                &run.id,
+                &repair_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("Fixed it.".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            // Now the re-review step is ready. Mark it done with MORE findings. Since max=1,
+            // the engine must NOT spawn another repair cycle — the run should finish.
+            let re_review_id = updated
+                .steps
+                .iter()
+                .find(|s| s.agent == "reviewer" && s.id != review_id)
+                .unwrap()
+                .id
+                .clone();
+            let after = step_state(
+                &run.id,
+                &re_review_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("## Critical\n- still broken\n".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            // Cap hit: run finishes, no additional steps spawned.
+            assert_eq!(after.status, "done", "cap hit should finish the run");
+            assert_eq!(after.steps.len(), 3, "no extra steps after cap");
+            assert_eq!(after.repair_rounds, 1);
+        });
+    }
+
+    /// When the re-review passes (clean output), the run should finish normally with the
+    /// repair chain marked done.
+    #[test]
+    fn auto_repair_completes_when_re_review_passes() {
+        with_tmp_workflows_file(|| {
+            let review_step = step_with_auto_repair(
+                "reviewer",
+                "Review the implementation",
+                None,
+            );
+            let inputs = vec![review_step];
+            let run = create(None, None, "passing-repair".into(), None, 3, &inputs).unwrap();
+            let run = start(&run.id).unwrap();
+            let review_id = run.steps[0].id.clone();
+
+            // Round 1: review finds issues.
+            let updated = step_state(
+                &run.id,
+                &review_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("## Critical\n- bug\n".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let repair_id = updated
+                .steps
+                .iter()
+                .find(|s| s.agent == "worker")
+                .unwrap()
+                .id
+                .clone();
+
+            // Run the repair step.
+            let updated = step_state(
+                &run.id,
+                &repair_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("Fixed the bug.".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let re_review_id = updated
+                .steps
+                .iter()
+                .find(|s| s.agent == "reviewer" && s.id != review_id)
+                .unwrap()
+                .id
+                .clone();
+
+            // Re-review passes — no findings.
+            let after = step_state(
+                &run.id,
+                &re_review_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("No critical issues found. All good.".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(after.status, "done");
+            assert_eq!(after.steps.len(), 3);
+            assert_eq!(after.repair_rounds, 1);
+        });
+    }
+
+    /// review_has_findings heuristic: detects actionable findings in review output.
+    #[test]
+    fn review_has_findings_detects_critical_and_warnings() {
+        assert!(review_has_findings(Some(
+            "## Critical\n- bug in foo\n"
+        )));
+        assert!(review_has_findings(Some(
+            "## Warnings\n- magic number\n"
+        )));
+        assert!(review_has_findings(Some(
+            "## Must Fix\n- security issue\n"
+        )));
+        assert!(review_has_findings(Some(
+            "## Should Fix\n- code smell\n"
+        )));
+        // Numbered list.
+        assert!(review_has_findings(Some(
+            "## Critical\n1. bug\n"
+        )));
+    }
+
+    /// review_has_findings heuristic: rejects clean reviews.
+    #[test]
+    fn review_has_findings_rejects_clean_reviews() {
+        assert!(!review_has_findings(None));
+        assert!(!review_has_findings(Some("")));
+        assert!(!review_has_findings(Some("   ")));
+        assert!(!review_has_findings(Some(
+            "No critical issues found."
+        )));
+        assert!(!review_has_findings(Some(
+            "No issues found."
+        )));
+        assert!(!review_has_findings(Some(
+            "No findings."
+        )));
+        assert!(!review_has_findings(Some(
+            "Looks good."
+        )));
+        assert!(!review_has_findings(Some(
+            "LGTM"
+        )));
+        // A section header with no bullets after it is not actionable.
+        assert!(!review_has_findings(Some(
+            "## Critical\n\n## Summary\nAll good."
+        )));
+    }
+
+    /// A step without auto_repair must NOT trigger the repair cycle even if it is a reviewer
+    /// with findings.
+    #[test]
+    fn non_auto_repair_step_does_not_trigger_cycle() {
+        with_tmp_workflows_file(|| {
+            let review_step = step("reviewer", "Review the implementation", None);
+            let inputs = vec![review_step];
+            let run = create(None, None, "no-auto".into(), None, 3, &inputs).unwrap();
+            let run = start(&run.id).unwrap();
+            let review_id = run.steps[0].id.clone();
+
+            let updated = step_state(
+                &run.id,
+                &review_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("## Critical\n- bug\n".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            // No auto_repair → run finishes, no extra steps.
+            assert_eq!(updated.status, "done");
+            assert_eq!(updated.steps.len(), 1);
+        });
+    }
+
+    /// The auto-repair cycle must broadcast step_state events for the spawned steps so the
+    /// UI graph panel reflects the new nodes immediately.
+    #[test]
+    fn auto_repair_broadcasts_spawned_step_events() {
+        with_tmp_workflows_file(|| {
+            let mut rx = subscribe_events();
+            let review_step = step_with_auto_repair("reviewer", "Review", None);
+            let inputs = vec![review_step];
+            let run = create(None, None, "repair-events".into(), None, 3, &inputs).unwrap();
+            let run = start(&run.id).unwrap();
+            let _ = rx.try_recv(); // workflow_start
+
+            let review_id = run.steps[0].id.clone();
+            let _ = step_state(
+                &run.id,
+                &review_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("## Critical\n- bug\n".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let mut seen_repair_ready = false;
+            let mut seen_re_review_pending = false;
+            while let Ok(frame) = rx.try_recv() {
+                if frame["event"]["type"] == "step_state" {
+                    let status = frame["event"]["status"].as_str().unwrap();
+                    let agent = frame["event"]["stepId"].as_str().unwrap();
+                    // The repair step (worker) should be "ready" and the re-review (reviewer)
+                    // should be "pending".
+                    if status == "ready" {
+                        seen_repair_ready = true;
+                    }
+                    if status == "pending" {
+                        seen_re_review_pending = true;
+                    }
+                    let _ = agent;
+                }
+            }
+            assert!(seen_repair_ready, "repair step ready event should be broadcast");
+            assert!(
+                seen_re_review_pending,
+                "re-review step pending event should be broadcast"
+            );
         });
     }
 }
