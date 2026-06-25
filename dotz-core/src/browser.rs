@@ -33,7 +33,21 @@ const VERSION: u32 = 1;
 const MAX_OUTPUT: i64 = 50_000;
 // 75s (not the oracle's 35s): the COLD first Chrome launch on a fresh profile can take ~40-50s here;
 // subsequent commands hit the warm agent-browser daemon and return fast.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(75);
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// Configurable wall-clock timeout for each agent-browser command. A hung command (e.g. a
+/// crashed Chrome that never returns) otherwise blocks the controller for 75s. Defaults to 75s;
+/// override with `DOTZ_BROWSER_TIMEOUT_MS` (clamped to [1s, 5m]).
+fn command_timeout() -> Duration {
+    const MIN_MS: u64 = 1_000; // 1 second — zero would time out before any command starts.
+    const MAX_MS: u64 = 300_000; // 5 minutes — anything larger defeats the purpose of the cap.
+    std::env::var("DOTZ_BROWSER_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|ms| ms.clamp(MIN_MS, MAX_MS))
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_COMMAND_TIMEOUT)
+}
 
 /// The closed set of valid actions. An unknown action string from an untrusted body would otherwise
 /// fall through action_args() to None and be silently no-op'd while returning a 200 "ready"
@@ -570,11 +584,14 @@ async fn run(
         .map_err(|e| format!("agent-browser spawn failed: {e}"))?;
     let pid = child.id();
 
-    let status = match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
+    let status = match tokio::time::timeout(command_timeout(), child.wait()).await {
         Err(_) => {
-            // Timed out: kill-tree (the child + its headless Chrome grandchild) and fail.
+            // Timed out: kill-tree (the child + its headless Chrome grandchild), reap the
+            // process so it does not become a zombie (Unix) or leak handles (Windows), then
+            // clean up the temp output files after the process has released them.
             kill_pid(pid);
             let _ = child.start_kill();
+            let _ = child.wait().await;
             let _ = std::fs::remove_file(&out_path);
             let _ = std::fs::remove_file(&err_path);
             return Err("agent-browser command timed out".into());
@@ -1787,6 +1804,165 @@ mod tests {
             console_errors: vec![],
             network_errors: vec![],
             error: None,
+        }
+    }
+
+    /// Serialize tests that mutate the process-global `DOTZ_BROWSER_TIMEOUT_MS` and
+    /// `DOTZ_BROWSER_BIN` env vars so concurrent browser timeout tests do not race.
+    static BROWSER_TIMEOUT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A timed-out agent-browser command must be reaped, not left as a zombie (Unix) or leaking
+    /// handles (Windows). Before the fix, `run()` killed the child but did not wait for it to
+    /// exit, so the process could outlive the timeout error. The timeout is configurable so the
+    /// test can use a very short value.
+    #[tokio::test]
+    async fn run_reaps_child_after_timeout() {
+        let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
+
+        let dir =
+            std::env::temp_dir().join(format!("dotz-browser-timeout-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        #[cfg(unix)]
+        let pidfile = dir.join("pid");
+
+        // Fake agent-browser binary: ignores arguments and sleeps long enough to be killed by the
+        // short test timeout. A single batch/shell script keeps the process tree simple.
+        #[cfg(windows)]
+        let script_path = {
+            let bat = dir.join("fake-browser.bat");
+            tokio::fs::write(&bat, "@echo off\nping -n 30 127.0.0.1 >nul\n")
+                .await
+                .unwrap();
+            bat
+        };
+        #[cfg(unix)]
+        let script_path = {
+            let sh = dir.join("fake-browser.sh");
+            tokio::fs::write(
+                &sh,
+                format!(
+                    "#!/bin/sh\necho $$ > \"{}\"\nsleep 30\n",
+                    pidfile.to_string_lossy()
+                ),
+            )
+            .await
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = tokio::fs::metadata(&sh).await.unwrap().permissions();
+            perms.set_mode(0o755);
+            tokio::fs::set_permissions(&sh, perms).await.unwrap();
+            sh
+        };
+
+        let sid = format!("dotz-browser-timeout-{}", uuid::Uuid::new_v4());
+        let profile_dir = dir.join("profile");
+        tokio::fs::create_dir_all(&profile_dir).await.unwrap();
+        let allowed = vec!["https://example.com".into()];
+
+        {
+            let mut store = sessions_guard();
+            store.insert(
+                sid.clone(),
+                SessionRecord {
+                    profile_dir: profile_dir.clone(),
+                    observation: fake_observation(&sid),
+                    frame_data: None,
+                    disposed: false,
+                },
+            );
+        }
+
+        let prev_bin = std::env::var("DOTZ_BROWSER_BIN").ok();
+        let prev_timeout = std::env::var("DOTZ_BROWSER_TIMEOUT_MS").ok();
+        std::env::set_var("DOTZ_BROWSER_BIN", script_path.to_string_lossy().to_string());
+        std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "500");
+
+        let start = std::time::Instant::now();
+        let result = run(&sid, &profile_dir, &allowed, &["get", "url"]).await;
+        let elapsed = start.elapsed();
+
+        match prev_bin {
+            Some(p) => std::env::set_var("DOTZ_BROWSER_BIN", p),
+            None => std::env::remove_var("DOTZ_BROWSER_BIN"),
+        }
+        match prev_timeout {
+            Some(p) => std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS"),
+        }
+
+        assert!(
+            result.is_err(),
+            "timed-out browser command must return an error: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("timed out"),
+            "error should mention timeout, got: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "browser timeout should return promptly, elapsed: {elapsed:?}"
+        );
+
+        #[cfg(unix)]
+        {
+            let pid_text = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            let pid: i32 = pid_text.trim().parse().unwrap_or(-1);
+            assert!(pid > 0, "test should have captured a valid child pid");
+            let gone = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+                .map(|o| !o.status.success())
+                .unwrap_or(true);
+            assert!(
+                gone,
+                "timed-out browser child (pid {pid}) should have been killed and reaped, not still running"
+            );
+        }
+
+        sessions_guard().remove(&sid);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The configurable browser-command timeout must clamp to sane bounds. A zero or extremely
+    /// small value would time out before any command starts; an enormous value defeats the cap.
+    #[tokio::test]
+    async fn command_timeout_clamps_invalid_values() {
+        let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
+        let prev = std::env::var("DOTZ_BROWSER_TIMEOUT_MS").ok();
+
+        std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS");
+        assert_eq!(
+            command_timeout().as_secs(),
+            75,
+            "default browser command timeout is 75 seconds"
+        );
+
+        std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "2000");
+        assert_eq!(
+            command_timeout().as_millis(),
+            2000,
+            "valid override is preserved"
+        );
+
+        std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "50");
+        assert_eq!(
+            command_timeout().as_millis(),
+            1000,
+            "below-minimum value clamps to 1 second"
+        );
+
+        std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "100000000");
+        assert_eq!(
+            command_timeout().as_millis(),
+            300_000,
+            "above-maximum value clamps to 5 minutes"
+        );
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS"),
         }
     }
 
