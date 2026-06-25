@@ -191,8 +191,8 @@ async fn post_model(
     if session::get(&id).is_none() {
         return Err(not_found());
     }
-    // Free-form providers + OpenAI-compatible providers accept any id; anthropic/google resolve to
-    // None in provider::resolve, mirroring the catalog-only restriction.
+    // Free-form providers + OpenAI-compatible providers accept any id; anthropic/google resolve
+    // through their native adapters and also accept any id the upstream API validates.
     if provider::resolve(&prov, &mid).is_none() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -998,6 +998,37 @@ mod tests {
         assert_eq!(resp.0["model"]["modelId"], "glm-5.2");
 
         session::dispose(&sid);
+    }
+
+    /// Anthropic and Google are routed to their native adapters, so `post_model` must accept them
+    /// instead of returning 404. Before the `provider::resolve` fix these providers resolved to
+    /// None and the model-update endpoint rejected them even though the adapters existed.
+    #[tokio::test]
+    async fn post_model_accepts_anthropic_and_google() {
+        let create_resp = create_session(Some(Json(json!({}))))
+            .await
+            .unwrap();
+        let sid = create_resp.0["sessionId"].as_str().unwrap().to_string();
+
+        let body = Json(json!({
+            "provider": "anthropic",
+            "modelId": "claude-sonnet-4"
+        }));
+        let resp = post_model(axum::extract::Path(sid.clone()), Some(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.0["model"]["provider"], "anthropic");
+        assert_eq!(resp.0["model"]["modelId"], "claude-sonnet-4");
+
+        let body = Json(json!({
+            "provider": "google",
+            "modelId": "gemini-2.5-pro"
+        }));
+        let resp = post_model(axum::extract::Path(sid), Some(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.0["model"]["provider"], "google");
+        assert_eq!(resp.0["model"]["modelId"], "gemini-2.5-pro");
     }
 
     #[tokio::test]

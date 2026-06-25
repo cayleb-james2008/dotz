@@ -138,7 +138,9 @@ fn provider_endpoint(provider: &str) -> Option<(String, String)> {
     }
 }
 
-/// Known per-model context windows for the seeded Ollama Cloud catalog (others fall back to 256k).
+/// Known per-model context windows. Ollama Cloud models are listed explicitly; Anthropic and
+/// Google use safe defaults (Claude 200k, Gemini 1M) since the native adapters accept any
+/// upstream-valid model id. Everything else falls back to 256k.
 fn context_window_for(provider: &str, model_id: &str) -> u64 {
     match (provider, model_id) {
         ("ollama", "glm-5.2") => 1_000_000,
@@ -146,13 +148,16 @@ fn context_window_for(provider: &str, model_id: &str) -> u64 {
         ("ollama", "deepseek-v4-pro") => 524_288,
         ("ollama", "kimi-k2.7-code") => 262_144,
         ("local", _) => 32_768,
+        ("anthropic", _) => 200_000,
+        ("google", _) => 1_000_000,
         _ => 256_000,
     }
 }
 
-/// Resolve a provider/model into endpoint + metadata. free-form providers (ollama/openrouter/local)
-/// accept ANY model id; OpenAI-compatible catalog providers also accept any id (the upstream API
-/// validates). Anthropic/Google return None here (their native adapters resolve endpoints themselves).
+/// Resolve a provider/model into endpoint + metadata. All known providers resolve here: the
+/// OpenAI-compatible providers use the shared chat-completions adapter, while anthropic/google use
+/// their native adapters (selected by `adapter_for`). Model ids are passed through to the upstream
+/// API; the upstream provider catalog is the source of truth for valid ids.
 /// Default: ollama/glm-5.2.
 pub fn resolve(provider: &str, model_id: &str) -> Option<ResolvedModel> {
     let (base_url, api_key_ref) = provider_endpoint(provider)?;
@@ -717,5 +722,37 @@ mod tests {
             elapsed >= std::time::Duration::from_millis(900),
             "adapter should wait for the configured timeout before returning, elapsed: {elapsed:?}"
         );
+    }
+
+    /// Anthropic and Google have native adapters in this crate, but they still need a
+    /// `ResolvedModel` (base URL + auth ref + context window) so `session::run_turn` and the
+    /// REST `post_model` handler can route to them. Before the fix `provider::resolve` returned
+    /// None for these providers, making them unusable end-to-end even though the adapters exist.
+    #[test]
+    fn resolve_returns_metadata_for_native_adapter_providers() {
+        let anthropic = resolve("anthropic", "claude-sonnet-4").expect("anthropic should resolve");
+        assert_eq!(anthropic.provider, "anthropic");
+        assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(anthropic.api_key_ref, "$ANTHROPIC_API_KEY");
+        assert_eq!(anthropic.context_window, 200_000);
+        assert!(anthropic.reasoning);
+
+        let google = resolve("google", "gemini-2.5-pro").expect("google should resolve");
+        assert_eq!(google.provider, "google");
+        assert_eq!(
+            google.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(google.api_key_ref, "$GEMINI_API_KEY");
+        assert_eq!(google.context_window, 1_000_000);
+        assert!(google.reasoning);
+    }
+
+    /// The native adapter providers accept arbitrary model ids (the upstream API validates them),
+    /// just like the free-form OpenAI-compatible providers.
+    #[test]
+    fn resolve_accepts_any_model_id_for_native_adapter_providers() {
+        assert!(resolve("anthropic", "any-model-id").is_some());
+        assert!(resolve("google", "any-model-id").is_some());
     }
 }
