@@ -2126,14 +2126,14 @@ function bindSettings() {
 }
 
 function bindUpdateCard() {
-  // Source-rebuild updater: APPLY = git pull + portable rebuild + relaunch (out of process).
+  // Tauri signed updater: APPLY downloads + installs the signed release + relaunches in place.
   $("update-apply").onclick = () => {
     if (window.dotz && window.dotz.update && window.dotz.update.apply) {
       window.dotz.update.apply();
       state.updateStatus = "updating…";
       $("settings-update-status").textContent = state.updateStatus;
       $("update-actions").classList.add("hidden");
-      $("update-body").textContent = "Pulling, rebuilding the portable exe, and relaunching. dotz will close shortly…";
+      $("update-body").textContent = "Downloading and installing the signed update. dotz will relaunch shortly…";
     }
   };
   $("update-later").onclick = () => {
@@ -2159,7 +2159,7 @@ function wireUpdaterIpc() {
         : "";
       $("update-body").innerHTML =
         `dotz is <strong>${n}</strong> ${plural} behind (${esc(data.localSha)} → ${esc(data.remoteSha)}). ` +
-        `UPDATE & RESTART pulls, rebuilds the portable exe, and relaunches.${dirtyWarn}`;
+        `UPDATE &amp; RESTART downloads and installs the signed update, then relaunches.${dirtyWarn}`;
       $("update-card").classList.remove("hidden");
       $("update-actions").classList.remove("hidden");
       $("update-progress").classList.add("hidden");
@@ -2171,16 +2171,17 @@ function wireUpdaterIpc() {
       $("settings-update-status").textContent = `up to date (${esc(data.localSha || "")})`;
     } else if (status === "applying") {
       $("update-actions").classList.add("hidden");
-      $("update-body").textContent = "Pulling, rebuilding the portable exe, and relaunching. dotz will close shortly…";
+      $("update-body").textContent = "Downloading and installing the signed update. dotz will relaunch shortly…";
       $("settings-update-status").textContent = "updating…";
     } else if (status === "failed") {
-      $("update-body").textContent = "Update error: " + esc(data.message);
+      const msg = esc(data.message || data.error || "unknown error");
+      $("update-body").textContent = "Update error: " + msg;
       $("update-card").classList.remove("hidden");
       $("update-actions").classList.remove("hidden");
       $("update-progress").classList.add("hidden");
       $("update-apply").classList.add("hidden");
       $("update-later").textContent = "CLOSE";
-      $("settings-update-status").textContent = "error: " + esc(data.message);
+      $("settings-update-status").textContent = "error: " + msg;
       $("update-later").focus();
     }
   });
