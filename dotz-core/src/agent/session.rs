@@ -13,6 +13,8 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
@@ -24,6 +26,11 @@ fn now_ms() -> i64 {
         .unwrap()
         .as_millis() as i64
 }
+
+/// Test-only hook: deterministic pause between the two `run_turn` lock acquisitions so the
+/// abort-race regression test can call abort() inside that window.
+#[cfg(test)]
+static RUNTURN_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// A live agent session. Mutable runtime state behind the store's Mutex; the turn loop snapshots
 /// what it needs and streams without holding the lock across awaits.
@@ -444,8 +451,13 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     // Reject turns against a session that has been disposed from the live store. A prompt task
     // spawned just before disposal may still hold an Arc and would otherwise start a new turn
     // (and replace the cancelled cancellation token) after the session is gone.
+    //
+    // The cancellation token is reset INSIDE this critical section so any abort() that arrives
+    // after turn_active becomes true cancels the token this turn will actually use. Before this
+    // fix, abort() could cancel the old token in the gap before the second lock acquisition
+    // replaced it with a fresh one, silently ignoring the abort.
     let _guard = {
-        let s = session_guard(&session);
+        let mut s = session_guard(&session);
         if s.disposed.load(Ordering::SeqCst) {
             let _ = s.tx.send(serde_json::json!({
                 "kind": "error",
@@ -464,10 +476,16 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             }));
             return;
         }
+        // Install a fresh cancellation token BEFORE checking abort_pending and BEFORE releasing
+        // the lock. This closes the race where abort() cancels the stale token in the window
+        // between the two lock acquisitions.
+        s.cancel = CancellationToken::new();
         if s.abort_pending.swap(false, Ordering::SeqCst) {
             // An abort arrived while no turn was active (or during the tiny window before this
-            // turn acquired the lock). Reject the turn and clear the pending flag.
+            // turn acquired the lock). Reject the turn, clear the pending flag, and cancel the
+            // fresh token so any concurrent waiter observes the abort.
             s.turn_active.store(false, Ordering::SeqCst);
+            s.cancel.cancel();
             let _ = s.tx.send(serde_json::json!({
                 "kind": "error",
                 "sessionId": s.id,
@@ -480,10 +498,21 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         }
     };
 
+    // Test-only hook: deterministically widen the window between the two lock acquisitions so a
+    // test can call abort() inside the race and prove the fresh token is already in place.
+    #[cfg(test)]
+    {
+        let ms = RUNTURN_PAUSE_MS.load(Ordering::SeqCst);
+        if ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+    }
+
     // Snapshot the immutable bits + append the user message under the lock; release before awaiting.
     let (sess_id, system_prompt, provider_id, model_id, thinking, cwd, tools_specs) = {
         let mut s = session_guard(&session);
-        s.cancel = CancellationToken::new();
+        // Cancellation token was already reset in the first critical section; do not replace it
+        // here or an abort that arrived in the gap would be silently lost.
         let ts = now_ms();
         let user_msg = Message::user(&prompt, ts);
         emit(&s, &AgentEvent::AgentStart);
@@ -1611,6 +1640,97 @@ mod tests {
         );
 
         dispose(&sid);
+    }
+
+    /// An abort sent during the narrow window between `run_turn`'s two lock acquisitions must not
+    /// be silently lost. Before the fix, the cancellation token was reset in the second lock
+    /// acquisition, so an abort() that arrived after `turn_active` was set but before that reset
+    /// cancelled the stale token and was ignored. With the fresh token installed in the first
+    /// critical section, the abort is observed and the turn stops with stopReason "aborted".
+    #[tokio::test]
+    async fn abort_during_turn_setup_is_observed() {
+        let _guard = SSE_TEST_LOCK.lock().await;
+
+        // A fake local endpoint is enough: the provider task is spawned and immediately aborted,
+        // so it never actually streams.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let (accept_tx, mut accept_rx) = tokio::sync::mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            // Accept at most one connection so a delayed request has somewhere to go.
+            let _ = listener.accept().await;
+            let _ = accept_tx.send(()).await;
+            std::future::pending::<()>().await;
+        });
+
+        let prev = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
+        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+
+        // Guard restores the test-only pause knob even if the test panics.
+        struct PauseGuard(u64);
+        impl Drop for PauseGuard {
+            fn drop(&mut self) {
+                RUNTURN_PAUSE_MS.store(self.0, Ordering::SeqCst);
+            }
+        }
+        let _pause_guard = PauseGuard(RUNTURN_PAUSE_MS.swap(400, Ordering::SeqCst));
+
+        let opts = CreateOpts {
+            model: Some(types::ModelRef {
+                provider: "local".into(),
+                model_id: "test".into(),
+            }),
+            ..Default::default()
+        };
+        let summary = create(opts).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+
+        let turn = tokio::spawn(run_turn(sess.clone(), "hello".into()));
+
+        // Wait until the turn has set turn_active (i.e. passed the first lock acquisition).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !sess.lock().unwrap().turn_active.load(Ordering::SeqCst) {
+            if tokio::time::Instant::now() > deadline {
+                panic!("run_turn did not acquire the first lock in time");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Abort while run_turn is paused between the two lock acquisitions.
+        assert!(abort(&sid), "abort should find the active session");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), turn).await;
+        assert!(result.is_ok(), "run_turn must finish promptly after abort");
+
+        let last = {
+            let g = sess.lock().unwrap();
+            g.history
+                .iter()
+                .rev()
+                .find(|m| m.role == "assistant")
+                .cloned()
+        };
+        assert_eq!(
+            last.and_then(|m| m.stop_reason).as_deref(),
+            Some("aborted"),
+            "abort during the setup window must produce stopReason aborted"
+        );
+
+        // Sanity: the provider task never needed to stream.
+        assert!(
+            accept_rx.try_recv().is_err(),
+            "provider task should have been aborted before streaming"
+        );
+
+        dispose(&sid);
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
+            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+        }
     }
 
     #[test]
