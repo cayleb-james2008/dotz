@@ -320,14 +320,31 @@ fn parse_prompt_description(raw: &str) -> Option<String> {
         .strip_prefix("---\n")
         .or_else(|| raw.strip_prefix("---\r\n"))?;
 
-    // Closing fence: a line that is exactly `---` (LF or CRLF) or at EOF.
+    // Closing fence: a line that is exactly `---` followed by a newline or EOF. We must validate
+    // that the `---` is a complete fence line — a bare `\n---` match inside content like
+    // `some-text---more-text` would otherwise be mistaken for the closing fence and truncate the
+    // frontmatter. This mirrors the validation in skills::split_frontmatter.
     let close_idx = if after_open.starts_with("---\n")
         || after_open.starts_with("---\r\n")
         || after_open == "---"
     {
         0
     } else {
-        after_open.find("\n---")?
+        // Find a `\n---` that is followed by a newline, CR, or EOF (a complete fence line).
+        let mut search_from = 0usize;
+        let idx = loop {
+            let Some(rel) = after_open[search_from..].find("\n---") else {
+                return None;
+            };
+            let pos = search_from + rel; // position of the `\n` before the `---`
+            let after_dashes = pos + 4; // just past `\n---`
+            let tail = &after_open[after_dashes..];
+            if tail.is_empty() || tail.starts_with('\n') || tail.starts_with('\r') {
+                break pos;
+            }
+            search_from = pos + 1;
+        };
+        idx
     };
 
     // Normalize CRLF in the frontmatter content so key:value parsing sees clean LF lines.
@@ -948,6 +965,40 @@ mod tests {
             by_name.get("windows-preset").cloned().unwrap_or_default(),
             "A Windows-style preset",
             "CRLF frontmatter description must be extracted"
+        );
+    }
+
+    /// A `---` sequence inside frontmatter content (not a closing fence) must not truncate the
+    /// frontmatter. Before the fix, `parse_prompt_description` matched any `\n---` as the
+    /// closing fence, so content like `note: see --- for details` would cut the frontmatter
+    /// short and miss the description field.
+    #[test]
+    fn parse_prompt_description_ignores_bare_dashes_in_content() {
+        let dir = std::env::temp_dir()
+            .join(format!("dotz-prompts-dashes-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dashed-preset.md"),
+            "---\ndescription: Real description\nnote: see --- for details\n---\nBody.\n",
+        )
+        .unwrap();
+
+        let cmds = prompt_commands_from_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let by_name: HashMap<String, String> = cmds
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v.get("name")?.as_str()?.to_string(),
+                    v.get("description")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            by_name.get("dashed-preset").cloned().unwrap_or_default(),
+            "Real description",
+            "a bare `---` in content must not be mistaken for the closing fence"
         );
     }
 
