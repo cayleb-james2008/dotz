@@ -610,7 +610,12 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                             let sid = session_id.clone();
                             tokio::spawn(async move {
                                 match crate::sandbox::start_run(
-                                    &language, &code, &mode, project_id.as_deref(), timeout_ms,
+                                    &language,
+                                    &code,
+                                    &mode,
+                                    project_id.as_deref(),
+                                    timeout_ms,
+                                    Some(tx.clone()),
                                 )
                                 .await
                                 {
