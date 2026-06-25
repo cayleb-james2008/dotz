@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -528,8 +528,22 @@ fn render_mirror_file(file: &std::path::Path, title: &str, items: &[MemoryView])
 /// ONLY the main server process enables capture — spawned subagents (separate processes) must never
 /// capture. Mirrors memory.ts autonomyEnabled / isMemoryAutonomyEnabled.
 static AUTONOMY: AtomicBool = AtomicBool::new(false);
-/// Facts captured since the last consolidation pass (counts stored facts, not exchanges).
-static CAPTURES_SINCE_CONSOLIDATE: AtomicI64 = AtomicI64::new(0);
+/// Capture counters per memory scope (user_id). A global atomic counter caused project captures
+/// to fire consolidation for unrelated global/project scopes; tracking per-scope keeps each
+/// scope's consolidation cadence independent.
+static CAPTURES_SINCE_CONSOLIDATE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+fn captures_since_consolidate() -> &'static Mutex<HashMap<String, i64>> {
+    CAPTURES_SINCE_CONSOLIDATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn increment_captures(user_id: &str, n: i64) -> i64 {
+    let mut map = captures_since_consolidate()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = map.entry(user_id.to_string()).or_insert(0);
+    *entry += n;
+    *entry
+}
 
 /// Enable autonomous memory capture for this process. Call once at server startup.
 pub fn enable_autonomy() {
@@ -717,20 +731,41 @@ pub async fn capture_exchange(
     }
 
     if !kept.is_empty() {
-        CAPTURES_SINCE_CONSOLIDATE.fetch_add(kept.len() as i64, Ordering::Relaxed);
-        maybe_auto_consolidate(cwd);
+        let count = increment_captures(&user_id, kept.len() as i64);
+        if count >= AUTO_CONSOLIDATE_EVERY {
+            maybe_auto_consolidate(cwd);
+        }
     }
     kept
 }
 
-/// Run consolidation if enough new captures have accumulated since the last pass. Resets the counter
-/// when it fires. Mirrors memory.ts maybeAutoConsolidate.
+/// Run consolidation if enough new captures have accumulated for any relevant scope since the last
+/// pass. Resets only the counters that fired, then consolidates the relevant scopes. Mirrors
+/// memory.ts maybeAutoConsolidate while keeping scope cadences independent.
 pub fn maybe_auto_consolidate(cwd: Option<&str>) {
-    if CAPTURES_SINCE_CONSOLIDATE.load(Ordering::Relaxed) < AUTO_CONSOLIDATE_EVERY {
-        return;
+    let scopes: Vec<String> = match cwd {
+        Some(c) => vec![
+            scope_user("project", Some(c)),
+            GLOBAL_USER.to_string(),
+        ],
+        None => vec![GLOBAL_USER.to_string()],
+    };
+    let mut fired = false;
+    {
+        let mut map = captures_since_consolidate()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for user_id in &scopes {
+            let count = map.entry(user_id.clone()).or_insert(0);
+            if *count >= AUTO_CONSOLIDATE_EVERY {
+                *count = 0;
+                fired = true;
+            }
+        }
     }
-    CAPTURES_SINCE_CONSOLIDATE.store(0, Ordering::Relaxed);
-    let _ = consolidate(cwd);
+    if fired {
+        let _ = consolidate(cwd);
+    }
 }
 
 // ---- public surface for the agent runtime (pre-turn recall + the memory_* tools) ----
@@ -926,6 +961,22 @@ pub fn router() -> Router<()> {
         )
         .route("/api/memory/search", post(search_memory))
         .route("/api/memory/consolidate", post(consolidate_memory))
+}
+
+#[cfg(test)]
+fn set_captures_since_consolidate(user_id: &str, count: i64) {
+    let mut map = captures_since_consolidate()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.insert(user_id.to_string(), count);
+}
+
+#[cfg(test)]
+fn get_captures_since_consolidate(user_id: &str) -> i64 {
+    let map = captures_since_consolidate()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *map.get(user_id).unwrap_or(&0)
 }
 
 #[cfg(test)]
@@ -1337,5 +1388,61 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "extract_facts should return promptly after timeout, elapsed: {elapsed:?}"
         );
+    }
+
+    /// Auto-consolidation counters must be tracked per memory scope. Before the fix, all captures
+    /// incremented a single global atomic, so a project capture could fire consolidation for an
+    /// unrelated global scope (and vice versa). With per-scope counters, each scope only
+    /// consolidates when its own capture count crosses the threshold.
+    #[test]
+    fn auto_consolidation_counter_is_per_scope() {
+        with_tmp_dir(|dir| {
+            let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+            std::env::set_var("DOTZ_CONFIG_DIR", dir);
+            drop(db().lock().unwrap());
+
+            let cwd = dir.join("project");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let cwd_s = cwd.to_string_lossy().to_string();
+            let global_user = scope_user("global", None);
+            let project_user = scope_user("project", Some(&cwd_s));
+
+            // Put global one capture shy of the threshold.
+            set_captures_since_consolidate(&global_user, AUTO_CONSOLIDATE_EVERY - 1);
+            set_captures_since_consolidate(&project_user, 0);
+
+            // A single project capture must NOT trigger consolidation just because global is near.
+            set_captures_since_consolidate(&project_user, 1);
+            maybe_auto_consolidate(Some(&cwd_s));
+            assert_eq!(
+                get_captures_since_consolidate(&project_user),
+                1,
+                "project counter must stay at 1 when it is below the threshold"
+            );
+            assert_eq!(
+                get_captures_since_consolidate(&global_user),
+                AUTO_CONSOLIDATE_EVERY - 1,
+                "global counter must stay at its pre-threshold value when it did not fire"
+            );
+
+            // Push project over its own threshold — only project counter should reset.
+            set_captures_since_consolidate(&project_user, AUTO_CONSOLIDATE_EVERY);
+            maybe_auto_consolidate(Some(&cwd_s));
+            assert_eq!(
+                get_captures_since_consolidate(&project_user),
+                0,
+                "project counter must reset after it fires consolidation"
+            );
+            assert_eq!(
+                get_captures_since_consolidate(&global_user),
+                AUTO_CONSOLIDATE_EVERY - 1,
+                "global counter must not be reset by a project-scope consolidation"
+            );
+
+            match prev {
+                Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+                None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            }
+        });
     }
 }
