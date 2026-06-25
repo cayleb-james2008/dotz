@@ -192,6 +192,17 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = builder.build(tauri::generate_context!())?;
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
+            // Dispose all browser sessions and reap any lingering agent-browser processes so the
+            // app does not leave headless Chrome instances running after exit. Bound the cleanup
+            // so a hung `agent-browser close` command cannot block shutdown indefinitely.
+            tauri::async_runtime::block_on(async {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    dotz_core::browser::dispose_all(),
+                )
+                .await;
+            });
+            dotz_core::browser::reap_stray_browsers();
             if let Some(tx) = app_handle.try_state::<tokio::sync::watch::Sender<()>>() {
                 let _ = tx.send(());
             }
