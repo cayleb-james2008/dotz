@@ -1125,8 +1125,11 @@ pub fn reload(id: &str) -> Result<Value, String> {
 pub fn set_model(id: &str, provider_id: &str, model_id: &str) -> Result<Value, String> {
     let s = get(id).ok_or("no such session")?;
     let mut g = session_guard(&s);
-    g.provider = provider_id.to_string();
-    g.model_id = types::strip_matching_provider_prefix(provider_id, model_id);
+    // Normalize to lowercase so internal callers and future REST paths store a canonical
+    // provider id that matches provider::resolve endpoint metadata.
+    let provider = provider_id.to_lowercase();
+    g.provider = provider.clone();
+    g.model_id = types::strip_matching_provider_prefix(&provider, model_id);
     Ok(g.summary())
 }
 
@@ -1462,6 +1465,25 @@ mod tests {
         let updated = set_model(&sid, "ollama", "  ollama/glm-5.2  ").unwrap();
         assert_eq!(updated["model"]["provider"], "ollama");
         assert_eq!(updated["model"]["modelId"], "glm-5.2");
+        dispose(&sid);
+    }
+
+    /// set_model must normalize a mixed-case provider string so the stored provider id matches
+    /// the lowercase endpoint metadata used by provider::resolve. Without this, a direct call
+    /// (or a future REST path) with "Ollama" would store the mixed-case id and later streaming
+    /// would fail to resolve the endpoint.
+    #[test]
+    fn set_model_normalizes_uppercase_provider() {
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let updated = set_model(&sid, "Ollama", "glm-5.2").unwrap();
+        assert_eq!(updated["model"]["provider"], "ollama");
+        assert_eq!(updated["model"]["modelId"], "glm-5.2");
+        // The stored provider must be canonical so resolution succeeds.
+        assert!(
+            provider::resolve(&updated["model"]["provider"].as_str().unwrap(), "glm-5.2").is_some(),
+            "normalized provider must resolve"
+        );
         dispose(&sid);
     }
 
