@@ -12,7 +12,8 @@
 //! false-success observation.
 //!
 //! ponytail: no persistent daemon management beyond what browser.ts does — one spawn per command, and
-//! a best-effort `reap_stray_browsers` backstop on app shutdown (disposeAll).
+//! a best-effort `reap_stray_browsers` backstop on app shutdown (the Tauri shell calls `dispose_all`
+//! and `reap_stray_browsers` on `RunEvent::Exit` so headless Chrome instances do not outlive the app).
 use axum::{
     extract::Query,
     http::{header, StatusCode},
@@ -1283,21 +1284,20 @@ fn frame(session_id: &str, after_seq: i64) -> Option<(i64, Vec<u8>)> {
     Some((seq, data.clone()))
 }
 
-/// disposeAll — stop every session + reap any stray agent-browser process (shutdown backstop).
-/// Called on app shutdown; safe to leave unused until the shutdown hook is wired.
-#[allow(dead_code)]
+/// Dispose every browser session. Called by the Tauri shell on `RunEvent::Exit` so the app does
+/// not leave headless Chrome profiles/processes behind. Each session stop is bounded so a hung
+/// `agent-browser close` command cannot block shutdown indefinitely.
 pub async fn dispose_all() {
     let ids: Vec<String> = sessions_guard().keys().cloned().collect();
     for id in ids {
-        let _ = stop(&id).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stop(&id)).await;
     }
-    reap_stray_browsers();
 }
 
 /// Force-kill any lingering agent-browser process tree by image name. Best-effort backstop —
-/// `agent-browser close` does not reliably reap the headless-Chrome grandchild.
-#[allow(dead_code)]
-fn reap_stray_browsers() {
+/// `agent-browser close` does not reliably reap the headless-Chrome grandchild. Exposed publicly
+/// so the Tauri shell can call it after `dispose_all` on shutdown.
+pub fn reap_stray_browsers() {
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("taskkill")
@@ -1692,6 +1692,102 @@ mod tests {
 
         // Cleanup.
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// `dispose_all` stops every tracked browser session and removes its disposable profile
+    /// directory, even when the external `agent-browser` binary is not present (the `stop()` path
+    /// deletes the record and temp dir regardless of whether `agent-browser close` succeeded).
+    #[tokio::test]
+    async fn dispose_all_closes_every_session_and_removes_profile_dirs() {
+        let base =
+            std::env::temp_dir().join(format!("dotz-browser-dispose-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+
+        let sid1 = "dotz-dispose-1";
+        let sid2 = "dotz-dispose-2";
+        let p1 = base.join("p1");
+        let p2 = base.join("p2");
+        tokio::fs::create_dir_all(&p1).await.unwrap();
+        tokio::fs::create_dir_all(&p2).await.unwrap();
+
+        {
+            let mut store = sessions_guard();
+            store.insert(
+                sid1.to_string(),
+                SessionRecord {
+                    profile_dir: p1.clone(),
+                    observation: fake_observation(sid1),
+                    frame_data: None,
+                    disposed: false,
+                },
+            );
+            store.insert(
+                sid2.to_string(),
+                SessionRecord {
+                    profile_dir: p2.clone(),
+                    observation: fake_observation(sid2),
+                    frame_data: None,
+                    disposed: false,
+                },
+            );
+        }
+
+        dispose_all().await;
+
+        assert!(
+            sessions_guard().is_empty(),
+            "dispose_all should remove every browser session from the store"
+        );
+        assert!(
+            !p1.exists(),
+            "dispose_all should remove the first profile directory"
+        );
+        assert!(
+            !p2.exists(),
+            "dispose_all should remove the second profile directory"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    fn fake_observation(session_id: &str) -> BrowserObservation {
+        BrowserObservation {
+            schema_version: VERSION,
+            session_id: session_id.to_string(),
+            seq: 0,
+            status: "ready".into(),
+            owner: BrowserOwner {
+                app: "dotz".into(),
+                project_id: "test-project".into(),
+                workflow_id: None,
+                step_id: None,
+            },
+            started_at: now_iso(),
+            updated_at: now_iso(),
+            page: Page {
+                url: "https://example.com".into(),
+                title: "Example".into(),
+                viewport: Viewport {
+                    width: 1280,
+                    height: 800,
+                },
+            },
+            allowed_origins: vec!["https://example.com".into()],
+            refs: vec![],
+            elements: vec![],
+            snapshot: "".into(),
+            current_action: None,
+            cursor: None,
+            frame: None,
+            counters: Counters {
+                actions: 0,
+                console_errors: 0,
+                network_errors: 0,
+            },
+            console_errors: vec![],
+            network_errors: vec![],
+            error: None,
+        }
     }
 
     /// A panic while holding the browser sessions mutex must not permanently brick the browser
