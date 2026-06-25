@@ -142,14 +142,6 @@ async fn create_run(
         Some(s) => s.to_string(),
         None => return Err(bad("language and code are required (strings)")),
     };
-    if !SANDBOX_LANGUAGES.contains(&language.as_str()) {
-        return Err(bad(format!(
-            "unsupported language: {}. Available: {}",
-            language,
-            SANDBOX_LANGUAGES.join(", ")
-        )));
-    }
-    // Validate mode — only "terminal"/"web" (or absent → "terminal").
     let mode = match b.get("mode") {
         None | Some(Value::Null) => "terminal".to_string(),
         Some(Value::String(s)) if s == "terminal" || s == "web" => s.clone(),
@@ -159,17 +151,42 @@ async fn create_run(
         .get("projectId")
         .and_then(|v| v.as_str())
         .map(String::from);
-    // A non-finite/absent timeout coerces to the default — never silently disable the timeout.
     let timeout_ms = match b.get("timeoutMs").and_then(|v| v.as_i64()) {
         Some(n) if n > 0 => n,
         _ => DEFAULT_TIMEOUT_MS,
     };
 
+    match start_run(&language, &code, &mode, project_id.as_deref(), timeout_ms).await {
+        Ok(run) => Ok(Json(run)),
+        Err(e) => Err(bad(e)),
+    }
+}
+
+/// Create and start a sandbox run without the axum JSON wrapper. Shared by the REST handler and
+/// the WebSocket control loop so both paths produce the same run record.
+pub async fn start_run(
+    language: &str,
+    code: &str,
+    mode: &str,
+    project_id: Option<&str>,
+    timeout_ms: i64,
+) -> Result<SandboxRun, String> {
+    if !SANDBOX_LANGUAGES.contains(&language) {
+        return Err(format!(
+            "unsupported language: {}. Available: {}",
+            language,
+            SANDBOX_LANGUAGES.join(", ")
+        ));
+    }
+    if mode != "terminal" && mode != "web" {
+        return Err("mode must be \"terminal\" or \"web\"".to_string());
+    }
+
     let run = SandboxRun {
         id: uuid::Uuid::new_v4().to_string(),
-        project_id,
-        language: language.clone(),
-        code: code.clone(),
+        project_id: project_id.map(String::from),
+        language: language.to_string(),
+        code: code.to_string(),
         status: "running".to_string(),
         output: String::new(),
         exit_code: None,
@@ -185,16 +202,27 @@ async fn create_run(
                 run: run.clone(),
                 pid: None,
                 killed_by_us: false,
-                mode,
+                mode: mode.to_string(),
                 port: None,
             },
         );
     }
 
-    // Spawn the executor task; it updates the store as the child runs and exits.
-    tokio::spawn(execute_run(id.clone(), language, code, timeout_ms));
+    tokio::spawn(execute_run(id.clone(), language.to_string(), code.to_string(), timeout_ms));
 
-    Ok(Json(run))
+    Ok(run)
+}
+
+/// Look up a run by id. Used by the WebSocket loop to poll for terminal status.
+pub fn lookup(id: &str) -> Option<SandboxRun> {
+    runs().lock().unwrap().get(id).map(|e| e.run.clone())
+}
+
+#[cfg(test)]
+/// Remove a run entry from the in-memory store. Test-only helper so WebSocket sandbox tests can
+/// clean up the process-global runs map.
+pub fn remove_test_run(id: &str) {
+    runs().lock().unwrap().remove(id);
 }
 
 /// Spawn the child for `language`, capture stdout+stderr, apply the timeout, then update the run.
@@ -391,11 +419,12 @@ fn kill_pid(pid: Option<u32>) {
     }
 }
 
-/// POST /api/sandbox/runs/:id/kill — kill the child, mark killed → { ok }.
-async fn kill_run(Path(id): Path<String>) -> Json<Value> {
+/// Kill a running sandbox run by id, returning true if a live child was signalled. Shared by the
+/// REST kill endpoint and the WebSocket kill message so both paths behave identically.
+pub fn kill_run_by_id(id: &str) -> bool {
     let pid = {
         let mut store = runs().lock().unwrap();
-        match store.get_mut(&id) {
+        match store.get_mut(id) {
             Some(e) if e.pid.is_some() && e.run.status == "running" => {
                 e.killed_by_us = true;
                 e.pid
@@ -406,10 +435,15 @@ async fn kill_run(Path(id): Path<String>) -> Json<Value> {
     match pid {
         Some(p) => {
             kill_pid(Some(p));
-            Json(json!({ "ok": true }))
+            true
         }
-        None => Json(json!({ "ok": false })),
+        None => false,
     }
+}
+
+/// POST /api/sandbox/runs/:id/kill — kill the child, mark killed → { ok }.
+async fn kill_run(Path(id): Path<String>) -> Json<Value> {
+    Json(json!({ "ok": kill_run_by_id(&id) }))
 }
 
 /// GET /api/sandbox/runs/:id/port — best-effort web port detection for mode:"web". 404 if none.
