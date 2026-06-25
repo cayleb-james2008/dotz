@@ -321,9 +321,9 @@ async fn execute_run(id: String, language: String, code: String, timeout_ms: i64
             let mut output = String::new();
             output.push_str(&String::from_utf8_lossy(&out));
             output.push_str(&String::from_utf8_lossy(&err));
-            let killed_by_us = runs()
-                .lock()
-                .unwrap()
+            // Recover from a poisoned runs mutex: a panic in another task (e.g. while holding
+            // the store lock) must not crash the normal exit path of a sandbox run.
+            let killed_by_us = runs_guard()
                 .get(&id)
                 .map(|e| e.killed_by_us)
                 .unwrap_or(false);
@@ -739,14 +739,81 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
+    /// The normal exit path of `execute_run` reads the run entry to decide between
+    /// `done`/`error`/`killed`. It must use `runs_guard()` so a poisoned mutex (from an unrelated
+    /// panic elsewhere) does not crash the run's finish path.
+    #[tokio::test]
+    async fn execute_run_normal_exit_recovers_from_poisoned_mutex() {
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut store = runs_guard();
+            store.insert(
+                id.clone(),
+                RunEntry {
+                    run: SandboxRun {
+                        id: id.clone(),
+                        project_id: None,
+                        language: "bash".to_string(),
+                        code: String::new(),
+                        status: "running".to_string(),
+                        output: String::new(),
+                        exit_code: None,
+                        started_at: now_ms(),
+                        ended_at: None,
+                    },
+                    pid: None,
+                    killed_by_us: false,
+                    mode: "terminal".to_string(),
+                    port: None,
+                },
+            );
+        }
+
+        // Intentionally poison the runs mutex while holding the lock.
+        let m = runs();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = m.lock().unwrap();
+            panic!("intentional sandbox runs mutex poison");
+        }));
+        assert!(poisoned.is_err(), "mutex should be poisoned");
+
+        // Run a quick command that exits cleanly, forcing `execute_run` to read `killed_by_us`
+        // via `runs_guard()` in the normal (non-timeout) exit path.
+        let (language, code) = if cfg!(windows) {
+            ("powershell", "Write-Output ok")
+        } else {
+            ("bash", "echo ok")
+        };
+        execute_run(
+            id.clone(),
+            language.to_string(),
+            code.to_string(),
+            5000,
+        )
+        .await;
+
+        {
+            let store = runs_guard();
+            let entry = store.get(&id).expect("run entry should exist");
+            assert_eq!(entry.run.status, "done");
+            assert!(entry.run.output.contains("ok"));
+        }
+
+        {
+            let mut store = runs_guard();
+            store.remove(&id);
+        }
+    }
+
     /// A panic while holding the sandbox runs mutex (e.g. inside a spawn callback or an I/O
     /// error path) must not permanently brick the sandbox REST endpoints, `/api/health`, or the
     /// WebSocket sandbox controls. `runs_guard()` recovers from a poisoned lock so the store
     /// remains usable.
     #[test]
     fn runs_guard_recovers_from_poisoned_mutex() {
-        // Ensure the singleton is initialized.
-        drop(runs().lock().unwrap());
+        // Ensure the singleton is initialized (use the same guard we are testing, in case a
+        // parallel test has already poisoned the mutex).
+        drop(runs_guard());
 
         let m = runs();
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
