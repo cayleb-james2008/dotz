@@ -391,6 +391,38 @@ fn ws_ping_interval() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(30))
 }
 
+/// Build a `{kind:"sandbox", sessionId, event}` WS frame, matching the contract app.js consumes.
+fn sandbox_event(session_id: &str, event: Value) -> Value {
+    json!({ "kind": "sandbox", "sessionId": session_id, "event": event })
+}
+
+/// Best-effort broadcast of a sandbox event to the session's WebSocket subscribers.
+fn emit_sandbox_event(tx: &broadcast::Sender<Value>, session_id: &str, event: Value) {
+    let _ = tx.send(sandbox_event(session_id, event));
+}
+
+/// Poll a sandbox run until it reaches a terminal status, then broadcast `sandbox_end`. This gives
+/// the UI the run lifecycle events it expects without requiring the executor task to know about
+/// sessions or WebSockets. Bounded by a 30s deadline so a stuck run can't leak the poller.
+fn spawn_sandbox_end_poller(session_id: String, run_id: String, tx: broadcast::Sender<Value>) {
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline {
+            if let Some(run) = crate::sandbox::lookup(&run_id) {
+                if run.status != "running" {
+                    emit_sandbox_event(
+                        &tx,
+                        &session_id,
+                        json!({ "type": "sandbox_end", "runId": run_id, "run": run }),
+                    );
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    });
+}
+
 async fn ws_loop(socket: WebSocket, session_id: String) {
     let (mut sink, mut stream) = socket.split();
 
@@ -534,6 +566,129 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                     }
                     "abort" => {
                         session::abort(&session_id);
+                    }
+                    // Sandbox controls — the UI sends these over WS instead of REST.
+                    "sandbox.start" => {
+                        let language = v
+                            .get("language")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let code = v
+                            .get("code")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let mode = v
+                            .get("mode")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("terminal")
+                            .to_string();
+                        let project_id = v
+                            .get("projectId")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string());
+                        let timeout_ms = v
+                            .get("timeoutMs")
+                            .and_then(|x| x.as_i64())
+                            .filter(|n| *n > 0)
+                            .unwrap_or(30_000);
+                        if let Some(sess) = session::get(&session_id) {
+                            let tx = sess.lock().unwrap().tx.clone();
+                            let sid = session_id.clone();
+                            tokio::spawn(async move {
+                                match crate::sandbox::start_run(
+                                    &language, &code, &mode, project_id.as_deref(), timeout_ms,
+                                )
+                                .await
+                                {
+                                    Ok(run) => {
+                                        let run_id = run.id.clone();
+                                        emit_sandbox_event(
+                                            &tx,
+                                            &sid,
+                                            json!({
+                                                "type": "sandbox_start",
+                                                "runId": run_id,
+                                                "run": run,
+                                            }),
+                                        );
+                                        spawn_sandbox_end_poller(sid, run_id, tx);
+                                    }
+                                    Err(e) => {
+                                        emit_sandbox_event(
+                                            &tx,
+                                            &sid,
+                                            json!({
+                                                "type": "sandbox_end",
+                                                "runId": Value::Null,
+                                                "error": e,
+                                            }),
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    "sandbox.kill" => {
+                        if let Some(run_id) = v.get("runId").and_then(|x| x.as_str()) {
+                            let killed = crate::sandbox::kill_run_by_id(run_id);
+                            if let Some(sess) = session::get(&session_id) {
+                                let tx = sess.lock().unwrap().tx.clone();
+                                let sid = session_id.clone();
+                                let rid = run_id.to_string();
+                                tokio::spawn(async move {
+                                    // Give the kill a moment to update status, then emit end.
+                                    if killed {
+                                        tokio::time::sleep(std::time::Duration::from_millis(200))
+                                            .await;
+                                    }
+                                    let run = crate::sandbox::lookup(&rid);
+                                    emit_sandbox_event(
+                                        &tx,
+                                        &sid,
+                                        json!({
+                                            "type": "sandbox_end",
+                                            "runId": rid,
+                                            "run": run,
+                                        }),
+                                    );
+                                });
+                            }
+                        }
+                    }
+                    "sandbox.cursor" => {
+                        let run_id = v.get("runId").and_then(|x| x.as_str()).unwrap_or("");
+                        let x = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                        let y = v.get("y").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                        let action = v
+                            .get("action")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("move")
+                            .to_string();
+                        let cursor_text = v
+                            .get("cursorText")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string());
+                        if !run_id.is_empty()
+                            && ["move", "click", "type"].contains(&action.as_str())
+                        {
+                            if let Some(sess) = session::get(&session_id) {
+                                let tx = sess.lock().unwrap().tx.clone();
+                                emit_sandbox_event(
+                                    &tx,
+                                    &session_id,
+                                    json!({
+                                        "type": "sandbox_cursor",
+                                        "runId": run_id,
+                                        "x": x,
+                                        "y": y,
+                                        "action": action,
+                                        "text": cursor_text,
+                                    }),
+                                );
+                            }
+                        }
                     }
                     // Resolve a pending human_gate (app.js sends {kind:"gate.approve"|"gate.reject", gateId, feedback?}).
                     "gate.approve" | "gate.reject" => {
@@ -1211,5 +1366,220 @@ mod tests {
             Some(p) => std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p),
             None => std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS"),
         }
+    }
+
+    /// A `sandbox.start` WebSocket message must create a sandbox run and emit `sandbox_start`
+    /// followed by `sandbox_end` when the run finishes. Before this wiring the UI's sandbox start
+    /// button sent the message into a void and never showed the run.
+    #[tokio::test]
+    async fn websocket_routes_sandbox_start_to_run_and_emits_lifecycle_events() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        let _guard = WS_TEST_LOCK.lock().await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(crate::server::serve_with_shutdown(
+            listener,
+            std::path::PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/sessions"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let summary = resp.json::<Value>().await.unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let url = format!("ws://127.0.0.1:{port}/ws?sessionId={sid}");
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(
+            ready.to_text().unwrap().contains("\"ready\""),
+            "first WS frame should be ready: {ready:?}"
+        );
+
+        let (language, code) = if cfg!(windows) {
+            ("powershell", "echo dotz-sandbox-start-test")
+        } else {
+            ("bash", "echo dotz-sandbox-start-test")
+        };
+        ws.send(Message::Text(
+            json!({
+                "kind": "sandbox.start",
+                "language": language,
+                "code": code,
+                "mode": "terminal",
+                "projectId": null,
+                "timeoutMs": 5000,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let mut run_id: Option<String> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let frame: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if frame.get("kind").and_then(|k| k.as_str()) == Some("sandbox") {
+                        let event = frame.get("event").cloned().unwrap_or_default();
+                        let ty = event.get("type").and_then(|t| t.as_str());
+                        if ty == Some("sandbox_start") {
+                            run_id = event
+                                .get("runId")
+                                .and_then(|r| r.as_str())
+                                .map(String::from);
+                            assert!(
+                                event.get("run").is_some(),
+                                "sandbox_start must include the run record"
+                            );
+                        } else if ty == Some("sandbox_end") {
+                            if let Some(id) = &run_id {
+                                assert_eq!(
+                                    event.get("runId").and_then(|r| r.as_str()),
+                                    Some(id.as_str()),
+                                    "sandbox_end runId must match sandbox_start"
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let rid = run_id.expect("sandbox_start event should set runId");
+        let run = crate::sandbox::lookup(&rid);
+        assert!(
+            run.is_some(),
+            "sandbox run should exist after websocket start"
+        );
+        assert_ne!(
+            run.unwrap().status,
+            "running",
+            "run should reach a terminal status before sandbox_end"
+        );
+
+        // Clean up the process-global run record so later tests see a stable store.
+        crate::sandbox::remove_test_run(&rid);
+        session::dispose(&sid);
+
+        let _ = tx.send(());
+        assert!(
+            handle.await.unwrap().is_ok(),
+            "server should shut down cleanly"
+        );
+    }
+
+    /// A `sandbox.cursor` WebSocket message must be echoed back as a `sandbox_cursor` event so the
+    /// agent cursor overlay renders in the web-preview panel.
+    #[tokio::test]
+    async fn websocket_echoes_sandbox_cursor_event() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        let _guard = WS_TEST_LOCK.lock().await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(crate::server::serve_with_shutdown(
+            listener,
+            std::path::PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/sessions"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let summary = resp.json::<Value>().await.unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let url = format!("ws://127.0.0.1:{port}/ws?sessionId={sid}");
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(
+            ready.to_text().unwrap().contains("\"ready\""),
+            "first WS frame should be ready: {ready:?}"
+        );
+
+        ws.send(Message::Text(
+            json!({
+                "kind": "sandbox.cursor",
+                "runId": "run-123",
+                "x": 42.5,
+                "y": 99.0,
+                "action": "click",
+                "cursorText": "submit",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let mut found = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let frame: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if frame.get("kind").and_then(|k| k.as_str()) == Some("sandbox") {
+                        let event = frame.get("event").cloned().unwrap_or_default();
+                        if event.get("type").and_then(|t| t.as_str()) == Some("sandbox_cursor") {
+                            assert_eq!(event["runId"], "run-123");
+                            assert_eq!(event["x"], 42.5);
+                            assert_eq!(event["y"], 99.0);
+                            assert_eq!(event["action"], "click");
+                            assert_eq!(event["text"], "submit");
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(found, "sandbox_cursor event should be echoed to the client");
+
+        session::dispose(&sid);
+        let _ = tx.send(());
+        assert!(
+            handle.await.unwrap().is_ok(),
+            "server should shut down cleanly"
+        );
     }
 }
