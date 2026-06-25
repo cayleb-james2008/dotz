@@ -59,12 +59,18 @@ pub fn apply_env(c: &DotzConfig) {
 }
 
 /// Strip any leading "<provider>/" prefix from a model string. This prevents stale prefixes from
-/// surviving a provider change and then being re-prepended by apply_env.
+/// surviving a provider change and then being re-prepended by apply_env. The match is
+/// case-insensitive so a persisted value like "OpenRouter/..." is normalized the same way as
+/// "openrouter/...".
 fn strip_any_provider_prefix(model: &str) -> String {
     let trimmed = model.trim();
+    let lower = trimmed.to_lowercase();
     for pid in types::provider_ids() {
-        if let Some(rest) = trimmed.strip_prefix(&format!("{pid}/")) {
-            return rest.to_string();
+        let prefix = format!("{pid}/");
+        if let Some(_rest) = lower.strip_prefix(&prefix) {
+            // provider ids are ASCII, so the byte length of the original prefix equals the
+            // lowercase prefix length.
+            return trimmed[prefix.len()..].to_string();
         }
     }
     trimmed.to_string()
@@ -343,6 +349,39 @@ mod tests {
             );
         });
     }
+
+    /// Provider prefixes in the persisted subagent model must be stripped case-insensitively.
+    /// Without this, "OpenRouter/model" under provider "openrouter" becomes the doubled
+    /// invalid prefix "openrouter/OpenRouter/model".
+    #[test]
+    fn apply_env_strips_case_insensitive_provider_prefix() {
+        with_tmp_dir(|_| {
+            let cfg = DotzConfig {
+                provider: "openrouter".into(),
+                executive_model: "nex-agi/nex-n2-pro:free".into(),
+                subagent_model: "OpenRouter/nvidia/nemotron-3-ultra-550b-a55b:free".into(),
+                thinking_level: "medium".into(),
+            };
+            apply_env(&cfg);
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+            );
+
+            // Also covers a mismatched provider prefix with different casing.
+            let cfg2 = DotzConfig {
+                provider: "ollama".into(),
+                subagent_model: "OPENROUTER/nvidia/nemotron-3-ultra-550b-a55b:free".into(),
+                ..cfg
+            };
+            apply_env(&cfg2);
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "ollama/nvidia/nemotron-3-ultra-550b-a55b:free"
+            );
+        });
+    }
+
     #[test]
     fn load_derives_subagent_model_when_missing() {
         with_tmp_dir(|_| {
