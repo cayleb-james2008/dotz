@@ -411,7 +411,7 @@ fn build_subagent_registry(agent: &AgentConfig) -> ToolRegistry {
 fn parse_subagent_model(effective_model: &str) -> (String, String) {
     match effective_model.split_once('/') {
         Some((p, m)) if !p.is_empty() && !m.is_empty() => {
-            let provider_id = p.to_string();
+            let provider_id = p.to_ascii_lowercase();
             let model_id = crate::types::strip_matching_provider_prefix(&provider_id, m);
             (provider_id, model_id)
         }
@@ -1156,6 +1156,27 @@ mod tests {
         assert_eq!(
             parse_subagent_model("openrouter/ollama/glm-5.2"),
             ("openrouter".to_string(), "ollama/glm-5.2".to_string())
+        );
+    }
+
+    /// A subagent `model` override written by the lead agent may use a mixed-case provider
+    /// segment (e.g. "Ollama/glm-5.2"). Without normalization, provider resolution is
+    /// case-sensitive and would reject the model; lowering the provider segment fixes the
+    /// fan-out while still stripping a redundant matching prefix.
+    #[test]
+    fn parse_subagent_model_lowercases_provider_segment() {
+        assert_eq!(
+            parse_subagent_model("Ollama/glm-5.2"),
+            ("ollama".to_string(), "glm-5.2".to_string())
+        );
+        assert_eq!(
+            parse_subagent_model("OpenRouter/nex-agi/nex-n2-pro:free"),
+            ("openrouter".to_string(), "nex-agi/nex-n2-pro:free".to_string())
+        );
+        assert_eq!(
+            parse_subagent_model("OPENROUTER/openrouter/nex-agi/nex-n2-pro:free"),
+            ("openrouter".to_string(), "nex-agi/nex-n2-pro:free".to_string()),
+            "uppercase provider segment with a redundant lowercase prefix must still be normalized"
         );
     }
 
