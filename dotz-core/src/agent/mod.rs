@@ -593,8 +593,7 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                             .and_then(|x| x.as_i64())
                             .filter(|n| *n > 0)
                             .unwrap_or(30_000);
-                        if let Some(sess) = session::get(&session_id) {
-                            let tx = sess.lock().unwrap().tx.clone();
+                        if let Some(tx) = session::tx(&session_id) {
                             let sid = session_id.clone();
                             tokio::spawn(async move {
                                 match crate::sandbox::start_run(
@@ -633,8 +632,7 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                     "sandbox.kill" => {
                         if let Some(run_id) = v.get("runId").and_then(|x| x.as_str()) {
                             let killed = crate::sandbox::kill_run_by_id(run_id);
-                            if let Some(sess) = session::get(&session_id) {
-                                let tx = sess.lock().unwrap().tx.clone();
+                            if let Some(tx) = session::tx(&session_id) {
                                 let sid = session_id.clone();
                                 let rid = run_id.to_string();
                                 tokio::spawn(async move {
@@ -673,8 +671,7 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                         if !run_id.is_empty()
                             && ["move", "click", "type"].contains(&action.as_str())
                         {
-                            if let Some(sess) = session::get(&session_id) {
-                                let tx = sess.lock().unwrap().tx.clone();
+                            if let Some(tx) = session::tx(&session_id) {
                                 emit_sandbox_event(
                                     &tx,
                                     &session_id,
