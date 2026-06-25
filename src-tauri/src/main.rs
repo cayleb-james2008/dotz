@@ -105,6 +105,10 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], PORT));
+    // Bind the server socket before spawning the server task. If port 4317 is already in use
+    // (e.g. a previous dotz instance or another service) we fail fast here instead of opening a
+    // window that connects to the wrong server while our own server task errors in the background.
+    let listener = bind_listener(addr)?;
 
     let builder = tauri::Builder::default()
         // single-instance first (Tauri 2 requirement): relaunching focuses the running window.
@@ -150,8 +154,8 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
 
             tauri::async_runtime::spawn(async move {
-                if let Err(e) =
-                    dotz_core::server::serve_with_shutdown_addr(addr, web_dir, shutdown).await
+                if let Err(e) = dotz_core::server::serve_with_shutdown(listener, web_dir, shutdown)
+                    .await
                 {
                     eprintln!("dotz-core server error: {e}");
                 }
@@ -209,4 +213,57 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
     Ok(())
+}
+
+/// Bind a tokio TcpListener for the dotz-core server, failing fast with a clear message when the
+/// configured port is already in use.
+fn bind_listener(
+    addr: SocketAddr,
+) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error + Send + Sync>> {
+    let std_listener = std::net::TcpListener::bind(addr).map_err(|e| {
+        Box::new(std::io::Error::new(
+            e.kind(),
+            format!("dotz-core server could not bind to {addr}: {e}"),
+        )) as Box<dyn std::error::Error + Send + Sync>
+    })?;
+    std_listener.set_nonblocking(true).map_err(|e| {
+        Box::new(std::io::Error::new(
+            e.kind(),
+            format!("failed to set non-blocking mode for server socket: {e}"),
+        )) as Box<dyn std::error::Error + Send + Sync>
+    })?;
+    Ok(tokio::net::TcpListener::from_std(std_listener)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Binding to an already-occupied port must fail fast with a clear error message instead of
+    /// letting the Tauri shell open a window against the wrong server.
+    #[tokio::test]
+    async fn bind_listener_fails_when_port_in_use() {
+        let occupant = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupant.local_addr().unwrap();
+
+        let result = bind_listener(addr);
+        assert!(
+            result.is_err(),
+            "bind_listener must fail when the port is already in use"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("could not bind"),
+            "error should explain the bind failure: {msg}"
+        );
+    }
+
+    /// Binding to an ephemeral/free port must succeed and return a usable tokio listener.
+    #[tokio::test]
+    async fn bind_listener_succeeds_on_free_port() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let listener = bind_listener(addr).expect("should bind to a free ephemeral port");
+        let bound_addr = listener.local_addr().expect("listener should have a local address");
+        assert!(bound_addr.port() > 0, "ephemeral bind should return a non-zero port");
+    }
 }
