@@ -34,6 +34,10 @@ const MAX_OUTPUT: i64 = 50_000;
 // 75s (not the oracle's 35s): the COLD first Chrome launch on a fresh profile can take ~40-50s here;
 // subsequent commands hit the warm agent-browser daemon and return fast.
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(75);
+/// Timeout for the `agent-browser close` command inside `stop()`. A hung close must not block
+/// process shutdown: `dispose_all()` wraps each stop, but if stop() itself could wait the full
+/// `command_timeout()` the outer wrap would drop the future and leak the session record.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Configurable wall-clock timeout for each agent-browser command. A hung command (e.g. a
 /// crashed Chrome that never returns) otherwise blocks the controller for 75s. Defaults to 75s;
@@ -1242,6 +1246,30 @@ async fn fresh_profile_dir(session_id: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Cleanup guard: ensures the session record and disposable profile directory are removed even
+/// if the async `stop()` future is cancelled (e.g. by `dispose_all()`'s outer timeout). Without
+/// this, a hung `agent-browser close` could leave the session in the in-memory store and its
+/// temp profile behind after the timeout drops the future.
+struct StopGuard {
+    session_id: String,
+    profile_dir: PathBuf,
+    disarm: bool,
+}
+impl StopGuard {
+    fn disarm(mut self) {
+        self.disarm = true;
+    }
+}
+impl Drop for StopGuard {
+    fn drop(&mut self) {
+        if self.disarm {
+            return;
+        }
+        sessions_guard().remove(&self.session_id);
+        let _ = std::fs::remove_dir_all(&self.profile_dir);
+    }
+}
+
 /// stop(): mark disposed, close the process, set status "stopped", bump seq, dispose the profile dir.
 pub async fn stop(session_id: &str) -> Result<BrowserObservation, String> {
     let (profile_dir, allowed_origins) = {
@@ -1250,7 +1278,18 @@ pub async fn stop(session_id: &str) -> Result<BrowserObservation, String> {
         r.disposed = true; // abort any in-flight run() before we remove the profile dir
         (r.profile_dir.clone(), r.observation.allowed_origins.clone())
     };
-    let _ = run(session_id, &profile_dir, &allowed_origins, &["close"]).await;
+    let guard = StopGuard {
+        session_id: session_id.to_string(),
+        profile_dir: profile_dir.clone(),
+        disarm: false,
+    };
+    // Bound close so a hung agent-browser cannot block shutdown. The result is best-effort:
+    // `reap_stray_browsers()` kills any lingering Chrome process tree afterwards.
+    let _ = tokio::time::timeout(
+        CLOSE_TIMEOUT,
+        run(session_id, &profile_dir, &allowed_origins, &["close"]),
+    )
+    .await;
 
     let stopped = {
         let mut store = sessions_guard();
@@ -1265,6 +1304,7 @@ pub async fn stop(session_id: &str) -> Result<BrowserObservation, String> {
     };
     let _ = tokio::fs::remove_dir_all(&profile_dir).await;
     sessions_guard().remove(session_id);
+    guard.disarm();
     Ok(stopped)
 }
 
@@ -1716,6 +1756,12 @@ mod tests {
     /// deletes the record and temp dir regardless of whether `agent-browser close` succeeded).
     #[tokio::test]
     async fn dispose_all_closes_every_session_and_removes_profile_dirs() {
+        // Serialize with other tests that mutate the process-global browser env / sessions store
+        // (e.g. the timeout tests that insert sessions and point DOTZ_BROWSER_BIN at a fake
+        // script). Without this lock a concurrent test can insert a session after we collect
+        // ids, leaving the store non-empty and failing the assertion.
+        let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
+
         let base =
             std::env::temp_dir().join(format!("dotz-browser-dispose-test-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&base).await.unwrap();
@@ -1765,6 +1811,100 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// `stop()` must dispose the session and profile directory even when the `agent-browser close`
+    /// command hangs. Before the fix, stop() waited for the full `command_timeout()` which let
+    /// `dispose_all()`'s outer timeout drop the future and leave the session record behind.
+    #[tokio::test]
+    async fn stop_disposes_session_even_when_close_command_hangs() {
+        let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
+
+        let dir = std::env::temp_dir()
+            .join(format!("dotz-browser-stop-hang-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Fake agent-browser binary: sleeps long enough that only the close timeout can end it.
+        #[cfg(windows)]
+        let script_path = {
+            let bat = dir.join("fake-browser.bat");
+            tokio::fs::write(&bat, "@echo off\nping -n 60 127.0.0.1 >nul\n")
+                .await
+                .unwrap();
+            bat
+        };
+        #[cfg(unix)]
+        let script_path = {
+            let sh = dir.join("fake-browser.sh");
+            tokio::fs::write(&sh, "#!/bin/sh\nsleep 60\n").await.unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = tokio::fs::metadata(&sh).await.unwrap().permissions();
+            perms.set_mode(0o755);
+            tokio::fs::set_permissions(&sh, perms).await.unwrap();
+            sh
+        };
+
+        let sid = format!("dotz-browser-stop-hang-{}", uuid::Uuid::new_v4());
+        let profile_dir = dir.join("profile");
+        tokio::fs::create_dir_all(&profile_dir).await.unwrap();
+
+        {
+            let mut store = sessions_guard();
+            store.insert(
+                sid.clone(),
+                SessionRecord {
+                    profile_dir: profile_dir.clone(),
+                    observation: fake_observation(&sid),
+                    frame_data: None,
+                    disposed: false,
+                },
+            );
+        }
+
+        let prev_bin = std::env::var("DOTZ_BROWSER_BIN").ok();
+        let prev_timeout = std::env::var("DOTZ_BROWSER_TIMEOUT_MS").ok();
+        // Use a huge command timeout so the only thing ending the close call is stop()'s own
+        // CLOSE_TIMEOUT — if stop() relied on command_timeout() this test would take 75s.
+        std::env::set_var("DOTZ_BROWSER_BIN", script_path.to_string_lossy().to_string());
+        std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "300000");
+
+        let start = std::time::Instant::now();
+        let result = stop(&sid).await;
+        let elapsed = start.elapsed();
+
+        match prev_bin {
+            Some(p) => std::env::set_var("DOTZ_BROWSER_BIN", p),
+            None => std::env::remove_var("DOTZ_BROWSER_BIN"),
+        }
+        match prev_timeout {
+            Some(p) => std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS"),
+        }
+
+        // stop() must complete well before the 5m command_timeout, bounded by CLOSE_TIMEOUT.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "stop() should not wait for the full command_timeout, elapsed: {elapsed:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "stop() should succeed even when close hangs: {}",
+            result.err().unwrap_or_default()
+        );
+        let obs = result.unwrap();
+        assert_eq!(obs.status, "stopped");
+        assert_eq!(obs.session_id, sid);
+
+        assert!(
+            sessions_guard().get(&sid).is_none(),
+            "stop() should remove the session even when close hangs"
+        );
+        assert!(
+            !profile_dir.exists(),
+            "stop() should remove the profile dir even when close hangs"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     fn fake_observation(session_id: &str) -> BrowserObservation {
