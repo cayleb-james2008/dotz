@@ -26,6 +26,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::json;
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     path::PathBuf,
     sync::{Mutex, OnceLock},
@@ -223,10 +224,10 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Split off a leading frontmatter block: between a leading `---\n` and the next `\n---`. Returns
-/// `(Some(yaml), body)` when present, else `(None, whole)`. Mirrors gray-matter's leading-fence split
-/// (it requires the `---` fence at the very start of the file).
-fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
+/// Split off a leading frontmatter block between a leading `---` fence and a matching closing
+/// `---` fence. Returns `(Some(yaml), body)` when present, else `(None, whole)`. Mirrors
+/// gray-matter's leading-fence split (the opening `---` must be at the very start of the file).
+fn split_frontmatter(raw: &str) -> (Option<Cow<'_, str>>, &str) {
     // The opening fence must be at the start: "---\n" or "---\r\n".
     let after_open = if let Some(rest) = raw.strip_prefix("---\n") {
         rest
@@ -235,6 +236,27 @@ fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
     } else {
         return (None, raw);
     };
+
+    // Body starts after the closing fence's own line terminator.
+    fn strip_body_newline(tail: &str) -> &str {
+        if let Some(b) = tail.strip_prefix("\r\n") {
+            b
+        } else if let Some(b) = tail.strip_prefix('\n') {
+            b
+        } else {
+            tail // closer at EOF, empty body
+        }
+    }
+
+    // The closing fence may be the very next line (empty frontmatter). Without this guard the
+    // "\n---" search would miss a fence at position 0 of `after_open`.
+    if after_open.starts_with("---\n")
+        || after_open.starts_with("---\r\n")
+        || after_open == "---"
+    {
+        return (Some(Cow::Borrowed("")), strip_body_newline(&after_open[3..]));
+    }
+
     // Find the closing fence: a line that is exactly "---" (preceded by a newline). We search for
     // "\n---" and require it to be followed by end-of-string or a newline.
     let mut search_from = 0usize;
@@ -244,16 +266,19 @@ fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
         let tail = &after_open[after_dashes..];
         // Valid closer iff the "---" is the whole line: end-of-file, or next char starts a newline.
         if tail.is_empty() || tail.starts_with('\n') || tail.starts_with('\r') {
-            let yaml = &after_open[..idx];
-            // Body starts after the closing fence's own line terminator.
-            let body = if let Some(b) = tail.strip_prefix("\r\n") {
-                b
-            } else if let Some(b) = tail.strip_prefix('\n') {
-                b
+            let mut yaml_end = idx;
+            if idx > 0 && after_open.as_bytes()[idx - 1] == b'\r' {
+                yaml_end -= 1; // don't leave a dangling \r before the closing fence
+            }
+            let yaml = &after_open[..yaml_end];
+            // Normalize CRLF / lone CR line endings in the frontmatter content so the YAML parser
+            // sees clean LF endings instead of embedded \r characters.
+            let yaml = if yaml.contains('\r') {
+                Cow::Owned(yaml.replace("\r\n", "\n").replace('\r', "\n"))
             } else {
-                tail // closer at EOF, empty body
+                Cow::Borrowed(yaml)
             };
-            return (Some(yaml), body);
+            return (Some(yaml), strip_body_newline(tail));
         }
         search_from = idx + 1;
     }
@@ -269,7 +294,7 @@ fn parse_skill_file(file: &std::path::Path, source: &'static str) -> Option<Skil
 
     // Parse the frontmatter; on any error fall back to an empty mapping (dirname name fallback).
     let fm: serde_yaml::Value = fm_src
-        .and_then(|y| serde_yaml::from_str::<serde_yaml::Value>(y).ok())
+        .and_then(|y| serde_yaml::from_str::<serde_yaml::Value>(&y).ok())
         .unwrap_or(serde_yaml::Value::Mapping(Default::default()));
 
     let get = |k: &str| fm.get(k);
@@ -688,5 +713,35 @@ mod tests {
 
         // reload_index must also recover and complete without panicking.
         reload_index();
+    }
+
+    /// `split_frontmatter` must recognize a closing fence on the very next line (empty frontmatter).
+    /// Without this, a SKILL.md like `---\n---\nbody` is treated as having no frontmatter and the
+    /// body starts with the closing fence line, breaking skill name/description extraction.
+    #[test]
+    fn split_frontmatter_handles_empty_frontmatter() {
+        let (yaml, body) = split_frontmatter("---\n---\nbody");
+        assert_eq!(yaml.as_deref(), Some(""), "empty frontmatter should yield empty yaml");
+        assert_eq!(body, "body", "body should follow the closing fence");
+
+        let (yaml, body) = split_frontmatter("---\r\n---\r\nbody");
+        assert_eq!(yaml.as_deref(), Some(""), "empty CRLF frontmatter should yield empty yaml");
+        assert_eq!(body, "body", "CRLF body should follow the closing fence");
+
+        let (yaml, body) = split_frontmatter("---\n---");
+        assert_eq!(yaml.as_deref(), Some(""), "EOF closing fence should yield empty yaml");
+        assert_eq!(body, "", "no body when closing fence is EOF");
+    }
+
+    /// Non-empty frontmatter must still parse correctly after the empty-frontmatter fix.
+    #[test]
+    fn split_frontmatter_preserves_nonempty_frontmatter() {
+        let (yaml, body) = split_frontmatter("---\nname: alpha\ndescription: A\n---\nbody alpha\n");
+        assert_eq!(yaml.as_deref(), Some("name: alpha\ndescription: A"));
+        assert_eq!(body, "body alpha\n");
+
+        let (yaml, body) = split_frontmatter("---\r\nname: beta\r\n---\r\nbody beta\r\n");
+        assert_eq!(yaml.as_deref(), Some("name: beta"));
+        assert_eq!(body, "body beta\r\n");
     }
 }
