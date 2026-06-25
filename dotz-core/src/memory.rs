@@ -636,8 +636,10 @@ async fn extract_facts(user_text: &str, assistant_text: &str) -> Vec<String> {
     parse_facts(content)
 }
 
-/// Parse the LLM reply into a fact list. Accepts a bare JSON array, or one fenced/embedded in prose
-/// (we slice the outermost [...]); falls back to non-empty trimmed lines. Always returns clean facts.
+/// Parse the LLM reply into a fact list. Accepts a bare JSON array, or one fenced/embedded in
+/// prose (we slice the outermost [...]). When no JSON array is present, fall back to non-empty
+/// trimmed prose lines so a model that ignores the output-format instruction still yields usable
+/// facts instead of silently dropping the entire exchange.
 fn parse_facts(content: &str) -> Vec<String> {
     let slice = match (content.find('['), content.rfind(']')) {
         (Some(a), Some(b)) if b > a => &content[a..=b],
@@ -650,7 +652,13 @@ fn parse_facts(content: &str) -> Vec<String> {
             .filter(|s| !s.is_empty())
             .collect();
     }
-    Vec::new()
+    // No JSON array found — best-effort line fallback. Keep only lines that look like content.
+    content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && *l != "[]")
+        .map(|l| l.to_string())
+        .collect()
 }
 
 /// Auto-capture a completed user↔assistant exchange. LLM-extracts durable facts, dedups each against
@@ -1011,10 +1019,26 @@ mod tests {
         assert_eq!(facts, vec!["Fact A", "Fact B"]);
     }
 
+    /// When the LLM ignores the output-format instruction and returns prose instead of a JSON
+    /// array, `parse_facts` must fall back to non-empty trimmed lines so durable facts are not
+    /// silently discarded.
     #[test]
-    fn parse_facts_returns_empty_for_invalid_json() {
-        let content = "Just some prose without an array.";
-        assert!(parse_facts(content).is_empty());
+    fn parse_facts_falls_back_to_non_empty_lines_for_prose() {
+        let content = "Use cargo test -p dotz-core for the gate.\n\nThe project root is /home/user/dotz.";
+        let facts = parse_facts(content);
+        assert_eq!(
+            facts,
+            vec![
+                "Use cargo test -p dotz-core for the gate.",
+                "The project root is /home/user/dotz."
+            ]
+        );
+    }
+
+    /// Purely empty or whitespace-only prose yields no facts.
+    #[test]
+    fn parse_facts_returns_empty_for_blank_prose() {
+        assert!(parse_facts("   \n\t  ").is_empty());
     }
 
     #[test]
