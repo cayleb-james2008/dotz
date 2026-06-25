@@ -120,6 +120,15 @@ fn store() -> &'static Mutex<HashMap<String, WorkflowRun>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Lock the workflow store, recovering from a poisoned lock. A panic while holding the store lock
+/// (e.g. inside the workflow bridge or a step-state callback) must not permanently brick the
+/// workflow REST endpoints or the `/api/health` active-count read.
+fn store_guard() -> std::sync::MutexGuard<'static, HashMap<String, WorkflowRun>> {
+    store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 const ACTIVE_CAP: usize = 100;
 
 fn now_ms() -> i64 {
@@ -344,7 +353,7 @@ fn create(
     };
 
     {
-        let mut active = store().lock().unwrap();
+        let mut active = store_guard();
         active.insert(run.id.clone(), run.clone());
         prune_active(&mut active);
     }
@@ -355,7 +364,7 @@ fn create(
 /// Mark a run as started and persist the transition.
 fn start(id: &str) -> Option<WorkflowRun> {
     let run = {
-        let mut active = store().lock().unwrap();
+        let mut active = store_guard();
         let run = active.get_mut(id)?;
         let now = now_ms();
         run.status = "running".to_string();
@@ -379,7 +388,7 @@ struct StepPatch {
 /// Update a step's state and propagate readiness to children. Returns the updated run (clone).
 fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowRun> {
     let run_snapshot = {
-        let mut active = store().lock().unwrap();
+        let mut active = store_guard();
         let run = active.get_mut(run_id)?;
         let now = now_ms();
 
@@ -499,7 +508,7 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
 /// Abort a run: mark aborted + sweep every non-terminal step to skipped.
 fn abort(id: &str) -> Option<WorkflowRun> {
     let run = {
-        let mut active = store().lock().unwrap();
+        let mut active = store_guard();
         let run = active.get_mut(id)?;
         let now = now_ms();
         run.status = "aborted".to_string();
@@ -520,16 +529,16 @@ fn abort(id: &str) -> Option<WorkflowRun> {
 }
 
 fn get_active(id: &str) -> Option<WorkflowRun> {
-    store().lock().unwrap().get(id).cloned()
+    store_guard().get(id).cloned()
 }
 
 fn list_active() -> Vec<WorkflowRun> {
-    store().lock().unwrap().values().cloned().collect()
+    store_guard().values().cloned().collect()
 }
 
 /// Number of workflow runs currently in the active map. Surfaced in `/api/health`.
 pub fn active_count() -> usize {
-    store().lock().unwrap().len()
+    store_guard().len()
 }
 
 fn list_history(project_id: Option<&str>) -> Vec<WorkflowRun> {
@@ -1086,6 +1095,31 @@ mod tests {
                 active_count(),
                 baseline + 1,
                 "active_count should still include the aborted run"
+            );
+        });
+    }
+
+    /// A panic while holding the workflow store lock must not permanently brick the store.
+    /// `store_guard` recovers from a poisoned mutex so subsequent reads and writes keep working.
+    #[test]
+    fn store_guard_recovers_from_poisoned_mutex() {
+        with_tmp_workflows_file(|| {
+            // Ensure the store singleton is initialized.
+            drop(store().lock().unwrap());
+
+            let m = store();
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = m.lock().unwrap();
+                panic!("intentional workflow store mutex poison");
+            }));
+            assert!(poisoned.is_err(), "workflow store mutex should be poisoned");
+
+            // Recovery: both public ops and direct guard usage must return a usable store.
+            let count = active_count();
+            let guard = store_guard();
+            assert_eq!(
+                count, guard.len(),
+                "active_count and store_guard must agree after recovering from a poisoned mutex"
             );
         });
     }
