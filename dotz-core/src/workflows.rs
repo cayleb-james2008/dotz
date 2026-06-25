@@ -19,16 +19,17 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Mutex, OnceLock},
 };
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 // ---- types (port of WorkflowStep / WorkflowRun from types.ts, serde camelCase) ----
 
 /// Usage stats from the subagent run.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<f64>,
@@ -118,6 +119,65 @@ struct CreateStepInput {
 fn store() -> &'static Mutex<HashMap<String, WorkflowRun>> {
     static STORE: OnceLock<Mutex<HashMap<String, WorkflowRun>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ---- live workflow event broadcast (UI graph panel consumes {kind:"workflow", runId, event}) ----
+
+static EVENTS: OnceLock<broadcast::Sender<Value>> = OnceLock::new();
+
+fn events_tx() -> &'static broadcast::Sender<Value> {
+    EVENTS.get_or_init(|| broadcast::channel::<Value>(1024).0)
+}
+
+/// Subscribe to live workflow events. Every WebSocket fan-out calls this once per connection.
+pub fn subscribe_events() -> broadcast::Receiver<Value> {
+    events_tx().subscribe()
+}
+
+fn emit_event(run_id: &str, event: Value) {
+    let _ = events_tx().send(json!({
+        "kind": "workflow",
+        "runId": run_id,
+        "event": event,
+    }));
+}
+
+fn emit_workflow_start(run: &WorkflowRun) {
+    emit_event(&run.id, json!({ "type": "workflow_start", "run": run }));
+}
+
+fn emit_workflow_end(run: &WorkflowRun) {
+    emit_event(&run.id, json!({ "type": "workflow_end", "run": run }));
+}
+
+fn emit_step_state(run_id: &str, step: &WorkflowStep) {
+    let mut event = json!({
+        "type": "step_state",
+        "stepId": step.id,
+        "status": step.status,
+    });
+    if let Some(o) = &step.output {
+        event["output"] = json!(o);
+    }
+    if let Some(e) = &step.error {
+        event["error"] = json!(e);
+    }
+    if let Some(u) = &step.usage {
+        event["usage"] = json!(u);
+    }
+    if let Some(s) = &step.sandbox_run_id {
+        event["sandboxRunId"] = json!(s);
+    }
+    if let Some(b) = &step.browser_session_id {
+        event["browserSessionId"] = json!(b);
+    }
+    if let Some(t) = &step.tool_call_ids {
+        event["toolCallIds"] = json!(t);
+    }
+    if let Some(t) = &step.thinking {
+        event["thinking"] = json!(t);
+    }
+    emit_event(run_id, event);
 }
 
 /// Lock the workflow store, recovering from a poisoned lock. A panic while holding the store lock
@@ -373,6 +433,7 @@ fn start(id: &str) -> Option<WorkflowRun> {
         run.clone()
     };
     persist(&run);
+    emit_workflow_start(&run);
     Some(run)
 }
 
@@ -391,21 +452,28 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
         let mut active = store_guard();
         let run = active.get_mut(run_id)?;
         let now = now_ms();
+        let mut changed: HashSet<String> = HashSet::new();
 
         let step_idx = run.steps.iter().position(|s| s.id == step_id)?;
         {
             let step = &mut run.steps[step_idx];
             if let Some(s) = &patch.status {
-                step.status = s.clone();
+                if step.status != *s {
+                    changed.insert(step.id.clone());
+                    step.status = s.clone();
+                }
             }
-            if patch.output.is_some() {
+            if patch.output.is_some() && step.output != patch.output {
                 step.output = patch.output.clone();
+                changed.insert(step.id.clone());
             }
-            if patch.error.is_some() {
+            if patch.error.is_some() && step.error != patch.error {
                 step.error = patch.error.clone();
+                changed.insert(step.id.clone());
             }
-            if patch.usage.is_some() {
+            if patch.usage.is_some() && step.usage != patch.usage {
                 step.usage = patch.usage.clone();
+                changed.insert(step.id.clone());
             }
             if step.status == "running" && step.started_at.is_none() {
                 step.started_at = Some(now);
@@ -439,6 +507,7 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
                 });
                 if all_parents_done {
                     run.steps[ci].status = "ready".to_string();
+                    changed.insert(child_id);
                 }
             }
         }
@@ -454,6 +523,7 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
                         || run.steps[ci].status == "running"
                     {
                         run.steps[ci].status = "skipped".to_string();
+                        changed.insert(child_id);
                         if run.steps[ci].ended_at.is_none() {
                             run.steps[ci].ended_at = Some(now);
                         }
@@ -472,7 +542,7 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
             .steps
             .iter()
             .all(|s| s.status == "done" || s.status == "skipped");
-        if (step_status == "done" || step_status == "skipped")
+        let became_terminal = if (step_status == "done" || step_status == "skipped")
             && run.status != "aborted"
             && run.status != "error"
             && run.status != "done"
@@ -481,6 +551,7 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
             run.status = "done".to_string();
             run.ended_at = Some(now);
             run.updated_at = now;
+            true
         } else if step_status == "error" {
             // Mark the run errored on the FIRST transition to terminal, then sweep every still-runnable
             // step to "skipped" (mirroring abort) so a child of the errored step isn't left "pending".
@@ -490,6 +561,7 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
                 for s in run.steps.iter_mut() {
                     if s.status == "pending" || s.status == "ready" || s.status == "running" {
                         s.status = "skipped".to_string();
+                        changed.insert(s.id.clone());
                         if s.ended_at.is_none() {
                             s.ended_at = Some(now);
                         }
@@ -497,12 +569,24 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
                 }
             }
             run.updated_at = now;
-        }
+            run.status == "error" || run.status == "done" || run.status == "aborted"
+        } else {
+            false
+        };
 
-        run.clone()
+        let run = run.clone();
+        (run, changed, became_terminal)
     };
-    persist(&run_snapshot);
-    Some(run_snapshot)
+    persist(&run_snapshot.0);
+    for step in &run_snapshot.0.steps {
+        if run_snapshot.1.contains(&step.id) {
+            emit_step_state(run_id, step);
+        }
+    }
+    if run_snapshot.2 {
+        emit_workflow_end(&run_snapshot.0);
+    }
+    Some(run_snapshot.0)
 }
 
 /// Abort a run: mark aborted + sweep every non-terminal step to skipped.
@@ -511,21 +595,30 @@ fn abort(id: &str) -> Option<WorkflowRun> {
         let mut active = store_guard();
         let run = active.get_mut(id)?;
         let now = now_ms();
+        let mut changed: HashSet<String> = HashSet::new();
         run.status = "aborted".to_string();
         run.ended_at = Some(now);
         run.updated_at = now;
         for step in run.steps.iter_mut() {
             if step.status == "running" || step.status == "ready" || step.status == "pending" {
                 step.status = "skipped".to_string();
+                changed.insert(step.id.clone());
                 if step.ended_at.is_none() {
                     step.ended_at = Some(now);
                 }
             }
         }
-        run.clone()
+        let run = run.clone();
+        (run, changed)
     };
-    persist(&run);
-    Some(run)
+    persist(&run.0);
+    for step in &run.0.steps {
+        if run.1.contains(&step.id) {
+            emit_step_state(id, step);
+        }
+    }
+    emit_workflow_end(&run.0);
+    Some(run.0)
 }
 
 fn get_active(id: &str) -> Option<WorkflowRun> {
@@ -1121,6 +1214,123 @@ mod tests {
                 count, guard.len(),
                 "active_count and store_guard must agree after recovering from a poisoned mutex"
             );
+        });
+    }
+
+    /// Workflow mutations must broadcast live events so the UI graph panel updates without
+    /// polling. start → workflow_start, step_state → step_state, terminal transition → workflow_end.
+    #[test]
+    fn workflow_mutations_broadcast_live_events() {
+        with_tmp_workflows_file(|| {
+            let mut rx = subscribe_events();
+
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(0)])),
+            ];
+            let run = create(None, None, "events".into(), None, &inputs).unwrap();
+            let child_id = run.steps[1].id.clone();
+
+            // start() emits workflow_start.
+            let started = start(&run.id).unwrap();
+            let start_frame = rx.try_recv().expect("workflow_start event should be broadcast");
+            assert_eq!(start_frame["kind"], "workflow");
+            assert_eq!(start_frame["runId"], started.id);
+            assert_eq!(start_frame["event"]["type"], "workflow_start");
+            assert_eq!(start_frame["event"]["run"]["status"], "running");
+
+            // Completing the parent makes the child ready.
+            let parent_id = run.steps[0].id.clone();
+            let _ = step_state(
+                &run.id,
+                &parent_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("parent output".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let mut seen_parent = false;
+            let mut seen_child_ready = false;
+            while let Ok(frame) = rx.try_recv() {
+                if frame["event"]["type"] == "step_state" {
+                    if frame["event"]["stepId"] == parent_id {
+                        assert_eq!(frame["event"]["status"], "done");
+                        assert_eq!(frame["event"]["output"], "parent output");
+                        seen_parent = true;
+                    }
+                    if frame["event"]["stepId"] == child_id {
+                        assert_eq!(frame["event"]["status"], "ready");
+                        seen_child_ready = true;
+                    }
+                }
+            }
+            assert!(seen_parent, "parent step_state event should be broadcast");
+            assert!(
+                seen_child_ready,
+                "child ready event should be broadcast when parent completes"
+            );
+
+            // Completing the child finishes the run.
+            let _ = step_state(
+                &run.id,
+                &child_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let mut seen_child_done = false;
+            let mut seen_end = false;
+            while let Ok(frame) = rx.try_recv() {
+                if frame["event"]["type"] == "step_state"
+                    && frame["event"]["stepId"] == child_id
+                    && frame["event"]["status"] == "done"
+                {
+                    seen_child_done = true;
+                }
+                if frame["event"]["type"] == "workflow_end" {
+                    assert_eq!(frame["event"]["run"]["status"], "done");
+                    seen_end = true;
+                }
+            }
+            assert!(seen_child_done, "child done step_state should be broadcast");
+            assert!(seen_end, "workflow_end should be broadcast when run finishes");
+        });
+    }
+
+    /// abort() broadcasts step_state events for every swept step plus a workflow_end event so the
+    /// UI graph reflects the terminal state immediately.
+    #[test]
+    fn abort_broadcasts_sweep_and_end_events() {
+        with_tmp_workflows_file(|| {
+            let mut rx = subscribe_events();
+
+            let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(0)]))];
+            let run = create(None, None, "abort-events".into(), None, &inputs).unwrap();
+            let _ = start(&run.id).unwrap();
+            // Drain the workflow_start event.
+            let _ = rx.try_recv();
+
+            let updated = abort(&run.id).unwrap();
+            let mut swept = 0;
+            let mut seen_end = false;
+            while let Ok(frame) = rx.try_recv() {
+                if frame["event"]["type"] == "step_state" {
+                    assert_eq!(frame["event"]["status"], "skipped");
+                    swept += 1;
+                }
+                if frame["event"]["type"] == "workflow_end" {
+                    assert_eq!(frame["event"]["run"]["status"], "aborted");
+                    seen_end = true;
+                }
+            }
+            assert_eq!(swept, updated.steps.len(), "every swept step should emit step_state");
+            assert!(seen_end, "abort should emit workflow_end");
         });
     }
 }
