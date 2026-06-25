@@ -572,13 +572,21 @@ fn kill_pid(pid: Option<u32>) {
 
 /// Kill a running sandbox run by id, returning true if a live child was signalled. Shared by the
 /// REST kill endpoint and the WebSocket kill message so both paths behave identically.
+///
+/// The run is marked `killed` (and `endedAt` set) immediately so the UI reflects the operator
+/// action without waiting for the asynchronous exit path to reap the process. If the process
+/// has already exited, `finish` is a no-op; otherwise the cleanup path removes the temp dir as
+/// usual once the child reaps.
 pub fn kill_run_by_id(id: &str) -> bool {
     let pid = {
         let mut store = runs_guard();
         match store.get_mut(id) {
             Some(e) if e.pid.is_some() && e.run.status == "running" => {
                 e.killed_by_us = true;
-                e.pid
+                e.run.status = "killed".to_string();
+                e.run.ended_at = Some(now_ms());
+                e.run.output.push_str("\n[killed]\n");
+                e.pid.take()
             }
             _ => None,
         }
@@ -1177,6 +1185,94 @@ mod tests {
         }
 
         drop(listener);
+        {
+            let mut store = runs_guard();
+            store.remove(&id);
+        }
+    }
+
+    /// Killing a sandbox run must mark it `killed` immediately and set `endedAt`, instead of
+    /// leaving the entry as `running` until the asynchronous cleanup path finishes reaping the
+    /// child. The UI polls the run record and needs the terminal state to appear promptly.
+    #[tokio::test]
+    async fn kill_run_by_id_marks_run_killed_immediately_and_reaps_child() {
+        let id = uuid::Uuid::new_v4().to_string();
+
+        // Spawn a long-lived child so we have a real, killable pid to exercise the path.
+        let mut child = if cfg!(windows) {
+            tokio::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+                .spawn()
+                .expect("powershell should be available")
+        } else {
+            tokio::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("sleep should be available")
+        };
+        let pid = child.id().expect("child should have a pid");
+
+        {
+            let mut store = runs_guard();
+            store.insert(
+                id.clone(),
+                RunEntry {
+                    run: SandboxRun {
+                        id: id.clone(),
+                        project_id: None,
+                        language: "bash".to_string(),
+                        code: String::new(),
+                        status: "running".to_string(),
+                        output: String::new(),
+                        exit_code: None,
+                        started_at: now_ms(),
+                        ended_at: None,
+                    },
+                    pid: Some(pid),
+                    killed_by_us: false,
+                    mode: "terminal".to_string(),
+                    port: None,
+                },
+            );
+        }
+
+        assert!(
+            kill_run_by_id(&id),
+            "kill_run_by_id should signal a live run"
+        );
+
+        {
+            let store = runs_guard();
+            let entry = store.get(&id).expect("run entry should exist");
+            assert_eq!(
+                entry.run.status, "killed",
+                "run status must become 'killed' immediately"
+            );
+            assert!(
+                entry.run.ended_at.is_some(),
+                "endedAt must be set immediately"
+            );
+            assert!(
+                entry.pid.is_none(),
+                "pid must be cleared so the cleanup path does not double-kill"
+            );
+            assert!(
+                entry.run.output.contains("[killed]"),
+                "output should contain a killed marker"
+            );
+        }
+
+        // Reap the child; it should exit quickly after being killed.
+        let reaped = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            child.wait(),
+        )
+        .await;
+        assert!(
+            reaped.is_ok(),
+            "killed child process should exit within 5 seconds"
+        );
+
         {
             let mut store = runs_guard();
             store.remove(&id);
