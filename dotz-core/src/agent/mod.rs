@@ -429,6 +429,10 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
     let (close_tx, mut close_rx) =
         tokio::sync::mpsc::unbounded_channel::<Option<axum::extract::ws::CloseFrame>>();
 
+    // Reader → fan: respond to client Ping frames with a matching Pong. RFC 6455 requires
+    // this; some proxies/load-balancers drop connections that don't answer pings.
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+
     // Fan agent events (broadcast) → socket, plus periodic keep-alive pings. The ping keeps the
     // connection alive through proxies that drop idle sockets; browsers auto-pong in response.
     let ping_interval = ws_ping_interval();
@@ -441,6 +445,16 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                 biased;
                 _ = done2.cancelled() => break Some(None),
                 frame = close_rx.recv() => break Some(frame.unwrap_or(None)),
+                bytes = pong_rx.recv() => {
+                    match bytes {
+                        Some(b) => {
+                            if sink.send(WsMessage::Pong(b)).await.is_err() {
+                                break Some(None);
+                            }
+                        }
+                        None => break Some(None),
+                    }
+                }
                 _ = ping_tick.tick() => {
                     if sink.send(WsMessage::Ping(Bytes::new())).await.is_err() {
                         break Some(None);
@@ -482,6 +496,13 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                 };
                 let text = match msg {
                     WsMessage::Text(t) => t.to_string(),
+                    WsMessage::Ping(bytes) => {
+                        // RFC 6455: respond to client pings with a matching pong so the
+                        // connection stays alive through strict proxies/load-balancers.
+                        // Hand off to the fan task, which owns the sink.
+                        let _ = pong_tx.send(bytes);
+                        continue;
+                    }
                     WsMessage::Close(frame) => {
                         let _ = close_tx.send(frame);
                         break;
@@ -994,6 +1015,83 @@ mod tests {
         assert!(
             found_ping,
             "expected a WebSocket ping frame from the server"
+        );
+    }
+
+    /// A client Ping must be answered with a matching Pong (RFC 6455). Without this, strict
+    /// proxies/load-balancers may terminate the connection, and custom clients that send their
+    /// own keep-alive pings never get a response.
+    #[tokio::test]
+    async fn websocket_responds_to_client_ping_with_matching_pong() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        let _guard = WS_TEST_LOCK.lock().await;
+
+        // Disable server-side pings so the only frame after the ready is our pong echo.
+        let prev_interval = std::env::var("DOTZ_WS_PING_INTERVAL_MS").ok();
+        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "3600000");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(crate::server::serve_with_shutdown(
+            listener,
+            std::path::PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/sessions"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let summary = resp.json::<Value>().await.unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let url = format!("ws://127.0.0.1:{port}/ws?sessionId={sid}");
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(
+            ready.to_text().unwrap().contains("\"ready\""),
+            "first WS frame should be ready: {ready:?}"
+        );
+
+        // Send a ping with recognizable payload; the server must echo it back in a pong.
+        let ping_payload = Bytes::from_static(b"dotz-ping");
+        ws.send(Message::Ping(ping_payload.clone())).await.unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for pong")
+            .expect("websocket stream ended without pong")
+            .expect("websocket error while waiting for pong");
+        match response {
+            Message::Pong(payload) => assert_eq!(
+                payload, ping_payload,
+                "server pong must mirror the client ping payload"
+            ),
+            other => panic!("expected Pong in response to Ping, got: {other:?}"),
+        }
+
+        match prev_interval {
+            Some(p) => std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p),
+            None => std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS"),
+        }
+
+        let _ = tx.send(());
+        assert!(
+            handle.await.unwrap().is_ok(),
+            "server should shut down cleanly"
         );
     }
 
