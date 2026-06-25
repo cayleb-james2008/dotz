@@ -1166,7 +1166,7 @@ pub fn summary(id: &str) -> Option<Value> {
     get(id).map(|s| session_guard(&s).summary())
 }
 
-/// Models list for GET /api/sessions/:id/models — current + default + providers + providerMeta.
+/// Models list for GET /api/sessions/:id/models — current + default + providers + providerMeta + available catalog.
 pub fn models(id: &str) -> Option<Value> {
     let s = get(id)?;
     let g = session_guard(&s);
@@ -1175,7 +1175,7 @@ pub fn models(id: &str) -> Option<Value> {
         "current": { "provider": g.provider, "modelId": g.model_id, "name": g.model_id, "reasoning": true },
         "default": default,
         "providers": types::provider_ids(),
-        "available": [],
+        "available": types::available_models(),
         "providerMeta": types::providers(),
     }))
 }
@@ -1462,6 +1462,53 @@ mod tests {
         let updated = set_model(&sid, "ollama", "  ollama/glm-5.2  ").unwrap();
         assert_eq!(updated["model"]["provider"], "ollama");
         assert_eq!(updated["model"]["modelId"], "glm-5.2");
+        dispose(&sid);
+    }
+
+    /// `models()` must return a non-empty `available` catalog so the model selector can populate
+    /// dropdowns/datalists. Before the fix it always returned `[]`, leaving fixed-provider
+    /// selectors empty and free-form inputs without suggestions.
+    #[test]
+    fn models_response_includes_available_catalog() {
+        let summary = create(CreateOpts {
+            model: Some(types::ModelRef {
+                provider: "anthropic".into(),
+                model_id: "claude-3-5-sonnet-latest".into(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let resp = models(&sid).expect("models() should return a response for an active session");
+        let available = resp
+            .get("available")
+            .and_then(|v| v.as_array())
+            .expect("available must be an array");
+        assert!(
+            !available.is_empty(),
+            "available catalog must not be empty"
+        );
+        assert!(
+            available.iter().any(|v| {
+                v.get("provider").and_then(|p| p.as_str()) == Some("anthropic")
+            }),
+            "available must include anthropic entries for fixed-provider dropdowns"
+        );
+        assert!(
+            available.iter().any(|v| {
+                v.get("provider").and_then(|p| p.as_str()) == Some("ollama")
+            }),
+            "available must include ollama suggestions for free-form datalist"
+        );
+        // Each entry must carry the modelId field the UI consumes.
+        for entry in available {
+            assert!(
+                entry.get("modelId").and_then(|v| v.as_str()).is_some(),
+                "every catalog entry must have a modelId"
+            );
+        }
+
         dispose(&sid);
     }
 
