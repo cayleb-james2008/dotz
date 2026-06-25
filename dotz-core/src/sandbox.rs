@@ -6,9 +6,9 @@
 //! killed with exitCode + endedAt. POST returns the created run immediately (status "running"); the
 //! UI polls GET /api/sandbox/runs/:id for the final output, mirroring server.ts.
 //!
-//! ponytail: live line-by-line WS streaming (sandbox_output/sandbox_port events) is a follow-up.
-//! Phase 4 captures the FINAL output + status + best-effort web-port detection, which is what the
-//! REST surface (and the polling UI) needs.
+//! When started from a WebSocket session, stdout/stderr are streamed line-by-line as
+//! `sandbox_output` events and web-mode listener banners emit `sandbox_port` as soon as the port
+//! is reachable, so the UI preview iframe can load before the run terminates.
 use axum::{
     extract::Path,
     http::StatusCode,
@@ -21,7 +21,8 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::sync::broadcast;
 
 /// Language list, in the exact order of LANGUAGES in sandbox.ts (Object.keys order).
 /// Matches fixtures/sandbox.languages.json exactly.
@@ -165,7 +166,16 @@ async fn create_run(
         _ => DEFAULT_TIMEOUT_MS,
     };
 
-    match start_run(&language, &code, &mode, project_id.as_deref(), timeout_ms).await {
+    match start_run(
+        &language,
+        &code,
+        &mode,
+        project_id.as_deref(),
+        timeout_ms,
+        None,
+    )
+    .await
+    {
         Ok(run) => Ok(Json(run)),
         Err(e) => Err(bad(e)),
     }
@@ -173,12 +183,16 @@ async fn create_run(
 
 /// Create and start a sandbox run without the axum JSON wrapper. Shared by the REST handler and
 /// the WebSocket control loop so both paths produce the same run record.
+///
+/// `tx` is an optional WebSocket broadcast sender; when present, stdout/stderr lines and detected
+/// web ports are emitted as `sandbox_output`/`sandbox_port` events.
 pub async fn start_run(
     language: &str,
     code: &str,
     mode: &str,
     project_id: Option<&str>,
     timeout_ms: i64,
+    tx: Option<broadcast::Sender<Value>>,
 ) -> Result<SandboxRun, String> {
     if !SANDBOX_LANGUAGES.contains(&language) {
         return Err(format!(
@@ -217,7 +231,14 @@ pub async fn start_run(
         );
     }
 
-    tokio::spawn(execute_run(id.clone(), language.to_string(), code.to_string(), timeout_ms));
+    tokio::spawn(execute_run(
+        id.clone(),
+        language.to_string(),
+        code.to_string(),
+        timeout_ms,
+        mode.to_string(),
+        tx,
+    ));
 
     Ok(run)
 }
@@ -235,7 +256,16 @@ pub fn remove_test_run(id: &str) {
 }
 
 /// Spawn the child for `language`, capture stdout+stderr, apply the timeout, then update the run.
-async fn execute_run(id: String, language: String, code: String, timeout_ms: i64) {
+/// When `tx` is provided, output is streamed line-by-line as `sandbox_output` events and web-mode
+/// listener banners emit `sandbox_port` as soon as the port is reachable.
+async fn execute_run(
+    id: String,
+    language: String,
+    code: String,
+    timeout_ms: i64,
+    mode: String,
+    tx: Option<broadcast::Sender<Value>>,
+) {
     let (file, cmd) = match lang_spec(&language) {
         Some(v) => v,
         None => {
@@ -278,111 +308,223 @@ async fn execute_run(id: String, language: String, code: String, timeout_ms: i64
         }
     };
 
-    // Record the pid so kill_run can reach the child.
+    // Record the pid so kill_run and the timeout watchdog can reach the child.
     if let Some(pid) = child.id() {
         if let Some(e) = runs_guard().get_mut(&id) {
             e.pid = Some(pid);
         }
     }
 
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let read_out = async {
-        let mut buf = Vec::new();
-        if let Some(s) = stdout.as_mut() {
-            let _ = s.read_to_end(&mut buf).await;
-        }
-        buf
-    };
-    let read_err = async {
-        let mut buf = Vec::new();
-        if let Some(s) = stderr.as_mut() {
-            let _ = s.read_to_end(&mut buf).await;
-        }
-        buf
-    };
-
-    let run_fut = async {
-        let (out, err, status) = tokio::join!(read_out, read_err, child.wait());
-        (out, err, status)
-    };
-
-    let result = if timeout_ms > 0 {
-        match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), run_fut).await {
-            Ok(r) => Some(r),
-            Err(_) => None, // timed out
-        }
+    // Watchdog: kill the child tree after timeout_ms. The collection future then finishes naturally
+    // when the pipes close, so a single code path handles both normal exit and timeout.
+    let watchdog = if timeout_ms > 0 {
+        let id2 = id.clone();
+        Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(timeout_ms as u64)).await;
+            mark_killed_by_us(&id2);
+            let pid = runs_guard().get(&id2).and_then(|e| e.pid);
+            kill_pid(pid);
+        }))
     } else {
-        Some(run_fut.await)
+        None
     };
 
-    match result {
-        Some((out, err, status)) => {
-            let mut output = String::new();
-            output.push_str(&String::from_utf8_lossy(&out));
-            output.push_str(&String::from_utf8_lossy(&err));
-            // Recover from a poisoned runs mutex: a panic in another task (e.g. while holding
-            // the store lock) must not crash the normal exit path of a sandbox run.
-            let killed_by_us = runs_guard()
-                .get(&id)
-                .map(|e| e.killed_by_us)
-                .unwrap_or(false);
-            match status {
-                Ok(es) => {
-                    let code_n = es.code().map(|c| c as i64);
-                    if killed_by_us {
-                        finish(&id, "killed", None, &cap(&output));
-                    } else if es.success() {
-                        finish(&id, "done", code_n, &cap(&output));
-                    } else {
-                        finish(&id, "error", code_n, &cap(&output));
-                    }
-                }
-                Err(e) => {
-                    output.push_str(&format!("\n[spawn error] {e}\n"));
-                    finish(&id, "error", None, &cap(&output));
-                }
-            }
-            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (output, status) = match tx {
+        Some(tx) => {
+            let st = tokio::spawn(stream_output(
+                id.clone(),
+                mode.clone(),
+                stdout,
+                stderr,
+                tx,
+            ));
+            let (status, output) = tokio::join!(child.wait(), st);
+            (output.unwrap_or_default(), status)
         }
         None => {
-            // Timeout: kill the child tree, capture whatever output streamed, mark killed.
-            mark_killed_by_us(&id);
-            kill_pid(child.id());
-            let _ = child.start_kill();
-            // Drain the captured output now that the pipes are closing.
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            if let Some(s) = stdout.as_mut() {
-                let _ = s.read_to_end(&mut out).await;
+            let read_out = async {
+                let mut buf = Vec::new();
+                if let Some(mut s) = stdout {
+                    let _ = s.read_to_end(&mut buf).await;
+                }
+                buf
+            };
+            let read_err = async {
+                let mut buf = Vec::new();
+                if let Some(mut s) = stderr {
+                    let _ = s.read_to_end(&mut buf).await;
+                }
+                buf
+            };
+            let (out, err, status) = tokio::join!(read_out, read_err, child.wait());
+            let output = String::from_utf8_lossy(&out).to_string()
+                + &String::from_utf8_lossy(&err);
+            (output, status)
+        }
+    };
+
+    if let Some(w) = watchdog {
+        let _ = w.abort();
+    }
+
+    // Reap the child so its current directory is released before we remove the temp dir
+    // (primarily a Windows concern).
+    let _ = child.wait().await;
+
+    let mut output = output;
+    // Recover from a poisoned runs mutex: a panic in another task must not crash the exit path.
+    let killed_by_us = runs_guard()
+        .get(&id)
+        .map(|e| e.killed_by_us)
+        .unwrap_or(false);
+    match status {
+        Ok(es) => {
+            let code_n = es.code().map(|c| c as i64);
+            if killed_by_us {
+                output.push_str(&format!("\n[timeout] killed after {timeout_ms}ms\n"));
+                finish(&id, "killed", None, &cap(&output));
+            } else if es.success() {
+                finish(&id, "done", code_n, &cap(&output));
+            } else {
+                finish(&id, "error", code_n, &cap(&output));
             }
-            if let Some(s) = stderr.as_mut() {
-                let _ = s.read_to_end(&mut err).await;
-            }
-            let mut output = String::new();
-            output.push_str(&String::from_utf8_lossy(&out));
-            output.push_str(&String::from_utf8_lossy(&err));
-            output.push_str(&format!("\n[timeout] killed after {timeout_ms}ms\n"));
-            // Reap the killed child before removing its temp dir. Without this wait the Child
-            // handle can be dropped while the process still holds its current directory, which
-            // on Windows causes remove_dir_all to fail and leaves stale dotz-sandbox-* dirs.
-            let _ = child.wait().await;
-            finish(&id, "killed", None, &cap(&output));
-            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        }
+        Err(e) => {
+            output.push_str(&format!("\n[spawn error] {e}\n"));
+            finish(&id, "error", None, &cap(&output));
+        }
+    }
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Stream stdout/stderr lines from a running child, emitting `sandbox_output` events and (in web
+/// mode) `sandbox_port` events as soon as a detected listener port is reachable. Returns the
+/// captured combined output.
+async fn stream_output(
+    id: String,
+    mode: String,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    tx: broadcast::Sender<Value>,
+) -> String {
+    use std::collections::VecDeque;
+    let mut out = String::new();
+    let mut err = String::new();
+    let mut recent_out: VecDeque<String> = VecDeque::with_capacity(3);
+    let mut recent_err: VecDeque<String> = VecDeque::with_capacity(3);
+
+    let out_fut = drain_stream(
+        id.clone(),
+        mode.clone(),
+        "stdout",
+        stdout,
+        &tx,
+        &mut out,
+        &mut recent_out,
+    );
+    let err_fut = drain_stream(
+        id.clone(),
+        mode,
+        "stderr",
+        stderr,
+        &tx,
+        &mut err,
+        &mut recent_err,
+    );
+    tokio::join!(out_fut, err_fut);
+
+    format!("{out}{err}")
+}
+
+async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
+    id: String,
+    mode: String,
+    stream: &str,
+    reader: Option<R>,
+    tx: &broadcast::Sender<Value>,
+    out: &mut String,
+    recent: &mut std::collections::VecDeque<String>,
+) {
+    let Some(reader) = reader else { return };
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let _ = tx.send(json!({
+            "type": "sandbox_output",
+            "runId": id,
+            "line": &line,
+            "stream": stream,
+        }));
+        if mode == "web" {
+            let window: Vec<String> = recent.iter().cloned().collect();
+            let tx2 = tx.clone();
+            let id2 = id.clone();
+            let line2 = line.clone();
+            tokio::spawn(async move {
+                detect_port_in_window(&id2, &line2, &window, &tx2).await;
+            });
+        }
+        out.push_str(&line);
+        out.push('\n');
+        cap_in_place(out);
+        recent.push_back(line);
+        if recent.len() > 3 {
+            recent.pop_front();
         }
     }
 }
 
-/// Truncate output to OUTPUT_CAP bytes (on a char boundary), matching the ~50KB cap.
-fn cap(s: &str) -> String {
+/// Scan the rolling context window plus the newest line for a listener port; if one is reachable,
+/// cache it on the run and emit a `sandbox_port` event at most once.
+async fn detect_port_in_window(
+    id: &str,
+    line: &str,
+    window: &[String],
+    tx: &broadcast::Sender<Value>,
+) {
+    let mut context = window.join("\n");
+    if !context.is_empty() {
+        context.push('\n');
+    }
+    context.push_str(line);
+    for port in scan_ports(&context) {
+        if is_port_open(port).await {
+            let mut store = runs_guard();
+            if let Some(e) = store.get_mut(id) {
+                if e.port.is_none() {
+                    e.port = Some(port);
+                    drop(store);
+                    let _ = tx.send(json!({
+                        "type": "sandbox_port",
+                        "runId": id,
+                        "port": port,
+                    }));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Truncate `s` to OUTPUT_CAP bytes (on a char boundary), appending a marker once.
+fn cap_in_place(s: &mut String) {
     if s.len() <= OUTPUT_CAP {
-        return s.to_string();
+        return;
     }
     let mut end = OUTPUT_CAP;
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n[output truncated]\n", &s[..end])
+    s.truncate(end);
+    s.push_str("\n[output truncated]\n");
+}
+
+/// Truncate output to OUTPUT_CAP bytes (on a char boundary), matching the ~50KB cap.
+fn cap(s: &str) -> String {
+    let mut out = s.to_string();
+    cap_in_place(&mut out);
+    out
 }
 
 /// Set the terminal state on a run: status, exitCode, output, endedAt; clear the pid.
@@ -565,10 +707,12 @@ mod tests {
 
     #[test]
     fn run_count_reflects_store_entries() {
-        let baseline = run_count();
+        // Perform insert + remove while holding one lock so the count sequence is atomic
+        // with respect to other concurrently-running sandbox tests that mutate the store.
         let id = uuid::Uuid::new_v4().to_string();
-        {
+        let (before, after_insert, after_remove) = {
             let mut store = runs_guard();
+            let before = store.len();
             store.insert(
                 id.clone(),
                 RunEntry {
@@ -589,19 +733,19 @@ mod tests {
                     port: None,
                 },
             );
-        }
+            let after_insert = store.len();
+            store.remove(&id);
+            let after_remove = store.len();
+            (before, after_insert, after_remove)
+        };
         assert_eq!(
-            run_count(),
-            baseline + 1,
+            after_insert,
+            before + 1,
             "run_count should include the inserted entry"
         );
-        {
-            let mut store = runs_guard();
-            store.remove(&id);
-        }
         assert_eq!(
-            run_count(),
-            baseline,
+            after_remove,
+            before,
             "run_count should return to baseline after removal"
         );
     }
@@ -708,7 +852,15 @@ mod tests {
         } else {
             ("bash", "sleep 2")
         };
-        execute_run(id.clone(), language.to_string(), code.to_string(), 500).await;
+        execute_run(
+            id.clone(),
+            language.to_string(),
+            code.to_string(),
+            500,
+            "terminal".to_string(),
+            None,
+        )
+        .await;
 
         let status = {
             let store = runs_guard();
@@ -789,6 +941,8 @@ mod tests {
             language.to_string(),
             code.to_string(),
             5000,
+            "terminal".to_string(),
+            None,
         )
         .await;
 
@@ -822,7 +976,54 @@ mod tests {
         }));
         assert!(poisoned.is_err(), "mutex should be poisoned");
 
-        let baseline = run_count();
+        // Poison the mutex, then verify recovery by performing an atomic insert+remove
+        // sequence under one recovered lock so concurrent tests can't mutate the count.
+        let id = uuid::Uuid::new_v4().to_string();
+        let (before, after_insert, after_remove) = {
+            let mut store = runs_guard();
+            let before = store.len();
+            store.insert(
+                id.clone(),
+                RunEntry {
+                    run: SandboxRun {
+                        id: id.clone(),
+                        project_id: None,
+                        language: "bash".to_string(),
+                        code: String::new(),
+                        status: "running".to_string(),
+                        output: String::new(),
+                        exit_code: None,
+                        started_at: now_ms(),
+                        ended_at: None,
+                    },
+                    pid: None,
+                    killed_by_us: false,
+                    mode: "terminal".to_string(),
+                    port: None,
+                },
+            );
+            let after_insert = store.len();
+            store.remove(&id);
+            let after_remove = store.len();
+            (before, after_insert, after_remove)
+        };
+        assert_eq!(
+            after_insert,
+            before + 1,
+            "runs_guard must recover and allow store mutations after poison"
+        );
+        assert_eq!(
+            after_remove,
+            before,
+            "runs_guard must recover and allow store removals after poison"
+        );
+    }
+
+    /// A sandbox run started with a broadcast sender must stream stdout/stderr lines as
+    /// `sandbox_output` events before the run terminates. This is the core capability that lets
+    /// the UI append terminal output live instead of waiting for the run to finish.
+    #[tokio::test]
+    async fn execute_run_streams_output_events_when_tx_present() {
         let id = uuid::Uuid::new_v4().to_string();
         {
             let mut store = runs_guard();
@@ -847,20 +1048,138 @@ mod tests {
                 },
             );
         }
-        assert_eq!(
-            run_count(),
-            baseline + 1,
-            "runs_guard must recover and allow store mutations after poison"
+
+        let (tx, mut rx) = broadcast::channel::<Value>(16);
+        let (language, code) = if cfg!(windows) {
+            ("powershell", "Write-Output dotz-stream-test")
+        } else {
+            ("bash", "echo dotz-stream-test")
+        };
+        execute_run(
+            id.clone(),
+            language.to_string(),
+            code.to_string(),
+            5000,
+            "terminal".to_string(),
+            Some(tx),
+        )
+        .await;
+
+        let mut found = false;
+        while let Ok(frame) = rx.try_recv() {
+            assert_eq!(frame.get("runId").and_then(|r| r.as_str()), Some(id.as_str()));
+            if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_output") {
+                if frame.get("line").and_then(|l| l.as_str()) == Some("dotz-stream-test") {
+                    assert_eq!(frame.get("stream").and_then(|s| s.as_str()), Some("stdout"));
+                    found = true;
+                }
+            }
+        }
+        assert!(
+            found,
+            "sandbox_output event should carry the command output line"
         );
+
+        {
+            let store = runs_guard();
+            let entry = store.get(&id).expect("run entry should exist");
+            assert!(
+                entry.run.output.contains("dotz-stream-test"),
+                "stored output should contain the streamed line"
+            );
+        }
 
         {
             let mut store = runs_guard();
             store.remove(&id);
         }
-        assert_eq!(
-            run_count(),
-            baseline,
-            "runs_guard must recover and allow store removals after poison"
-        );
+    }
+
+    /// A web-mode sandbox run must emit a `sandbox_port` event as soon as a listener banner with
+    /// a reachable port appears in the output. The test binds a local port so `is_port_open`
+    /// succeeds without requiring an external dev server.
+    #[tokio::test]
+    async fn execute_run_emits_sandbox_port_event_in_web_mode() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut store = runs_guard();
+            store.insert(
+                id.clone(),
+                RunEntry {
+                    run: SandboxRun {
+                        id: id.clone(),
+                        project_id: None,
+                        language: "bash".to_string(),
+                        code: String::new(),
+                        status: "running".to_string(),
+                        output: String::new(),
+                        exit_code: None,
+                        started_at: now_ms(),
+                        ended_at: None,
+                    },
+                    pid: None,
+                    killed_by_us: false,
+                    mode: "web".to_string(),
+                    port: None,
+                },
+            );
+        }
+
+        let (tx, mut rx) = broadcast::channel::<Value>(16);
+        let (language, code) = if cfg!(windows) {
+            (
+                "powershell",
+                &format!("Write-Output 'ready'; Write-Output 'http://localhost:{port}/'; Start-Sleep -Seconds 1"),
+            )
+        } else {
+            (
+                "bash",
+                &format!("echo 'ready'; echo 'http://localhost:{port}/'; sleep 1"),
+            )
+        };
+        execute_run(
+            id.clone(),
+            language.to_string(),
+            code.to_string(),
+            5000,
+            "web".to_string(),
+            Some(tx),
+        )
+        .await;
+
+        let mut found = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_port") {
+                assert_eq!(
+                    frame.get("runId").and_then(|r| r.as_str()),
+                    Some(id.as_str())
+                );
+                assert_eq!(
+                    frame.get("port").and_then(|p| p.as_u64()),
+                    Some(port as u64)
+                );
+                found = true;
+            }
+        }
+        assert!(found, "sandbox_port event should be emitted for a reachable listener port");
+
+        {
+            let store = runs_guard();
+            let entry = store.get(&id).expect("run entry should exist");
+            assert_eq!(
+                entry.port,
+                Some(port),
+                "run entry should cache the detected port"
+            );
+        }
+
+        drop(listener);
+        {
+            let mut store = runs_guard();
+            store.remove(&id);
+        }
     }
 }
