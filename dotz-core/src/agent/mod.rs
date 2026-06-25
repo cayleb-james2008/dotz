@@ -56,6 +56,7 @@ async fn create_session(
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
 
     // Validate model shape (must be {provider, modelId} when present).
+    // Provider is normalized to lowercase so "Ollama" / "OPENROUTER" etc. are accepted.
     let model = match b.get("model") {
         None | Some(Value::Null) => None,
         Some(m) => {
@@ -63,24 +64,26 @@ async fn create_session(
                 .get("provider")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
-                .trim();
+                .trim()
+                .to_lowercase();
             let mid = m
                 .get("modelId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
-                .trim();
+                .trim()
+                .to_string();
             if prov.is_empty() || mid.is_empty() {
                 return Err(bad("model must be { provider, modelId }"));
             }
-            if !types::is_known_provider(prov) {
+            if !types::is_known_provider(&prov) {
                 return Err(bad(format!(
                     "provider must be one of: {}",
                     types::provider_ids().join(", ")
                 )));
             }
             Some(types::ModelRef {
-                provider: prov.to_string(),
-                model_id: mid.to_string(),
+                provider: prov,
+                model_id: mid,
             })
         }
     };
@@ -175,7 +178,7 @@ async fn post_model(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
-        .to_string();
+        .to_lowercase();
     let mid = b
         .get("modelId")
         .and_then(|v| v.as_str())
@@ -750,6 +753,20 @@ mod tests {
         session::dispose(&sid);
     }
 
+    /// Provider strings are case-insensitive at session creation: a mixed-case provider like
+    /// "Ollama" is accepted and stored as the canonical lowercase id.
+    #[tokio::test]
+    async fn create_session_accepts_uppercase_provider() {
+        let body = Json(json!({
+            "model": { "provider": "Ollama", "modelId": "glm-5.2" }
+        }));
+        let resp = create_session(Some(body)).await.unwrap();
+        let sid = resp.0["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(resp.0["model"]["provider"], "ollama");
+        assert_eq!(resp.0["model"]["modelId"], "glm-5.2");
+        session::dispose(&sid);
+    }
+
     /// A model id with a redundant provider prefix passed at session creation must be normalized
     /// to a bare id, matching the global config behavior.
     #[tokio::test]
@@ -778,6 +795,28 @@ mod tests {
         let body = Json(json!({
             "provider": "ollama",
             "modelId": "ollama/glm-5.2"
+        }));
+        let resp = post_model(axum::extract::Path(sid.clone()), Some(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.0["model"]["provider"], "ollama");
+        assert_eq!(resp.0["model"]["modelId"], "glm-5.2");
+
+        session::dispose(&sid);
+    }
+
+    /// Provider strings are case-insensitive in the model-update path: "Ollama" is accepted and
+    /// normalized to "ollama" so the UI/provider resolution does not fail on mixed-case input.
+    #[tokio::test]
+    async fn post_model_accepts_uppercase_provider() {
+        let create_resp = create_session(Some(Json(json!({}))))
+            .await
+            .unwrap();
+        let sid = create_resp.0["sessionId"].as_str().unwrap().to_string();
+
+        let body = Json(json!({
+            "provider": "Ollama",
+            "modelId": "glm-5.2"
         }));
         let resp = post_model(axum::extract::Path(sid.clone()), Some(body))
             .await
