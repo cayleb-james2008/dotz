@@ -127,11 +127,14 @@ pub fn render_low_cost_models() -> String {
 /// This fixes the common UI mistake of pasting a full "provider/model-id" string into the model
 /// field, which would otherwise be sent to the upstream API verbatim and fail. Prefixes that do
 /// not match the current provider are preserved so cross-provider model namespaces (e.g. an
-/// OpenRouter id that starts with "ollama/") are not corrupted.
+/// OpenRouter id that starts with "ollama/") are not corrupted. The provider segment is compared
+/// case-insensitively so "Ollama/glm-5.2" under provider "ollama" is normalized too.
 pub fn strip_matching_provider_prefix(provider: &str, model_id: &str) -> String {
     let trimmed = model_id.trim();
-    if let Some(rest) = trimmed.strip_prefix(&format!("{provider}/")) {
-        return rest.to_string();
+    if let Some(slash) = trimmed.find('/') {
+        if trimmed[..slash].eq_ignore_ascii_case(provider) {
+            return trimmed[slash + 1..].to_string();
+        }
     }
     trimmed.to_string()
 }
@@ -231,6 +234,21 @@ mod tests {
         assert_eq!(
             strip_matching_provider_prefix("ollama", "  ollama/glm-5.2  "),
             "glm-5.2"
+        );
+    }
+
+    /// A pasted model id may have a provider prefix in a different case (e.g. "Ollama/glm-5.2").
+    /// The prefix check is case-insensitive for the provider segment only, so the bare model id
+    /// still reaches the upstream API.
+    #[test]
+    fn strip_matching_provider_prefix_is_case_insensitive_for_provider_segment() {
+        assert_eq!(
+            strip_matching_provider_prefix("ollama", "Ollama/glm-5.2"),
+            "glm-5.2"
+        );
+        assert_eq!(
+            strip_matching_provider_prefix("openrouter", "OPENROUTER/nex-agi/nex-n2-pro:free"),
+            "nex-agi/nex-n2-pro:free"
         );
     }
 
