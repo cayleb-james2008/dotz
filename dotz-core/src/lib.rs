@@ -13,5 +13,6 @@ pub mod projects;
 pub mod sandbox;
 pub mod server;
 pub mod skills;
+pub mod templates;
 pub mod types;
 pub mod workflows;
