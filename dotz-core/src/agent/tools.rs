@@ -164,9 +164,13 @@ impl Tool for WriteTool {
         let content = str_arg(args, "content").unwrap_or("");
         let path = ctx.resolve_in_cwd(p)?;
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("create dir for {p}: {e}"))?;
         }
-        std::fs::write(&path, content).map_err(|e| format!("write {p}: {e}"))?;
+        tokio::fs::write(&path, content)
+            .await
+            .map_err(|e| format!("write {p}: {e}"))?;
         Ok(format!("wrote {} bytes to {p}", content.len()))
     }
 }
@@ -196,7 +200,9 @@ impl Tool for EditTool {
         let old = str_arg(args, "old_string").ok_or("old_string is required")?;
         let new = str_arg(args, "new_string").unwrap_or("");
         let path = ctx.resolve_in_cwd(p)?;
-        let content = std::fs::read_to_string(&path).map_err(|e| format!("read {p}: {e}"))?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| format!("read {p}: {e}"))?;
         let count = content.matches(old).count();
         if count == 0 {
             return Err(format!("old_string not found in {p}"));
@@ -205,7 +211,9 @@ impl Tool for EditTool {
             return Err(format!("old_string is not unique in {p} ({count} matches)"));
         }
         let updated = content.replacen(old, new, 1);
-        std::fs::write(&path, updated).map_err(|e| format!("write {p}: {e}"))?;
+        tokio::fs::write(&path, updated)
+            .await
+            .map_err(|e| format!("write {p}: {e}"))?;
         Ok(format!("edited {p}"))
     }
 }
@@ -1157,6 +1165,64 @@ mod tests {
             .await
             .unwrap();
         assert!(edited.contains("edited"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The `write` tool must create any missing parent directories asynchronously and write the
+    /// file so the agent can create deeply nested files in a single call. This exercises the
+    /// tokio::fs path introduced to avoid blocking the async runtime on directory creation and I/O.
+    #[tokio::test]
+    async fn write_tool_creates_nested_parent_directories_async() {
+        let base =
+            std::env::temp_dir().join(format!("dotz-write-nested-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["write".to_string(), "read".to_string(), "edit".to_string()]);
+        let ctx = ToolCtx {
+            cwd: base.clone(),
+            tx: None,
+        };
+
+        let out = registry
+            .run(
+                "write",
+                &json!({
+                    "file_path": "src/agent/nested/note.txt",
+                    "content": "nested hello"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("wrote"), "write should report success: {out}");
+
+        let text = registry
+            .run("read", &json!({"file_path": "src/agent/nested/note.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(text, "nested hello");
+
+        let edited = registry
+            .run(
+                "edit",
+                &json!({
+                    "file_path": "src/agent/nested/note.txt",
+                    "old_string": "nested hello",
+                    "new_string": "nested world"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(edited.contains("edited"), "edit should report success: {edited}");
+
+        let text = registry
+            .run("read", &json!({"file_path": "src/agent/nested/note.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(text, "nested world");
 
         let _ = std::fs::remove_dir_all(&base);
     }
