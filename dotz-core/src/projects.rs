@@ -124,19 +124,23 @@ fn is_non_empty_str(v: Option<&Value>) -> bool {
 }
 
 /// `m` is a valid ModelRef: an object with a known `provider` and non-empty `modelId`.
+/// Normalizes the provider to lowercase and strips a redundant "provider/" prefix from the
+/// model id so persisted project models match the session/config normalization and reach the
+/// upstream API as bare ids.
 fn parse_valid_model(v: &Value) -> Option<ModelRef> {
     let obj = v.as_object()?;
-    let provider = obj.get("provider")?.as_str()?;
+    let provider = obj.get("provider")?.as_str()?.trim().to_lowercase();
     let model_id = obj.get("modelId")?.as_str()?;
-    if provider.trim().is_empty() || model_id.trim().is_empty() {
+    if provider.is_empty() || model_id.trim().is_empty() {
         return None;
     }
-    if !types::is_known_provider(provider.trim()) {
+    if !types::is_known_provider(&provider) {
         return None;
     }
+    let model_id = types::strip_matching_provider_prefix(&provider, model_id);
     Some(ModelRef {
-        provider: provider.to_string(),
-        model_id: model_id.to_string(),
+        provider,
+        model_id,
     })
 }
 
@@ -868,6 +872,81 @@ mod tests {
             msg.contains("model must be a known provider"),
             "unexpected error: {msg}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// create_project must accept a mixed-case provider string and store it as the canonical
+    /// lowercase id. Without this normalization, sessions bound to the project resolve the
+    /// provider against lowercase endpoint metadata and fail to stream.
+    #[tokio::test]
+    async fn create_project_normalizes_uppercase_provider() {
+        let _g = with_tmp_projects_file();
+        let dir = std::env::temp_dir().join(format!(
+            "dotz-project-case-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let body = Json(json!({
+            "name": "case-test",
+            "cwd": dir.to_string_lossy(),
+            "model": { "provider": "Ollama", "modelId": "glm-5.2" }
+        }));
+        let created = create_project(Some(body)).await.unwrap().0;
+        assert_eq!(created["model"]["provider"], "ollama");
+        assert_eq!(created["model"]["modelId"], "glm-5.2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model id pasted with a redundant provider prefix must be normalized to a bare id so the
+    /// upstream API receives "glm-5.2" instead of "ollama/glm-5.2". Mismatched prefixes are
+    /// preserved so cross-provider namespaces are not corrupted.
+    #[tokio::test]
+    async fn create_project_normalizes_redundant_provider_prefix() {
+        let _g = with_tmp_projects_file();
+        let dir = std::env::temp_dir().join(format!(
+            "dotz-project-prefix-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let body = Json(json!({
+            "name": "prefix-test",
+            "cwd": dir.to_string_lossy(),
+            "model": { "provider": "ollama", "modelId": "ollama/glm-5.2" }
+        }));
+        let created = create_project(Some(body)).await.unwrap().0;
+        assert_eq!(created["model"]["provider"], "ollama");
+        assert_eq!(created["model"]["modelId"], "glm-5.2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// patch_project must apply the same model normalization as create_project.
+    #[tokio::test]
+    async fn patch_project_normalizes_model_case_and_prefix() {
+        let _g = with_tmp_projects_file();
+        let dir = std::env::temp_dir().join(format!(
+            "dotz-patch-normalize-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let create_body = Json(json!({
+            "name": "demo",
+            "cwd": dir.to_string_lossy(),
+        }));
+        let created = create_project(Some(create_body)).await.unwrap().0;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let patch_body = Json(json!({
+            "model": { "provider": "OpenRouter", "modelId": "openrouter/nex-agi/nex-n2-pro:free" }
+        }));
+        let patched = patch_project(Path(id), Some(patch_body)).await.unwrap().0;
+        assert_eq!(patched["model"]["provider"], "openrouter");
+        assert_eq!(patched["model"]["modelId"], "nex-agi/nex-n2-pro:free");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
