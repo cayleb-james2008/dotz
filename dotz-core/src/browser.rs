@@ -1329,6 +1329,11 @@ fn list() -> Vec<BrowserObservation> {
         .collect()
 }
 
+/// Number of active browser sessions. Surfaced in `/api/health`.
+pub fn session_count() -> usize {
+    sessions_guard().len()
+}
+
 /// frame(sessionId, afterSeq): the latest JPEG bytes + seq, or None when not newer than afterSeq.
 fn frame(session_id: &str, after_seq: i64) -> Option<(i64, Vec<u8>)> {
     let store = sessions_guard();
@@ -1905,6 +1910,58 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// `session_count` must reflect the number of active browser sessions so the `/api/health`
+    /// endpoint can surface live browser activity to the operator.
+    #[test]
+    fn session_count_reflects_active_sessions() {
+        let baseline = session_count();
+        let sid1 = format!("dotz-count-1-{}", uuid::Uuid::new_v4());
+        let sid2 = format!("dotz-count-2-{}", uuid::Uuid::new_v4());
+        let dir = std::env::temp_dir().join(format!("dotz-browser-count-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let mut store = sessions_guard();
+            store.insert(
+                sid1.clone(),
+                SessionRecord {
+                    profile_dir: dir.join("p1"),
+                    observation: fake_observation(&sid1),
+                    frame_data: None,
+                    disposed: false,
+                },
+            );
+            store.insert(
+                sid2.clone(),
+                SessionRecord {
+                    profile_dir: dir.join("p2"),
+                    observation: fake_observation(&sid2),
+                    frame_data: None,
+                    disposed: false,
+                },
+            );
+        }
+
+        assert_eq!(
+            session_count(),
+            baseline + 2,
+            "session_count should include the inserted browser sessions"
+        );
+
+        {
+            let mut store = sessions_guard();
+            store.remove(&sid1);
+            store.remove(&sid2);
+        }
+        assert_eq!(
+            session_count(),
+            baseline,
+            "session_count should return to baseline after removal"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn fake_observation(session_id: &str) -> BrowserObservation {

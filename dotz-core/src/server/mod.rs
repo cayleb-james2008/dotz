@@ -55,6 +55,7 @@ async fn health(State(_s): State<Shared>) -> Json<Value> {
         "sessions": crate::agent::session_count(),
         "sandboxRuns": crate::sandbox::run_count(),
         "workflowRuns": crate::workflows::active_count(),
+        "browserSessions": crate::browser::session_count(),
         "embedderReady": crate::embed::model_files_present(),
     }))
 }
@@ -307,6 +308,10 @@ mod tests {
         assert!(
             text.contains("\"workflowRuns\""),
             "health body missing workflowRuns field: {text}"
+        );
+        assert!(
+            text.contains("\"browserSessions\""),
+            "health body missing browserSessions field: {text}"
         );
         assert!(
             text.contains("\"embedderReady\""),
