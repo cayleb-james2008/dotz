@@ -96,9 +96,18 @@ fn runs() -> &'static Mutex<HashMap<String, RunEntry>> {
     RUNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Lock the sandbox runs mutex, recovering from a poisoned lock. A panic while holding the runs
+/// lock (e.g. inside a spawn callback or an I/O error path) must not permanently brick the sandbox
+/// REST endpoints, `/api/health`, or the WebSocket sandbox controls.
+fn runs_guard() -> std::sync::MutexGuard<'static, HashMap<String, RunEntry>> {
+    runs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Live sandbox run count, for the `/api/health` merge.
 pub fn run_count() -> usize {
-    runs().lock().unwrap().len()
+    runs_guard().len()
 }
 
 pub fn router() -> Router<()> {
@@ -115,13 +124,13 @@ async fn languages() -> Json<Value> {
 }
 
 async fn list_runs() -> Json<Value> {
-    let store = runs().lock().unwrap();
+    let store = runs_guard();
     let list: Vec<&SandboxRun> = store.values().map(|e| &e.run).collect();
     Json(json!({ "runs": list }))
 }
 
 async fn get_run(Path(id): Path<String>) -> Result<Json<SandboxRun>, (StatusCode, Json<Value>)> {
-    let store = runs().lock().unwrap();
+    let store = runs_guard();
     match store.get(&id) {
         Some(e) => Ok(Json(e.run.clone())),
         None => Err(not_found("no such sandbox run")),
@@ -195,7 +204,7 @@ pub async fn start_run(
     };
     let id = run.id.clone();
     {
-        let mut store = runs().lock().unwrap();
+        let mut store = runs_guard();
         store.insert(
             id.clone(),
             RunEntry {
@@ -215,14 +224,14 @@ pub async fn start_run(
 
 /// Look up a run by id. Used by the WebSocket loop to poll for terminal status.
 pub fn lookup(id: &str) -> Option<SandboxRun> {
-    runs().lock().unwrap().get(id).map(|e| e.run.clone())
+    runs_guard().get(id).map(|e| e.run.clone())
 }
 
 #[cfg(test)]
 /// Remove a run entry from the in-memory store. Test-only helper so WebSocket sandbox tests can
 /// clean up the process-global runs map.
 pub fn remove_test_run(id: &str) {
-    runs().lock().unwrap().remove(id);
+    runs_guard().remove(id);
 }
 
 /// Spawn the child for `language`, capture stdout+stderr, apply the timeout, then update the run.
@@ -271,7 +280,7 @@ async fn execute_run(id: String, language: String, code: String, timeout_ms: i64
 
     // Record the pid so kill_run can reach the child.
     if let Some(pid) = child.id() {
-        if let Some(e) = runs().lock().unwrap().get_mut(&id) {
+        if let Some(e) = runs_guard().get_mut(&id) {
             e.pid = Some(pid);
         }
     }
@@ -378,7 +387,7 @@ fn cap(s: &str) -> String {
 
 /// Set the terminal state on a run: status, exitCode, output, endedAt; clear the pid.
 fn finish(id: &str, status: &str, exit_code: Option<i64>, output: &str) {
-    if let Some(e) = runs().lock().unwrap().get_mut(id) {
+    if let Some(e) = runs_guard().get_mut(id) {
         // Don't clobber a run already moved to a terminal state (e.g. kill raced the timeout).
         if e.run.status != "running" {
             return;
@@ -392,7 +401,7 @@ fn finish(id: &str, status: &str, exit_code: Option<i64>, output: &str) {
 }
 
 fn mark_killed_by_us(id: &str) {
-    if let Some(e) = runs().lock().unwrap().get_mut(id) {
+    if let Some(e) = runs_guard().get_mut(id) {
         e.killed_by_us = true;
     }
 }
@@ -423,7 +432,7 @@ fn kill_pid(pid: Option<u32>) {
 /// REST kill endpoint and the WebSocket kill message so both paths behave identically.
 pub fn kill_run_by_id(id: &str) -> bool {
     let pid = {
-        let mut store = runs().lock().unwrap();
+        let mut store = runs_guard();
         match store.get_mut(id) {
             Some(e) if e.pid.is_some() && e.run.status == "running" => {
                 e.killed_by_us = true;
@@ -449,7 +458,7 @@ async fn kill_run(Path(id): Path<String>) -> Json<Value> {
 /// GET /api/sandbox/runs/:id/port — best-effort web port detection for mode:"web". 404 if none.
 async fn run_port(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let (output, mode, cached) = {
-        let store = runs().lock().unwrap();
+        let store = runs_guard();
         match store.get(&id) {
             Some(e) => (e.run.output.clone(), e.mode.clone(), e.port),
             None => return Err(not_found("no such sandbox run")),
@@ -466,7 +475,7 @@ async fn run_port(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Js
     // Scan the captured output for a listener banner, then TCP-probe the candidate.
     for cand in scan_ports(&output) {
         if is_port_open(cand).await {
-            if let Some(e) = runs().lock().unwrap().get_mut(&id) {
+            if let Some(e) = runs_guard().get_mut(&id) {
                 e.port = Some(cand);
             }
             return Ok(Json(json!({ "port": cand })));
@@ -559,7 +568,7 @@ mod tests {
         let baseline = run_count();
         let id = uuid::Uuid::new_v4().to_string();
         {
-            let mut store = runs().lock().unwrap();
+            let mut store = runs_guard();
             store.insert(
                 id.clone(),
                 RunEntry {
@@ -587,7 +596,7 @@ mod tests {
             "run_count should include the inserted entry"
         );
         {
-            let mut store = runs().lock().unwrap();
+            let mut store = runs_guard();
             store.remove(&id);
         }
         assert_eq!(
@@ -670,7 +679,7 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         let temp_dir = std::env::temp_dir().join(format!("dotz-sandbox-{id}"));
         {
-            let mut store = runs().lock().unwrap();
+            let mut store = runs_guard();
             store.insert(
                 id.clone(),
                 RunEntry {
@@ -702,7 +711,7 @@ mod tests {
         execute_run(id.clone(), language.to_string(), code.to_string(), 500).await;
 
         let status = {
-            let store = runs().lock().unwrap();
+            let store = runs_guard();
             let entry = store.get(&id).expect("run entry should exist");
             entry.run.status.clone()
         };
@@ -724,9 +733,67 @@ mod tests {
 
         // Be a good citizen: remove the terminal run entry and any leftover temp dir.
         {
-            let mut store = runs().lock().unwrap();
+            let mut store = runs_guard();
             store.remove(&id);
         }
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// A panic while holding the sandbox runs mutex (e.g. inside a spawn callback or an I/O
+    /// error path) must not permanently brick the sandbox REST endpoints, `/api/health`, or the
+    /// WebSocket sandbox controls. `runs_guard()` recovers from a poisoned lock so the store
+    /// remains usable.
+    #[test]
+    fn runs_guard_recovers_from_poisoned_mutex() {
+        // Ensure the singleton is initialized.
+        drop(runs().lock().unwrap());
+
+        let m = runs();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = m.lock().unwrap();
+            panic!("intentional sandbox runs mutex poison");
+        }));
+        assert!(poisoned.is_err(), "mutex should be poisoned");
+
+        let baseline = run_count();
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut store = runs_guard();
+            store.insert(
+                id.clone(),
+                RunEntry {
+                    run: SandboxRun {
+                        id: id.clone(),
+                        project_id: None,
+                        language: "bash".to_string(),
+                        code: String::new(),
+                        status: "running".to_string(),
+                        output: String::new(),
+                        exit_code: None,
+                        started_at: now_ms(),
+                        ended_at: None,
+                    },
+                    pid: None,
+                    killed_by_us: false,
+                    mode: "terminal".to_string(),
+                    port: None,
+                },
+            );
+        }
+        assert_eq!(
+            run_count(),
+            baseline + 1,
+            "runs_guard must recover and allow store mutations after poison"
+        );
+
+        {
+            let mut store = runs_guard();
+            store.remove(&id);
+        }
+        assert_eq!(
+            run_count(),
+            baseline,
+            "runs_guard must recover and allow store removals after poison"
+        );
     }
 }
