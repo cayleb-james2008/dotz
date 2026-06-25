@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-use crate::{profiles, skills, types};
+use crate::{profiles, projects, skills, types};
 
 fn bad(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     (
@@ -126,16 +126,30 @@ async fn create_session(
         }
     };
 
+    // Validate projectId: a present (non-null) id must reference an existing project so the
+    // session actually inherits the project's cwd/profile/model/thinking. Without this, the UI
+    // could bind a session to a deleted project and silently fall back to defaults.
+    let project_id = match b.get("projectId") {
+        None | Some(Value::Null) => None,
+        Some(p) => {
+            let pid = p.as_str().unwrap_or("").trim();
+            if pid.is_empty() {
+                return Err(bad("projectId must be a non-empty string"));
+            }
+            if projects::find(pid).is_none() {
+                return Err(bad(format!("no such project: {pid}")));
+            }
+            Some(pid.to_string())
+        }
+    };
+
     let opts = session::CreateOpts {
         cwd: b.get("cwd").and_then(|v| v.as_str()).map(String::from),
         model,
         thinking_level: thinking,
         tools,
         profile_id,
-        project_id: b
-            .get("projectId")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        project_id,
     };
     match session::create(opts) {
         Ok(summary) => Ok(Json(summary)),
@@ -1104,6 +1118,19 @@ mod tests {
         let sid = resp.0["sessionId"].as_str().unwrap().to_string();
         assert_eq!(resp.0["profileId"], "solo");
         session::dispose(&sid);
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_unknown_project_id() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = Json(json!({ "projectId": id }));
+        let err = create_session(Some(body)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let msg = err.1 .0["error"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("no such project"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// A connected WebSocket must close promptly when its session is disposed server-side.
