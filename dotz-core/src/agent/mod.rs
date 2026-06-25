@@ -298,14 +298,27 @@ fn prompt_commands_from_dir(dir: &std::path::Path) -> Vec<Value> {
 }
 
 /// Extract the `description:` value from a leading `--- ... ---` frontmatter block. Mirrors the
-/// simple `key: value` subset used by the bundled `.pi/prompts/*.md` files.
+/// simple `key: value` subset used by the bundled `.pi/prompts/*.md` files. Recognizes both LF
+/// and CRLF line endings so Windows-checked-out or user-edited prompt files keep their descriptions.
 fn parse_prompt_description(raw: &str) -> Option<String> {
     let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let after_open = raw
         .strip_prefix("---\n")
         .or_else(|| raw.strip_prefix("---\r\n"))?;
-    let close_idx = after_open.find("\n---")?;
+
+    // Closing fence: a line that is exactly `---` (LF or CRLF) or at EOF.
+    let close_idx = if after_open.starts_with("---\n")
+        || after_open.starts_with("---\r\n")
+        || after_open == "---"
+    {
+        0
+    } else {
+        after_open.find("\n---")?
+    };
+
+    // Normalize CRLF in the frontmatter content so key:value parsing sees clean LF lines.
     let fm = &after_open[..close_idx];
+    let fm = fm.replace("\r\n", "\n");
     for line in fm.lines() {
         let mut parts = line.splitn(2, ':');
         let key = parts.next()?.trim();
@@ -868,6 +881,38 @@ mod tests {
         assert_eq!(
             by_name.get("scout-and-plan").cloned().unwrap_or_default(),
             "Scout maps, planner plans"
+        );
+    }
+
+    /// CRLF line endings in a prompt file must not prevent description extraction. Before the fix,
+    /// `parse_prompt_description` searched for a literal `\n---` closing fence and treated CRLF
+    /// frontmatter as having no frontmatter at all.
+    #[test]
+    fn prompt_commands_from_dir_reads_crlf_frontmatter_description() {
+        let dir = std::env::temp_dir().join(format!("dotz-prompts-crlf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("windows-preset.md"),
+            "---\r\ndescription: A Windows-style preset\r\n---\r\nBody.\r\n",
+        )
+        .unwrap();
+
+        let cmds = prompt_commands_from_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let by_name: HashMap<String, String> = cmds
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v.get("name")?.as_str()?.to_string(),
+                    v.get("description")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            by_name.get("windows-preset").cloned().unwrap_or_default(),
+            "A Windows-style preset",
+            "CRLF frontmatter description must be extracted"
         );
     }
 
