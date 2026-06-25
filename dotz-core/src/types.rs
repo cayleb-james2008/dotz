@@ -149,6 +149,48 @@ pub fn provider_default(id: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// Curated model catalog surfaced to the UI for fixed-provider dropdowns and free-form
+/// provider datalist suggestions. Free-form providers (ollama/openrouter/local) get their
+/// known defaults + low-cost suggestions; fixed providers get a small set of common current
+/// model ids so the model selector is usable instead of empty.
+pub fn available_models() -> Vec<ModelRef> {
+    let mut out = Vec::new();
+
+    // Free-form provider suggestions (datalist). These model ids are validated by the upstream
+    // provider's catalog; the suggestions are the same ones dotz already recommends elsewhere.
+    out.extend(low_cost_models());
+    if let Some((exec, _sub)) = provider_default("local") {
+        out.push(ModelRef {
+            provider: "local".into(),
+            model_id: exec.into(),
+        });
+    }
+
+    // Fixed-provider dropdown entries. The UI hides the free-form input for these providers, so
+    // without a catalog the operator could not pick a model at all. These ids are the current
+    // flagship models for each provider; unknown ids are rejected by the upstream API, not by dotz.
+    let fixed: &[(&str, &[&str])] = &[
+        ("anthropic", &["claude-3-5-sonnet-latest", "claude-3-opus-latest", "claude-3-5-haiku-latest"]),
+        ("openai", &["gpt-4o", "gpt-4o-mini", "o3-mini"]),
+        ("google", &["gemini-1.5-pro-latest", "gemini-1.5-flash-latest"]),
+        ("groq", &["llama-3.3-70b-versatile", "mixtral-8x7b-32768"]),
+        ("mistral", &["mistral-large-latest", "mistral-small-latest"]),
+        ("xai", &["grok-2-1212", "grok-2-vision-1212"]),
+        ("deepseek", &["deepseek-chat", "deepseek-reasoner"]),
+        ("cohere", &["command-r", "command-r-plus"]),
+    ];
+    for (provider, ids) in fixed {
+        for id in *ids {
+            out.push(ModelRef {
+                provider: (*provider).into(),
+                model_id: (*id).into(),
+            });
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +362,51 @@ mod tests {
         assert!(rendered.contains("nex-agi/nex-n2-pro:free"));
         assert!(rendered.contains("Do NOT pass a `model` override"));
         assert!(rendered.contains("minimax-m3"));
+    }
+
+    /// The model catalog must expose entries for fixed providers so the UI can render a dropdown.
+    /// Without this, non-free-form providers (anthropic, openai, ...) show an empty selector.
+    #[test]
+    fn available_models_includes_fixed_provider_entries() {
+        let models = available_models();
+        assert!(
+            models.iter().any(|m| m.provider == "anthropic"),
+            "catalog must include anthropic models"
+        );
+        assert!(
+            models.iter().any(|m| m.provider == "openai"),
+            "catalog must include openai models"
+        );
+        assert!(
+            models.iter().any(|m| m.provider == "google"),
+            "catalog must include google models"
+        );
+        // Every entry must be a known provider.
+        for m in &models {
+            assert!(
+                is_known_provider(&m.provider),
+                "catalog entry {} is not a known provider",
+                m.provider
+            );
+        }
+    }
+
+    /// Free-form providers should still contribute suggestions to the datalist (their default
+    /// worker models), while fixed providers contribute dropdown entries. The UI filters by provider.
+    #[test]
+    fn available_models_includes_free_form_suggestions() {
+        let models = available_models();
+        assert!(
+            models.iter().any(|m| m.provider == "ollama"),
+            "catalog must include ollama suggestions"
+        );
+        assert!(
+            models.iter().any(|m| m.provider == "openrouter"),
+            "catalog must include openrouter suggestions"
+        );
+        assert!(
+            models.iter().any(|m| m.provider == "local"),
+            "catalog must include local suggestions"
+        );
     }
 }
