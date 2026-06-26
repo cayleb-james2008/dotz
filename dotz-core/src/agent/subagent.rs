@@ -17,6 +17,7 @@
 use super::event::{ContentBlock, Message};
 use super::provider::{self, ChatRequest, StreamDelta};
 use super::tools::{ToolCtx, ToolRegistry};
+use crate::context_bus::ContextBus;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -430,8 +431,9 @@ async fn run_single_agent(
     model_override: Option<&str>,
     cwd: &str,
     step: Option<usize>,
+    bus: Option<&ContextBus>,
 ) -> SingleResult {
-    run_single_agent_inner(agents, agent_name, task, model_override, cwd, step).await
+    run_single_agent_inner(agents, agent_name, task, model_override, cwd, step, bus).await
 }
 
 /// The actual subagent loop. The provider stream task is aborted on the wall-clock timeout so a
@@ -443,6 +445,7 @@ async fn run_single_agent_inner(
     model_override: Option<&str>,
     cwd: &str,
     step: Option<usize>,
+    bus: Option<&ContextBus>,
 ) -> SingleResult {
     let Some(agent) = agents.iter().find(|a| a.name == agent_name) else {
         return unknown_agent_result(agent_name, task, agents, step);
@@ -507,7 +510,13 @@ async fn run_single_agent_inner(
     };
 
     // Conversation history (rich Messages, like the executive session).
-    let mut history: Vec<Message> = vec![Message::user(&format!("Task: {task}"), now_ms())];
+    // Inject shared context from the inter-agent bus into the task prompt. When the
+    // bus is present and non-empty, the task is prepended with a compact JSON block of
+    // prior agent outputs so this subagent inherits scout findings / planner plans /
+    // reviewer gap-lists without re-reading the repo or parsing raw text.
+    let effective_task = bus.map(|b| crate::context_bus::inject_context_into_task(task, b))
+        .unwrap_or_else(|| task.to_string());
+    let mut history: Vec<Message> = vec![Message::user(&format!("Task: {effective_task}"), now_ms())];
 
     for _round in 0..MAX_ROUNDS {
         let messages = to_openai_messages(&system_prompt, &history);
@@ -641,6 +650,30 @@ pub async fn run_single_agent_public(
         model_override,
         cwd,
         None,
+        None,
+    )
+    .await
+}
+
+/// Public single-agent entry WITH a context bus. The workflow executor uses this so each
+/// subagent inherits shared context (scout findings, planner plans, reviewer gap-lists)
+/// and can read/write structured data on the bus.
+pub async fn run_single_agent_with_bus(
+    agent_name: &str,
+    task: &str,
+    model_override: Option<&str>,
+    cwd: &str,
+    bus: Option<&ContextBus>,
+) -> SingleResult {
+    let discovery = discover_agents(cwd, "user");
+    run_single_agent(
+        &discovery.agents,
+        agent_name,
+        task,
+        model_override,
+        cwd,
+        None,
+        bus,
     )
     .await
 }
@@ -843,19 +876,24 @@ pub fn parameters_schema() -> Value {
             "chain": { "type": "array", "items": task_item, "description": "Array of {agent, task} for sequential execution; use {previous} in a task for the prior step's output (max 16)" },
             "agentScope": { "type": "string", "enum": ["user", "project", "both"], "description": "Which agent dirs to use (default user; both to include project-local .pi/agents)" },
             "cwd": { "type": "string", "description": "Working directory (single mode)" },
-            "model": { "type": "string", "description": "Model override for single mode (provider/model-id)" }
+            "model": { "type": "string", "description": "Model override for single mode (provider/model-id)" },
+            "runId": { "type": "string", "description": "Workflow run id — when provided, the subagent inherits the shared context bus for that run (prior agent findings, plans, gap-lists)" }
         }
     })
 }
 
 /// Entry the `subagent` tool calls. Parses the tool args (single / parallel / chain), discovers
 /// agents for `cwd`, runs the selected mode, and assembles the result the workflow bridge reads.
+/// `run_id` is the workflow run this dispatch belongs to; when present, the shared context
+/// bus for that run is passed to each subagent so they inherit prior findings.
 pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
     let scope = args
         .get("agentScope")
         .and_then(|v| v.as_str())
         .unwrap_or("user")
         .to_string();
+    let run_id = args.get("runId").and_then(|v| v.as_str());
+    let bus = run_id.map(|id| ContextBus { run_id: id.to_string() });
     let discovery = discover_agents(cwd, &scope);
     let agents = discovery.agents;
     let project_agents_dir = discovery.project_agents_dir.clone();
@@ -920,7 +958,7 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
             // Substitute {previous} (literal replacement — no regex specials).
             let task = task_tmpl.replace("{previous}", &previous);
             let r =
-                run_single_agent(&agents, agent_name, &task, model, step_cwd, Some(i + 1)).await;
+                run_single_agent(&agents, agent_name, &task, model, step_cwd, Some(i + 1), bus.as_ref()).await;
             let failed = r.is_failed();
             results.push(r);
             if failed {
@@ -984,6 +1022,7 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
                 .map(|s| s.to_string());
             let agents = agents.clone();
             let sem = sem.clone();
+            let bus = bus.clone();
             set.spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 let r = run_single_agent(
@@ -993,6 +1032,7 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
                     model.as_deref(),
                     &task_cwd,
                     None,
+                    bus.as_ref(),
                 )
                 .await;
                 (idx, r)
@@ -1042,7 +1082,7 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
     let task = single_task.unwrap();
     let model = args.get("model").and_then(|v| v.as_str());
     let single_cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(cwd);
-    let r = run_single_agent(&agents, agent_name, task, model, single_cwd, None).await;
+    let r = run_single_agent(&agents, agent_name, task, model, single_cwd, None, bus.as_ref()).await;
     if r.is_failed() {
         let errmsg = r.result_output();
         let label = r.stop_reason.clone().unwrap_or_else(|| "failed".into());
@@ -1358,7 +1398,7 @@ mod tests {
         // wire we know the provider stream is hung and the timeout is actually being exercised.
         let mut run = tokio::spawn(async move {
             let agents = [agent];
-            run_single_agent(&agents, "test", "task", Some("local/test"), &cwd, None).await
+            run_single_agent(&agents, "test", "task", Some("local/test"), &cwd, None, None).await
         });
 
         tokio::select! {
@@ -1484,7 +1524,7 @@ mod tests {
 
         let mut run = tokio::spawn(async move {
             let agents = [agent];
-            run_single_agent(&agents, "test", "task", Some("local/test"), &cwd, None).await
+            run_single_agent(&agents, "test", "task", Some("local/test"), &cwd, None, None).await
         });
 
         tokio::select! {
