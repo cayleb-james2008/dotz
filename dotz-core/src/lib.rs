@@ -15,4 +15,5 @@ pub mod server;
 pub mod skills;
 pub mod templates;
 pub mod types;
+pub mod workflow_executor;
 pub mod workflows;
