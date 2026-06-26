@@ -17,7 +17,8 @@
 //!
 //! Bounded concurrency: a tokio Semaphore (default 4, configurable via DOTZ_WF_CONCURRENCY)
 //! gates how many steps execute in parallel, matching the subagent fan-out pool.
-use crate::agent::subagent::run_single_agent_public;
+use crate::agent::subagent::run_single_agent_with_bus;
+use crate::context_bus::ContextBus;
 use crate::workflows;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,6 +80,10 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
 
     // Mark started (emits workflow_start event).
     let _run = workflows::start(run_id)?;
+
+    // Create the shared context bus for this run. Subagents inherit it so scout findings,
+    // planner plans, and reviewer gap-lists flow between steps as structured data.
+    let bus = ContextBus::create(run_id);
 
     let sem = Arc::new(Semaphore::new(concurrency()));
     let cwd = std::env::current_dir()
@@ -160,11 +165,12 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
             let cwd = cwd.clone();
             let rid = run_id.to_string();
             let sid = step_id.clone();
+            let bus = bus.clone();
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 let result = tokio::time::timeout(
                     step_timeout(),
-                    run_single_agent_public(&agent, &task, None, &cwd),
+                    run_single_agent_with_bus(&agent, &task, None, &cwd, Some(&bus)),
                 )
                 .await;
 
@@ -214,6 +220,28 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
         // auto-repair children) will be picked up in the next loop iteration.
         for h in handles {
             let _ = h.await;
+        }
+
+        // Auto-populate the bus from completed steps' outputs so the NEXT batch of
+        // ready steps can read them via context_read without parsing raw text. We
+        // write under `step:<id>:output` (full text) and `step:<id>:summary` (first
+        // line) so downstream agents can choose granularity.
+        if let Some(run) = workflows::get_active(run_id) {
+            for step in &run.steps {
+                if step.status == "done" || step.status == "error" {
+                    if let Some(ref out) = step.output {
+                        bus.write(
+                            &format!("step:{}:output", step.id),
+                            serde_json::Value::String(out.clone()),
+                        );
+                        let summary = out.lines().next().unwrap_or("").to_string();
+                        bus.write(
+                            &format!("step:{}:summary", step.id),
+                            serde_json::Value::String(summary),
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -406,6 +434,108 @@ mod tests {
         // Both steps should be terminal: first is error, second is skipped.
         assert_eq!(run.steps[0].status, "error");
         assert_eq!(run.steps[1].status, "skipped");
+
+        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
+        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+    }
+
+    /// The context bus must auto-populate `step:<id>:output` and `step:<id>:summary`
+    /// entries for completed steps, so a downstream step can read prior results via
+    /// context_read without parsing raw text.
+    #[tokio::test]
+    async fn context_bus_auto_populates_from_completed_steps() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file = set_tmp_workflows_file();
+        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
+        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
+
+        // Two-step chain: step 0 is an unknown agent (errors), step 1 depends on step 0.
+        // The bus should contain step 0's output after the run completes.
+        let run = workflows::create(
+            None,
+            None,
+            "bus-pop".into(),
+            None,
+            3,
+            &[
+                step("dotz-bus-step-a", "alpha", None),
+                step("dotz-bus-step-b", "beta", Some(vec![json!(0)])),
+            ],
+        )
+        .unwrap();
+
+        let result = run_workflow(&run.id).await;
+        assert!(result.is_some());
+        let run = result.unwrap();
+
+        // Step 0 errored (unknown agent), step 1 was skipped.
+        assert_eq!(run.steps[0].status, "error");
+        assert_eq!(run.steps[1].status, "skipped");
+
+        // The executor creates the bus internally; read from it after the run.
+        // Auto-population happens inside the executor loop.
+        let bus = ContextBus { run_id: run.id.clone() };
+
+        // The bus must contain step 0's output and summary.
+        let step0_output_key = format!("step:{}:output", run.steps[0].id);
+        let step0_summary_key = format!("step:{}:summary", run.steps[0].id);
+        assert!(
+            bus.read(&step0_output_key).is_some(),
+            "bus should auto-populate step output key"
+        );
+        let summary = bus.read(&step0_summary_key);
+        assert!(
+            summary.is_some(),
+            "bus should auto-populate step summary key"
+        );
+        // Summary must be a single line (first line of the output).
+        let summary_str = summary.unwrap().as_str().unwrap().to_string();
+        assert!(
+            !summary_str.contains('\n'),
+            "summary should be a single line"
+        );
+
+        // Clean up.
+        ContextBus::destroy(&run.id);
+        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
+        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+    }
+
+    /// The context bus must survive run completion so callers can inspect it. The
+    /// caller is responsible for destroying it explicitly (bounded: one bus per run).
+    #[tokio::test]
+    async fn context_bus_persists_after_run_completion() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file = set_tmp_workflows_file();
+        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
+        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
+
+        let run = workflows::create(
+            None,
+            None,
+            "bus-persist".into(),
+            None,
+            3,
+            &[step("dotz-bus-persist", "do stuff", None)],
+        )
+        .unwrap();
+
+        let run_id = run.id.clone();
+        let result = run_workflow(&run_id).await;
+        assert!(result.is_some());
+
+        // The bus persists after completion — caller inspects, then destroys.
+        let bus = ContextBus { run_id: run_id.clone() };
+        assert!(
+            !bus.read_all().is_empty(),
+            "bus should persist and contain step data after run completion"
+        );
+        ContextBus::destroy(&run_id);
+        assert!(bus.read_all().is_empty(), "after destroy, bus should be empty");
 
         std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
         std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
