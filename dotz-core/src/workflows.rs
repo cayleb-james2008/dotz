@@ -113,22 +113,22 @@ pub struct WorkflowRun {
 // ---- create input (POST body steps) ----
 
 #[derive(Debug, Deserialize)]
-struct CreateStepInput {
-    agent: String,
-    task: String,
+pub struct CreateStepInput {
+    pub agent: String,
+    pub task: String,
     #[serde(default)]
-    parents: Option<Vec<Value>>,
+    pub parents: Option<Vec<Value>>,
     #[serde(rename = "sandboxRunId", default)]
-    sandbox_run_id: Option<String>,
+    pub sandbox_run_id: Option<String>,
     #[serde(rename = "browserSessionId", default)]
-    browser_session_id: Option<String>,
+    pub browser_session_id: Option<String>,
     #[serde(rename = "toolCallIds", default)]
-    tool_call_ids: Option<Vec<String>>,
+    pub tool_call_ids: Option<Vec<String>>,
     #[serde(default)]
-    thinking: Option<String>,
+    pub thinking: Option<String>,
     /// When true, a "done" transition with review findings auto-spawns a repair cycle.
     #[serde(rename = "autoRepair", default)]
-    auto_repair: bool,
+    pub auto_repair: bool,
 }
 
 // ---- module-level store (OnceLock<Mutex<..>>; mirrors the Node module-singleton) ----
@@ -323,11 +323,11 @@ fn prune_active(active: &mut HashMap<String, WorkflowRun>) {
 
 /// Marker for a cyclic submission (maps to a 400 in the POST handler).
 #[derive(Debug)]
-struct CycleError;
+pub struct CycleError;
 
 /// Create a new run with the given steps (parents/children resolved from inputs).
 /// Returns Err(CycleError) when the submitted steps form a cycle.
-fn create(
+pub fn create(
     project_id: Option<String>,
     session_id: Option<String>,
     label: String,
@@ -486,7 +486,7 @@ fn create(
 }
 
 /// Mark a run as started and persist the transition.
-fn start(id: &str) -> Option<WorkflowRun> {
+pub fn start(id: &str) -> Option<WorkflowRun> {
     let run = {
         let mut active = store_guard();
         let run = active.get_mut(id)?;
@@ -501,17 +501,17 @@ fn start(id: &str) -> Option<WorkflowRun> {
     Some(run)
 }
 
-/// A validated step-state patch (built by the POST handler).
+/// A validated step-state patch (built by the POST handler, also used by the workflow executor).
 #[derive(Default)]
-struct StepPatch {
-    status: Option<String>,
-    output: Option<String>,
-    error: Option<String>,
-    usage: Option<Usage>,
+pub struct StepPatch {
+    pub status: Option<String>,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub usage: Option<Usage>,
 }
 
 /// Update a step's state and propagate readiness to children. Returns the updated run (clone).
-fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowRun> {
+pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowRun> {
     let run_snapshot = {
         let mut active = store_guard();
         let run = active.get_mut(run_id)?;
@@ -736,7 +736,7 @@ fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<WorkflowR
 }
 
 /// Abort a run: mark aborted + sweep every non-terminal step to skipped.
-fn abort(id: &str) -> Option<WorkflowRun> {
+pub fn abort(id: &str) -> Option<WorkflowRun> {
     let run = {
         let mut active = store_guard();
         let run = active.get_mut(id)?;
@@ -767,7 +767,7 @@ fn abort(id: &str) -> Option<WorkflowRun> {
     Some(run.0)
 }
 
-fn get_active(id: &str) -> Option<WorkflowRun> {
+pub fn get_active(id: &str) -> Option<WorkflowRun> {
     store_guard().get(id).cloned()
 }
 
@@ -962,6 +962,24 @@ async fn abort_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCod
     Ok(Json(json!({ "ok": true })))
 }
 
+/// POST /api/workflows/:id/execute → drive the run to completion via real subagent dispatch.
+/// Returns { run: ... } with the final run state. 404 for unknown run.
+async fn execute_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // If the run is already terminal, return it directly without re-executing.
+    if let Some(run) = get_active(&id) {
+        if run.status == "done" || run.status == "error" || run.status == "aborted" {
+            return Ok(Json(json!({ "run": run })));
+        }
+    } else {
+        return Err(not_found("no such workflow run"));
+    }
+
+    match crate::workflow_executor::run_workflow(&id).await {
+        Some(run) => Ok(Json(json!({ "run": run }))),
+        None => Err(not_found("no such workflow run")),
+    }
+}
+
 // ---- helpers ----
 
 /// JSON value → Option<String>: a string stays, anything else (null/absent/number) becomes None.
@@ -977,7 +995,8 @@ fn not_found(msg: &str) -> (StatusCode, Json<Value>) {
     (StatusCode::NOT_FOUND, Json(json!({ "error": msg })))
 }
 
-/// Register the /api/workflows routes with stateless handlers.
+/// Register the /api/workflows routes with stateless handlers, including the executor
+/// endpoint that drives a run to completion via real subagent dispatch.
 pub fn router() -> Router<()> {
     Router::new()
         .route(
@@ -988,6 +1007,7 @@ pub fn router() -> Router<()> {
         .route("/api/workflows/{id}", get(get_handler))
         .route("/api/workflows/{id}/step", post(step_handler))
         .route("/api/workflows/{id}/abort", post(abort_handler))
+        .route("/api/workflows/{id}/execute", post(execute_handler))
 }
 
 #[cfg(test)]
@@ -1484,6 +1504,7 @@ mod tests {
 
             let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(0)]))];
             let run = create(None, None, "abort-events".into(), None, 3, &inputs).unwrap();
+            let run_id = run.id.clone();
             let _ = start(&run.id).unwrap();
             // Drain the workflow_start event.
             let _ = rx.try_recv();
@@ -1492,6 +1513,11 @@ mod tests {
             let mut swept = 0;
             let mut seen_end = false;
             while let Ok(frame) = rx.try_recv() {
+                // Filter by runId — the global workflow event channel carries events from
+                // every concurrent run (e.g. workflow_executor tests running in parallel).
+                if frame["runId"] != json!(run_id) {
+                    continue;
+                }
                 if frame["event"]["type"] == "step_state" {
                     assert_eq!(frame["event"]["status"], "skipped");
                     swept += 1;
