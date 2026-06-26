@@ -5,6 +5,7 @@ pub mod agent;
 pub mod browser;
 pub mod config;
 pub mod connections;
+pub mod context_bus;
 pub mod design;
 pub mod embed;
 pub mod memory;

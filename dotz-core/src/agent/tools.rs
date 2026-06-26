@@ -718,6 +718,8 @@ impl ToolRegistry {
         add(Box::new(BrowserStartTool));
         add(Box::new(BrowserActTool));
         add(Box::new(BrowserStopTool));
+        add(Box::new(crate::context_bus::ContextReadTool));
+        add(Box::new(crate::context_bus::ContextWriteTool));
         // The remaining pi tools: agents_md, create_agent/skill, rsi_baseline/compare, human_gate.
         super::extra_tools::register(&mut add);
 
@@ -743,6 +745,8 @@ impl ToolRegistry {
             "rsi_baseline",
             "rsi_compare",
             "human_gate",
+            "context_read",
+            "context_write",
         ]
         .into_iter()
         .map(String::from)
