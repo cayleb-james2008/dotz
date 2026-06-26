@@ -306,7 +306,7 @@ pub struct SubagentDetails {
 }
 
 impl SingleResult {
-    fn is_failed(&self) -> bool {
+    pub fn is_failed(&self) -> bool {
         self.exit_code != 0
             || self.stop_reason.as_deref() == Some("error")
             || self.stop_reason.as_deref() == Some("aborted")
@@ -314,7 +314,7 @@ impl SingleResult {
     }
 
     /// The final assistant text output (last assistant message's text blocks).
-    fn final_output(&self) -> String {
+    pub fn final_output(&self) -> String {
         for m in self.messages.iter().rev() {
             if m.get("role").and_then(|r| r.as_str()) == Some("assistant") {
                 if let Some(blocks) = m.get("content").and_then(|c| c.as_array()) {
@@ -334,7 +334,7 @@ impl SingleResult {
     }
 
     /// Output for assembly: error detail when failed, else the final assistant text.
-    fn result_output(&self) -> String {
+    pub fn result_output(&self) -> String {
         if self.is_failed() {
             return self
                 .error_message
