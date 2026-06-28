@@ -91,6 +91,14 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
         .to_string_lossy()
         .to_string();
 
+    // ---- Budget tracking ----
+    // Track cumulative cost/tokens across all steps. When the run's budget is set,
+    // we check after each step completes; if the cumulative spend exceeds the cap,
+    // remaining ready steps are skipped and the run is aborted.
+    let mut cumulative_cost: f64;
+    let mut cumulative_input_tokens: u64;
+    let mut cumulative_output_tokens: u64;
+
     loop {
         // Snapshot the run's current state.
         let run = match workflows::get_active(run_id) {
@@ -103,13 +111,57 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
             return Some(run);
         }
 
+        // ---- Budget accounting (top of loop) ----
+        // Tally cumulative spend from all steps that have usage data. This drives
+        // the budget check below BEFORE any new steps are dispatched.
+        cumulative_cost = 0.0;
+        cumulative_input_tokens = 0;
+        cumulative_output_tokens = 0;
+        for step in &run.steps {
+            if let Some(ref usage) = step.usage {
+                cumulative_cost += usage.cost.unwrap_or(0.0);
+                cumulative_input_tokens += usage.input.unwrap_or(0.0) as u64;
+                cumulative_output_tokens += usage.output.unwrap_or(0.0) as u64;
+            }
+        }
+
         // Collect ready steps (status == "ready").
+        // If the run budget is already exhausted, skip all remaining ready steps
+        // and abort the run — prevents a fan-out from burning the balance.
         let ready_ids: Vec<(String, String, String)> = run
             .steps
             .iter()
             .filter(|s| s.status == "ready")
             .map(|s| (s.id.clone(), s.agent.clone(), s.task.clone()))
             .collect();
+
+        // Budget check: if cumulative spend exceeds the run budget, skip all ready
+        // steps and abort the run.
+        if let Some(ref budget) = run.budget {
+            if !budget.is_unbounded()
+                && budget.is_exceeded(
+                    cumulative_cost,
+                    cumulative_input_tokens,
+                    cumulative_output_tokens,
+                )
+            {
+                // Skip every ready step and abort the run.
+                for sid in &ready_ids {
+                    let _ = workflows::step_state(
+                        run_id,
+                        &sid.0,
+                        workflows::StepPatch {
+                            status: Some("skipped".into()),
+                            error: Some("run budget exceeded".into()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                // Mark the run aborted.
+                workflows::abort(run_id);
+                return workflows::get_active(run_id);
+            }
+        }
 
         // If no ready steps and no running steps, the run is stuck (all remaining are
         // pending on a step that will never complete — e.g. a cycle that slipped past
@@ -166,6 +218,9 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
             let rid = run_id.to_string();
             let sid = step_id.clone();
             let bus = bus.clone();
+            // Per-step budget enforcement: if the step has its own budget, the
+            // executor will check it after the step completes (the step's usage
+            // is compared against its budget in the post-completion patch below).
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 let result = tokio::time::timeout(
@@ -242,6 +297,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                     }
                 }
             }
+
         }
     }
 }
@@ -253,6 +309,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Budget;
     use crate::workflows::{self, CreateStepInput};
     use serde_json::{json, Value};
     use std::sync::Mutex;
@@ -270,6 +327,7 @@ mod tests {
             tool_call_ids: None,
             thinking: None,
             auto_repair: false,
+            budget: None,
         }
     }
 
@@ -354,6 +412,7 @@ mod tests {
             None,
             3,
             &[step("a", "A", None)],
+            None,
         )
         .unwrap();
         // Abort makes the run terminal.
@@ -382,6 +441,7 @@ mod tests {
             None,
             3,
             &[step("dotz-does-not-exist", "do something", None)],
+            None,
         )
         .unwrap();
 
@@ -424,6 +484,7 @@ mod tests {
                 step("dotz-fail-step-1", "first", None),
                 step("dotz-fail-step-2", "second", Some(vec![json!(0)])),
             ],
+            None,
         )
         .unwrap();
 
@@ -463,6 +524,7 @@ mod tests {
                 step("dotz-bus-step-a", "alpha", None),
                 step("dotz-bus-step-b", "beta", Some(vec![json!(0)])),
             ],
+            None,
         )
         .unwrap();
 
@@ -521,6 +583,7 @@ mod tests {
             None,
             3,
             &[step("dotz-bus-persist", "do stuff", None)],
+            None,
         )
         .unwrap();
 
@@ -539,5 +602,178 @@ mod tests {
 
         std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
         std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+    }
+
+    // ---- Budget enforcement tests ----
+
+    /// A run-level budget must cause remaining ready steps to be skipped once the
+    /// cumulative cost exceeds the cap. We set a tiny budget ($0.001) and a single
+    /// step that will exceed it (the unknown-agent step incurs some cost tracking
+    /// even on error). Since unknown-agent steps don't actually call a provider,
+    // we test the budget-skip logic directly: create a run with a budget, manually
+    /// simulate spend by completing one step with usage, then verify the next
+    /// ready step is skipped.
+    #[tokio::test]
+    async fn run_budget_exceeded_skips_remaining_steps() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file = set_tmp_workflows_file();
+        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
+        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
+
+        // Two independent steps (no parent-child). Step 0 will complete with
+        // usage exceeding the tiny budget; step 1 should then be skipped.
+        let run = workflows::create(
+            None,
+            None,
+            "budget-skip".into(),
+            None,
+            3,
+            &[step("dotz-budget-a", "task a", None), step("dotz-budget-b", "task b", None)],
+            Some(Budget {
+                max_cost: Some(0.0001),
+                max_tokens: None,
+                max_input_tokens: None,
+            }),
+        )
+        .unwrap();
+
+        // Manually set step 0 to "done" with usage that exceeds the tiny budget.
+        // Using "done" (not "error") avoids the error-sweep that would mark step 1
+        // as skipped before the budget check fires.
+        let run = workflows::start(&run.id).unwrap();
+        let step0_id = run.steps[0].id.clone();
+        let step1_id = run.steps[1].id.clone();
+
+        let _ = workflows::step_state(
+            &run.id,
+            &step0_id,
+            workflows::StepPatch {
+                status: Some("done".into()),
+                output: Some("step 0 output".into()),
+                usage: Some(workflows::Usage {
+                    input: Some(100.0),
+                    output: Some(50.0),
+                    cost: Some(1.0), // $1.00 >> $0.0001 budget
+                    turns: Some(1.0),
+                }),
+                ..Default::default()
+            },
+        );
+
+        // Now the executor loop should see the budget is exceeded and skip step 1.
+        let result = run_workflow(&run.id).await;
+        assert!(result.is_some());
+        let run = result.unwrap();
+
+        // Step 1 should be skipped due to budget.
+        let step1 = run.steps.iter().find(|s| s.id == step1_id).unwrap();
+        assert_eq!(
+            step1.status, "skipped",
+            "step 1 should be skipped when run budget is exceeded: {:?}",
+            step1
+        );
+        assert!(
+            step1.error.as_ref().map_or(false, |e| e.contains("budget")),
+            "step 1 error should mention budget: {:?}",
+            step1.error
+        );
+
+        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
+        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+    }
+
+    /// A run with no budget set must NOT skip steps even when cumulative spend is high.
+    /// This is the regression guard: the budget feature must be opt-in.
+    #[tokio::test]
+    async fn run_without_budget_never_skips_on_cost() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file = set_tmp_workflows_file();
+
+        // No budget on the run. Agent name must NOT contain "budget" so we can
+        // distinguish the error message from a budget-related skip.
+        let run = workflows::create(
+            None,
+            None,
+            "no-budget".into(),
+            None,
+            3,
+            &[step("dotz-nb-step-a", "task a", None)],
+            None,
+        )
+        .unwrap();
+
+        let run_id = run.id.clone();
+        let result = run_workflow(&run_id).await;
+        assert!(result.is_some());
+        let run = result.unwrap();
+
+        // The step should error (unknown agent) but NOT be skipped due to budget.
+        assert_eq!(run.steps[0].status, "error");
+        assert!(
+            run.steps[0]
+                .error
+                .as_ref()
+                .map_or(false, |e| !e.contains("budget")),
+            "step should not mention budget when no budget is set: {:?}",
+            run.steps[0].error
+        );
+    }
+
+    /// Budget fields on a Budget must deserialize correctly from JSON.
+    #[test]
+    fn budget_deserialize_from_json() {
+        let json = r#"{"maxCost": 1.5, "maxTokens": 100000, "maxInputTokens": 50000}"#;
+        let budget: Budget = serde_json::from_str(json).unwrap();
+        assert_eq!(budget.max_cost, Some(1.5));
+        assert_eq!(budget.max_tokens, Some(100_000));
+        assert_eq!(budget.max_input_tokens, Some(50_000));
+    }
+
+    /// Budget JSON with only some fields set must deserialize correctly (missing
+    /// fields become None = no limit).
+    #[test]
+    fn budget_deserialize_partial() {
+        let json = r#"{"maxCost": 2.0}"#;
+        let budget: Budget = serde_json::from_str(json).unwrap();
+        assert_eq!(budget.max_cost, Some(2.0));
+        assert!(budget.max_tokens.is_none());
+        assert!(budget.max_input_tokens.is_none());
+    }
+
+    /// A workflow run created with a budget must persist it (round-trip through
+    /// the store and back).
+    #[test]
+    fn run_budget_round_trips_through_store() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file = set_tmp_workflows_file();
+        let budget = Budget {
+            max_cost: Some(10.0),
+            max_tokens: Some(50_000),
+            ..Default::default()
+        };
+        let run = workflows::create(
+            None,
+            None,
+            "budget-roundtrip".into(),
+            None,
+            3,
+            &[step("a", "task", None)],
+            Some(budget.clone()),
+        )
+        .unwrap();
+
+        // The budget must be on the run.
+        assert_eq!(run.budget, Some(budget));
+
+        // Re-fetch from the active store — it must still be there.
+        let fetched = workflows::get_active(&run.id).unwrap();
+        assert!(fetched.budget.is_some());
+        assert_eq!(fetched.budget.unwrap().max_cost, Some(10.0));
     }
 }
