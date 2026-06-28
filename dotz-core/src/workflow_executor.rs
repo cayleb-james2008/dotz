@@ -85,6 +85,24 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
     // planner plans, and reviewer gap-lists flow between steps as structured data.
     let bus = ContextBus::create(run_id);
 
+    // ---- Resume: pre-populate the bus from completed-step outputs ----
+    // On server restart the in-memory bus is gone (it lived only in the prior process).
+    // The executor's auto-population path (bottom of the loop) only writes outputs for
+    // steps that complete during THIS session. Without preloading, a resumed run's
+    // downstream steps lose every prior agent's findings/plans/gap-lists — the
+    // subagent reads an empty bus and starts from scratch. Replay every terminal
+    // step's output onto the bus so the resumed run sees the same context a
+    // non-interrupted run would have.
+    if let Some(run) = workflows::get_active(run_id) {
+        let has_completed = run
+            .steps
+            .iter()
+            .any(|s| s.status == "done" || s.status == "error");
+        if has_completed {
+            bus.preload_from_run(&run);
+        }
+    }
+
     let sem = Arc::new(Semaphore::new(concurrency()));
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
@@ -602,6 +620,168 @@ mod tests {
         ContextBus::destroy(&run_id);
         assert!(bus.read_all().is_empty(), "after destroy, bus should be empty");
 
+        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
+        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+    }
+
+    /// On resume, the executor must pre-populate the fresh context bus from
+    /// completed steps' outputs so downstream subagents see prior agent data
+    /// (scout findings, planner plans, reviewer gap-lists) — the same data
+    /// they would have seen without a restart. Without this, a resumed run's
+    /// worker step reads an empty bus and starts from scratch.
+    #[tokio::test]
+    async fn run_workflow_preloads_context_bus_on_resume() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file = set_tmp_workflows_file();
+        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
+        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
+
+        // Two-step chain: step 0 (unknown agent) will error, step 1 depends on step 0.
+        // After step 0 errors, step 1 is skipped. The bus should contain step 0's
+        // output after the run completes.
+        let run = workflows::create(
+            None,
+            None,
+            "resume-bus-prepop".into(),
+            None,
+            3,
+            &[
+                step("dotz-bus-step-0", "alpha", None),
+                step("dotz-bus-step-1", "beta", Some(vec![json!(0)])),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let run_id = run.id.clone();
+        let step0_id = run.steps[0].id.clone();
+
+        // Manually complete step 0 with output (simulating a step that finished
+        // before the server shut down).
+        let run = workflows::start(&run_id).unwrap();
+        let _ = workflows::step_state(
+            &run_id,
+            &step0_id,
+            workflows::StepPatch {
+                status: Some("done".into()),
+                output: Some("scout found 42 files in src/".into()),
+                ..Default::default()
+            },
+        );
+
+        // Step 1 should now be ready (parent done). Complete it too.
+        let step1_id = run.steps[1].id.clone();
+        let run = workflows::get_active(&run_id).unwrap();
+        assert_eq!(run.steps[1].status, "ready");
+        let _ = workflows::step_state(
+            &run_id,
+            &step1_id,
+            workflows::StepPatch {
+                status: Some("done".into()),
+                output: Some("plan complete".into()),
+                ..Default::default()
+            },
+        );
+
+        // Run is now done. Destroy the bus (simulates shutdown).
+        ContextBus::destroy(&run_id);
+
+        // Now create a NEW run with TWO steps: step 0 completes before
+        // shutdown, step 1 was running at shutdown (interrupted). This is
+        // the real resume scenario: some steps finished, some were in-flight.
+        let run2 = workflows::create(
+            None,
+            None,
+            "resume-bus-prepop-2".into(),
+            None,
+            3,
+            &[
+                step("dotz-bus-step-resume-done", "done task", None),
+                step("dotz-bus-step-resume-running", "running task", Some(vec![json!(0)])),
+            ],
+            None,
+        )
+        .unwrap();
+        let run2_id = run2.id.clone();
+        let run2_step0_id = run2.steps[0].id.clone();
+        let run2_step1_id = run2.steps[1].id.clone();
+
+        // Mark step 0 as done with output, step 1 as running, then mark
+        // interrupted (simulates shutdown mid-flight).
+        let run2 = workflows::start(&run2_id).unwrap();
+        let _ = workflows::step_state(
+            &run2_id,
+            &run2_step0_id,
+            workflows::StepPatch {
+                status: Some("done".into()),
+                output: Some("pre-shutdown scout results".into()),
+                ..Default::default()
+            },
+        );
+        // Mark step 1 as running (simulates the executor picking it up).
+        let _ = workflows::step_state(
+            &run2_id,
+            &run2_step1_id,
+            workflows::StepPatch {
+                status: Some("running".into()),
+                ..Default::default()
+            },
+        );
+        // Mark interrupted (this is what startup_resume does) — step 1
+        // becomes interrupted, step 0 stays done.
+        let _ = workflows::mark_interrupted(&run2_id);
+
+        // Destroy the bus (simulates shutdown destroying the in-memory bus).
+        ContextBus::destroy(&run2_id);
+
+        // Call run_workflow — this is what resume() does. The executor should
+        // pre-populate the bus from the completed step's output.
+        let result = run_workflow(&run2_id).await;
+        assert!(result.is_some());
+
+        // The bus must contain step 0's output (completed before shutdown)
+        // AND step 1's key must NOT exist (it was interrupted, not done).
+        let bus = ContextBus { run_id: run2_id.clone() };
+        let output_key = format!("step:{}:output", run2_step0_id);
+        let loaded = bus.read(&output_key);
+        assert!(
+            loaded.is_some(),
+            "bus should contain completed step output after resume"
+        );
+        assert_eq!(
+            loaded.unwrap().as_str().unwrap(),
+            "pre-shutdown scout results",
+            "preloaded output must match the step's persisted output"
+        );
+
+        // The summary key must also be present.
+        let summary_key = format!("step:{}:summary", run2_step0_id);
+        let summary = bus.read(&summary_key);
+        assert!(
+            summary.is_some(),
+            "bus should contain completed step summary after resume"
+        );
+        assert_eq!(
+            summary.unwrap().as_str().unwrap(),
+            "pre-shutdown scout results",
+            "preloaded summary must be the first line of the output"
+        );
+
+        // Step 1 was interrupted, then re-executed by the executor, so its
+        // output IS on the bus now (from the executor's auto-population).
+        // The key assertion is that step 0's preloaded output (from BEFORE
+        // shutdown) is present — that's what the resume scenario needs.
+        let step1_key = format!("step:{}:output", run2_step1_id);
+        assert!(
+            bus.read(&step1_key).is_some(),
+            "step 1 was re-executed and auto-populated by the executor"
+        );
+
+        // Clean up.
+        ContextBus::destroy(&run_id);
+        ContextBus::destroy(&run2_id);
         std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
         std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
     }
