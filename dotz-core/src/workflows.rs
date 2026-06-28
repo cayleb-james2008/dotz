@@ -10,6 +10,7 @@
 //! `<dotz_dir>/ai-agents/workflows.json` (same path Node uses), honoring DOTZ_CONFIG_DIR via
 //! `crate::config::dotz_dir()`.
 use crate::config::dotz_dir;
+use crate::types::Budget;
 use axum::{
     extract::{Path, Query},
     http::StatusCode,
@@ -78,6 +79,18 @@ pub struct WorkflowStep {
     /// Surfaced so the UI can render "repair round 2/3" on the step badge.
     #[serde(rename = "repairRound", default)]
     pub repair_round: u32,
+    /// Per-step budget: when set, the executor aborts or downgrades the step before it
+    /// can exceed the cost/token limits. A step's budget is consumed from the run's
+    /// budget pool (when both are set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
+    /// Cumulative cost actually consumed by this step (set at completion). Surfaced in
+    /// the UI brain float so the operator can see per-step spend after a fan-out.
+    #[serde(rename = "actualCost", skip_serializing_if = "Option::is_none")]
+    pub actual_cost: Option<f64>,
+    /// Cumulative total tokens actually consumed by this step (set at completion).
+    #[serde(rename = "actualTokens", skip_serializing_if = "Option::is_none")]
+    pub actual_tokens: Option<u64>,
 }
 
 /// A workflow run — a DAG of steps, observable by the UI.
@@ -108,6 +121,18 @@ pub struct WorkflowRun {
     /// Current repair-round counter, incremented each time a review step spawns a repair pair.
     #[serde(rename = "repairRounds", default)]
     pub repair_rounds: u32,
+    /// Per-run budget: the cap on cumulative cost/tokens across ALL steps in this run.
+    /// When the run's cumulative spend exceeds this, remaining ready steps are skipped
+    /// and the run is aborted. Prevents a fan-out from burning the provider balance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
+    /// Cumulative cost actually consumed across all steps so far (set incrementally
+    /// as each step completes). Surfaced in the brain float.
+    #[serde(rename = "actualCost", skip_serializing_if = "Option::is_none")]
+    pub actual_cost: Option<f64>,
+    /// Cumulative total tokens consumed across all steps so far.
+    #[serde(rename = "actualTokens", skip_serializing_if = "Option::is_none")]
+    pub actual_tokens: Option<u64>,
 }
 
 // ---- create input (POST body steps) ----
@@ -129,6 +154,10 @@ pub struct CreateStepInput {
     /// When true, a "done" transition with review findings auto-spawns a repair cycle.
     #[serde(rename = "autoRepair", default)]
     pub auto_repair: bool,
+    /// Per-step budget: cost/token limits for this individual step only. When set, the
+    /// executor aborts or downgrades the step before it can exceed these limits.
+    #[serde(default)]
+    pub budget: Option<Budget>,
 }
 
 // ---- module-level store (OnceLock<Mutex<..>>; mirrors the Node module-singleton) ----
@@ -334,6 +363,7 @@ pub fn create(
     origin: Option<String>,
     max_repair_rounds: u32,
     inputs: &[CreateStepInput],
+    run_budget: Option<Budget>,
 ) -> Result<WorkflowRun, CycleError> {
     let now = now_ms();
 
@@ -361,6 +391,9 @@ pub fn create(
             ended_at: None,
             auto_repair: s.auto_repair,
             repair_round: 0,
+            budget: s.budget.clone(),
+            actual_cost: None,
+            actual_tokens: None,
         })
         .collect();
 
@@ -474,6 +507,9 @@ pub fn create(
         ended_at: None,
         max_repair_rounds,
         repair_rounds: 0,
+        budget: run_budget,
+        actual_cost: None,
+        actual_tokens: None,
     };
 
     {
@@ -621,6 +657,9 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
                     ended_at: None,
                     auto_repair: false,
                     repair_round: next_round,
+                    budget: None,
+                    actual_cost: None,
+                    actual_tokens: None,
                 };
                 let re_review_step = WorkflowStep {
                     id: new_id(),
@@ -640,6 +679,9 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
                     ended_at: None,
                     auto_repair: true,
                     repair_round: next_round,
+                    budget: None,
+                    actual_cost: None,
+                    actual_tokens: None,
                 };
 
                 // Wire the review step → repair → re-review chain.
@@ -883,7 +925,11 @@ async fn create_handler(
         .unwrap_or(3)
         .clamp(0, 10);
 
-    let run = match create(project_id, session_id, label, origin, max_repair_rounds, &inputs) {
+    // Parse optional run-level budget from the request body. Each step can also carry
+    // its own per-step budget; the run budget is the cumulative cap across all steps.
+    let run_budget = body.get("budget").and_then(|v| serde_json::from_value::<Budget>(v.clone()).ok());
+
+    let run = match create(project_id, session_id, label, origin, max_repair_rounds, &inputs, run_budget) {
         Ok(run) => run,
         Err(CycleError) => return Err(bad("workflow steps form a cycle")),
     };
@@ -1027,6 +1073,7 @@ mod tests {
             tool_call_ids: None,
             thinking: None,
             auto_repair: false,
+            budget: None,
         }
     }
 
@@ -1044,6 +1091,7 @@ mod tests {
             tool_call_ids: None,
             thinking: None,
             auto_repair: true,
+            budget: None,
         }
     }
 
@@ -1068,7 +1116,7 @@ mod tests {
                 step("b", "B", Some(vec![json!(0)])),
                 step("c", "C", Some(vec![json!(1)])),
             ];
-            let run = create(None, None, "test".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "test".into(), None, 3, &inputs, None).unwrap();
             let ids: Vec<_> = run.steps.iter().map(|s| s.id.clone()).collect();
 
             assert!(run.steps[0].parents.is_empty());
@@ -1090,6 +1138,7 @@ mod tests {
                 None,
                 3,
                 &[step("a", "A", None), step("b", "B", Some(vec![json!(0)]))],
+                None,
             )
             .unwrap();
             let string = create(
@@ -1099,6 +1148,7 @@ mod tests {
                 None,
                 3,
                 &[step("a", "A", None), step("b", "B", Some(vec![json!("0")]))],
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -1118,7 +1168,7 @@ mod tests {
     fn out_of_range_numeric_parent_is_skipped() {
         with_tmp_workflows_file(|| {
             let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(99)]))];
-            let run = create(None, None, "test".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "test".into(), None, 3, &inputs, None).unwrap();
             assert!(run.steps[1].parents.is_empty());
             assert_eq!(run.steps[1].status, "ready");
         });
@@ -1135,7 +1185,7 @@ mod tests {
                 step("a", "A", None),
                 step("b", "B", Some(vec![json!("99")])),
             ];
-            let run = create(None, None, "test".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "test".into(), None, 3, &inputs, None).unwrap();
             assert!(run.steps[1].parents.is_empty());
             assert_eq!(run.steps[1].status, "ready");
         });
@@ -1155,7 +1205,7 @@ mod tests {
                     Some(vec![json!("0"), json!("no-such"), json!("0"), json!("99")]),
                 ),
             ];
-            let run = create(None, None, "test".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "test".into(), None, 3, &inputs, None).unwrap();
             let ids: Vec<_> = run.steps.iter().map(|s| s.id.clone()).collect();
             assert_eq!(run.steps[2].parents, vec![ids[0].clone()]);
             assert_eq!(run.steps[2].status, "pending");
@@ -1170,7 +1220,7 @@ mod tests {
                 step("b", "B", Some(vec![json!(0)])),
                 step("c", "C", Some(vec![json!(0)])),
             ];
-            let run = create(None, None, "error-sweep".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "error-sweep".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let parent_id = run.steps[0].id.clone();
 
@@ -1206,7 +1256,7 @@ mod tests {
     fn abort_sweeps_runnable_steps_to_skipped_with_ended_at() {
         with_tmp_workflows_file(|| {
             let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(0)]))];
-            let run = create(None, None, "abort-sweep".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "abort-sweep".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
 
             let updated = abort(&run.id).unwrap();
@@ -1226,7 +1276,7 @@ mod tests {
     fn explicit_skipped_patch_sets_ended_at() {
         with_tmp_workflows_file(|| {
             let inputs = vec![step("a", "A", None)];
-            let run = create(None, None, "skip".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "skip".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let step_id = run.steps[0].id.clone();
 
@@ -1258,7 +1308,7 @@ mod tests {
                 step("b", "B", Some(vec![json!(0)])),
                 step("c", "C", Some(vec![json!(1)])),
             ];
-            let run = create(None, None, "skip-cascade".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "skip-cascade".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let parent_id = run.steps[0].id.clone();
 
@@ -1302,7 +1352,7 @@ mod tests {
     fn skipped_leaf_finishes_run() {
         with_tmp_workflows_file(|| {
             let inputs = vec![step("a", "A", None)];
-            let run = create(None, None, "skip-leaf".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "skip-leaf".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let step_id = run.steps[0].id.clone();
 
@@ -1331,7 +1381,7 @@ mod tests {
             ];
             assert!(
                 matches!(
-                    create(None, None, "cycle".into(), None, 3, &inputs),
+                    create(None, None, "cycle".into(), None, 3, &inputs, None),
                     Err(CycleError)
                 ),
                 "a dependency cycle must be rejected"
@@ -1346,7 +1396,7 @@ mod tests {
                 step("a", "A", None),
                 step("b", "B", Some(vec![json!(0), json!(0)])),
             ];
-            let run = create(None, None, "dup".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "dup".into(), None, 3, &inputs, None).unwrap();
             assert_eq!(run.steps[1].parents.len(), 1);
         });
     }
@@ -1358,7 +1408,7 @@ mod tests {
                 step("a", "A", None),
                 step("b", "B", Some(vec![json!("no-such-id")])),
             ];
-            let run = create(None, None, "test".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "test".into(), None, 3, &inputs, None).unwrap();
             assert!(run.steps[1].parents.is_empty());
             assert_eq!(run.steps[1].status, "ready");
         });
@@ -1370,7 +1420,7 @@ mod tests {
     fn active_count_returns_store_size() {
         with_tmp_workflows_file(|| {
             let baseline = active_count();
-            let run = create(None, None, "count".into(), None, 3, &[step("a", "A", None)]).unwrap();
+            let run = create(None, None, "count".into(), None, 3, &[step("a", "A", None)], None).unwrap();
             assert_eq!(active_count(), baseline + 1, "active_count should include the new run");
 
             // Abort marks the run terminal but keeps it in the active map (eviction only happens
@@ -1420,7 +1470,7 @@ mod tests {
                 step("a", "A", None),
                 step("b", "B", Some(vec![json!(0)])),
             ];
-            let run = create(None, None, "events".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "events".into(), None, 3, &inputs, None).unwrap();
             let child_id = run.steps[1].id.clone();
 
             // start() emits workflow_start.
@@ -1503,7 +1553,7 @@ mod tests {
             let mut rx = subscribe_events();
 
             let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(0)]))];
-            let run = create(None, None, "abort-events".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "abort-events".into(), None, 3, &inputs, None).unwrap();
             let run_id = run.id.clone();
             let _ = start(&run.id).unwrap();
             // Drain the workflow_start event.
@@ -1545,7 +1595,7 @@ mod tests {
                 None,
             );
             let inputs = vec![review_step];
-            let run = create(None, None, "auto-repair".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "auto-repair".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let review_id = run.steps[0].id.clone();
             assert_eq!(run.steps.len(), 1);
@@ -1613,7 +1663,7 @@ mod tests {
                 None,
             );
             let inputs = vec![review_step];
-            let run = create(None, None, "clean-review".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "clean-review".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let review_id = run.steps[0].id.clone();
 
@@ -1648,7 +1698,7 @@ mod tests {
                 None,
             );
             let inputs = vec![review_step];
-            let run = create(None, None, "capped-repair".into(), None, 1, &inputs).unwrap();
+            let run = create(None, None, "capped-repair".into(), None, 1, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let review_id = run.steps[0].id.clone();
 
@@ -1723,7 +1773,7 @@ mod tests {
                 None,
             );
             let inputs = vec![review_step];
-            let run = create(None, None, "passing-repair".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "passing-repair".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let review_id = run.steps[0].id.clone();
 
@@ -1838,7 +1888,7 @@ mod tests {
         with_tmp_workflows_file(|| {
             let review_step = step("reviewer", "Review the implementation", None);
             let inputs = vec![review_step];
-            let run = create(None, None, "no-auto".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "no-auto".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let review_id = run.steps[0].id.clone();
 
@@ -1867,7 +1917,7 @@ mod tests {
             let mut rx = subscribe_events();
             let review_step = step_with_auto_repair("reviewer", "Review", None);
             let inputs = vec![review_step];
-            let run = create(None, None, "repair-events".into(), None, 3, &inputs).unwrap();
+            let run = create(None, None, "repair-events".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let _ = rx.try_recv(); // workflow_start
 
