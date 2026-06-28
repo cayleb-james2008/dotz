@@ -178,6 +178,16 @@ pub async fn serve_with_shutdown(
     });
     // Only the main server process captures memory autonomously (subagents never do).
     crate::memory::enable_autonomy();
+
+    // Resume interrupted workflow runs from the on-disk history. Without this, a
+    // run that was `running` at shutdown would be lost forever — the in-memory
+    // active map is empty after a restart. This scans `workflows.json`, marks
+    // in-flight steps `interrupted`, and re-spawns the executor for each.
+    let resumed = crate::workflows::startup_resume();
+    if resumed > 0 {
+        eprintln!("dotz-core resumed {resumed} interrupted workflow run(s)");
+    }
+
     eprintln!(
         "dotz-core listening on http://{}  (web: {})",
         listener.local_addr()?,
