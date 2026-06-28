@@ -148,11 +148,16 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
         // shut down — they must be re-dispatched to complete the run. If the run
         // budget is already exhausted, skip all remaining ready steps and abort
         // the run — prevents a fan-out from burning the balance.
-        let ready_ids: Vec<(String, String, String)> = run
+        // Collect ready steps with their agent, task, and optional model override.
+        // The WorkflowStep model field takes precedence over the agent's default;
+        // the executor passes it to run_single_agent_with_bus which forwards it
+        // to the provider. The stored step carries the model so a rerun with a
+        // different model (picked from the UI node drawer) uses the chosen model.
+        let ready_ids: Vec<(String, String, String, Option<String>)> = run
             .steps
             .iter()
             .filter(|s| s.status == "ready" || s.status == "interrupted")
-            .map(|s| (s.id.clone(), s.agent.clone(), s.task.clone()))
+            .map(|s| (s.id.clone(), s.agent.clone(), s.task.clone(), s.model.clone()))
             .collect();
 
         // Budget check: if cumulative spend exceeds the run budget, skip all ready
@@ -222,7 +227,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
 
         // Spawn each ready step as a subagent task. The Semaphore bounds concurrency.
         let mut handles = Vec::new();
-        for (step_id, agent, task) in ready_ids {
+        for (step_id, agent, task, model) in ready_ids {
             // Mark the step as "running" so it won't be picked up again.
             let _ = workflows::step_state(
                 run_id,
@@ -241,11 +246,12 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
             // Per-step budget enforcement: if the step has its own budget, the
             // executor will check it after the step completes (the step's usage
             // is compared against its budget in the post-completion patch below).
+            let model_override = model.clone();
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 let result = tokio::time::timeout(
                     step_timeout(),
-                    run_single_agent_with_bus(&agent, &task, None, &cwd, Some(&bus)),
+                    run_single_agent_with_bus(&agent, &task, model_override.as_deref(), &cwd, Some(&bus)),
                 )
                 .await;
 
@@ -348,6 +354,7 @@ mod tests {
             thinking: None,
             auto_repair: false,
             budget: None,
+            model: None,
         }
     }
 
@@ -710,7 +717,7 @@ mod tests {
 
         // Mark step 0 as done with output, step 1 as running, then mark
         // interrupted (simulates shutdown mid-flight).
-        let run2 = workflows::start(&run2_id).unwrap();
+        let _run2 = workflows::start(&run2_id).unwrap();
         let _ = workflows::step_state(
             &run2_id,
             &run2_step0_id,
