@@ -49,6 +49,26 @@ pub struct Usage {
     pub turns: Option<f64>,
 }
 
+/// A concrete artifact a step produced — the primary, inspectable result of a worker
+/// step (and, in future, screenshots / file previews / etc). The UI node drawer
+/// renders the artifact ABOVE the prose output so "the result" is a concrete
+/// change the operator can review, not a summary they have to cross-reference.
+///
+/// The `kind` field discriminates the renderer:
+///   - `git_diff`      → `content` is a unified diff string (already colored by the
+///                        UI's diff renderer).
+///   - `patch_review`  → `content` is a reviewer's structured findings markdown;
+///                        rendered as a markdown block with approve/reject buttons.
+///
+/// `title` is a short label (e.g. "3 files changed" or "review round 1").
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Artifact {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub content: String,
+}
+
 /// A node in a workflow run's DAG — one agent executing one task.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkflowStep {
@@ -105,6 +125,13 @@ pub struct WorkflowStep {
     /// The UI node drawer surfaces a model picker that patches this field.
     #[serde(rename = "model", skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The concrete artifact this step produced. For worker steps this is the
+    /// `git diff` of the cwd at completion; for review steps this is the
+    /// reviewer's findings markdown. The UI renders this as the primary
+    /// inspectable result — above the prose `output` — so the operator can
+    /// review the actual change without cross-referencing a terminal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<Artifact>,
 }
 
 /// A workflow run — a DAG of steps, observable by the UI.
@@ -415,6 +442,7 @@ pub fn create(
             actual_cost: None,
             actual_tokens: None,
             model: s.model.clone(),
+            artifact: None,
         })
         .collect();
 
@@ -565,6 +593,7 @@ pub struct StepPatch {
     pub output: Option<String>,
     pub error: Option<String>,
     pub usage: Option<Usage>,
+    pub artifact: Option<Artifact>,
 }
 
 /// Update a step's state and propagate readiness to children. Returns the updated run (clone).
@@ -594,6 +623,10 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
             }
             if patch.usage.is_some() && step.usage != patch.usage {
                 step.usage = patch.usage.clone();
+                changed.insert(step.id.clone());
+            }
+            if patch.artifact.is_some() && step.artifact != patch.artifact {
+                step.artifact = patch.artifact.clone();
                 changed.insert(step.id.clone());
             }
             if step.status == "running" && step.started_at.is_none() {
@@ -682,6 +715,7 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
                     actual_cost: None,
                     actual_tokens: None,
                     model: None,
+                    artifact: None,
                 };
                 let re_review_step = WorkflowStep {
                     id: new_id(),
@@ -705,6 +739,7 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
                     actual_cost: None,
                     actual_tokens: None,
                     model: None,
+                    artifact: None,
                 };
 
                 // Wire the review step → repair → re-review chain.
@@ -1154,6 +1189,7 @@ struct StepBody {
     output: Option<String>,
     error: Option<String>,
     usage: Option<Usage>,
+    artifact: Option<Artifact>,
 }
 
 const ALLOWED_STATUS: [&str; 7] = ["pending", "ready", "running", "done", "error", "skipped", "interrupted"];
@@ -1206,6 +1242,7 @@ async fn step_handler(
         output: body.output,
         error: body.error,
         usage: body.usage,
+        artifact: body.artifact,
     };
     match step_state(&id, &step_id, patch) {
         Some(updated) => Ok(Json(updated)),
@@ -1349,6 +1386,7 @@ async fn rerun_step_handler(
         output: None,
         error: None,
         usage: None,
+        artifact: None,
     };
     // Apply the state change first.
     let updated = match step_state(&id, &step_id, patch) {
@@ -1685,6 +1723,7 @@ async fn insert_steps_handler(
             actual_cost: None,
             actual_tokens: None,
             model: input.model.clone(),
+            artifact: None,
         });
     }
 
@@ -1974,6 +2013,7 @@ pub fn insert_steps(
                 actual_cost: None,
                 actual_tokens: None,
                 model: input.model.clone(),
+                artifact: None,
             }
         })
         .collect();
@@ -3490,6 +3530,7 @@ mod tests {
                     output: None,
                     error: None,
                     usage: None,
+                    artifact: None,
                 },
             );
 
@@ -3646,6 +3687,64 @@ mod tests {
             let run = create(None, None, "model-persist".into(), None, 3, &[input], None).unwrap();
             let s = &run.steps[0];
             assert_eq!(s.model, Some("anthropic/claude-sonnet-4-20250514".to_string()));
+        });
+    }
+
+    /// Patching a step's artifact via `step_state` stores the artifact and
+    /// round-trips through the store. This mirrors what the executor does for
+    // worker steps after subagent completion.
+    #[test]
+    fn patch_artifact_sets_field_and_roundtrips() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("worker", "implement", None)];
+            let run = create(None, None, "artifact-patch".into(), None, 3, &inputs, None).unwrap();
+            let step_id = run.steps[0].id.clone();
+            assert!(run.steps[0].artifact.is_none());
+
+            let diff = Artifact {
+                kind: "git_diff".to_string(),
+                title: Some("1 file changed, 2 insertions(+)".to_string()),
+                content: "diff --git a/README.md b/README.md\n...".to_string(),
+            };
+
+            let patch = StepPatch {
+                artifact: Some(diff.clone()),
+                ..Default::default()
+            };
+            let updated = super::step_state(&run.id, &step_id, patch).unwrap();
+            let s = updated.steps.iter().find(|s| s.id == step_id).unwrap();
+            assert_eq!(s.artifact, Some(diff), "artifact must round-trip through step_state");
+        });
+    }
+
+    /// A step's artifact serializes to JSON and deserializes back correctly,
+    /// including the `kind`, `title`, and `content` fields.
+    #[test]
+    fn artifact_serde_roundtrip() {
+        let original = Artifact {
+            kind: "git_diff".to_string(),
+            title: Some("3 files changed".to_string()),
+            content: "diff --git a.rs b.rs\n...".to_string(),
+        };
+        let json = serde_json::to_string(&original).expect("serialize artifact");
+        let deserialized: Artifact = serde_json::from_str(&json).expect("deserialize artifact");
+        assert_eq!(deserialized.kind, "git_diff");
+        assert_eq!(deserialized.title, Some("3 files changed".to_string()));
+        assert_eq!(deserialized.content, original.content);
+    }
+
+    /// A step without an artifact serializes with the field omitted (skip_serializing_if).
+    #[test]
+    fn artifact_none_serializes_as_absent() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("worker", "task", None)];
+            let run = create(None, None, "artifact-absent".into(), None, 3, &inputs, None).unwrap();
+            let s = &run.steps[0];
+            let json = serde_json::to_value(s).expect("serialize step");
+            assert!(
+                json.get("artifact").is_none(),
+                "artifact field must be absent when None (skip_serializing_if)"
+            );
         });
     }
 }

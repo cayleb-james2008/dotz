@@ -46,6 +46,7 @@ use axum::{
     Json, Router,
 };
 use axum::http::StatusCode;
+use crate::workflows;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
@@ -213,6 +214,78 @@ pub fn git_head_sha(cwd: &str) -> Option<String> {
                 None
             } else {
                 Some(sha.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Capture the working-tree diff at `cwd` as an `Artifact`.
+///
+/// This is the primary inspectable result of a worker step: the actual code
+/// change the agent produced, surfaced in the UI node drawer above the prose
+/// summary so the operator can review / approve / reject the concrete diff
+/// without cross-referencing a terminal.
+///
+/// Runs `git diff` (unstaged) + `git diff --cached` (staged) and concatenates
+/// them. Returns `None` when `cwd` is not inside a git worktree or when git
+/// is not installed — the caller falls back to the prose `output` and the UI
+/// degrades gracefully (no artifact row).
+///
+/// The `title` is a short summary line like "3 files changed, 42 insertions(+), 7 deletions(-)"
+/// so the UI can render a one-liner header without parsing the diff body.
+pub fn git_diff_artifact(cwd: &str) -> Option<workflows::Artifact> {
+    if !is_inside_git_worktree(cwd) {
+        return None;
+    }
+
+    let mut content = String::new();
+
+    // Unstaged changes (working tree vs index).
+    if let Ok((stdout, _, 0)) = git(cwd, &["diff"]) {
+        if !stdout.trim().is_empty() {
+            content.push_str(&stdout);
+        }
+    }
+
+    // Staged changes (index vs HEAD).
+    if let Ok((stdout, _, 0)) = git(cwd, &["diff", "--cached"]) {
+        if !stdout.trim().is_empty() {
+            if !content.is_empty() {
+                content.push_str("\n--- staged changes ---\n");
+            }
+            content.push_str(&stdout);
+        }
+    }
+
+    if content.trim().is_empty() {
+        // No diff — the agent ran but produced no file changes. Return None
+        // so the UI doesn't show an empty artifact block.
+        return None;
+    }
+
+    // Build a title line with change stats (insertions/deletions) by parsing
+    // the diff summary that `git diff --stat` produces. Fall back to a generic
+    // title if parsing fails.
+    let title = git_diff_stat(cwd);
+
+    Some(workflows::Artifact {
+        kind: "git_diff".to_string(),
+        title,
+        content,
+    })
+}
+
+/// Run `git diff --shortstat` and return a human-readable title like
+/// "3 files changed, 42 insertions(+), 7 deletions(-)". Returns None on error.
+fn git_diff_stat(cwd: &str) -> Option<String> {
+    match git(cwd, &["diff", "--shortstat"]) {
+        Ok((stdout, _, 0)) => {
+            let s = stdout.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
             }
         }
         _ => None,
@@ -651,5 +724,71 @@ mod tests {
             "# hello\n"
         );
         assert!(!dir.join("untracked.sh").exists());
+    }
+
+    // ---- git_diff_artifact tests ----
+
+    /// `git_diff_artifact` returns None when `cwd` is not inside a git worktree.
+    #[test]
+    fn git_diff_artifact_returns_none_for_no_git() {
+        let _guard = test_lock();
+        let dir = std::env::temp_dir().join(format!("dtz-diff-nogit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = git_diff_artifact(dir.to_str().unwrap());
+        assert!(result.is_none(), "no git repo → None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git_diff_artifact` returns None when the working tree is clean (no changes).
+    #[test]
+    fn git_diff_artifact_returns_none_for_clean_tree() {
+        let _guard = test_lock();
+        let dir = init_git_repo();
+        let cwd = dir.to_str().unwrap();
+        let result = git_diff_artifact(cwd);
+        assert!(result.is_none(), "clean tree → None");
+    }
+
+    /// `git_diff_artifact` returns a `git_diff` Artifact with content and a stat
+    /// title when the working tree has unstaged changes.
+    #[test]
+    fn git_diff_artifact_captures_unstaged_changes() {
+        let _guard = test_lock();
+        let dir = init_git_repo();
+        let cwd = dir.to_str().unwrap();
+
+        // Make a change.
+        std::fs::write(dir.join("README.md"), "# modified\n").unwrap();
+
+        let art = git_diff_artifact(cwd).expect("dirty tree → Some artifact");
+        assert_eq!(art.kind, "git_diff");
+        assert!(!art.content.is_empty(), "diff content must not be empty");
+        assert!(
+            art.content.contains("README.md"),
+            "diff should mention the changed file"
+        );
+        // Title is the shortstat line (e.g. "1 file changed, 1 insertion(+)").
+        assert!(
+            art.title.is_some(),
+            "title should be set from git diff --shortstat"
+        );
+    }
+
+    /// `git_diff_artifact` includes staged changes when they exist.
+    #[test]
+    fn git_diff_artifact_includes_staged_changes() {
+        let _guard = test_lock();
+        let dir = init_git_repo();
+        let cwd = dir.to_str().unwrap();
+
+        std::fs::write(dir.join("README.md"), "staged line\n").unwrap();
+        git(cwd, &["add", "README.md"]).unwrap();
+
+        let art = git_diff_artifact(cwd).expect("staged changes → Some artifact");
+        assert_eq!(art.kind, "git_diff");
+        assert!(
+            art.content.contains("README.md"),
+            "staged diff should mention the file"
+        );
     }
 }

@@ -390,6 +390,7 @@ mod tests {
                     actual_cost: None,
                     actual_tokens: None,
                     model: None,
+                    artifact: None,
                 },
                 crate::workflows::WorkflowStep {
                     id: "step-1".into(),
@@ -413,6 +414,7 @@ mod tests {
                     actual_cost: None,
                     actual_tokens: None,
                     model: None,
+                    artifact: None,
                 },
                 // A pending step (not yet run) — must NOT be preloaded.
                 crate::workflows::WorkflowStep {
@@ -437,6 +439,7 @@ mod tests {
                     actual_cost: None,
                     actual_tokens: None,
                     model: None,
+                    artifact: None,
                 },
             ],
             status: "running".into(),
@@ -526,6 +529,7 @@ mod tests {
                     actual_cost: None,
                     actual_tokens: None,
                     model: None,
+                    artifact: None,
                 },
             ],
             status: "error".into(),
