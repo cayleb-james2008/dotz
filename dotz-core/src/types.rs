@@ -4,6 +4,42 @@ use serde_json::{json, Value};
 
 pub const DEFAULT_PROVIDER: &str = "ollama";
 
+/// Hard cost/token budgets for a task or workflow. When a budget is set, the executor
+/// aborts (or downgrades) a step before it can exceed the cap — so a fan-out can't
+/// quietly burn the provider balance while unattended.
+///
+/// All fields are optional: an absent field means "no limit" for that dimension.
+/// `max_cost` is in USD (the same unit `Usage.cost.total` reports).
+/// `max_tokens` is the total token budget (input + output).
+/// `max_input_tokens` is a separate cap on input tokens alone (prompt-bloat guard).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Budget {
+    /// Max cumulative cost (USD) before the step/run is aborted or downgraded.
+    #[serde(rename = "maxCost", skip_serializing_if = "Option::is_none")]
+    pub max_cost: Option<f64>,
+    /// Max cumulative total tokens (input + output) before the step/run is aborted.
+    #[serde(rename = "maxTokens", skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// Max cumulative input tokens (prompt-bloat guard).
+    #[serde(rename = "maxInputTokens", skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+}
+
+impl Budget {
+    /// True when no budget constraints are set (the common case — no enforcement needed).
+    pub fn is_unbounded(&self) -> bool {
+        self.max_cost.is_none() && self.max_tokens.is_none() && self.max_input_tokens.is_none()
+    }
+
+    /// True when the given cumulative usage exceeds ANY of the set budget limits.
+    pub fn is_exceeded(&self, cost: f64, input_tokens: u64, output_tokens: u64) -> bool {
+        let total = input_tokens.saturating_add(output_tokens);
+        self.max_cost.map_or(false, |max| cost > max)
+            || self.max_tokens.map_or(false, |max| total > max)
+            || self.max_input_tokens.map_or(false, |max| input_tokens > max)
+    }
+}
+
 pub const THINKING_LEVELS: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 pub fn is_valid_thinking(s: &str) -> bool {
     THINKING_LEVELS.contains(&s)
@@ -408,5 +444,73 @@ mod tests {
             models.iter().any(|m| m.provider == "local"),
             "catalog must include local suggestions"
         );
+    }
+
+    #[test]
+    fn budget_unbounded_when_all_fields_none() {
+        let b = Budget::default();
+        assert!(b.is_unbounded());
+        assert!(!b.is_exceeded(100.0, 1_000_000, 500_000));
+    }
+
+    #[test]
+    fn budget_cost_limit_triggers_when_exceeded() {
+        let b = Budget {
+            max_cost: Some(1.0),
+            ..Default::default()
+        };
+        assert!(!b.is_exceeded(0.5, 100, 100));
+        assert!(b.is_exceeded(1.01, 100, 100));
+        // Boundary: exactly at limit is NOT exceeded.
+        assert!(!b.is_exceeded(1.0, 100, 100));
+    }
+
+    #[test]
+    fn budget_tokens_limit_triggers_when_exceeded() {
+        let b = Budget {
+            max_tokens: Some(1_000),
+            ..Default::default()
+        };
+        assert!(!b.is_exceeded(0.0, 500, 499)); // 999 total
+        assert!(b.is_exceeded(0.0, 500, 501)); // 1001 total
+        assert!(b.is_exceeded(0.0, 1_001, 0)); // all input
+    }
+
+    #[test]
+    fn budget_input_tokens_limit_triggers_independently() {
+        let b = Budget {
+            max_input_tokens: Some(500),
+            ..Default::default()
+        };
+        // Under input cap but huge output.
+        assert!(!b.is_exceeded(0.0, 400, 100_000));
+        // Over input cap even with zero output.
+        assert!(b.is_exceeded(0.0, 501, 0));
+    }
+
+    #[test]
+    fn budget_any_limit_triggers() {
+        // If ANY of the three limits is exceeded, the whole budget is exceeded.
+        let b = Budget {
+            max_cost: Some(10.0),
+            max_tokens: Some(1_000_000),
+            max_input_tokens: Some(500),
+        };
+        // Cost OK, tokens OK, input over.
+        assert!(b.is_exceeded(5.0, 600, 10));
+        // Cost over, tokens OK, input OK.
+        assert!(b.is_exceeded(20.0, 100, 100));
+    }
+
+    #[test]
+    fn budget_serialize_skip_none_fields() {
+        let b = Budget {
+            max_cost: Some(5.0),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&b).unwrap();
+        assert_eq!(json["maxCost"], serde_json::json!(5.0));
+        assert!(json.get("maxTokens").is_none());
+        assert!(json.get("maxInputTokens").is_none());
     }
 }
