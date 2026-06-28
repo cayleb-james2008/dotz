@@ -762,6 +762,37 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                             extra_tools::resolve_gate(gid, kind == "gate.approve", fb);
                         }
                     }
+                    // Live-editable workflow steering: rerun a step with feedback.
+                    "workflow.rerun" => {
+                        let run_id = v.get("runId").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        let step_id = v.get("stepId").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        let feedback = v.get("feedback").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        if let (Some(rid), Some(sid)) = (run_id, step_id) {
+                            // Spawn the executor so the HTTP response returns immediately.
+                            tokio::spawn(async move {
+                                crate::workflows::rerun_step_and_dispatch(&rid, &sid, feedback).await;
+                            });
+                        }
+                    }
+                    // Live-editable workflow steering: patch a step's parents.
+                    "workflow.patchParents" => {
+                        let run_id = v.get("runId").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        let step_id = v.get("stepId").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        let parents = v.get("parents").and_then(|x| x.as_array()).cloned();
+                        if let (Some(rid), Some(sid)) = (run_id, step_id) {
+                            let parents = parents.unwrap_or_default();
+                            let _ = crate::workflows::patch_parents(&rid, &sid, parents);
+                        }
+                    }
+                    // Live-editable workflow steering: patch a step's model.
+                    "workflow.patchModel" => {
+                        let run_id = v.get("runId").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        let step_id = v.get("stepId").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        let model = v.get("model").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        if let (Some(rid), Some(sid)) = (run_id, step_id) {
+                            let _ = crate::workflows::patch_model(&rid, &sid, model.as_deref());
+                        }
+                    }
                     _ => {}
                 }
             }

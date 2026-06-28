@@ -660,6 +660,48 @@ code { font-family: var(--mono); color: var(--peach); }
 }
 .nd-link:hover { color: var(--lav); }
 
+/* ---- NODE DETAIL: LIVE-EDIT CONTROLS ---- */
+.nd-controls {
+  margin-top: 16px; padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+.nd-controls-title {
+  font-size: 10px; letter-spacing: 2px; color: var(--dim);
+  margin-bottom: 10px; text-transform: uppercase;
+}
+.nd-control-row {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 8px;
+}
+.nd-control-label {
+  font-size: 10px; color: var(--dim); letter-spacing: 1px;
+  min-width: 52px; flex-shrink: 0;
+}
+.nd-control-row input[type="text"],
+.nd-control-row textarea {
+  flex: 1; min-width: 0;
+  background: var(--mantle); border: 1px solid var(--border);
+  color: var(--text); font-family: var(--mono); font-size: 11px;
+  padding: 5px 8px; border-radius: var(--radius-sm);
+}
+.nd-control-row input[type="text"]:focus,
+.nd-control-row textarea:focus {
+  outline: none; border-color: var(--cyan);
+}
+.nd-model-input { min-width: 120px; }
+.nd-parents-input { min-width: 120px; }
+.nd-feedback { resize: vertical; min-height: 48px; }
+.nd-btn {
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--text); font-family: var(--mono); font-size: 11px;
+  padding: 5px 10px; border-radius: var(--radius-sm); cursor: pointer;
+  white-space: nowrap; flex-shrink: 0;
+}
+.nd-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+.nd-btn.primary {
+  background: var(--cyan); color: var(--bg); border-color: var(--cyan);
+}
+.nd-btn.primary:hover { background: var(--lav); border-color: var(--lav); color: var(--bg); }
+
 /* ---- HUMAN GATE CARD ---- */
 .gate-card {
   position: fixed; inset: 0; background: rgba(13,13,18,0.8);

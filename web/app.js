@@ -2074,6 +2074,71 @@ function showNodeDetail(run, step) {
   }
   if (step.startedAt) body.appendChild(makeNdRow("STARTED", new Date(step.startedAt).toLocaleTimeString()));
   if (step.endedAt) body.appendChild(makeNdRow("ENDED", new Date(step.endedAt).toLocaleTimeString()));
+
+  // ---- live-editing controls (the "steer" surface) ----
+  // Shown for non-terminal, non-running steps (failed, pending, ready, done).
+  const editable = step.status !== "running" && step.status !== "aborted";
+  if (editable) {
+    const controls = el("div", "nd-controls");
+    controls.appendChild(el("div", "nd-controls-title", "STEER"));
+
+    // Model picker
+    const modelRow = el("div", "nd-control-row");
+    modelRow.appendChild(el("span", "nd-control-label", "Model"));
+    const modelInput = el("input", "nd-model-input");
+    modelInput.type = "text";
+    modelInput.placeholder = step.model || "inherit (agent default)";
+    modelInput.value = step.model || "";
+    modelInput.addEventListener("keydown", (e) => { if (e.key === "Enter") applyModel(step, modelInput.value); });
+    modelRow.appendChild(modelInput);
+    const modelBtn = el("button", "nd-btn", "Set");
+    modelBtn.onclick = () => applyModel(step, modelInput.value);
+    modelRow.appendChild(modelBtn);
+    controls.appendChild(modelRow);
+
+    // Parents editor (comma-separated step indices or ids)
+    const parentsRow = el("div", "nd-control-row");
+    parentsRow.appendChild(el("span", "nd-control-label", "Parents"));
+    const parentsInput = el("input", "nd-parents-input");
+    parentsInput.type = "text";
+    // Show the agent names of current parent steps for readability.
+    const parentLabels = (step.parents || []).map((pid) => {
+      const p = run.steps.find((s) => s.id === pid);
+      return p ? p.agent : pid.slice(0, 8);
+    });
+    parentsInput.placeholder = "e.g. scout, planner (or leave empty for root)";
+    parentsInput.value = parentLabels.join(", ");
+    parentsInput.addEventListener("keydown", (e) => { if (e.key === "Enter") applyParents(step, parentsInput.value, run); });
+    parentsRow.appendChild(parentsInput);
+    const parentsBtn = el("button", "nd-btn", "Wire");
+    parentsBtn.onclick = () => applyParents(step, parentsInput.value, run);
+    parentsRow.appendChild(parentsBtn);
+    controls.appendChild(parentsRow);
+
+    // Feedback + Rerun (only for failed or done-with-error steps)
+    if (step.status === "error" || step.error) {
+      const fbRow = el("div", "nd-control-row");
+      fbRow.appendChild(el("span", "nd-control-label", "Feedback"));
+      const fbInput = el("textarea", "nd-feedback");
+      fbInput.placeholder = "What went wrong? What should the agent check?";
+      fbInput.value = "";
+      fbInput.rows = 3;
+      fbRow.appendChild(fbInput);
+      const rerunBtn = el("button", "nd-btn primary", "↻ Rerun with feedback");
+      rerunBtn.onclick = () => rerunStep(step, fbInput.value);
+      fbRow.appendChild(rerunBtn);
+      controls.appendChild(fbRow);
+    } else if (step.status === "done" || step.status === "ready" || step.status === "pending") {
+      // Simple rerun without feedback (for done steps that the operator wants to redo)
+      const rerunRow = el("div", "nd-control-row");
+      const rerunBtn = el("button", "nd-btn", "↻ Rerun step");
+      rerunBtn.onclick = () => rerunStep(step, "");
+      rerunRow.appendChild(rerunBtn);
+      controls.appendChild(rerunRow);
+    }
+
+    body.appendChild(controls);
+  }
 }
 
 function makeNdRow(label, val) {
@@ -2081,6 +2146,56 @@ function makeNdRow(label, val) {
   row.appendChild(el("span", "label", label + ": "));
   row.appendChild(el("span", "val", val));
   return row;
+}
+
+/* ---------- live-editing helpers ---------- */
+
+function applyModel(step, value) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) { pushError("not connected"); return; }
+  const model = value.trim();
+  state.ws.send(JSON.stringify({
+    kind: "workflow.patchModel",
+    runId: state.openNodeDetail.runId,
+    stepId: step.id,
+    model: model || null,
+  }));
+  // Optimistic update.
+  step.model = model || null;
+  logBrain(model ? `step ${step.agent}: model → ${model}` : `step ${step.agent}: model cleared`);
+}
+
+function applyParents(step, value, run) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) { pushError("not connected"); return; }
+  // Parse comma-separated agent names or ids. Resolve names back to step ids.
+  const tokens = value.split(",").map((s) => s.trim()).filter(Boolean);
+  const parentIds = tokens.map((tok) => {
+    // Find by agent name first.
+    const byAgent = run.steps.find((s) => s.agent === tok && s.id !== step.id);
+    if (byAgent) return byAgent.id;
+    // Find by prefix match on id.
+    const byId = run.steps.find((s) => s.id.startsWith(tok) && s.id !== step.id);
+    if (byId) return byId.id;
+    // Return as-is (may be a valid id we can't see).
+    return tok;
+  });
+  state.ws.send(JSON.stringify({
+    kind: "workflow.patchParents",
+    runId: state.openNodeDetail.runId,
+    stepId: step.id,
+    parents: parentIds,
+  }));
+  logBrain(`step ${step.agent}: parents wired to [${tokens.join(", ")}]`);
+}
+
+function rerunStep(step, feedback) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) { pushError("not connected"); return; }
+  state.ws.send(JSON.stringify({
+    kind: "workflow.rerun",
+    runId: state.openNodeDetail.runId,
+    stepId: step.id,
+    feedback: feedback || null,
+  }));
+  logBrain(`rerunning step ${step.agent}${feedback ? " with feedback"}`);
 }
 
 /* ---------- human gate ---------- */
