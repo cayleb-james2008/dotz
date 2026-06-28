@@ -18,6 +18,7 @@
 //! Bounded concurrency: a tokio Semaphore (default 4, configurable via DOTZ_WF_CONCURRENCY)
 //! gates how many steps execute in parallel, matching the subagent fan-out pool.
 use crate::agent::subagent::run_single_agent_with_bus;
+use crate::checkpoint::git_diff_artifact;
 use crate::context_bus::ContextBus;
 use crate::workflows;
 use std::sync::Arc;
@@ -247,11 +248,17 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
             // executor will check it after the step completes (the step's usage
             // is compared against its budget in the post-completion patch below).
             let model_override = model.clone();
+            // Capture whether this step is a "worker" so we know to attach a
+            // git-diff artifact on completion. The agent name convention is
+            // "worker" for code-producing steps and "reviewer" / "scout" /
+            // "planner" for non-editing steps.
+            let is_worker = agent.contains("worker");
+            let agent_name = agent.clone();
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 let result = tokio::time::timeout(
                     step_timeout(),
-                    run_single_agent_with_bus(&agent, &task, model_override.as_deref(), &cwd, Some(&bus)),
+                    run_single_agent_with_bus(&agent_name, &task, model_override.as_deref(), &cwd, Some(&bus)),
                 )
                 .await;
 
@@ -280,6 +287,18 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                     }
                 };
 
+                // For worker steps that completed successfully, capture the
+                // working-tree diff as the step's primary artifact. This makes
+                // "the result" a concrete, reviewable change in the UI node
+                // drawer — not a prose summary the operator cross-references.
+                // Non-worker steps (scout/planner/reviewer) produce no diff;
+                // the artifact stays None and the UI falls back to `output`.
+                let artifact = if is_worker && status == "done" {
+                    git_diff_artifact(&cwd)
+                } else {
+                    None
+                };
+
                 // Record the result via step_state (propagates readiness, handles auto-repair,
                 // cascades errors, finishes the run).
                 let _ = workflows::step_state(
@@ -289,6 +308,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                         status: Some(status),
                         output,
                         error,
+                        artifact,
                         ..Default::default()
                     },
                 );

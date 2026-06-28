@@ -2041,6 +2041,43 @@ function showNodeDetail(run, step) {
   body.appendChild(makeNdRow("AGENT", step.agent));
   body.appendChild(makeNdRow("TASK", step.task));
   body.appendChild(makeNdRow("STATUS", step.status));
+
+  // ---- ARTIFACT: the primary, inspectable result of a worker step ----
+  // Rendered ABOVE the prose output so the operator sees the concrete
+  // change (git diff) first, with inline approve/review controls. For
+  // review steps the artifact is the findings markdown.
+  if (step.artifact && step.artifact.content) {
+    const art = step.artifact;
+    const artWrap = el("div", "nd-artifact");
+    const artTitle = el("div", "nd-artifact-title", art.title || (art.kind === "git_diff" ? "CHANGES" : art.kind));
+    artWrap.appendChild(artTitle);
+
+    if (art.kind === "git_diff") {
+      // Render the unified diff with basic syntax coloring.
+      const pre = el("pre", "nd-diff");
+      pre.textContent = art.content;
+      pre.classList.add("nd-diff-colored");
+      artWrap.appendChild(pre);
+
+      // Inline approve / request-changes controls for worker steps in
+      // terminal state (the operator reviewing the result).
+      if (step.status === "done" || step.status === "error") {
+        const controls = el("div", "nd-artifact-controls");
+        const approveBtn = el("button", "nd-btn nd-btn-approve", "✓ Approve");
+        approveBtn.onclick = () => actOnStep(step, "approve");
+        const rejectBtn = el("button", "nd-btn nd-btn-reject", "✗ Request changes");
+        rejectBtn.onclick = () => actOnStep(step, "reject");
+        controls.appendChild(approveBtn);
+        controls.appendChild(rejectBtn);
+        artWrap.appendChild(controls);
+      }
+    } else {
+      // Generic artifact (review findings markdown, future kinds).
+      artWrap.appendChild(el("div", "nd-block", art.content));
+    }
+    body.appendChild(artWrap);
+  }
+
   if (step.output) {
     body.appendChild(makeNdRow("OUTPUT", ""));
     body.appendChild(el("div", "nd-block", step.output));
@@ -2162,6 +2199,21 @@ function applyModel(step, value) {
   // Optimistic update.
   step.model = model || null;
   logBrain(model ? `step ${step.agent}: model → ${model}` : `step ${step.agent}: model cleared`);
+}
+
+// Approve / request-changes on a worker step from the artifact controls.
+// "approve" marks the step accepted (UI-only signal; auto-repair reviewer
+// already produced the artifact). "reject" sends a rejection note that
+// the run executor can feed into a repair cycle.
+function actOnStep(step, action) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) { pushError("not connected"); return; }
+  state.ws.send(JSON.stringify({
+    kind: "workflow.actOnStep",
+    runId: state.openNodeDetail.runId,
+    stepId: step.id,
+    action,
+  }));
+  logBrain(`step ${step.agent}: ${action} submitted`);
 }
 
 function applyParents(step, value, run) {
