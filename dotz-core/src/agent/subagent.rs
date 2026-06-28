@@ -424,7 +424,7 @@ fn parse_subagent_model(effective_model: &str) -> (String, String) {
 /// model, NO memory autonomy (the agent's own prompt only), and the agent's tool set (or the default
 /// active set). Captures the message list + usage as a SingleResult. A wall-clock timeout prevents a
 /// hung provider or long tool chain from stalling the executive turn indefinitely.
-async fn run_single_agent(
+async fn run_single_agent_with_progress(
     agents: &[AgentConfig],
     agent_name: &str,
     task: &str,
@@ -432,12 +432,16 @@ async fn run_single_agent(
     cwd: &str,
     step: Option<usize>,
     bus: Option<&ContextBus>,
+    progress_tx: Option<mpsc::Sender<StreamDelta>>,
 ) -> SingleResult {
-    run_single_agent_inner(agents, agent_name, task, model_override, cwd, step, bus).await
+    run_single_agent_inner(agents, agent_name, task, model_override, cwd, step, bus, progress_tx).await
 }
 
 /// The actual subagent loop. The provider stream task is aborted on the wall-clock timeout so a
 /// hung provider cannot keep holding a connection (and a tokio task) after the subagent returns.
+/// `progress_tx`, when present, receives a copy of every `StreamDelta` the subagent's provider
+/// streams — the lead session forwards these as `subagent_progress` events so the orchestrator
+/// (and the operator) can see a drifting scout/planner's reasoning mid-run.
 async fn run_single_agent_inner(
     agents: &[AgentConfig],
     agent_name: &str,
@@ -446,6 +450,7 @@ async fn run_single_agent_inner(
     cwd: &str,
     step: Option<usize>,
     bus: Option<&ContextBus>,
+    progress_tx: Option<mpsc::Sender<StreamDelta>>,
 ) -> SingleResult {
     let Some(agent) = agents.iter().find(|a| a.name == agent_name) else {
         return unknown_agent_result(agent_name, task, agents, step);
@@ -535,9 +540,19 @@ async fn run_single_agent_inner(
 
         let mut acc = Acc::new(&provider_id, &model_id, now_ms());
         let mut stop_reason = "stop".to_string();
+        // Clone the progress sender once per round so each delta can be forwarded without
+        // holding a borrow across the apply_delta call.
+        let progress = progress_tx.clone();
         loop {
             match tokio::time::timeout_at(deadline, delta_rx.recv()).await {
-                Ok(Some(delta)) => apply_delta(&mut acc, delta, &mut stop_reason),
+                Ok(Some(delta)) => {
+                    // Forward the raw delta to the lead session (best-effort: a laggard/leaded
+                    // receiver must not stall the subagent's own streaming loop).
+                    if let Some(tx) = &progress {
+                        let _ = tx.send(delta.clone()).await;
+                    }
+                    apply_delta(&mut acc, delta, &mut stop_reason);
+                }
                 Ok(None) => break,
                 Err(_) => {
                     stream_task.abort();
@@ -643,12 +658,13 @@ pub async fn run_single_agent_public(
     cwd: &str,
 ) -> SingleResult {
     let discovery = discover_agents(cwd, "user");
-    run_single_agent(
+    run_single_agent_with_progress(
         &discovery.agents,
         agent_name,
         task,
         model_override,
         cwd,
+        None,
         None,
         None,
     )
@@ -666,7 +682,7 @@ pub async fn run_single_agent_with_bus(
     bus: Option<&ContextBus>,
 ) -> SingleResult {
     let discovery = discover_agents(cwd, "user");
-    run_single_agent(
+    run_single_agent_with_progress(
         &discovery.agents,
         agent_name,
         task,
@@ -674,6 +690,7 @@ pub async fn run_single_agent_with_bus(
         cwd,
         None,
         bus,
+        None,
     )
     .await
 }
@@ -882,11 +899,30 @@ pub fn parameters_schema() -> Value {
     })
 }
 
-/// Entry the `subagent` tool calls. Parses the tool args (single / parallel / chain), discovers
-/// agents for `cwd`, runs the selected mode, and assembles the result the workflow bridge reads.
+/// Entry the `subagent` tool calls (no progress streaming). Kept for the workflow executor
+/// and any caller that does not need live intermediate streaming.
+pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
+    dispatch_inner(args, cwd, None).await
+}
+
+/// Like `dispatch`, but forwards each subagent's provider-stream deltas to `progress_tx`.
+/// The sender is cloned per-mode and per-task/step so each subagent run gets its own handle.
+/// A dropped or laggard receiver is ignored (the subagent completes regardless).
+pub async fn dispatch_with_progress(
+    args: &Value,
+    cwd: &str,
+    progress_tx: mpsc::Sender<StreamDelta>,
+) -> Dispatch {
+    dispatch_inner(args, cwd, Some(progress_tx)).await
+}
+
+/// Shared implementation: parses the tool args (single / parallel / chain), discovers agents for
+/// `cwd`, runs the selected mode, and assembles the result the workflow bridge reads.
 /// `run_id` is the workflow run this dispatch belongs to; when present, the shared context
 /// bus for that run is passed to each subagent so they inherit prior findings.
-pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
+/// `progress_tx` is the channel that receives a copy of every streamed delta the subagent's
+/// provider emits — the session layer converts these into `subagent_progress` events.
+async fn dispatch_inner(args: &Value, cwd: &str, progress_tx: Option<mpsc::Sender<StreamDelta>>) -> Dispatch {
     let scope = args
         .get("agentScope")
         .and_then(|v| v.as_str())
@@ -958,7 +994,7 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
             // Substitute {previous} (literal replacement — no regex specials).
             let task = task_tmpl.replace("{previous}", &previous);
             let r =
-                run_single_agent(&agents, agent_name, &task, model, step_cwd, Some(i + 1), bus.as_ref()).await;
+                run_single_agent_with_progress(&agents, agent_name, &task, model, step_cwd, Some(i + 1), bus.as_ref(), progress_tx.clone()).await;
             let failed = r.is_failed();
             results.push(r);
             if failed {
@@ -1023,9 +1059,10 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
             let agents = agents.clone();
             let sem = sem.clone();
             let bus = bus.clone();
+            let tx = progress_tx.clone();
             set.spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
-                let r = run_single_agent(
+                let r = run_single_agent_with_progress(
                     &agents[..],
                     &agent_name,
                     &task,
@@ -1033,6 +1070,7 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
                     &task_cwd,
                     None,
                     bus.as_ref(),
+                    tx,
                 )
                 .await;
                 (idx, r)
@@ -1082,7 +1120,7 @@ pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
     let task = single_task.unwrap();
     let model = args.get("model").and_then(|v| v.as_str());
     let single_cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(cwd);
-    let r = run_single_agent(&agents, agent_name, task, model, single_cwd, None, bus.as_ref()).await;
+    let r = run_single_agent_with_progress(&agents, agent_name, task, model, single_cwd, None, bus.as_ref(), progress_tx).await;
     if r.is_failed() {
         let errmsg = r.result_output();
         let label = r.stop_reason.clone().unwrap_or_else(|| "failed".into());
@@ -1398,7 +1436,7 @@ mod tests {
         // wire we know the provider stream is hung and the timeout is actually being exercised.
         let mut run = tokio::spawn(async move {
             let agents = [agent];
-            run_single_agent(&agents, "test", "task", Some("local/test"), &cwd, None, None).await
+            run_single_agent_with_progress(&agents, "test", "task", Some("local/test"), &cwd, None, None, None).await
         });
 
         tokio::select! {
@@ -1524,7 +1562,7 @@ mod tests {
 
         let mut run = tokio::spawn(async move {
             let agents = [agent];
-            run_single_agent(&agents, "test", "task", Some("local/test"), &cwd, None, None).await
+            run_single_agent_with_progress(&agents, "test", "task", Some("local/test"), &cwd, None, None, None).await
         });
 
         tokio::select! {

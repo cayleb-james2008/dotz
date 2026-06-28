@@ -509,6 +509,7 @@ code { font-family: var(--mono); color: var(--peach); }
 .toolcard-body { padding: 0 11px 9px; font-family: var(--mono); font-size: 11px; }
 .toolcard-args { color: var(--cyan); white-space: pre-wrap; word-break: break-word; margin: 0; background: rgba(13,13,18,0.5); padding: 8px 10px; border-radius: var(--radius-sm); border: 1px solid var(--glass-border); }
 .toolcard-out { color: var(--muted); white-space: pre-wrap; max-height: 240px; overflow-y: auto; margin: 7px 0 0; background: rgba(13,13,18,0.5); padding: 8px 10px; border-radius: var(--radius-sm); border: 1px solid var(--glass-border); }
+.toolcard-live { color: var(--cyan); white-space: pre-wrap; max-height: 180px; overflow-y: auto; margin: 7px 0 0; background: rgba(130,200,255,0.08); padding: 8px 10px; border-radius: var(--radius-sm); border: 1px dashed rgba(130,200,255,0.3); font-style: italic; }
 .msg-error { border: 1px solid var(--red); border-left: 3px solid var(--red); background: rgba(243,139,168,0.10); color: var(--red); padding: 8px 11px; font-family: var(--mono); font-size: 12px; border-radius: var(--radius-sm); }
 
 .composer { border-top: 1px solid var(--border); background: var(--crust); padding: 10px 12px; }
