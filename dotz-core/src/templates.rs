@@ -59,7 +59,15 @@ fn now_ms() -> u64 {
 }
 
 fn bundled_dir() -> PathBuf {
-    skills::pi_dir().join("prompts")
+    let configured = skills::pi_dir().join("prompts");
+    if configured.exists() {
+        return configured;
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.join(".pi").join("prompts"))
+        .filter(|p| p.exists())
+        .unwrap_or(configured)
 }
 
 fn user_dir() -> PathBuf {
@@ -117,10 +125,7 @@ fn meta_from(t: &Template) -> TemplateMeta {
 /// everything after the closing `---` is the prompt body.
 fn parse_bundled(path: &StdPath) -> Option<Template> {
     let raw = std::fs::read_to_string(path).ok()?;
-    let id = path
-        .file_stem()
-        .and_then(|s| s.to_str())?
-        .to_string();
+    let id = path.file_stem().and_then(|s| s.to_str())?.to_string();
     let mut name: Option<String> = None;
     let mut description = String::new();
     let mut body = raw.clone();
@@ -143,12 +148,9 @@ fn parse_bundled(path: &StdPath) -> Option<Template> {
             for line in fm_lines {
                 let mut parts = line.splitn(2, ':');
                 let key = parts.next().map(|k| k.trim());
-                let val = parts.next().map(|v| {
-                    v.trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_string()
-                });
+                let val = parts
+                    .next()
+                    .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string());
                 match key {
                     Some("name") => name = val,
                     Some("description") => {
@@ -590,7 +592,8 @@ mod tests {
 
     #[test]
     fn parse_bundled_extracts_description_and_body() {
-        let dir = std::env::temp_dir().join(format!("dotz-templates-md-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("dotz-templates-md-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("scout-and-plan.md");
         std::fs::write(
@@ -667,17 +670,17 @@ mod tests {
             Some(vec!["ops".into()]),
         )
         .unwrap();
-            assert_eq!(t.id, "my-template");
-            assert_eq!(t.source, "user");
+        assert_eq!(t.id, "my-template");
+        assert_eq!(t.source, "user");
 
-            let fetched = get_template("my-template").unwrap();
-            assert_eq!(fetched.name, "My Template");
-            assert_eq!(fetched.body, "Run $@");
-            assert_eq!(fetched.description, "does things");
-            assert_eq!(fetched.tags, Some(vec!["ops".into()]));
+        let fetched = get_template("my-template").unwrap();
+        assert_eq!(fetched.name, "My Template");
+        assert_eq!(fetched.body, "Run $@");
+        assert_eq!(fetched.description, "does things");
+        assert_eq!(fetched.tags, Some(vec!["ops".into()]));
 
-            let meta = list_meta();
-            assert!(meta.iter().any(|m| m.id == "my-template" && m.has_args));
+        let meta = list_meta();
+        assert!(meta.iter().any(|m| m.id == "my-template" && m.has_args));
     }
 
     #[test]
@@ -690,8 +693,14 @@ mod tests {
             None,
         )
         .unwrap();
-        let updated = update(&t.id, Some("Renamed".into()), None, Some("new desc".into()), None)
-            .unwrap();
+        let updated = update(
+            &t.id,
+            Some("Renamed".into()),
+            None,
+            Some("new desc".into()),
+            None,
+        )
+        .unwrap();
         assert_eq!(updated.name, "Renamed");
         assert_eq!(updated.body, "first");
         assert_eq!(updated.description, "new desc");

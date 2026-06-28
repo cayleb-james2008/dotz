@@ -166,8 +166,8 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
 
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = dotz_core::server::serve_with_shutdown(listener, web_dir, shutdown)
-                    .await
+                if let Err(e) =
+                    dotz_core::server::serve_with_shutdown(listener, web_dir, shutdown).await
                 {
                     eprintln!("dotz-core server error: {e}");
                 }
@@ -275,7 +275,12 @@ mod tests {
     async fn bind_listener_succeeds_on_free_port() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let listener = bind_listener(addr).expect("should bind to a free ephemeral port");
-        let bound_addr = listener.local_addr().expect("listener should have a local address");
-        assert!(bound_addr.port() > 0, "ephemeral bind should return a non-zero port");
+        let bound_addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        assert!(
+            bound_addr.port() > 0,
+            "ephemeral bind should return a non-zero port"
+        );
     }
 }

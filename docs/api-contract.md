@@ -113,6 +113,53 @@ Bundled presets ship in `.pi/prompts/` (the 6 workflow slash commands). User tem
  the user store so it can be edited. `run` expands `$@` with `args` and sends the result as a
 prompt to the live session — equivalent to typing the slash command in the composer.
 
+### Spec-driven workflow (OpenSpec-compatible)
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/api/specs/status?projectId=<id>` | - | `{ cwd, openspecDir, changes, active, blocked, native, cli }` |
+| GET | `/api/specs/changes?projectId=<id>` | - | `{ changes: SpecChange[] }` |
+| POST | `/api/specs/changes` | `{ projectId?, title, description?, slug? }` | `{ change: SpecChange }` |
+| GET | `/api/specs/changes/:id?projectId=<id>` | - | `{ change: SpecChange }` |
+| PATCH | `/api/specs/changes/:id` | `{ projectId?, title?, description?, proposal?, design?, tasks?, readiness?, spec? }` | `{ change }` |
+| POST | `/api/specs/changes/:id/apply` | `{ projectId? }` | `{ change, tasks, message }` |
+| POST | `/api/specs/changes/:id/verify` | `{ projectId? }` | `{ ok, change, missingArtifacts, pendingReadiness, incompleteTasks }` |
+| POST | `/api/specs/changes/:id/sync` | `{ projectId? }` | `{ ok, copied, change }` |
+| POST | `/api/specs/changes/:id/archive` | `{ projectId? }` | `{ ok, archivedPath, change }` |
+
+`SpecChange = { id, title, description, status, path, artifacts:SpecArtifact[], readiness:ReadinessFinding[], createdAt, updatedAt, archivedAt? }`.
+Changes are stored under `<cwd>/openspec/changes/<slug>/` with `proposal.md`, `design.md`,
+`tasks.md`, `specs/`, and dotz's `readiness.md`. `sync` copies change-local specs into
+`<cwd>/openspec/specs/`; `archive` moves the change under `openspec/changes/archive/`.
+
+### Living docs
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/api/living-docs?projectId=<id>&scope=project|global` | - | `{ scope, docs, suggestions }` |
+| PATCH | `/api/living-docs?projectId=<id>&scope=project|global` | `{ kind, content }` | `{ doc, docs }` |
+| POST | `/api/living-docs/suggestions/:id/accept?projectId=<id>&scope=project|global` | - | `{ ok, suggestion, docs, suggestions }` |
+| POST | `/api/living-docs/suggestions/:id/reject?projectId=<id>&scope=project|global` | - | `{ ok, suggestion, docs, suggestions }` |
+
+`kind` is `anti_patterns`, `non_inferables`, `context_scope`, or `living_docs`. Project docs live in
+`<cwd>/.ai-agents/`; global docs live in `~/.dotz/ai-agents/`. The agent prompt receives compact
+summaries beside memory. Explicit high-confidence `agent_end` labels append automatically;
+ambiguous labels become suggestions for the LIVING DOCS panel.
+
+### VCS
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/api/vcs/status?projectId=<id>` | - | `{ status: VcsStatus }` |
+| POST | `/api/vcs/branch` | `{ projectId?, slug?, name? }` | `{ ok, branch, reused, status }` |
+| POST | `/api/vcs/commit` | `{ projectId?, message, body?, files? }` | `{ ok, commitId, status }` |
+| POST | `/api/vcs/pr` | `{ projectId?, title?, body?, base?, draft? }` | `{ ok, url }` |
+| POST | `/api/vcs/rollback` | `{ projectId?, target, mode:"checkpoint"|"revert"|"reset", confirm? }` | `{ ok, mode, target, status? }` |
+
+`branch` creates/reuses `dotz/<slug>` unless `name` is already a full branch name. `commit` is an
+atomic logical commit and stages `files` or all changes when `files` is omitted. `pr` uses `gh` only
+when the GitHub CLI is installed and logged in. `reset` rollback requires `confirm:true`.
+
 ### Sandbox (visual web preview + agent cursor)
 
 | Method | Path | Body | Returns |
@@ -219,7 +266,7 @@ cursor over it.
 - `step_added` — `{ type, step:WorkflowStep }`.
 - `step_state` — `{ type, stepId, status, output?, error?, usage?, sandboxRunId?, browserSessionId?, toolCallIds?, thinking? }`.
 
-`WorkflowStep = { id, agent, task, status:"pending"|"ready"|"running"|"done"|"error"|"skipped", parents, children, output?, error?, usage?, sandboxRunId?, browserSessionId?, toolCallIds?, thinking?, startedAt?, endedAt? }`.
+`WorkflowStep = { id, agent, task, status:"pending"|"ready"|"running"|"done"|"error"|"skipped", parents, children, output?, error?, usage?, sandboxRunId?, browserSessionId?, toolCallIds?, thinking?, specChangeId?, specTaskId?, commitId?, readinessStatus?, rollbackTarget?, startedAt?, endedAt? }`.
 
 ### Gate events (server ↔ client, human approval)
 

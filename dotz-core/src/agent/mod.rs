@@ -972,7 +972,8 @@ mod tests {
     /// frontmatter as having no frontmatter at all.
     #[test]
     fn prompt_commands_from_dir_reads_crlf_frontmatter_description() {
-        let dir = std::env::temp_dir().join(format!("dotz-prompts-crlf-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("dotz-prompts-crlf-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("windows-preset.md"),
@@ -1005,8 +1006,8 @@ mod tests {
     /// short and miss the description field.
     #[test]
     fn parse_prompt_description_ignores_bare_dashes_in_content() {
-        let dir = std::env::temp_dir()
-            .join(format!("dotz-prompts-dashes-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("dotz-prompts-dashes-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("dashed-preset.md"),
@@ -1144,9 +1145,7 @@ mod tests {
     /// normalized to "ollama" so the UI/provider resolution does not fail on mixed-case input.
     #[tokio::test]
     async fn post_model_accepts_uppercase_provider() {
-        let create_resp = create_session(Some(Json(json!({}))))
-            .await
-            .unwrap();
+        let create_resp = create_session(Some(Json(json!({})))).await.unwrap();
         let sid = create_resp.0["sessionId"].as_str().unwrap().to_string();
 
         let body = Json(json!({
@@ -1167,9 +1166,7 @@ mod tests {
     /// None and the model-update endpoint rejected them even though the adapters existed.
     #[tokio::test]
     async fn post_model_accepts_anthropic_and_google() {
-        let create_resp = create_session(Some(Json(json!({}))))
-            .await
-            .unwrap();
+        let create_resp = create_session(Some(Json(json!({})))).await.unwrap();
         let sid = create_resp.0["sessionId"].as_str().unwrap().to_string();
 
         let body = Json(json!({
@@ -1225,10 +1222,7 @@ mod tests {
         let err = create_session(Some(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         let msg = err.1 .0["error"].as_str().unwrap_or("");
-        assert!(
-            msg.contains("no such project"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("no such project"), "unexpected error: {msg}");
     }
 
     /// A connected WebSocket must close promptly when its session is disposed server-side.
@@ -1799,8 +1793,10 @@ mod tests {
         let _guard = WS_TEST_LOCK.lock().await;
 
         // Isolate the workflow history file so this test does not pollute the real store.
-        let workflows_file =
-            std::env::temp_dir().join(format!("dotz-ws-workflows-test-{}.json", uuid::Uuid::new_v4()));
+        let workflows_file = std::env::temp_dir().join(format!(
+            "dotz-ws-workflows-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
         let prev_workflows_file = std::env::var("DOTZ_WORKFLOWS_FILE").ok();
         std::env::set_var(
             "DOTZ_WORKFLOWS_FILE",
@@ -1885,7 +1881,9 @@ mod tests {
 
         // Update the first step to done.
         let step_resp = client
-            .post(format!("http://127.0.0.1:{port}/api/workflows/{run_id}/step"))
+            .post(format!(
+                "http://127.0.0.1:{port}/api/workflows/{run_id}/step"
+            ))
             .json(&json!({ "stepId": step_id, "status": "done", "output": "ok" }))
             .send()
             .await
@@ -1933,4 +1931,3 @@ mod tests {
         );
     }
 }
-

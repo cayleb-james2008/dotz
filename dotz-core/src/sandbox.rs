@@ -333,13 +333,7 @@ async fn execute_run(
     let stderr = child.stderr.take();
     let (output, status) = match tx {
         Some(tx) => {
-            let st = tokio::spawn(stream_output(
-                id.clone(),
-                mode.clone(),
-                stdout,
-                stderr,
-                tx,
-            ));
+            let st = tokio::spawn(stream_output(id.clone(), mode.clone(), stdout, stderr, tx));
             let (status, output) = tokio::join!(child.wait(), st);
             (output.unwrap_or_default(), status)
         }
@@ -359,8 +353,7 @@ async fn execute_run(
                 buf
             };
             let (out, err, status) = tokio::join!(read_out, read_err, child.wait());
-            let output = String::from_utf8_lossy(&out).to_string()
-                + &String::from_utf8_lossy(&err);
+            let output = String::from_utf8_lossy(&out).to_string() + &String::from_utf8_lossy(&err);
             (output, status)
         }
     };
@@ -752,8 +745,7 @@ mod tests {
             "run_count should include the inserted entry"
         );
         assert_eq!(
-            after_remove,
-            before,
+            after_remove, before,
             "run_count should return to baseline after removal"
         );
     }
@@ -1021,8 +1013,7 @@ mod tests {
             "runs_guard must recover and allow store mutations after poison"
         );
         assert_eq!(
-            after_remove,
-            before,
+            after_remove, before,
             "runs_guard must recover and allow store removals after poison"
         );
     }
@@ -1075,7 +1066,10 @@ mod tests {
 
         let mut found = false;
         while let Ok(frame) = rx.try_recv() {
-            assert_eq!(frame.get("runId").and_then(|r| r.as_str()), Some(id.as_str()));
+            assert_eq!(
+                frame.get("runId").and_then(|r| r.as_str()),
+                Some(id.as_str())
+            );
             if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_output") {
                 if frame.get("line").and_then(|l| l.as_str()) == Some("dotz-stream-test") {
                     assert_eq!(frame.get("stream").and_then(|s| s.as_str()), Some("stdout"));
@@ -1172,7 +1166,10 @@ mod tests {
                 found = true;
             }
         }
-        assert!(found, "sandbox_port event should be emitted for a reachable listener port");
+        assert!(
+            found,
+            "sandbox_port event should be emitted for a reachable listener port"
+        );
 
         {
             let store = runs_guard();
@@ -1263,11 +1260,7 @@ mod tests {
         }
 
         // Reap the child; it should exit quickly after being killed.
-        let reaped = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            child.wait(),
-        )
-        .await;
+        let reaped = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
         assert!(
             reaped.is_ok(),
             "killed child process should exit within 5 seconds"

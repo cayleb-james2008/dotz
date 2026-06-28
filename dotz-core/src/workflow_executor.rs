@@ -158,7 +158,14 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
             .steps
             .iter()
             .filter(|s| s.status == "ready" || s.status == "interrupted")
-            .map(|s| (s.id.clone(), s.agent.clone(), s.task.clone(), s.model.clone()))
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.agent.clone(),
+                    s.task.clone(),
+                    s.model.clone(),
+                )
+            })
             .collect();
 
         // Budget check: if cumulative spend exceeds the run budget, skip all ready
@@ -258,7 +265,13 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 let result = tokio::time::timeout(
                     step_timeout(),
-                    run_single_agent_with_bus(&agent_name, &task, model_override.as_deref(), &cwd, Some(&bus)),
+                    run_single_agent_with_bus(
+                        &agent_name,
+                        &task,
+                        model_override.as_deref(),
+                        &cwd,
+                        Some(&bus),
+                    ),
                 )
                 .await;
 
@@ -279,10 +292,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                         (
                             "error".to_string(),
                             None,
-                            Some(format!(
-                                "step '{sid}' timed out after {:?}",
-                                step_timeout()
-                            )),
+                            Some(format!("step '{sid}' timed out after {:?}", step_timeout())),
                         )
                     }
                 };
@@ -343,7 +353,6 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                     }
                 }
             }
-
         }
     }
 }
@@ -379,8 +388,7 @@ mod tests {
     }
 
     fn set_tmp_workflows_file() -> std::path::PathBuf {
-        let file =
-            std::env::temp_dir().join(format!("dotz-wf-exec-test-{}.json", Uuid::new_v4()));
+        let file = std::env::temp_dir().join(format!("dotz-wf-exec-test-{}.json", Uuid::new_v4()));
         std::env::set_var("DOTZ_WORKFLOWS_FILE", file.to_string_lossy().to_string());
         file
     }
@@ -392,7 +400,10 @@ mod tests {
         // Default when unset.
         std::env::remove_var("DOTZ_WF_CONCURRENCY");
         let c = concurrency();
-        assert!(c >= 1 && c <= MAX_CONCURRENCY, "default concurrency out of bounds: {c}");
+        assert!(
+            c >= 1 && c <= MAX_CONCURRENCY,
+            "default concurrency out of bounds: {c}"
+        );
 
         // Valid override is preserved.
         std::env::set_var("DOTZ_WF_CONCURRENCY", "2");
@@ -429,7 +440,11 @@ mod tests {
         assert_eq!(step_timeout().as_millis(), 1000, "below-min clamps to 1s");
 
         std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "100000000");
-        assert_eq!(step_timeout().as_millis(), 3_600_000, "above-max clamps to 1h");
+        assert_eq!(
+            step_timeout().as_millis(),
+            3_600_000,
+            "above-max clamps to 1h"
+        );
 
         std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
     }
@@ -495,7 +510,11 @@ mod tests {
         let result = run_workflow(&run.id).await;
         assert!(result.is_some());
         let run = result.unwrap();
-        assert_eq!(run.status, "error", "run should be errored: {:?}", run.steps);
+        assert_eq!(
+            run.status, "error",
+            "run should be errored: {:?}",
+            run.steps
+        );
         assert_eq!(run.steps[0].status, "error");
         assert!(
             run.steps[0]
@@ -585,7 +604,9 @@ mod tests {
 
         // The executor creates the bus internally; read from it after the run.
         // Auto-population happens inside the executor loop.
-        let bus = ContextBus { run_id: run.id.clone() };
+        let bus = ContextBus {
+            run_id: run.id.clone(),
+        };
 
         // The bus must contain step 0's output and summary.
         let step0_output_key = format!("step:{}:output", run.steps[0].id);
@@ -639,13 +660,18 @@ mod tests {
         assert!(result.is_some());
 
         // The bus persists after completion — caller inspects, then destroys.
-        let bus = ContextBus { run_id: run_id.clone() };
+        let bus = ContextBus {
+            run_id: run_id.clone(),
+        };
         assert!(
             !bus.read_all().is_empty(),
             "bus should persist and contain step data after run completion"
         );
         ContextBus::destroy(&run_id);
-        assert!(bus.read_all().is_empty(), "after destroy, bus should be empty");
+        assert!(
+            bus.read_all().is_empty(),
+            "after destroy, bus should be empty"
+        );
 
         std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
         std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
@@ -726,7 +752,11 @@ mod tests {
             3,
             &[
                 step("dotz-bus-step-resume-done", "done task", None),
-                step("dotz-bus-step-resume-running", "running task", Some(vec![json!(0)])),
+                step(
+                    "dotz-bus-step-resume-running",
+                    "running task",
+                    Some(vec![json!(0)]),
+                ),
             ],
             None,
         )
@@ -770,7 +800,9 @@ mod tests {
 
         // The bus must contain step 0's output (completed before shutdown)
         // AND step 1's key must NOT exist (it was interrupted, not done).
-        let bus = ContextBus { run_id: run2_id.clone() };
+        let bus = ContextBus {
+            run_id: run2_id.clone(),
+        };
         let output_key = format!("step:{}:output", run2_step0_id);
         let loaded = bus.read(&output_key);
         assert!(
@@ -839,7 +871,10 @@ mod tests {
             "budget-skip".into(),
             None,
             3,
-            &[step("dotz-budget-a", "task a", None), step("dotz-budget-b", "task b", None)],
+            &[
+                step("dotz-budget-a", "task a", None),
+                step("dotz-budget-b", "task b", None),
+            ],
             Some(Budget {
                 max_cost: Some(0.0001),
                 max_tokens: None,

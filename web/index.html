@@ -466,6 +466,97 @@
       </div>
     </template>
 
+    <template id="tpl-spec">
+      <div class="panel" data-panel="spec" role="region" aria-label="Spec">
+        <div class="panel-head" draggable="true"><span class="panel-icon">◇</span> SPEC <button class="panel-close">×</button></div>
+        <div class="panel-body ops-body">
+          <div class="ops-toolbar">
+            <input id="spec-title" class="pf-input" placeholder="new change title" />
+            <button id="spec-create" class="btn-mini btn-go">+ PROPOSE</button>
+            <button id="spec-refresh" class="btn-mini">REFRESH</button>
+          </div>
+          <div id="spec-status" class="skills-count dim mono">loading…</div>
+          <div class="ops-split">
+            <div id="spec-list" class="ops-list"></div>
+            <div id="spec-detail" class="ops-detail">
+              <div class="dim mono">select a change</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <template id="tpl-living-docs">
+      <div class="panel" data-panel="living-docs" role="region" aria-label="Living Docs">
+        <div class="panel-head" draggable="true"><span class="panel-icon">◧</span> LIVING DOCS <button class="panel-close">×</button></div>
+        <div class="panel-body ops-body">
+          <div class="ops-toolbar">
+            <select id="ld-scope" class="pf-select">
+              <option value="project">project</option>
+              <option value="global">global</option>
+            </select>
+            <select id="ld-kind" class="pf-select">
+              <option value="anti_patterns">anti-patterns</option>
+              <option value="non_inferables">non-inferables</option>
+              <option value="context_scope">context scope</option>
+              <option value="living_docs">living docs</option>
+            </select>
+            <button id="ld-save" class="btn-mini btn-go">SAVE</button>
+            <button id="ld-refresh" class="btn-mini">REFRESH</button>
+          </div>
+          <div id="ld-status" class="skills-count dim mono">loading…</div>
+          <div class="ops-split">
+            <textarea id="ld-editor" class="ops-editor" spellcheck="false"></textarea>
+            <div class="ops-detail">
+              <div class="sb-pane-head">SUGGESTIONS</div>
+              <div id="ld-suggestions" class="ops-list"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <template id="tpl-vcs">
+      <div class="panel" data-panel="vcs" role="region" aria-label="VCS">
+        <div class="panel-head" draggable="true"><span class="panel-icon">⌁</span> VCS <button class="panel-close">×</button></div>
+        <div class="panel-body ops-body">
+          <div class="ops-toolbar">
+            <button id="vcs-refresh" class="btn-mini">REFRESH</button>
+            <span id="vcs-status-chip" class="skills-count dim mono">loading…</span>
+          </div>
+          <div id="vcs-status" class="ops-kv"></div>
+          <div class="ops-section">
+            <div class="sb-pane-head">BRANCH</div>
+            <div class="ops-row">
+              <input id="vcs-branch-name" class="pf-input" placeholder="spec slug or branch name" />
+              <button id="vcs-branch" class="btn-mini btn-go">CREATE / SWITCH</button>
+            </div>
+          </div>
+          <div class="ops-section">
+            <div class="sb-pane-head">COMMIT</div>
+            <input id="vcs-commit-msg" class="pf-input" placeholder="atomic commit message" />
+            <button id="vcs-commit" class="btn-mini btn-go">COMMIT STAGED / ALL</button>
+          </div>
+          <div class="ops-section">
+            <div class="sb-pane-head">PR / ROLLBACK</div>
+            <div class="ops-row">
+              <button id="vcs-pr" class="btn-mini">OPEN PR</button>
+              <select id="vcs-rollback-mode" class="pf-select">
+                <option value="revert">revert</option>
+                <option value="checkpoint">checkpoint</option>
+                <option value="reset">reset</option>
+              </select>
+            </div>
+            <div class="ops-row">
+              <input id="vcs-rollback-target" class="pf-input" placeholder="commit sha or checkpoint run id" />
+              <label class="ops-check"><input id="vcs-rollback-confirm" type="checkbox" /> confirm reset</label>
+              <button id="vcs-rollback" class="btn-mini btn-stop">ROLLBACK</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
     <template id="tpl-doctrine">
       <div class="panel" data-panel="doctrine" role="region" aria-label="Doctrine">
         <div class="panel-head" draggable="true"><span class="panel-icon">◈</span> DOCTRINE <button class="panel-close">×</button></div>

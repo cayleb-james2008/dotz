@@ -40,13 +40,13 @@
 //!
 //! ponytail: uses `std::process::Command` to shell out to `git` — no new crate dependency,
 //! matches the style of `agent/tools.rs::BashTool` and `sandbox.rs::create_run`.
+use crate::workflows;
+use axum::http::StatusCode;
 use axum::{
     extract::Path,
     routing::{get, post},
     Json, Router,
 };
-use axum::http::StatusCode;
-use crate::workflows;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
@@ -403,9 +403,7 @@ pub fn restore_checkpoint(run_id: &str, cwd: &str) -> Result<(), CheckpointError
     // Validate the snapshot SHA still exists in this repo (defensive against a
     // `git gc` or manual force-push that rewrote history).
     let (stdout, _, code) = git(cwd, &["cat-file", "-t", &snapshot_sha]).map_err(|e| {
-        CheckpointError::RestoreFailed(format!(
-            "git cat-file for snapshot {snapshot_sha}: {e}"
-        ))
+        CheckpointError::RestoreFailed(format!("git cat-file for snapshot {snapshot_sha}: {e}"))
     })?;
     if code != 0 || stdout.trim() != "commit" {
         return Err(CheckpointError::RestoreFailed(format!(
@@ -426,10 +424,9 @@ pub fn restore_checkpoint(run_id: &str, cwd: &str) -> Result<(), CheckpointError
 
     // Remove any untracked files the run created. `git reset --hard` doesn't touch
     // untracked files; the run's subagents may have created new ones (build output,
-        // temp files, etc.) that aren't in the snapshot.
-    let (_, _, _) = git(cwd, &["clean", "-fd"]).map_err(|e| {
-        CheckpointError::RestoreFailed(format!("git clean -fd: {e}"))
-    })?;
+    // temp files, etc.) that aren't in the snapshot.
+    let (_, _, _) = git(cwd, &["clean", "-fd"])
+        .map_err(|e| CheckpointError::RestoreFailed(format!("git clean -fd: {e}")))?;
 
     // Remove the in-memory entry.
     remove_checkpoint(run_id);
@@ -456,8 +453,7 @@ fn now_ms() -> i64 {
 /// Resolve a working directory for the run's project. Prefers the project's stored
 /// cwd (if the run was created with a project_id); falls back to server cwd.
 fn cwd_for_run(run_id: &str) -> String {
-    let project_id = crate::workflows::get_active(run_id)
-        .and_then(|r| r.project_id.clone());
+    let project_id = crate::workflows::get_active(run_id).and_then(|r| r.project_id.clone());
     if let Some(pid) = project_id {
         if let Some(cwd) = crate::projects::cwd_for_project(Some(&pid)) {
             return cwd;
@@ -478,7 +474,10 @@ async fn create_checkpoint_handler(
     match save_checkpoint(&run_id, &cwd) {
         Ok(snapshot_sha) => {
             let cp = get_checkpoint(&run_id).unwrap();
-            Ok((StatusCode::CREATED, Json(json!({ "checkpoint": cp, "snapshotSha": snapshot_sha }))))
+            Ok((
+                StatusCode::CREATED,
+                Json(json!({ "checkpoint": cp, "snapshotSha": snapshot_sha })),
+            ))
         }
         Err(e) => Err(e.into_response()),
     }
@@ -490,10 +489,12 @@ async fn get_checkpoint_handler(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match get_checkpoint(&run_id) {
         Some(cp) => Ok(Json(json!({ "checkpoint": cp }))),
-        None => Err((StatusCode::NOT_FOUND, Json(json!({ "error": "no checkpoint for this run" })))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no checkpoint for this run" })),
+        )),
     }
 }
-
 
 /// GET /api/checkpoints → list all active checkpoints (for the checkpoint panel).
 async fn list_checkpoints_handler() -> Json<Value> {
@@ -548,7 +549,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         git(dir.to_str().unwrap(), &["init"]).unwrap();
         git(dir.to_str().unwrap(), &["config", "core.autocrlf", "false"]).unwrap();
-        git(dir.to_str().unwrap(), &["config", "user.email", "test@dotz"]).unwrap();
+        git(
+            dir.to_str().unwrap(),
+            &["config", "user.email", "test@dotz"],
+        )
+        .unwrap();
         git(dir.to_str().unwrap(), &["config", "user.name", "dotz test"]).unwrap();
         std::fs::write(dir.join("README.md"), "# hello\n").unwrap();
         git(dir.to_str().unwrap(), &["add", "README.md"]).unwrap();
@@ -603,7 +608,10 @@ mod tests {
 
         // README is back to original.
         let restored = std::fs::read_to_string(dir.join("README.md")).unwrap();
-        assert_eq!(restored, original, "restored README should match pre-run content");
+        assert_eq!(
+            restored, original,
+            "restored README should match pre-run content"
+        );
 
         // New file was removed.
         assert!(
