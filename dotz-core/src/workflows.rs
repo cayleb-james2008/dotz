@@ -100,6 +100,14 @@ pub struct WorkflowStep {
     /// Cumulative total tokens actually consumed by this step (set at completion).
     #[serde(rename = "actualTokens", skip_serializing_if = "Option::is_none")]
     pub actual_tokens: Option<u64>,
+    /// The subagent's full conversation history for this step, captured at completion.
+    /// Persisted so the UI step-detail drawer can render tool calls / tool results /
+    /// thinking blocks, and so a resumed interrupted step can re-inherit prior
+    /// conversation context instead of re-executing already-completed tool calls.
+    /// None when the step has not yet completed (or was interrupted before the
+    /// subagent returned any output).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<Value>>,
 }
 
 /// A workflow run — a DAG of steps, observable by the UI.
@@ -260,6 +268,19 @@ fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// Truncate a string to at most `cap` bytes, respecting UTF-8 boundaries.
+fn truncate_bytes(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let omitted = s.len() - end;
+    format!("{}\n\n[context truncated: {omitted} bytes omitted]", &s[..end])
+}
+
 /// Heuristic: does a review step's output contain actionable findings?
 /// Matches the reviewer agent's output format (## Critical / ## Warnings sections) and a
 /// generic "issues found" pattern. A review that reports no issues (e.g. "No critical issues
@@ -405,6 +426,7 @@ pub fn create(
             budget: s.budget.clone(),
             actual_cost: None,
             actual_tokens: None,
+            messages: None,
         })
         .collect();
 
@@ -671,6 +693,7 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
                     budget: None,
                     actual_cost: None,
                     actual_tokens: None,
+                    messages: None,
                 };
                 let re_review_step = WorkflowStep {
                     id: new_id(),
@@ -693,6 +716,7 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
                     budget: None,
                     actual_cost: None,
                     actual_tokens: None,
+                    messages: None,
                 };
 
                 // Wire the review step → repair → re-review chain.
@@ -786,6 +810,148 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
         emit_workflow_end(&run_snapshot.0);
     }
     Some(run_snapshot.0)
+}
+
+/// Set the subagent message history on a step. Called by the executor after a step
+/// completes (success or failure) so the full conversation — tool calls, tool
+/// results, thinking blocks — is preserved on the step for the UI step-detail
+/// drawer AND for resume: a step that was interrupted can re-inherit its prior
+/// conversation instead of re-executing already-completed tool calls.
+pub fn step_messages(
+    run_id: &str,
+    step_id: &str,
+    messages: Vec<Value>,
+) -> Option<WorkflowRun> {
+    let run = {
+        let mut active = store_guard();
+        let run = active.get_mut(run_id)?;
+        let step = run.steps.iter_mut().find(|s| s.id == step_id)?;
+        step.messages = Some(messages);
+        run.updated_at = now_ms();
+        run.clone()
+    };
+    persist(&run);
+    Some(run)
+}
+
+/// Build a resume-context prefix from the messages of completed steps in a run.
+///
+/// When a step was interrupted (server restart mid-flight), the executor must
+/// re-dispatch it. Without context, the subagent starts from scratch — re-calling
+/// tools it already called, re-reading files it already read. This function
+/// assembles a compact "prior context" block from the last completed step's
+/// messages (if any) so the executor can inject it into the interrupted step's
+/// task prompt.
+///
+/// The context is a single string containing the last completed step's
+/// conversation in a condensed format: each message role + text content,
+/// truncated to `max_bytes` total. Tool-call/result messages are kept as
+/// one-liners (name + first 200 chars of input/output) to bound token cost.
+///
+/// Returns None when no completed step has messages to inject.
+pub fn build_resume_context(run: &WorkflowRun, max_bytes: usize) -> Option<String> {
+    // Find the last completed step that has messages. Prefer steps that are
+    // `done` (fully completed) over `error` (partial — but their messages are
+    // still useful as context).
+    let source = run
+        .steps
+        .iter()
+        .rev()
+        .find(|s| s.messages.is_some() && (s.status == "done" || s.status == "error"));
+    let source = match source {
+        Some(s) => s,
+        None => return None,
+    };
+    let messages = source.messages.as_ref()?;
+    if messages.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Prior context from completed step '{}' (agent: {}, status: {})\n\n",
+        source.id, source.agent, source.status
+    ));
+    out.push_str("The following is the subagent conversation from a previously-completed step in this workflow. Use this context to avoid re-doing work (re-reading files, re-calling tools) that was already completed.\n\n");
+
+    for msg in messages {
+        let role = msg
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("unknown");
+        match role {
+            "user" => {
+                let text = text_content(msg);
+                let truncated = truncate_bytes(&text, 1024);
+                out.push_str(&format!("[user]\n{}\n\n", truncated));
+            }
+            "assistant" => {
+                let text = text_content(msg);
+                let truncated = truncate_bytes(&text, 1024);
+                let tool_calls = msg.get("tool_calls").and_then(|tc| tc.as_array());
+                out.push_str(&format!("[assistant]\n{}\n", truncated));
+                if let Some(tcs) = tool_calls {
+                    for tc in tcs {
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("?");
+                        let args = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("");
+                        let args_truncated = truncate_bytes(args, 200);
+                        out.push_str(&format!("  - tool_call({}): {}\n", name, args_truncated));
+                    }
+                }
+                out.push('\n');
+            }
+            "tool" => {
+                let text = text_content(msg);
+                let truncated = truncate_bytes(&text, 512);
+                let tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or("?");
+                out.push_str(&format!("[tool:{}]\n{}\n\n", tool_call_id, truncated));
+            }
+            _ => {}
+        }
+        if out.len() >= max_bytes {
+            out.push_str("[context truncated]\n");
+            break;
+        }
+    }
+
+    if out.len() > max_bytes {
+        truncate_bytes(&out, max_bytes).to_string().into()
+    } else {
+        Some(out)
+    }
+}
+
+/// Extract the text content from a message JSON (handles both plain string content
+/// and array-of-content-blocks format).
+fn text_content(msg: &Value) -> String {
+    if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+        return text.to_string();
+    }
+    if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
+        return blocks
+            .iter()
+            .filter_map(|b| {
+                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    b.get("text").and_then(|t| t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
+    }
+    String::new()
 }
 
 /// Abort a run: mark aborted + sweep every non-terminal step to skipped.
@@ -2512,6 +2678,298 @@ mod tests {
             let history = list_history(None);
             let found = history.iter().find(|r| r.id == run.id).unwrap();
             assert_eq!(found.status, "interrupted");
+        });
+    }
+
+    // ---- subagent message persistence + resume context tests ----
+
+    /// `step_messages` persists the subagent's conversation history onto a step.
+    #[test]
+    fn step_messages_persists_conversation_history() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None), step("b", "B", None)];
+            let run = create(None, None, "messages".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let step0_id = run.steps[0].id.clone();
+
+            // Initially, the step has no messages.
+            assert!(get_active(&run.id).unwrap().steps[0].messages.is_none());
+
+            // Mark step done (required so step_messages can find the step).
+            let _ = step_state(
+                &run.id,
+                &step0_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("Done!".into()),
+                    ..Default::default()
+                },
+            );
+
+            // Persist messages as plain Values (no nested JSON-in-JSON).
+            let messages: Vec<Value> = vec![
+                json!({"role": "user", "content": "Task: do something"}),
+                json!({"role": "assistant", "content": "I did it"}),
+                json!({"role": "tool", "tool_call_id": "t1", "content": "tool output"}),
+            ];
+
+            let updated = step_messages(&run.id, &step0_id, messages.clone()).unwrap();
+            let s0 = updated.steps.iter().find(|s| s.id == step0_id).unwrap();
+            assert_eq!(s0.messages, Some(messages.clone()));
+
+            // Messages survive a round-trip through the store (persist + reload).
+            let reloaded = get_active(&run.id).unwrap();
+            let s0 = reloaded.steps.iter().find(|s| s.id == step0_id).unwrap();
+            assert_eq!(s0.messages, Some(messages));
+        });
+    }
+
+    /// `step_messages` returns None for an unknown run.
+    #[test]
+    fn step_messages_returns_none_for_unknown_run() {
+        with_tmp_workflows_file(|| {
+            let result = step_messages("no-such-run", "step-id", vec![]);
+            assert!(result.is_none());
+        });
+    }
+
+    /// `build_resume_context` extracts messages from the last completed step.
+    #[test]
+    fn build_resume_context_extracts_completed_step_messages() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None), step("b", "B", None)];
+            let run = create(None, None, "ctx".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let step0_id = run.steps[0].id.clone();
+
+            // Complete step 0 with messages.
+            let messages = vec![
+                json!({"role": "user", "content": "Task: alpha"}),
+                json!({"role": "assistant", "content": "Result of alpha"}),
+            ];
+            let _ = step_state(
+                &run.id,
+                &step0_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("Result of alpha".into()),
+                    ..Default::default()
+                },
+            );
+            let _ = step_messages(&run.id, &step0_id, messages);
+
+            // Build context from the run.
+            let run_snapshot = get_active(&run.id).unwrap();
+            let ctx = build_resume_context(&run_snapshot, 8192);
+            assert!(ctx.is_some(), "should build context from completed step");
+            let ctx = ctx.unwrap();
+            assert!(ctx.contains("Prior context"), "should have header");
+            assert!(ctx.contains("alpha"), "should reference the step's task");
+            assert!(ctx.contains("Result of alpha"), "should include assistant output");
+        });
+    }
+
+    /// `build_resume_context` returns None when no completed step has messages.
+    #[test]
+    fn build_resume_context_returns_none_when_no_messages() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "no-ctx".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+
+            // Step is done but has no messages.
+            let _ = step_state(
+                &run.id,
+                &run.steps[0].id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("output".into()),
+                    ..Default::default()
+                },
+            );
+
+            let run_snapshot = get_active(&run.id).unwrap();
+            let ctx = build_resume_context(&run_snapshot, 8192);
+            assert!(ctx.is_none(), "no messages → no context");
+        });
+    }
+
+    /// `build_resume_context` includes tool-call one-liners so the resumed subagent
+    /// can see which tools were already called.
+    #[test]
+    fn build_resume_context_includes_tool_call_details() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "tool-ctx".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let step0_id = run.steps[0].id.clone();
+
+            // Build a tool_call message where arguments is a JSON string.
+            let tool_call = {
+                let mut m = serde_json::Map::new();
+                m.insert("id".to_string(), json!("call_1"));
+                m.insert("type".to_string(), json!("function"));
+                let mut func = serde_json::Map::new();
+                func.insert("name".to_string(), json!("bash"));
+                // arguments is a JSON-encoded string
+                let args_str = serde_json::to_string(&json!({"command": "cat Cargo.toml"})).unwrap();
+                func.insert("arguments".to_string(), Value::String(args_str));
+                m.insert("function".to_string(), Value::Object(func));
+                Value::Object(m)
+            };
+            let messages: Vec<Value> = vec![
+                json!({"role": "assistant", "content": null, "tool_calls": [tool_call]}),
+                json!({"role": "tool", "tool_call_id": "call_1", "content": "[package]\nname = dotz\n"}),
+            ];
+            let _ = step_state(
+                &run.id,
+                &step0_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    ..Default::default()
+                },
+            );
+            let _ = step_messages(&run.id, &step0_id, messages);
+
+            let run_snapshot = get_active(&run.id).unwrap();
+            let ctx = build_resume_context(&run_snapshot, 8192).unwrap();
+            assert!(ctx.contains("tool_call(bash)"), "should include tool call name");
+            assert!(ctx.contains("Cargo.toml"), "should include tool call args");
+        });
+    }
+
+    /// Full lifecycle: step completes with messages → interrupt → resume → context is
+    /// available for the interrupted step. This is the core resumability guarantee.
+    #[test]
+    fn resume_preserves_completed_step_messages_for_context() {
+        with_tmp_workflows_file(|| {
+            // Two independent steps: A (completes with messages) and B (interrupted).
+            let inputs = vec![step("a", "Task A", None), step("b", "Task B", None)];
+            let run = create(None, None, "resume-ctx".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let step_a_id = run.steps[0].id.clone();
+            let step_b_id = run.steps[1].id.clone();
+
+            // Step A completes with messages.
+            let a_messages = vec![
+                json!({"role": "user", "content": "Task: Task A"}),
+                json!({"role": "assistant", "content": "Completed task A"}),
+            ];
+            let _ = step_state(
+                &run.id,
+                &step_a_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    output: Some("Completed task A".into()),
+                    ..Default::default()
+                },
+            );
+            let _ = step_messages(&run.id, &step_a_id, a_messages);
+
+            // Step B is running when the server shuts down.
+            let _ = step_state(
+                &run.id,
+                &step_b_id,
+                StepPatch {
+                    status: Some("running".into()),
+                    ..Default::default()
+                },
+            );
+
+            // Simulate shutdown: mark interrupted.
+            let _ = mark_interrupted(&run.id);
+            let interrupted = get_active(&run.id).unwrap();
+            assert_eq!(interrupted.status, "interrupted");
+            let s_b = interrupted.steps.iter().find(|s| s.id == step_b_id).unwrap();
+            assert_eq!(s_b.status, "interrupted");
+
+            // Resume.
+            let resumed = resume_sync(&run.id).unwrap();
+            assert_eq!(resumed.status, "running");
+
+            // Step B should be ready (reset from interrupted).
+            let s_b = resumed.steps.iter().find(|s| s.id == step_b_id).unwrap();
+            assert_eq!(s_b.status, "ready");
+
+            // Step A's messages should still be accessible (for the executor to
+            // build resume context).
+            let s_a = resumed.steps.iter().find(|s| s.id == step_a_id).unwrap();
+            assert!(s_a.messages.is_some(), "step A messages should survive resume");
+
+            // build_resume_context should produce a non-empty string referencing
+            // step A's output.
+            let ctx = build_resume_context(&resumed, 8192);
+            assert!(ctx.is_some(), "resume context should be available");
+            assert!(ctx.unwrap().contains("Task A"), "context should reference step A");
+        });
+    }
+
+    /// `build_resume_context` respects the max_bytes cap.
+    #[test]
+    fn build_resume_context_respects_max_bytes_cap() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "cap".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let step0_id = run.steps[0].id.clone();
+
+            // Large message content.
+            let big_text = "x".repeat(5000);
+            let messages = vec![
+                json!({"role": "assistant", "content": big_text}),
+            ];
+            let _ = step_state(
+                &run.id,
+                &step0_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    ..Default::default()
+                },
+            );
+            let _ = step_messages(&run.id, &step0_id, messages);
+
+            let run_snapshot = get_active(&run.id).unwrap();
+            // Cap at 100 bytes — output must be truncated.
+            let ctx = build_resume_context(&run_snapshot, 100).unwrap();
+            assert!(ctx.len() <= 200, "context should be roughly capped: got {} bytes", ctx.len());
+            assert!(ctx.contains("truncated"), "should indicate truncation");
+        });
+    }
+
+    /// `build_resume_context` prefers the LAST completed step (reverse order).
+    #[test]
+    fn build_resume_context_prefers_last_completed_step() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "first", None),
+                step("b", "second", None),
+                step("c", "third", None),
+            ];
+            let run = create(None, None, "last-step".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+
+            // Complete steps A and C (C is last). Leave B pending.
+            for step_id in &[&run.steps[0].id, &run.steps[2].id] {
+                let _ = step_state(
+                    &run.id,
+                    step_id,
+                    StepPatch {
+                        status: Some("done".into()),
+                        output: Some("output".into()),
+                        ..Default::default()
+                    },
+                );
+            }
+            // Give C distinct messages.
+            let c_messages = vec![
+                json!({"role": "assistant", "content": "third step output"}),
+            ];
+            let _ = step_messages(&run.id, &run.steps[2].id, c_messages);
+
+            let run_snapshot = get_active(&run.id).unwrap();
+            let ctx = build_resume_context(&run_snapshot, 8192).unwrap();
+            // Should reference C ("third"), not A ("first").
+            assert!(ctx.contains("third"), "should use the last completed step");
         });
     }
 }
