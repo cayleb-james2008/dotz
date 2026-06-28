@@ -640,6 +640,15 @@ function handleEvent(e) {
     case "tool_execution_start": toolCard(e.toolCallId, { name: e.toolName, args: e.args, status: "run" }); logBrain("tool: " + e.toolName); break;
     case "tool_execution_update": toolCard(e.toolCallId, { output: stringifyResult(e.partialResult) }); break;
     case "tool_execution_end": toolCard(e.toolCallId, { status: e.isError ? "err" : "done", output: stringifyResult(e.result), name: e.toolName }); break;
+    case "subagent_progress":
+      // Live subagent reasoning: stream the partial thinking text into the subagent's
+      // tool card so the operator can see a drifting scout/planner's reasoning as it
+      // happens rather than only after it finishes.
+      if (e.toolCallId && e.partial) {
+        const thinking = (e.partial.content || []).filter((b) => b.type === "thinking" || b.type === "text").map((b) => b.thinking || b.text || "").join("");
+        if (thinking) toolCard(e.toolCallId, { liveThinking: thinking });
+      }
+      break;
     case "agent_end": setStreaming(false); refreshStats(); logBrain("agent_end"); break;
   }
   scrollBottom();
@@ -1063,6 +1072,17 @@ function toolCard(id, patch) {
   if (d.name) { tc.nameEl.textContent = d.name; tc.previewEl.textContent = toolPreview(d.name, d.args); }
   if (d.args !== undefined) tc.argsEl.textContent = typeof d.args === "string" ? d.args : JSON.stringify(d.args, null, 2);
   if (d.output) { tc.outEl.style.display = ""; tc.outEl.textContent = d.output; }
+  // Live subagent thinking: a compact preview of the subagent's streamed reasoning,
+  // shown inline while the subagent is still running.
+  if (d.liveThinking !== undefined) {
+    if (!tc.liveEl) {
+      tc.liveEl = el("div", "toolcard-live");
+      tc.liveEl.style.display = "none";
+      tc.outEl.parentNode.insertBefore(tc.liveEl, tc.outEl);
+    }
+    tc.liveEl.style.display = "";
+    tc.liveEl.textContent = d.liveThinking;
+  }
   const st = d.status || "run";
   tc.card.classList.toggle("is-running", st === "run");
   tc.badge.className = "toolcard-status " + (st === "done" ? "status-done" : st === "err" ? "status-err" : "status-run");
