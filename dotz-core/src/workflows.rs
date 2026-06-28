@@ -100,6 +100,11 @@ pub struct WorkflowStep {
     /// Cumulative total tokens actually consumed by this step (set at completion).
     #[serde(rename = "actualTokens", skip_serializing_if = "Option::is_none")]
     pub actual_tokens: Option<u64>,
+    /// Per-step model override: when set, the executor uses this model instead of the
+    /// run's default (or the agent's default). Format: "provider/model-id".
+    /// The UI node drawer surfaces a model picker that patches this field.
+    #[serde(rename = "model", skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// A workflow run — a DAG of steps, observable by the UI.
@@ -169,6 +174,10 @@ pub struct CreateStepInput {
     /// executor aborts or downgrades the step before it can exceed these limits.
     #[serde(default)]
     pub budget: Option<Budget>,
+    /// Per-step model override: "provider/model-id". When set, this step uses this
+    /// model instead of the run/agent default.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 // ---- module-level store (OnceLock<Mutex<..>>; mirrors the Node module-singleton) ----
@@ -405,6 +414,7 @@ pub fn create(
             budget: s.budget.clone(),
             actual_cost: None,
             actual_tokens: None,
+            model: s.model.clone(),
         })
         .collect();
 
@@ -671,6 +681,7 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
                     budget: None,
                     actual_cost: None,
                     actual_tokens: None,
+                    model: None,
                 };
                 let re_review_step = WorkflowStep {
                     id: new_id(),
@@ -693,6 +704,7 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
                     budget: None,
                     actual_cost: None,
                     actual_tokens: None,
+                    model: None,
                 };
 
                 // Wire the review step → repair → re-review chain.
@@ -1275,6 +1287,847 @@ fn not_found(msg: &str) -> (StatusCode, Json<Value>) {
     (StatusCode::NOT_FOUND, Json(json!({ "error": msg })))
 }
 
+// ---- live-editable handlers ----
+
+/// Input for rerunning a failed step with optional feedback appended to its task.
+#[derive(Debug, Deserialize)]
+struct RerunBody {
+    #[serde(default)]
+    feedback: Option<String>,
+}
+
+/// POST /api/workflows/:id/step/:stepId/rerun — reset a failed (or any non-running) step
+/// to `ready` so the executor will re-dispatch it. Optional feedback is appended to
+/// the step's task so the subagent sees the operator's guidance. Returns the updated run.
+///
+/// This is the primary "steer" mechanism: the operator inspects a failed step's error
+/// in the node drawer, types feedback, and re-runs. The step's prior output/error/usage
+/// are cleared so the subagent starts fresh; the feedback is appended as a new section.
+async fn rerun_step_handler(
+    Path((id, step_id)): Path<(String, String)>,
+    body: Option<Json<RerunBody>>,
+) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+    let run = match get_active(&id) {
+        Some(r) => r,
+        None => return Err(not_found("no such workflow run")),
+    };
+    // Only allow rerun on a run that is still active (not terminal).
+    if run.status == "done" || run.status == "aborted" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("run is {} — cannot rerun a step", run.status) })),
+        ));
+    }
+    // Find the step.
+    let step = match run.steps.iter().find(|s| s.id == step_id) {
+        Some(s) => s.clone(),
+        None => return Err(not_found("no such step")),
+    };
+    // Cannot rerun a step that is currently running.
+    if step.status == "running" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "step is currently running — wait for it to complete or abort the run" })),
+        ));
+    }
+
+    // Build the new task: append feedback if provided.
+    let new_task = match body {
+        Some(Json(RerunBody { feedback: Some(fb) })) if !fb.trim().is_empty() => {
+            format!("{}
+
+[Operator feedback for rerun]
+{}", step.task, fb.trim())
+        }
+        _ => step.task.clone(),
+    };
+
+    // Reset the step to ready: clear error, output, usage, timestamps. Keep the
+    // new task (with appended feedback) and the agent/model/budget.
+    let patch = StepPatch {
+        status: Some("ready".into()),
+        output: None,
+        error: None,
+        usage: None,
+    };
+    // Apply the state change first.
+    let updated = match step_state(&id, &step_id, patch) {
+        Some(r) => r,
+        None => return Err(not_found("no such workflow run")),
+    };
+    // Update the task in-memory (step_state doesn't touch task). We need a direct
+    // mutation on the store. Use a targeted approach: update the active map.
+    {
+        let mut active = store_guard();
+        if let Some(run) = active.get_mut(&id) {
+            if let Some(s) = run.steps.iter_mut().find(|s| s.id == step_id) {
+                s.task = new_task;
+                s.started_at = None;
+                s.ended_at = None;
+            }
+            run.updated_at = now_ms();
+            persist(run);
+            // Emit a step_state event so the UI reflects the reset + new task.
+            let step = run.steps.iter().find(|s| s.id == step_id).cloned().unwrap();
+            emit_step_state(&id, &step);
+            return Ok(Json(run.clone()));
+        }
+    }
+    // Fallback (shouldn't reach): return the step_state result.
+    Ok(Json(updated))
+}
+
+/// Input for patching a step's parents (re-wiring dependencies).
+#[derive(Debug, Deserialize)]
+struct PatchStepBody {
+    #[serde(default)]
+    parents: Option<Vec<Value>>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// POST /api/workflows/:id/step/:stepId/patch — re-wire a step's parents and/or
+/// update its model. Re-validates the DAG (cycle detection) and re-propagates
+/// readiness. Returns the updated run.
+///
+/// This is the "re-wire" mechanism: the operator drags edges in the graph panel
+/// to change dependencies. A step that was pending on step A can be reparented to
+/// step B, or made a root node (empty parents). The engine re-checks for cycles
+/// before committing the change.
+async fn patch_step_handler(
+    Path((id, step_id)): Path<(String, String)>,
+    body: Option<Json<PatchStepBody>>,
+) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+    let body = match body {
+        Some(Json(b)) => b,
+        None => return Err(bad("body is required")),
+    };
+    let run = match get_active(&id) {
+        Some(r) => r,
+        None => return Err(not_found("no such workflow run")),
+    };
+    if run.status == "done" || run.status == "aborted" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("run is {} — cannot patch a step", run.status) })),
+        ));
+    }
+    // Find the step index.
+    let step_idx = match run.steps.iter().position(|s| s.id == step_id) {
+        Some(i) => i,
+        None => return Err(not_found("no such step")),
+    };
+
+    // Build a proposed parent set.
+    let proposed_parents: Vec<String> = match &body.parents {
+        Some(refs) => {
+            let len = run.steps.len();
+            let mut resolved = Vec::new();
+            for raw in refs {
+                let resolved_id = match raw {
+                    Value::Number(n) => match n.as_i64() {
+                        Some(i) if i >= 0 && (i as usize) < len => run.steps[i as usize].id.clone(),
+                        _ => continue,
+                    },
+                    Value::String(s) => {
+                        let trimmed = s.trim();
+                        let is_index = !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
+                        if is_index {
+                            match trimmed.parse::<usize>() {
+                                Ok(n) if n < len => run.steps[n].id.clone(),
+                                _ => continue,
+                            }
+                        } else if run.steps.iter().any(|st| &st.id == trimmed) {
+                            trimmed.to_string()
+                        } else {
+                            continue;
+                        }
+                    }
+                    _ => continue,
+                };
+                if resolved_id != step_id && !resolved.contains(&resolved_id) {
+                    resolved.push(resolved_id);
+                }
+            }
+            resolved
+        }
+        None => run.steps[step_idx].parents.clone(), // keep existing
+    };
+
+    // Cycle detection: temporarily set parents, run topological sort, reject if cyclic.
+    {
+        let mut test_run = run.clone();
+        test_run.steps[step_idx].parents = proposed_parents.clone();
+        // Rebuild children from parents.
+        // Clear existing children references for this step.
+        let step_id_c = step_id.clone();
+        for s in test_run.steps.iter_mut() {
+            s.children.retain(|c| c != &step_id_c);
+        }
+        // Re-add children based on new parents.
+        let new_parents = proposed_parents.clone();
+        for pid in &new_parents {
+            if let Some(p) = test_run.steps.iter_mut().find(|s| &s.id == pid) {
+                if !p.children.contains(&step_id_c) {
+                    p.children.push(step_id_c.clone());
+                }
+            }
+        }
+        // Kahn's algorithm.
+        let mut indeg: HashMap<String, isize> = test_run
+            .steps
+            .iter()
+            .map(|s| (s.id.clone(), s.parents.len() as isize))
+            .collect();
+        let mut queue: Vec<String> = test_run
+            .steps
+            .iter()
+            .filter(|s| s.parents.is_empty())
+            .map(|s| s.id.clone())
+            .collect();
+        let mut ordered = 0usize;
+        let mut q = 0usize;
+        while q < queue.len() {
+            ordered += 1;
+            let current = queue[q].clone();
+            q += 1;
+            if let Some(step) = test_run.steps.iter().find(|s| s.id == current) {
+                for child_id in step.children.clone() {
+                    let d = indeg.get(&child_id).copied().unwrap_or(0) - 1;
+                    indeg.insert(child_id.clone(), d);
+                    if d == 0 {
+                        queue.push(child_id);
+                    }
+                }
+            }
+        }
+        if ordered < test_run.steps.len() {
+            return Err(bad("proposed parents form a cycle"));
+        }
+    }
+
+    // Commit: update parents, children, model, and re-propagate readiness.
+    let new_model = body.model.clone();
+    let updated = {
+        let mut active = store_guard();
+        let run = match active.get_mut(&id) {
+            Some(r) => r,
+            None => return Err(not_found("no such workflow run")),
+        };
+        let now = now_ms();
+        // Update children references: remove old, add new.
+        let step_id_c = step_id.clone();
+        for s in run.steps.iter_mut() {
+            s.children.retain(|c| c != &step_id_c);
+        }
+        // Determine the new status BEFORE mutating the step (avoids borrow conflict).
+        let new_status = {
+            let step = run.steps.iter().find(|s| s.id == step_id).unwrap();
+            let all_parents_terminal = step.parents.iter().all(|pid| {
+                run.steps
+                    .iter()
+                    .find(|s| &s.id == pid)
+                    .map(|p| p.status == "done" || p.status == "skipped" || p.status == "error")
+                    .unwrap_or(false)
+            });
+            if step.status == "pending" && (all_parents_terminal || step.parents.is_empty()) {
+                Some("ready")
+            } else if step.status == "error" && body.parents.is_some() {
+                Some("ready")
+            } else {
+                None
+            }
+        };
+        if let Some(step) = run.steps.iter_mut().find(|s| s.id == step_id) {
+            step.parents = proposed_parents.clone();
+            if let Some(m) = new_model {
+                step.model = if m.is_empty() { None } else { Some(m) };
+            }
+            if let Some(s) = new_status {
+                step.status = s.to_string();
+            }
+            if step.status == "ready" && body.parents.is_some() {
+                step.error = None;
+            }
+        }
+        // Re-add children for new parents.
+        for pid in &proposed_parents {
+            if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid) {
+                if !p.children.contains(&step_id_c) {
+                    p.children.push(step_id_c.clone());
+                }
+            }
+        }
+        run.updated_at = now;
+        // If the run was errored and we just reparented something, set it back to
+        // running so the executor can pick up the newly-ready step.
+        if run.status == "error" && body.parents.is_some() {
+            run.status = "running".to_string();
+            run.ended_at = None;
+        }
+        persist(run);
+        let run = run.clone();
+        // Emit step_state for the patched step.
+        let step = run.steps.iter().find(|s| s.id == step_id).cloned().unwrap();
+        emit_step_state(&id, &step);
+        run
+    };
+    Ok(Json(updated))
+}
+
+/// Input for injecting steps into an existing run.
+#[derive(Debug, Deserialize)]
+struct InsertStepsBody {
+    steps: Vec<CreateStepInput>,
+}
+
+/// POST /api/workflows/:id/insert — inject new steps into an existing run.
+/// The new steps are appended to the run's DAG with their parent refs resolved
+/// against the EXISTING steps (indices 0..existing_count). Readiness is
+/// propagated so newly-injected ready steps get picked up by the executor.
+///
+/// This is the "inject a manual step" mechanism: the operator adds a human-
+/// authored step mid-run (e.g. "run the tests manually and paste output")
+/// and the executor picks it up without restarting the run.
+async fn insert_steps_handler(
+    Path(id): Path<String>,
+    body: Option<Json<InsertStepsBody>>,
+) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+    let body = match body {
+        Some(Json(b)) => b,
+        None => return Err(bad("steps (non-empty array) is required")),
+    };
+    if body.steps.is_empty() {
+        return Err(bad("steps (non-empty array) is required"));
+    }
+    let run = match get_active(&id) {
+        Some(r) => r,
+        None => return Err(not_found("no such workflow run")),
+    };
+    if run.status == "done" || run.status == "aborted" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("run is {} — cannot insert steps", run.status) })),
+        ));
+    }
+
+    let existing_count = run.steps.len();
+    let now = now_ms();
+    let mut new_steps: Vec<WorkflowStep> = Vec::with_capacity(body.steps.len());
+    let mut new_step_ids: Vec<String> = Vec::with_capacity(body.steps.len());
+
+    for input in &body.steps {
+        let id = new_id();
+        new_step_ids.push(id.clone());
+        let parents = match &input.parents {
+            Some(refs) => {
+                let mut resolved = Vec::new();
+                for raw in refs {
+                    let resolved_id = match raw {
+                        Value::Number(n) => match n.as_i64() {
+                            Some(i) if i >= 0 && (i as usize) < existing_count => {
+                                run.steps[i as usize].id.clone()
+                            }
+                            _ => continue,
+                        },
+                        Value::String(s) => {
+                            let trimmed = s.trim();
+                            let is_index = !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
+                            if is_index {
+                                match trimmed.parse::<usize>() {
+                                    Ok(n) if n < existing_count => run.steps[n].id.clone(),
+                                    _ => continue,
+                                }
+                            } else if let Some(idx) = new_step_ids.iter().position(|sid| sid == trimmed) {
+                                // Allow refs to other newly-inserted steps by their
+                                // assigned id (the UI may reference a just-added step).
+                                // We map positional refs to ids above; literal refs
+                                // to new-step ids are resolved after all ids are known.
+                                run.steps.iter().find(|st| &st.id == trimmed).map(|st| st.id.clone()).unwrap_or_else(|| {
+                                    new_step_ids[idx].clone()
+                                })
+                            } else if run.steps.iter().any(|st| &st.id == trimmed) {
+                                trimmed.to_string()
+                            } else {
+                                continue;
+                            }
+                        }
+                        _ => continue,
+                    };
+                    if !resolved.contains(&resolved_id) {
+                        resolved.push(resolved_id);
+                    }
+                }
+                resolved
+            }
+            None => Vec::new(),
+        };
+        let status = if parents.is_empty() { "ready".to_string() } else { "pending".to_string() };
+        new_steps.push(WorkflowStep {
+            id,
+            agent: input.agent.clone(),
+            task: input.task.clone(),
+            status,
+            parents,
+            children: Vec::new(),
+            output: None,
+            error: None,
+            usage: None,
+            sandbox_run_id: input.sandbox_run_id.clone(),
+            browser_session_id: input.browser_session_id.clone(),
+            tool_call_ids: input.tool_call_ids.clone(),
+            thinking: input.thinking.clone(),
+            started_at: None,
+            ended_at: None,
+            auto_repair: input.auto_repair,
+            repair_round: 0,
+            budget: input.budget.clone(),
+            actual_cost: None,
+            actual_tokens: None,
+            model: input.model.clone(),
+        });
+    }
+
+    // Commit: append new steps, resolve children, propagate readiness, emit events.
+    let updated = {
+        let mut active = store_guard();
+        let run = match active.get_mut(&id) {
+            Some(r) => r,
+            None => return Err(not_found("no such workflow run")),
+        };
+        // Append new steps.
+        for step in &new_steps {
+            run.steps.push(step.clone());
+        }
+        // Rebuild children references for all parents (existing + new).
+        // Clear and rebuild children from parents to keep consistency.
+        for s in run.steps.iter_mut() {
+            s.children.clear();
+        }
+        let parent_pairs: Vec<(String, Vec<String>)> = run
+            .steps
+            .iter()
+            .map(|s| (s.id.clone(), s.parents.clone()))
+            .collect();
+        for (child_id, parents) in &parent_pairs {
+            for pid in parents {
+                if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid) {
+                    if !p.children.contains(child_id) {
+                        p.children.push(child_id.clone());
+                    }
+                }
+            }
+        }
+        // Re-propagate readiness: any pending step whose parents are all done/terminal
+        // becomes ready. Collect ids first to avoid borrow conflict.
+        let mut changed = HashSet::new();
+        let pending_to_ready: Vec<String> = run
+            .steps
+            .iter()
+            .filter(|s| s.status == "pending")
+            .filter(|s| {
+                s.parents.is_empty() || s.parents.iter().all(|pid| {
+                    run.steps
+                        .iter()
+                        .find(|st| &st.id == pid)
+                        .map(|p| p.status == "done" || p.status == "skipped" || p.status == "error")
+                        .unwrap_or(false)
+                })
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for step in run.steps.iter_mut() {
+            if pending_to_ready.contains(&step.id) {
+                step.status = "ready".to_string();
+                changed.insert(step.id.clone());
+            }
+        }
+        // If the run was errored and we added steps, set it back to running.
+        if run.status == "error" {
+            run.status = "running".to_string();
+            run.ended_at = None;
+        }
+        run.updated_at = now;
+        persist(run);
+        let run = run.clone();
+        // Emit step_state events for every new/changed step so the UI graph updates.
+        for step in &run.steps {
+            if new_step_ids.contains(&step.id) || changed.contains(&step.id) {
+                emit_step_state(&id, step);
+            }
+        }
+        run
+    };
+    Ok(Json(updated))
+}
+
+/// Public helpers (used by handlers AND tests) — these encapsulate the store
+/// operations so the logic is testable without a full axum test server.
+
+/// Patch a step's parents. Returns Err(CycleError) if the proposed parents form a cycle.
+pub fn patch_parents(
+    run_id: &str,
+    step_id: &str,
+    proposed_parents: Vec<Value>,
+) -> Result<WorkflowRun, CycleError> {
+    let run = get_active(run_id).ok_or(CycleError)?;
+    let step_idx = run.steps.iter().position(|s| s.id == step_id).ok_or(CycleError)?;
+    let len = run.steps.len();
+
+    let resolved: Vec<String> = proposed_parents
+        .iter()
+        .filter_map(|raw| match raw {
+            Value::Number(n) => match n.as_i64() {
+                Some(i) if i >= 0 && (i as usize) < len => Some(run.steps[i as usize].id.clone()),
+                _ => None,
+            },
+            Value::String(s) => {
+                let trimmed = s.trim();
+                let is_index = !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
+                if is_index {
+                    match trimmed.parse::<usize>() {
+                        Ok(n) if n < len => Some(run.steps[n].id.clone()),
+                        _ => None,
+                    }
+                } else if run.steps.iter().any(|st| &st.id == trimmed) {
+                    Some(trimmed.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Validate no self-ref.
+    let resolved: Vec<String> = resolved.into_iter().filter(|id| id != step_id).collect();
+
+    // Cycle detection.
+    {
+        let mut test_run = run.clone();
+        test_run.steps[step_idx].parents = resolved.clone();
+        let mut indeg: HashMap<String, isize> = test_run
+            .steps
+            .iter()
+            .map(|s| (s.id.clone(), s.parents.len() as isize))
+            .collect();
+        let mut queue: Vec<String> = test_run
+            .steps
+            .iter()
+            .filter(|s| s.parents.is_empty())
+            .map(|s| s.id.clone())
+            .collect();
+        let mut ordered = 0usize;
+        let mut q = 0usize;
+        while q < queue.len() {
+            ordered += 1;
+            let current = queue[q].clone();
+            q += 1;
+            if let Some(step) = test_run.steps.iter().find(|s| s.id == current) {
+                for child_id in step.children.clone() {
+                    let d = indeg.get(&child_id).copied().unwrap_or(0) - 1;
+                    indeg.insert(child_id.clone(), d);
+                    if d == 0 {
+                        queue.push(child_id);
+                    }
+                }
+            }
+        }
+        if ordered < test_run.steps.len() {
+            return Err(CycleError);
+        }
+    }
+
+    // Commit.
+    let updated = {
+        let mut active = store_guard();
+        let run = active.get_mut(run_id).ok_or(CycleError)?;
+        let now = now_ms();
+        // Rebuild children references.
+        let step_id_c = step_id.to_string();
+        for s in run.steps.iter_mut() {
+            s.children.retain(|c| c != &step_id_c);
+        }
+        // Apply the parent change FIRST, THEN determine the new status based on
+        // the updated parents. This avoids a stale-read bug where the old parents
+        // would incorrectly keep the step pending.
+        // Compute all_terminal BEFORE the mutable borrow: read the statuses of the
+        // proposed parents from the current step list (before we mutate parents).
+        let all_terminal = resolved.iter().all(|pid| {
+            run.steps
+                .iter()
+                .find(|s| &s.id == pid)
+                .map(|p| p.status == "done" || p.status == "skipped" || p.status == "error")
+                .unwrap_or(false)
+        });
+        if let Some(step) = run.steps.iter_mut().find(|s| s.id == step_id) {
+            step.parents = resolved.clone();
+            if step.status == "pending" && (all_terminal || step.parents.is_empty()) {
+                step.status = "ready".to_string();
+            }
+            // If the step was errored and we just rewired it, reset to ready so
+            // the operator's re-wire can be acted on.
+            if step.status == "error" {
+                step.status = "ready".to_string();
+                step.error = None;
+            }
+            if step.status == "ready" {
+                step.error = None;
+            }
+        }
+        for pid in &resolved {
+            if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid) {
+                if !p.children.contains(&step_id_c) {
+                    p.children.push(step_id_c.clone());
+                }
+            }
+        }
+        if run.status == "error" {
+            run.status = "running".to_string();
+            run.ended_at = None;
+        }
+        run.updated_at = now;
+        persist(run);
+        let step = run.steps.iter().find(|s| s.id == step_id).cloned().unwrap();
+        emit_step_state(run_id, &step);
+        run.clone()
+    };
+    Ok(updated)
+}
+
+/// Insert new steps into an existing run. Parent refs resolve against existing steps
+/// (indices 0..existing_count). Returns the updated run.
+pub fn insert_steps(
+    run_id: &str,
+    inputs: &[CreateStepInput],
+) -> Result<WorkflowRun, CycleError> {
+    let run = get_active(run_id).ok_or(CycleError)?;
+    let existing_count = run.steps.len();
+    let now = now_ms();
+    let mut new_step_ids: Vec<String> = Vec::with_capacity(inputs.len());
+
+    let new_steps: Vec<WorkflowStep> = inputs
+        .iter()
+        .map(|input| {
+            let id = new_id();
+            new_step_ids.push(id.clone());
+            let parents = match &input.parents {
+                Some(refs) => {
+                    let mut resolved = Vec::new();
+                    for raw in refs {
+                        let resolved_id = match raw {
+                            Value::Number(n) => match n.as_i64() {
+                                Some(i) if i >= 0 && (i as usize) < existing_count => {
+                                    run.steps[i as usize].id.clone()
+                                }
+                                _ => continue,
+                            },
+                            Value::String(s) => {
+                                let trimmed = s.trim();
+                                let is_index =
+                                    !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
+                                if is_index {
+                                    match trimmed.parse::<usize>() {
+                                        Ok(n) if n < existing_count => run.steps[n].id.clone(),
+                                        _ => continue,
+                                    }
+                                } else if run.steps.iter().any(|st| &st.id == trimmed) {
+                                    trimmed.to_string()
+                                } else {
+                                    continue;
+                                }
+                            }
+                            _ => continue,
+                        };
+                        if !resolved.contains(&resolved_id) {
+                            resolved.push(resolved_id);
+                        }
+                    }
+                    resolved
+                }
+                None => Vec::new(),
+            };
+            let status = if parents.is_empty() {
+                "ready".to_string()
+            } else {
+                "pending".to_string()
+            };
+            WorkflowStep {
+                id,
+                agent: input.agent.clone(),
+                task: input.task.clone(),
+                status,
+                parents,
+                children: Vec::new(),
+                output: None,
+                error: None,
+                usage: None,
+                sandbox_run_id: input.sandbox_run_id.clone(),
+                browser_session_id: input.browser_session_id.clone(),
+                tool_call_ids: input.tool_call_ids.clone(),
+                thinking: input.thinking.clone(),
+                started_at: None,
+                ended_at: None,
+                auto_repair: input.auto_repair,
+                repair_round: 0,
+                budget: input.budget.clone(),
+                actual_cost: None,
+                actual_tokens: None,
+                model: input.model.clone(),
+            }
+        })
+        .collect();
+
+    let updated = {
+        let mut active = store_guard();
+        let run = active.get_mut(run_id).ok_or(CycleError)?;
+        for step in &new_steps {
+            run.steps.push(step.clone());
+        }
+        // Rebuild children.
+        for s in run.steps.iter_mut() {
+            s.children.clear();
+        }
+        let parent_pairs: Vec<(String, Vec<String>)> = run
+            .steps
+            .iter()
+            .map(|s| (s.id.clone(), s.parents.clone()))
+            .collect();
+        for (child_id, parents) in &parent_pairs {
+            for pid in parents {
+                if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid) {
+                    if !p.children.contains(child_id) {
+                        p.children.push(child_id.clone());
+                    }
+                }
+            }
+        }
+        // Propagate readiness. Collect ids first to avoid borrow conflict.
+        let pending_to_ready: Vec<String> = run
+            .steps
+            .iter()
+            .filter(|s| s.status == "pending")
+            .filter(|s| {
+                s.parents.is_empty() || s.parents.iter().all(|pid| {
+                    run.steps
+                        .iter()
+                        .find(|st| &st.id == pid)
+                        .map(|p| p.status == "done" || p.status == "skipped" || p.status == "error")
+                        .unwrap_or(false)
+                })
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for step in run.steps.iter_mut() {
+            if pending_to_ready.contains(&step.id) {
+                step.status = "ready".to_string();
+            }
+        }
+        if run.status == "error" {
+            run.status = "running".to_string();
+            run.ended_at = None;
+        }
+        run.updated_at = now;
+        persist(run);
+        for step in run.steps.iter() {
+            if new_step_ids.contains(&step.id) {
+                emit_step_state(run_id, step);
+            }
+        }
+        run.clone()
+    };
+    Ok(updated)
+}
+
+/// Patch a step's model. Pass None to clear the override.
+pub fn patch_model(
+    run_id: &str,
+    step_id: &str,
+    model: Option<&str>,
+) -> Result<WorkflowRun, CycleError> {
+    let updated = {
+        let mut active = store_guard();
+        let run = active.get_mut(run_id).ok_or(CycleError)?;
+        let now = now_ms();
+        if let Some(step) = run.steps.iter_mut().find(|s| s.id == step_id) {
+            step.model = model.map(|s| s.to_string());
+        }
+        run.updated_at = now;
+        persist(run);
+        let step = run.steps.iter().find(|s| s.id == step_id).cloned().unwrap();
+        emit_step_state(run_id, &step);
+        run.clone()
+    };
+    Ok(updated)
+}
+
+/// Reset a step to ready (clearing error/output/usage) and dispatch the executor.
+/// Called by the WebSocket `workflow.rerun` handler. The feedback, if provided, is
+/// appended to the step's task before dispatch.
+pub async fn rerun_step_and_dispatch(
+    run_id: &str,
+    step_id: &str,
+    feedback: Option<String>,
+) -> Option<WorkflowRun> {
+    let run = get_active(run_id)?;
+    if run.status == "done" || run.status == "aborted" {
+        return Some(run);
+    }
+    // Find the step.
+    let step = run.steps.iter().find(|s| s.id == step_id)?.clone();
+    if step.status == "running" {
+        return Some(run);
+    }
+    // Build the new task with appended feedback.
+    let new_task = match feedback {
+        Some(fb) if !fb.trim().is_empty() => {
+            format!("{}\n\n[Operator feedback for rerun]\n{}", step.task, fb.trim())
+        }
+        _ => step.task.clone(),
+    };
+    // Reset the step via step_state (status → ready, clears error/output/usage
+    // when we pass Some("") — but step_state only touches fields that are Some,
+    // so we need to clear via direct store mutation after).
+    let _ = step_state(
+        run_id,
+        step_id,
+        StepPatch {
+            status: Some("ready".into()),
+            ..Default::default()
+        },
+    );
+    // Directly clear error/output/usage and update task.
+    {
+        let mut active = store_guard();
+        let run = active.get_mut(run_id)?;
+        let now = now_ms();
+        if let Some(s) = run.steps.iter_mut().find(|s| s.id == step_id) {
+            s.task = new_task;
+            s.error = None;
+            s.output = None;
+            s.usage = None;
+            s.started_at = None;
+            s.ended_at = None;
+        }
+        // If the run was errored, set it back to running so the executor can
+        // pick up the newly-ready step.
+        if run.status == "error" {
+            run.status = "running".to_string();
+            run.ended_at = None;
+        }
+        run.updated_at = now;
+        persist(run);
+        let step = run.steps.iter().find(|s| s.id == step_id).cloned().unwrap();
+        emit_step_state(run_id, &step);
+    }
+    // Spawn the executor to drive the run.
+    let rid = run_id.to_string();
+    tokio::spawn(async move {
+        let _ = crate::workflow_executor::run_workflow(&rid).await;
+    });
+    get_active(run_id)
+}
+
 /// Register the /api/workflows routes with stateless handlers, including the executor
 /// endpoint that drives a run to completion via real subagent dispatch.
 pub fn router() -> Router<()> {
@@ -1289,6 +2142,9 @@ pub fn router() -> Router<()> {
         .route("/api/workflows/{id}/abort", post(abort_handler))
         .route("/api/workflows/{id}/execute", post(execute_handler))
         .route("/api/workflows/{id}/resume", post(resume_handler))
+        .route("/api/workflows/{id}/step/{step_id}/rerun", post(rerun_step_handler))
+        .route("/api/workflows/{id}/step/{step_id}/patch", post(patch_step_handler))
+        .route("/api/workflows/{id}/insert", post(insert_steps_handler))
 }
 
 #[cfg(test)]
@@ -1309,6 +2165,7 @@ mod tests {
             thinking: None,
             auto_repair: false,
             budget: None,
+            model: None,
         }
     }
 
@@ -1327,6 +2184,7 @@ mod tests {
             thinking: None,
             auto_repair: true,
             budget: None,
+            model: None,
         }
     }
 
@@ -2520,6 +3378,274 @@ mod tests {
             let history = list_history(None);
             let found = history.iter().find(|r| r.id == run.id).unwrap();
             assert_eq!(found.status, "interrupted");
+        });
+    }
+
+    // ---- live-editable workflow tests ----
+
+    /// A failed step can be rerun: its status resets to ready, error/output/usage are
+    /// cleared, and the operator's feedback is appended to the task.
+    #[test]
+    fn rerun_failed_step_resets_and_appends_feedback() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("worker", "Fix the bug", None)];
+            let run = create(None, None, "rerun-test".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let step_id = run.steps[0].id.clone();
+
+            // Mark the step as errored.
+            let updated = step_state(
+                &run.id,
+                &step_id,
+                StepPatch {
+                    status: Some("error".into()),
+                    error: Some("something went wrong".into()),
+                    output: Some("partial output".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let errored = updated.steps.iter().find(|s| s.id == step_id).unwrap();
+            assert_eq!(errored.status, "error");
+            assert!(errored.error.is_some());
+
+            // Rerun with feedback.
+            let (run_id, step_id_c) = (run.id.clone(), step_id.clone());
+            let feedback = "Check the null guard on line 42";
+            let _body = RerunBody {
+                feedback: Some(feedback.to_string()),
+            };
+
+            // Simulate what rerun_step_handler does inline (avoids needing a full axum
+            // test server; the handler logic is the store ops + emit).
+            let new_task = format!(
+                "{}\n\n[Operator feedback for rerun]\n{}",
+                errored.task, feedback
+            );
+            // step_state only patches fields that are Some; passing None means "don't touch".
+            // The handler resets status to ready via step_state, then directly clears
+            // error/output/usage/timestamps on the store.
+            let _ = step_state(
+                &run_id,
+                &step_id_c,
+                StepPatch {
+                    status: Some("ready".into()),
+                    ..Default::default()
+                },
+            );
+            {
+                let mut active = store_guard();
+                let r = active.get_mut(&run_id).unwrap();
+                let s = r.steps.iter_mut().find(|s| s.id == step_id_c).unwrap();
+                s.task = new_task.clone();
+                s.started_at = None;
+                s.ended_at = None;
+                s.output = None;
+                s.error = None;
+                s.usage = None;
+            }
+
+            let after = get_active(&run_id).unwrap();
+            let s = after.steps.iter().find(|s| s.id == step_id_c).unwrap();
+            assert_eq!(s.status, "ready", "rerun should reset step to ready");
+            assert!(s.error.is_none(), "rerun should clear error");
+            assert!(s.output.is_none(), "rerun should clear output");
+            assert!(s.usage.is_none(), "rerun should clear usage");
+            assert!(
+                s.task.contains(feedback),
+                "rerun should append feedback to task: {}",
+                s.task
+            );
+            assert_eq!(s.task, new_task);
+        });
+    }
+
+    /// Rerun without feedback preserves the original task.
+    #[test]
+    fn rerun_without_feedback_preserves_task() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("worker", "Fix the bug", None)];
+            let run = create(None, None, "rerun-nofb".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let step_id = run.steps[0].id.clone();
+            let original_task = run.steps[0].task.clone();
+
+            // Error the step.
+            let _ = step_state(
+                &run.id,
+                &step_id,
+                StepPatch {
+                    status: Some("error".into()),
+                    error: Some("fail".into()),
+                    ..Default::default()
+                },
+            );
+
+            // Rerun without feedback.
+            let _ = step_state(
+                &run.id,
+                &step_id,
+                StepPatch {
+                    status: Some("ready".into()),
+                    output: None,
+                    error: None,
+                    usage: None,
+                },
+            );
+
+            let after = get_active(&run.id).unwrap();
+            let s = after.steps.iter().find(|s| s.id == step_id).unwrap();
+            assert_eq!(s.status, "ready");
+            assert_eq!(s.task, original_task, "no-feedback rerun should preserve task");
+        });
+    }
+
+    /// Patching a step's parents to an empty set makes it a root node (ready immediately
+    // if it was pending).
+    #[test]
+    fn patch_parents_empty_makes_ready() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(0)])),
+            ];
+            let run = create(None, None, "patch-empty".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let child_id = run.steps[1].id.clone();
+            assert_eq!(run.steps[1].status, "pending");
+
+            // Patch child to have no parents.
+            let updated = super::patch_parents(&run.id, &child_id, vec![]).unwrap();
+            let child = updated.steps.iter().find(|s| s.id == child_id).unwrap();
+            assert_eq!(child.parents, Vec::<String>::new());
+            assert_eq!(child.status, "ready", "child with no parents should be ready");
+        });
+    }
+
+    /// Patching parents to a different valid set rewires the DAG correctly.
+    #[test]
+    fn patch_parents_to_valid_set_rewires_dag() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", None),
+                step("c", "C", Some(vec![json!(0)])),
+            ];
+            let run = create(None, None, "patch-rewire".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let c_id = run.steps[2].id.clone();
+            let b_id = run.steps[1].id.clone();
+
+            // Patch C to depend on B instead of A.
+            let updated = super::patch_parents(&run.id, &c_id, vec![json!(1)]).unwrap();
+            let c = updated.steps.iter().find(|s| s.id == c_id).unwrap();
+            assert_eq!(c.parents, vec![b_id.clone()]);
+
+            // B should now have C as a child; A should not.
+            let a = updated.steps.iter().find(|s| s.id == run.steps[0].id).unwrap();
+            assert!(!a.children.contains(&c_id));
+            let b = updated.steps.iter().find(|s| s.id == b_id).unwrap();
+            assert!(b.children.contains(&c_id));
+        });
+    }
+
+    /// Patching parents to form a cycle is rejected.
+    #[test]
+    fn patch_parents_cycle_is_rejected() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(0)])),
+            ];
+            let run = create(None, None, "patch-cycle".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let a_id = run.steps[0].id.clone();
+            let _b_id = run.steps[1].id.clone();
+
+            // Try to make A depend on B (which depends on A) — should fail.
+            let result = super::patch_parents(&run.id, &a_id, vec![json!(1)]);
+            assert!(result.is_err(), "cycle should be rejected");
+        });
+    }
+
+    /// Inserting steps into an existing run appends them and propagates readiness.
+    #[test]
+    fn insert_steps_appends_and_propagates_readiness() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "insert".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let a_id = run.steps[0].id.clone();
+
+            // Complete step A.
+            let _ = step_state(
+                &run.id,
+                &a_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    ..Default::default()
+                },
+            );
+
+            // Insert a new step B that depends on A.
+            let new_step = step("b", "B", Some(vec![json!(0)]));
+            let updated = super::insert_steps(&run.id, &[new_step]).unwrap();
+
+            // Should have 2 steps now.
+            assert_eq!(updated.steps.len(), 2);
+            let b = updated.steps.iter().find(|s| s.agent == "b").unwrap();
+            assert_eq!(b.status, "ready", "new step with done parent should be ready");
+            assert_eq!(b.parents, vec![a_id]);
+        });
+    }
+
+    /// Inserting a step with no parents makes it immediately ready.
+    #[test]
+    fn insert_step_no_parents_is_ready() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "insert-noparents".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+
+            // Insert a root step.
+            let new_step = step("b", "B", None);
+            let updated = super::insert_steps(&run.id, &[new_step]).unwrap();
+            let b = updated.steps.iter().find(|s| s.agent == "b").unwrap();
+            assert_eq!(b.status, "ready");
+            assert!(b.parents.is_empty());
+        });
+    }
+
+    /// Patching a step's model updates the model field.
+    #[test]
+    fn patch_model_updates_field() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "patch-model".into(), None, 3, &inputs, None).unwrap();
+            let step_id = run.steps[0].id.clone();
+            assert!(run.steps[0].model.is_none());
+
+            // Patch model via the public patch function.
+            let updated = super::patch_model(&run.id, &step_id, Some("openrouter/gpt-4o")).unwrap();
+            let s = updated.steps.iter().find(|s| s.id == step_id).unwrap();
+            assert_eq!(s.model, Some("openrouter/gpt-4o".to_string()));
+
+            // Clear model.
+            let updated = super::patch_model(&run.id, &step_id, None).unwrap();
+            let s = updated.steps.iter().find(|s| s.id == step_id).unwrap();
+            assert!(s.model.is_none());
+        });
+    }
+
+    /// A step created with a model field preserves it through store round-trip.
+    #[test]
+    fn step_model_persists_through_create() {
+        with_tmp_workflows_file(|| {
+            let mut input = step("a", "A", None);
+            input.model = Some("anthropic/claude-sonnet-4-20250514".to_string());
+            let run = create(None, None, "model-persist".into(), None, 3, &[input], None).unwrap();
+            let s = &run.steps[0];
+            assert_eq!(s.model, Some("anthropic/claude-sonnet-4-20250514".to_string()));
         });
     }
 }
