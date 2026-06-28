@@ -3,6 +3,7 @@
 //! (see docs/api-contract.md). The vanilla `web/` UI is served unchanged.
 pub mod agent;
 pub mod browser;
+pub mod checkpoint;
 pub mod config;
 pub mod connections;
 pub mod context_bus;

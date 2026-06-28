@@ -1236,6 +1236,8 @@ async fn resume_handler(
 
 /// POST /api/workflows/:id/execute → drive the run to completion via real subagent dispatch.
 /// Returns { run: ... } with the final run state. 404 for unknown run.
+/// Creates a git-backed checkpoint (if the project is in a git repo) before executing,
+/// so a failed run can be rolled back via POST /:id/rollback.
 async fn execute_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // If the run is already terminal, return it directly without re-executing.
     if let Some(run) = get_active(&id) {
@@ -1246,8 +1248,14 @@ async fn execute_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
         return Err(not_found("no such workflow run"));
     }
 
+    let checkpoint = match crate::checkpoint::save_checkpoint(&id, &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).to_string_lossy()) {
+        Ok(sha) => Some(sha),
+        Err(crate::checkpoint::CheckpointError::NotAGitRepo) => None, // graceful degradation
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.message() })))),
+    };
+
     match crate::workflow_executor::run_workflow(&id).await {
-        Some(run) => Ok(Json(json!({ "run": run }))),
+        Some(run) => Ok(Json(json!({ "run": run, "checkpoint": checkpoint }))),
         None => Err(not_found("no such workflow run")),
     }
 }
