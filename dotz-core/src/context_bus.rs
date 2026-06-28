@@ -45,9 +45,7 @@ impl ContextBus {
     /// Create a new empty bus for a run. Any prior bus for the same run id is replaced, so
     /// re-creating a bus (e.g. on executor restart) starts clean.
     pub fn create(run_id: &str) -> Self {
-        let mut guard = global_buses()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut guard = global_buses().lock().unwrap_or_else(|p| p.into_inner());
         guard.insert(run_id.to_string(), HashMap::new());
         Self {
             run_id: run_id.to_string(),
@@ -86,26 +84,20 @@ impl ContextBus {
 
     /// Destroy a run's bus (called when the run terminates). A missing bus is a no-op.
     pub fn destroy(run_id: &str) {
-        let mut guard = global_buses()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut guard = global_buses().lock().unwrap_or_else(|p| p.into_inner());
         guard.remove(run_id);
     }
 
     /// Read a key. Returns None if the key does not exist OR if the run's bus has been
     /// destroyed.
     pub fn read(&self, key: &str) -> Option<Value> {
-        let guard = global_buses()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let guard = global_buses().lock().unwrap_or_else(|p| p.into_inner());
         guard.get(&self.run_id)?.get(key).cloned()
     }
 
     /// List all keys currently in the bus (for context injection + UI).
     pub fn list_keys(&self) -> Vec<String> {
-        let guard = global_buses()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let guard = global_buses().lock().unwrap_or_else(|p| p.into_inner());
         guard
             .get(&self.run_id)
             .map(|m| m.keys().cloned().collect())
@@ -115,18 +107,14 @@ impl ContextBus {
     /// Write a key. Creates the run's bus if it doesn't exist (defensive — the executor
     /// always creates it first, but a tool call path shouldn't crash if it did).
     pub fn write(&self, key: &str, value: Value) {
-        let mut guard = global_buses()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut guard = global_buses().lock().unwrap_or_else(|p| p.into_inner());
         let entry = guard.entry(self.run_id.clone()).or_default();
         entry.insert(key.to_string(), value);
     }
 
     /// Read all entries (used for full-context injection into a task prompt).
     pub fn read_all(&self) -> HashMap<String, Value> {
-        let guard = global_buses()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let guard = global_buses().lock().unwrap_or_else(|p| p.into_inner());
         guard.get(&self.run_id).cloned().unwrap_or_default()
     }
 
@@ -230,9 +218,7 @@ impl Tool for ContextWriteTool {
             .get("key")
             .and_then(|v| v.as_str())
             .ok_or("key is required")?;
-        let value = args
-            .get("value")
-            .ok_or("value is required")?;
+        let value = args.get("value").ok_or("value is required")?;
         let run_id = args
             .get("runId")
             .and_then(|v| v.as_str())
@@ -480,10 +466,7 @@ mod tests {
             step1_out.is_some(),
             "step-1 output should be preloaded on the bus"
         );
-        assert_eq!(
-            step1_out.unwrap().as_str().unwrap(),
-            "plan:\n1. add tests"
-        );
+        assert_eq!(step1_out.unwrap().as_str().unwrap(), "plan:\n1. add tests");
 
         // The pending step must NOT appear on the bus.
         assert!(
@@ -506,32 +489,30 @@ mod tests {
             project_id: None,
             session_id: None,
             label: "test".into(),
-            steps: vec![
-                crate::workflows::WorkflowStep {
-                    id: "step-err".into(),
-                    agent: "worker".into(),
-                    task: "fail".into(),
-                    status: "error".into(),
-                    parents: vec![],
-                    children: vec![],
-                    output: None,
-                    error: Some("something went wrong".into()),
-                    usage: None,
-                    sandbox_run_id: None,
-                    browser_session_id: None,
-                    tool_call_ids: None,
-                    thinking: None,
-                    started_at: Some(1000),
-                    ended_at: Some(2000),
-                    auto_repair: false,
-                    repair_round: 0,
-                    budget: None,
-                    actual_cost: None,
-                    actual_tokens: None,
-                    model: None,
-                    artifact: None,
-                },
-            ],
+            steps: vec![crate::workflows::WorkflowStep {
+                id: "step-err".into(),
+                agent: "worker".into(),
+                task: "fail".into(),
+                status: "error".into(),
+                parents: vec![],
+                children: vec![],
+                output: None,
+                error: Some("something went wrong".into()),
+                usage: None,
+                sandbox_run_id: None,
+                browser_session_id: None,
+                tool_call_ids: None,
+                thinking: None,
+                started_at: Some(1000),
+                ended_at: Some(2000),
+                auto_repair: false,
+                repair_round: 0,
+                budget: None,
+                actual_cost: None,
+                actual_tokens: None,
+                model: None,
+                artifact: None,
+            }],
             status: "error".into(),
             origin: None,
             created_at: 0,

@@ -3,7 +3,12 @@ use crate::{
     config::{self, CleanPatch, DotzConfig},
     profiles, types,
 };
-use axum::{extract::State, http::StatusCode, routing::{get, post}, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
 use serde_json::{json, Value};
 use std::{
     net::SocketAddr,
@@ -35,7 +40,10 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
         .route("/api/providers", get(providers))
         .route("/api/profiles", get(profiles_list))
         .route("/api/config", get(get_config).post(post_config))
-        .route("/api/verify/suite/{profile}", get(crate::verify::suite_handler))
+        .route(
+            "/api/verify/suite/{profile}",
+            get(crate::verify::suite_handler),
+        )
         .route("/api/verify/run", post(crate::verify::run_handler))
         .with_state(state)
         // Phase 2 cold modules — self-contained, stateless Router<()> merged after with_state.
@@ -46,6 +54,9 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
         .merge(crate::workflows::router())
         .merge(crate::skills::router())
         .merge(crate::templates::router())
+        .merge(crate::specs::router())
+        .merge(crate::living_docs::router())
+        .merge(crate::vcs::router())
         .merge(crate::memory::router())
         .merge(crate::agent::router())
         .merge(crate::browser::router())

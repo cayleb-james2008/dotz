@@ -308,7 +308,10 @@ pub fn router() -> Router<()> {
 // ---- helpers ----------------------------------------------------------------
 
 fn bad(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg.into() })))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg.into() })),
+    )
 }
 
 #[cfg(test)]
@@ -375,10 +378,7 @@ mod tests {
         let b = suite_entries("frontend");
         // Equality check is sufficient — OnceLock guarantees identity for free.
         assert_eq!(a.len(), b.len());
-        assert_eq!(
-            a.first().unwrap().kind,
-            b.first().unwrap().kind,
-        );
+        assert_eq!(a.first().unwrap().kind, b.first().unwrap().kind,);
     }
 
     // ---- kind parsing ----
@@ -415,8 +415,14 @@ mod tests {
     #[test]
     fn typecheck_command_branches_on_cargo_or_tsconfig() {
         let cmd = command_for(VerificationKind::TypeCheck);
-        assert!(cmd.contains("cargo check"), "backend/typecheck should use cargo check");
-        assert!(cmd.contains("tsc --noEmit"), "frontend fallback should be tsc");
+        assert!(
+            cmd.contains("cargo check"),
+            "backend/typecheck should use cargo check"
+        );
+        assert!(
+            cmd.contains("tsc --noEmit"),
+            "frontend fallback should be tsc"
+        );
     }
 
     #[test]

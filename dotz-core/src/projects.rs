@@ -138,10 +138,7 @@ fn parse_valid_model(v: &Value) -> Option<ModelRef> {
         return None;
     }
     let model_id = types::strip_matching_provider_prefix(&provider, model_id);
-    Some(ModelRef {
-        provider,
-        model_id,
-    })
+    Some(ModelRef { provider, model_id })
 }
 
 /// Validate a cwd: MUST be an absolute path that EXISTS as a directory. Returns an error string for
@@ -246,10 +243,12 @@ async fn create_project(
     let model = match body.get("model") {
         Some(m) => match parse_valid_model(m) {
             Some(mr) => Some(mr),
-            None => return Err(bad(format!(
-                "model must be a known provider and non-empty modelId (providers: {})",
-                types::provider_ids().join(", ")
-            ))),
+            None => {
+                return Err(bad(format!(
+                    "model must be a known provider and non-empty modelId (providers: {})",
+                    types::provider_ids().join(", ")
+                )))
+            }
         },
         None => None,
     };
@@ -407,10 +406,12 @@ async fn patch_project(
     if let Some(v) = raw.get("model") {
         match parse_valid_model(v) {
             Some(mr) => new_model = Some(mr),
-            None => return Err(bad(format!(
-                "model must be a known provider and non-empty modelId (providers: {})",
-                types::provider_ids().join(", ")
-            ))),
+            None => {
+                return Err(bad(format!(
+                    "model must be a known provider and non-empty modelId (providers: {})",
+                    types::provider_ids().join(", ")
+                )))
+            }
         }
     }
     if let Some(v) = raw.get("thinkingLevel") {
@@ -781,7 +782,10 @@ mod tests {
             let err = create_project(Some(body)).await.unwrap_err();
             assert_eq!(err.0, StatusCode::BAD_REQUEST);
             assert!(
-                err.1 .0["error"].as_str().unwrap().contains("profileId must be one of:"),
+                err.1 .0["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("profileId must be one of:"),
                 "error should list valid profileIds, got: {:?}",
                 err.1 .0
             );
@@ -806,7 +810,10 @@ mod tests {
             let err = patch_project(Path(id), Some(patch_body)).await.unwrap_err();
             assert_eq!(err.0, StatusCode::BAD_REQUEST);
             assert!(
-                err.1 .0["error"].as_str().unwrap().contains("profileId must be one of:"),
+                err.1 .0["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("profileId must be one of:"),
                 "error should list valid profileIds, got: {:?}",
                 err.1 .0
             );
@@ -849,10 +856,8 @@ mod tests {
     #[tokio::test]
     async fn patch_project_rejects_unknown_provider() {
         let _g = with_tmp_projects_file();
-        let dir = std::env::temp_dir().join(format!(
-            "dotz-patch-provider-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dotz-patch-provider-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let create_body = Json(json!({
@@ -882,10 +887,8 @@ mod tests {
     #[tokio::test]
     async fn create_project_normalizes_uppercase_provider() {
         let _g = with_tmp_projects_file();
-        let dir = std::env::temp_dir().join(format!(
-            "dotz-project-case-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dotz-project-case-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let body = Json(json!({
@@ -906,10 +909,8 @@ mod tests {
     #[tokio::test]
     async fn create_project_normalizes_redundant_provider_prefix() {
         let _g = with_tmp_projects_file();
-        let dir = std::env::temp_dir().join(format!(
-            "dotz-project-prefix-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dotz-project-prefix-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let body = Json(json!({

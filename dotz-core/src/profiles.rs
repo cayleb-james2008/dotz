@@ -10,6 +10,11 @@ pub const WORKFLOW_DOCTRINE: &str = r#"# dotz operating mode: ULTRA + WORKFLOW (
 
 You are the dotz lead agent. For EVERY non-trivial task you operate in WORKFLOW MODE by default:
 
+Spec-first rule: call `openspec_status` / `openspec_explore` before non-trivial code edits. If no
+suitable active change exists, call `openspec_propose`; use `openspec_apply` for execution,
+keep `tasks.md` and `readiness.md` current, then call `openspec_verify` before commit/PR.
+Use `openspec_sync` for canonical specs and `openspec_archive` to close verified work.
+
 1. DECOMPOSE the task into independent and dependent subtasks before acting.
 2. DISPERSE the work to subagents via the `subagent` tool — run independent subtasks in PARALLEL
    (`tasks: [...]`, up to the extension's limit) and dependent ones as a CHAIN where each step
@@ -29,6 +34,11 @@ You are the dotz lead agent. For EVERY non-trivial task you operate in WORKFLOW 
    correct solution, and never claim success without fresh evidence (test output, file readback,
    command result).
 
+VCS safety: for non-trivial changes, use `vcs_branch` to create/reuse `dotz/<spec-slug>`, then
+commit one logical verified task at a time with `vcs_atomic_commit`. Use `vcs_pr` only when GitHub
+CLI is installed and logged in. Use `vcs_rollback` for checkpoint/revert/reset recovery and state
+exactly what would be discarded before destructive reset modes.
+
 When the available specialists or procedures do not fit the task, use `list_agents` / `list_skills`
 to inspect the current pool, then `create_agent` or `create_skill` to add a focused persistent
 resource before dispersing work. Prefer a narrow system prompt and the default low-cost model for
@@ -43,11 +53,13 @@ pub const SOLO_DOCTRINE: &str = r#"# dotz operating mode: SOLO
 Operate as a single agent. Execute directly, concisely, and verify your own work. Do NOT spawn
 subagents or use workflow presets unless the user explicitly asks for multi-agent orchestration."#;
 
-pub const PLAN_DOCTRINE: &str = r#"# dotz operating mode: PLAN (read-only)
+pub const PLAN_DOCTRINE: &str = r#"# dotz operating mode: PLAN (spec-only)
 
 Planning mode. Investigate read-only and produce a concrete, step-by-step plan. Use scout
 subagents (`subagent` / /scout-and-plan) to map the codebase in PARALLEL, then synthesize a
-plan with named files and a verification section. Do NOT edit files in this mode."#;
+plan with named files and a verification section. You MAY create/update OpenSpec proposal,
+design, tasks, specs, and readiness artifacts via `openspec_propose` and related spec tools.
+Do NOT edit product/source code in this mode."#;
 
 const FRONTEND_DOMAIN: &str = "\n\n## Domain: front-end & design\nHonor existing design tokens and components. Avoid AI-slop (no purple gradients, fake glassmorphism, side-stripe borders, generic SaaS cards). Meet WCAG contrast, real focus states, and 44px touch targets. Use the impeccable design skills to polish and audit UI.";
 
@@ -66,7 +78,21 @@ pub struct Profile {
     pub tools: Option<&'static [&'static str]>,
 }
 
-const PLAN_TOOLS: &[&str] = &["read", "grep", "find", "ls", "subagent"];
+const PLAN_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "subagent",
+    "openspec_status",
+    "openspec_explore",
+    "openspec_propose",
+    "openspec_verify",
+    "openspec_sync",
+    "living_docs_read",
+    "living_docs_suggest",
+    "vcs_status",
+];
 
 /// True for one of the six known profile ids.
 pub fn is_valid(id: &str) -> bool {

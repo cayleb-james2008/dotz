@@ -434,7 +434,17 @@ async fn run_single_agent_with_progress(
     bus: Option<&ContextBus>,
     progress_tx: Option<mpsc::Sender<StreamDelta>>,
 ) -> SingleResult {
-    run_single_agent_inner(agents, agent_name, task, model_override, cwd, step, bus, progress_tx).await
+    run_single_agent_inner(
+        agents,
+        agent_name,
+        task,
+        model_override,
+        cwd,
+        step,
+        bus,
+        progress_tx,
+    )
+    .await
 }
 
 /// The actual subagent loop. The provider stream task is aborted on the wall-clock timeout so a
@@ -519,9 +529,11 @@ async fn run_single_agent_inner(
     // bus is present and non-empty, the task is prepended with a compact JSON block of
     // prior agent outputs so this subagent inherits scout findings / planner plans /
     // reviewer gap-lists without re-reading the repo or parsing raw text.
-    let effective_task = bus.map(|b| crate::context_bus::inject_context_into_task(task, b))
+    let effective_task = bus
+        .map(|b| crate::context_bus::inject_context_into_task(task, b))
         .unwrap_or_else(|| task.to_string());
-    let mut history: Vec<Message> = vec![Message::user(&format!("Task: {effective_task}"), now_ms())];
+    let mut history: Vec<Message> =
+        vec![Message::user(&format!("Task: {effective_task}"), now_ms())];
 
     for _round in 0..MAX_ROUNDS {
         let messages = to_openai_messages(&system_prompt, &history);
@@ -922,14 +934,20 @@ pub async fn dispatch_with_progress(
 /// bus for that run is passed to each subagent so they inherit prior findings.
 /// `progress_tx` is the channel that receives a copy of every streamed delta the subagent's
 /// provider emits — the session layer converts these into `subagent_progress` events.
-async fn dispatch_inner(args: &Value, cwd: &str, progress_tx: Option<mpsc::Sender<StreamDelta>>) -> Dispatch {
+async fn dispatch_inner(
+    args: &Value,
+    cwd: &str,
+    progress_tx: Option<mpsc::Sender<StreamDelta>>,
+) -> Dispatch {
     let scope = args
         .get("agentScope")
         .and_then(|v| v.as_str())
         .unwrap_or("user")
         .to_string();
     let run_id = args.get("runId").and_then(|v| v.as_str());
-    let bus = run_id.map(|id| ContextBus { run_id: id.to_string() });
+    let bus = run_id.map(|id| ContextBus {
+        run_id: id.to_string(),
+    });
     let discovery = discover_agents(cwd, &scope);
     let agents = discovery.agents;
     let project_agents_dir = discovery.project_agents_dir.clone();
@@ -993,8 +1011,17 @@ async fn dispatch_inner(args: &Value, cwd: &str, progress_tx: Option<mpsc::Sende
             let model = step.get("model").and_then(|v| v.as_str());
             // Substitute {previous} (literal replacement — no regex specials).
             let task = task_tmpl.replace("{previous}", &previous);
-            let r =
-                run_single_agent_with_progress(&agents, agent_name, &task, model, step_cwd, Some(i + 1), bus.as_ref(), progress_tx.clone()).await;
+            let r = run_single_agent_with_progress(
+                &agents,
+                agent_name,
+                &task,
+                model,
+                step_cwd,
+                Some(i + 1),
+                bus.as_ref(),
+                progress_tx.clone(),
+            )
+            .await;
             let failed = r.is_failed();
             results.push(r);
             if failed {
@@ -1120,7 +1147,17 @@ async fn dispatch_inner(args: &Value, cwd: &str, progress_tx: Option<mpsc::Sende
     let task = single_task.unwrap();
     let model = args.get("model").and_then(|v| v.as_str());
     let single_cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(cwd);
-    let r = run_single_agent_with_progress(&agents, agent_name, task, model, single_cwd, None, bus.as_ref(), progress_tx).await;
+    let r = run_single_agent_with_progress(
+        &agents,
+        agent_name,
+        task,
+        model,
+        single_cwd,
+        None,
+        bus.as_ref(),
+        progress_tx,
+    )
+    .await;
     if r.is_failed() {
         let errmsg = r.result_output();
         let label = r.stop_reason.clone().unwrap_or_else(|| "failed".into());
@@ -1249,11 +1286,17 @@ mod tests {
         );
         assert_eq!(
             parse_subagent_model("OpenRouter/nex-agi/nex-n2-pro:free"),
-            ("openrouter".to_string(), "nex-agi/nex-n2-pro:free".to_string())
+            (
+                "openrouter".to_string(),
+                "nex-agi/nex-n2-pro:free".to_string()
+            )
         );
         assert_eq!(
             parse_subagent_model("OPENROUTER/openrouter/nex-agi/nex-n2-pro:free"),
-            ("openrouter".to_string(), "nex-agi/nex-n2-pro:free".to_string()),
+            (
+                "openrouter".to_string(),
+                "nex-agi/nex-n2-pro:free".to_string()
+            ),
             "uppercase provider segment with a redundant lowercase prefix must still be normalized"
         );
     }
@@ -1436,7 +1479,17 @@ mod tests {
         // wire we know the provider stream is hung and the timeout is actually being exercised.
         let mut run = tokio::spawn(async move {
             let agents = [agent];
-            run_single_agent_with_progress(&agents, "test", "task", Some("local/test"), &cwd, None, None, None).await
+            run_single_agent_with_progress(
+                &agents,
+                "test",
+                "task",
+                Some("local/test"),
+                &cwd,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         tokio::select! {
@@ -1562,7 +1615,17 @@ mod tests {
 
         let mut run = tokio::spawn(async move {
             let agents = [agent];
-            run_single_agent_with_progress(&agents, "test", "task", Some("local/test"), &cwd, None, None, None).await
+            run_single_agent_with_progress(
+                &agents,
+                "test",
+                "task",
+                Some("local/test"),
+                &cwd,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         tokio::select! {

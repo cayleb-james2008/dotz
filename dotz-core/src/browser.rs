@@ -1767,8 +1767,10 @@ mod tests {
         // ids, leaving the store non-empty and failing the assertion.
         let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
 
-        let base =
-            std::env::temp_dir().join(format!("dotz-browser-dispose-test-{}", uuid::Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!(
+            "dotz-browser-dispose-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         tokio::fs::create_dir_all(&base).await.unwrap();
 
         let sid1 = "dotz-dispose-1";
@@ -1825,8 +1827,10 @@ mod tests {
     async fn stop_disposes_session_even_when_close_command_hangs() {
         let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
 
-        let dir = std::env::temp_dir()
-            .join(format!("dotz-browser-stop-hang-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "dotz-browser-stop-hang-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         // Fake agent-browser binary: sleeps long enough that only the close timeout can end it.
@@ -1841,7 +1845,9 @@ mod tests {
         #[cfg(unix)]
         let script_path = {
             let sh = dir.join("fake-browser.sh");
-            tokio::fs::write(&sh, "#!/bin/sh\nsleep 60\n").await.unwrap();
+            tokio::fs::write(&sh, "#!/bin/sh\nsleep 60\n")
+                .await
+                .unwrap();
             use std::os::unix::fs::PermissionsExt;
             let mut perms = tokio::fs::metadata(&sh).await.unwrap().permissions();
             perms.set_mode(0o755);
@@ -1870,7 +1876,10 @@ mod tests {
         let prev_timeout = std::env::var("DOTZ_BROWSER_TIMEOUT_MS").ok();
         // Use a huge command timeout so the only thing ending the close call is stop()'s own
         // CLOSE_TIMEOUT — if stop() relied on command_timeout() this test would take 75s.
-        std::env::set_var("DOTZ_BROWSER_BIN", script_path.to_string_lossy().to_string());
+        std::env::set_var(
+            "DOTZ_BROWSER_BIN",
+            script_path.to_string_lossy().to_string(),
+        );
         std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "300000");
 
         let start = std::time::Instant::now();
@@ -1919,7 +1928,8 @@ mod tests {
         let baseline = session_count();
         let sid1 = format!("dotz-count-1-{}", uuid::Uuid::new_v4());
         let sid2 = format!("dotz-count-2-{}", uuid::Uuid::new_v4());
-        let dir = std::env::temp_dir().join(format!("dotz-browser-count-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("dotz-browser-count-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         {
@@ -2016,8 +2026,10 @@ mod tests {
     async fn run_reaps_child_after_timeout() {
         let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
 
-        let dir =
-            std::env::temp_dir().join(format!("dotz-browser-timeout-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "dotz-browser-timeout-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         #[cfg(unix)]
@@ -2072,7 +2084,10 @@ mod tests {
 
         let prev_bin = std::env::var("DOTZ_BROWSER_BIN").ok();
         let prev_timeout = std::env::var("DOTZ_BROWSER_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_BROWSER_BIN", script_path.to_string_lossy().to_string());
+        std::env::set_var(
+            "DOTZ_BROWSER_BIN",
+            script_path.to_string_lossy().to_string(),
+        );
         std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "500");
 
         let start = std::time::Instant::now();

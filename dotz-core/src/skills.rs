@@ -250,11 +250,11 @@ fn split_frontmatter(raw: &str) -> (Option<Cow<'_, str>>, &str) {
 
     // The closing fence may be the very next line (empty frontmatter). Without this guard the
     // "\n---" search would miss a fence at position 0 of `after_open`.
-    if after_open.starts_with("---\n")
-        || after_open.starts_with("---\r\n")
-        || after_open == "---"
-    {
-        return (Some(Cow::Borrowed("")), strip_body_newline(&after_open[3..]));
+    if after_open.starts_with("---\n") || after_open.starts_with("---\r\n") || after_open == "---" {
+        return (
+            Some(Cow::Borrowed("")),
+            strip_body_newline(&after_open[3..]),
+        );
     }
 
     // Find the closing fence: a line that is exactly "---" (preceded by a newline). We search for
@@ -414,7 +414,9 @@ fn index() -> &'static Mutex<BTreeMap<String, Skill>> {
 /// (e.g. inside `parse_skill_file` or `build_index`) must not permanently brick the skills REST
 /// endpoints or system-prompt injection.
 fn index_guard() -> std::sync::MutexGuard<'static, BTreeMap<String, Skill>> {
-    index().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    index()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Force a rebuild of the cached skill index so newly-created or removed skills are visible
@@ -694,7 +696,9 @@ mod tests {
     /// recovery, lookups, list, and reload keep working after a previous lock owner panicked.
     #[test]
     fn index_guard_recovers_from_poisoned_mutex() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Ensure the cache is initialized.
         drop(index().lock().unwrap());
 
@@ -721,15 +725,27 @@ mod tests {
     #[test]
     fn split_frontmatter_handles_empty_frontmatter() {
         let (yaml, body) = split_frontmatter("---\n---\nbody");
-        assert_eq!(yaml.as_deref(), Some(""), "empty frontmatter should yield empty yaml");
+        assert_eq!(
+            yaml.as_deref(),
+            Some(""),
+            "empty frontmatter should yield empty yaml"
+        );
         assert_eq!(body, "body", "body should follow the closing fence");
 
         let (yaml, body) = split_frontmatter("---\r\n---\r\nbody");
-        assert_eq!(yaml.as_deref(), Some(""), "empty CRLF frontmatter should yield empty yaml");
+        assert_eq!(
+            yaml.as_deref(),
+            Some(""),
+            "empty CRLF frontmatter should yield empty yaml"
+        );
         assert_eq!(body, "body", "CRLF body should follow the closing fence");
 
         let (yaml, body) = split_frontmatter("---\n---");
-        assert_eq!(yaml.as_deref(), Some(""), "EOF closing fence should yield empty yaml");
+        assert_eq!(
+            yaml.as_deref(),
+            Some(""),
+            "EOF closing fence should yield empty yaml"
+        );
         assert_eq!(body, "", "no body when closing fence is EOF");
     }
 

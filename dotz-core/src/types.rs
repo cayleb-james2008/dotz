@@ -36,7 +36,9 @@ impl Budget {
         let total = input_tokens.saturating_add(output_tokens);
         self.max_cost.map_or(false, |max| cost > max)
             || self.max_tokens.map_or(false, |max| total > max)
-            || self.max_input_tokens.map_or(false, |max| input_tokens > max)
+            || self
+                .max_input_tokens
+                .map_or(false, |max| input_tokens > max)
     }
 }
 
@@ -50,6 +52,150 @@ pub struct ModelRef {
     pub provider: String,
     #[serde(rename = "modelId")]
     pub model_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecStatus {
+    Draft,
+    Ready,
+    Applying,
+    Verified,
+    Blocked,
+    Archived,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpecArtifact {
+    pub kind: String,
+    pub path: String,
+    pub exists: bool,
+    #[serde(rename = "sizeBytes", skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadinessFinding {
+    pub id: String,
+    pub area: String,
+    pub status: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpecChange {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub status: SpecStatus,
+    pub path: String,
+    pub artifacts: Vec<SpecArtifact>,
+    pub readiness: Vec<ReadinessFinding>,
+    #[serde(rename = "createdAt")]
+    pub created_at: u64,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: u64,
+    #[serde(rename = "archivedAt", skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LivingDocKind {
+    AntiPatterns,
+    NonInferables,
+    ContextScope,
+    LivingDocs,
+}
+
+impl LivingDocKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AntiPatterns => "anti_patterns",
+            Self::NonInferables => "non_inferables",
+            Self::ContextScope => "context_scope",
+            Self::LivingDocs => "living_docs",
+        }
+    }
+
+    pub fn file_name(&self) -> &'static str {
+        match self {
+            Self::AntiPatterns => "anti-patterns.md",
+            Self::NonInferables => "non-inferables.md",
+            Self::ContextScope => "context-scope.md",
+            Self::LivingDocs => "living-docs.md",
+        }
+    }
+
+    pub fn heading(&self) -> &'static str {
+        match self {
+            Self::AntiPatterns => "Anti-Patterns",
+            Self::NonInferables => "Non-Inferables",
+            Self::ContextScope => "Context Scope",
+            Self::LivingDocs => "Living Docs",
+        }
+    }
+
+    pub fn all() -> &'static [LivingDocKind] {
+        &[
+            LivingDocKind::AntiPatterns,
+            LivingDocKind::NonInferables,
+            LivingDocKind::ContextScope,
+            LivingDocKind::LivingDocs,
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VcsStatus {
+    pub cwd: String,
+    #[serde(rename = "insideWorktree")]
+    pub inside_worktree: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(rename = "headSha", skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    pub dirty: bool,
+    pub staged: bool,
+    pub untracked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    #[serde(rename = "ghInstalled")]
+    pub gh_installed: bool,
+    #[serde(rename = "ghLoggedIn")]
+    pub gh_logged_in: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct AtomicCommitRequest {
+    #[serde(rename = "projectId", skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct RollbackTarget {
+    #[serde(rename = "projectId", skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub target: String,
+    #[serde(default = "default_rollback_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+fn default_rollback_mode() -> String {
+    "revert".to_string()
 }
 
 pub fn default_model() -> ModelRef {
@@ -206,9 +352,19 @@ pub fn available_models() -> Vec<ModelRef> {
     // without a catalog the operator could not pick a model at all. These ids are the current
     // flagship models for each provider; unknown ids are rejected by the upstream API, not by dotz.
     let fixed: &[(&str, &[&str])] = &[
-        ("anthropic", &["claude-3-5-sonnet-latest", "claude-3-opus-latest", "claude-3-5-haiku-latest"]),
+        (
+            "anthropic",
+            &[
+                "claude-3-5-sonnet-latest",
+                "claude-3-opus-latest",
+                "claude-3-5-haiku-latest",
+            ],
+        ),
         ("openai", &["gpt-4o", "gpt-4o-mini", "o3-mini"]),
-        ("google", &["gemini-1.5-pro-latest", "gemini-1.5-flash-latest"]),
+        (
+            "google",
+            &["gemini-1.5-pro-latest", "gemini-1.5-flash-latest"],
+        ),
         ("groq", &["llama-3.3-70b-versatile", "mixtral-8x7b-32768"]),
         ("mistral", &["mistral-large-latest", "mistral-small-latest"]),
         ("xai", &["grok-2-1212", "grok-2-vision-1212"]),

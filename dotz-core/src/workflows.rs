@@ -985,9 +985,7 @@ pub fn resume_sync(run_id: &str) -> Option<WorkflowRun> {
                             .iter()
                             .find(|s| &s.id == pid)
                             .map(|p| {
-                                p.status == "done"
-                                    || p.status == "skipped"
-                                    || p.status == "error"
+                                p.status == "done" || p.status == "skipped" || p.status == "error"
                             })
                             .unwrap_or(false)
                 })
@@ -1028,11 +1026,7 @@ pub fn resume_sync(run_id: &str) -> Option<WorkflowRun> {
 pub fn startup_resume() -> usize {
     let non_terminal: Vec<WorkflowRun> = list_history(None)
         .into_iter()
-        .filter(|r| {
-            r.status != "done"
-                && r.status != "error"
-                && r.status != "aborted"
-        })
+        .filter(|r| r.status != "done" && r.status != "error" && r.status != "aborted")
         .collect();
 
     let mut resumed = 0;
@@ -1169,9 +1163,19 @@ async fn create_handler(
 
     // Parse optional run-level budget from the request body. Each step can also carry
     // its own per-step budget; the run budget is the cumulative cap across all steps.
-    let run_budget = body.get("budget").and_then(|v| serde_json::from_value::<Budget>(v.clone()).ok());
+    let run_budget = body
+        .get("budget")
+        .and_then(|v| serde_json::from_value::<Budget>(v.clone()).ok());
 
-    let run = match create(project_id, session_id, label, origin, max_repair_rounds, &inputs, run_budget) {
+    let run = match create(
+        project_id,
+        session_id,
+        label,
+        origin,
+        max_repair_rounds,
+        &inputs,
+        run_budget,
+    ) {
         Ok(run) => run,
         Err(CycleError) => return Err(bad("workflow steps form a cycle")),
     };
@@ -1192,7 +1196,15 @@ struct StepBody {
     artifact: Option<Artifact>,
 }
 
-const ALLOWED_STATUS: [&str; 7] = ["pending", "ready", "running", "done", "error", "skipped", "interrupted"];
+const ALLOWED_STATUS: [&str; 7] = [
+    "pending",
+    "ready",
+    "running",
+    "done",
+    "error",
+    "skipped",
+    "interrupted",
+];
 
 /// POST /api/workflows/:id/step → update a step + propagate, return the run.
 /// 404 unknown run/step, 409 finished run, 400 bad stepId/status.
@@ -1233,7 +1245,9 @@ async fn step_handler(
         // resume a run via POST /:id/resume instead, which resets interrupted steps
         // to ready and re-dispatches them through the executor.
         if st == "interrupted" {
-            return Err(bad("interrupted is a server-initiated status; use POST /:id/resume to resume"));
+            return Err(bad(
+                "interrupted is a server-initiated status; use POST /:id/resume to resume",
+            ));
         }
     }
 
@@ -1297,10 +1311,20 @@ async fn execute_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
         return Err(not_found("no such workflow run"));
     }
 
-    let checkpoint = match crate::checkpoint::save_checkpoint(&id, &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).to_string_lossy()) {
+    let checkpoint = match crate::checkpoint::save_checkpoint(
+        &id,
+        &std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .to_string_lossy(),
+    ) {
         Ok(sha) => Some(sha),
         Err(crate::checkpoint::CheckpointError::NotAGitRepo) => None, // graceful degradation
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.message() })))),
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.message() })),
+            ))
+        }
     };
 
     match crate::workflow_executor::run_workflow(&id).await {
@@ -1364,17 +1388,23 @@ async fn rerun_step_handler(
     if step.status == "running" {
         return Err((
             StatusCode::CONFLICT,
-            Json(json!({ "error": "step is currently running — wait for it to complete or abort the run" })),
+            Json(
+                json!({ "error": "step is currently running — wait for it to complete or abort the run" }),
+            ),
         ));
     }
 
     // Build the new task: append feedback if provided.
     let new_task = match body {
         Some(Json(RerunBody { feedback: Some(fb) })) if !fb.trim().is_empty() => {
-            format!("{}
+            format!(
+                "{}
 
 [Operator feedback for rerun]
-{}", step.task, fb.trim())
+{}",
+                step.task,
+                fb.trim()
+            )
         }
         _ => step.task.clone(),
     };
@@ -1469,7 +1499,8 @@ async fn patch_step_handler(
                     },
                     Value::String(s) => {
                         let trimmed = s.trim();
-                        let is_index = !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
+                        let is_index =
+                            !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
                         if is_index {
                             match trimmed.parse::<usize>() {
                                 Ok(n) if n < len => run.steps[n].id.clone(),
@@ -1670,20 +1701,25 @@ async fn insert_steps_handler(
                         },
                         Value::String(s) => {
                             let trimmed = s.trim();
-                            let is_index = !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
+                            let is_index =
+                                !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
                             if is_index {
                                 match trimmed.parse::<usize>() {
                                     Ok(n) if n < existing_count => run.steps[n].id.clone(),
                                     _ => continue,
                                 }
-                            } else if let Some(idx) = new_step_ids.iter().position(|sid| sid == trimmed) {
+                            } else if let Some(idx) =
+                                new_step_ids.iter().position(|sid| sid == trimmed)
+                            {
                                 // Allow refs to other newly-inserted steps by their
                                 // assigned id (the UI may reference a just-added step).
                                 // We map positional refs to ids above; literal refs
                                 // to new-step ids are resolved after all ids are known.
-                                run.steps.iter().find(|st| &st.id == trimmed).map(|st| st.id.clone()).unwrap_or_else(|| {
-                                    new_step_ids[idx].clone()
-                                })
+                                run.steps
+                                    .iter()
+                                    .find(|st| &st.id == trimmed)
+                                    .map(|st| st.id.clone())
+                                    .unwrap_or_else(|| new_step_ids[idx].clone())
                             } else if run.steps.iter().any(|st| &st.id == trimmed) {
                                 trimmed.to_string()
                             } else {
@@ -1700,7 +1736,11 @@ async fn insert_steps_handler(
             }
             None => Vec::new(),
         };
-        let status = if parents.is_empty() { "ready".to_string() } else { "pending".to_string() };
+        let status = if parents.is_empty() {
+            "ready".to_string()
+        } else {
+            "pending".to_string()
+        };
         new_steps.push(WorkflowStep {
             id,
             agent: input.agent.clone(),
@@ -1765,13 +1805,16 @@ async fn insert_steps_handler(
             .iter()
             .filter(|s| s.status == "pending")
             .filter(|s| {
-                s.parents.is_empty() || s.parents.iter().all(|pid| {
-                    run.steps
-                        .iter()
-                        .find(|st| &st.id == pid)
-                        .map(|p| p.status == "done" || p.status == "skipped" || p.status == "error")
-                        .unwrap_or(false)
-                })
+                s.parents.is_empty()
+                    || s.parents.iter().all(|pid| {
+                        run.steps
+                            .iter()
+                            .find(|st| &st.id == pid)
+                            .map(|p| {
+                                p.status == "done" || p.status == "skipped" || p.status == "error"
+                            })
+                            .unwrap_or(false)
+                    })
             })
             .map(|s| s.id.clone())
             .collect();
@@ -1810,7 +1853,11 @@ pub fn patch_parents(
     proposed_parents: Vec<Value>,
 ) -> Result<WorkflowRun, CycleError> {
     let run = get_active(run_id).ok_or(CycleError)?;
-    let step_idx = run.steps.iter().position(|s| s.id == step_id).ok_or(CycleError)?;
+    let step_idx = run
+        .steps
+        .iter()
+        .position(|s| s.id == step_id)
+        .ok_or(CycleError)?;
     let len = run.steps.len();
 
     let resolved: Vec<String> = proposed_parents
@@ -1936,10 +1983,7 @@ pub fn patch_parents(
 
 /// Insert new steps into an existing run. Parent refs resolve against existing steps
 /// (indices 0..existing_count). Returns the updated run.
-pub fn insert_steps(
-    run_id: &str,
-    inputs: &[CreateStepInput],
-) -> Result<WorkflowRun, CycleError> {
+pub fn insert_steps(run_id: &str, inputs: &[CreateStepInput]) -> Result<WorkflowRun, CycleError> {
     let run = get_active(run_id).ok_or(CycleError)?;
     let existing_count = run.steps.len();
     let now = now_ms();
@@ -1963,8 +2007,8 @@ pub fn insert_steps(
                             },
                             Value::String(s) => {
                                 let trimmed = s.trim();
-                                let is_index =
-                                    !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
+                                let is_index = !trimmed.is_empty()
+                                    && trimmed.chars().all(|c| c.is_ascii_digit());
                                 if is_index {
                                     match trimmed.parse::<usize>() {
                                         Ok(n) if n < existing_count => run.steps[n].id.clone(),
@@ -2048,13 +2092,16 @@ pub fn insert_steps(
             .iter()
             .filter(|s| s.status == "pending")
             .filter(|s| {
-                s.parents.is_empty() || s.parents.iter().all(|pid| {
-                    run.steps
-                        .iter()
-                        .find(|st| &st.id == pid)
-                        .map(|p| p.status == "done" || p.status == "skipped" || p.status == "error")
-                        .unwrap_or(false)
-                })
+                s.parents.is_empty()
+                    || s.parents.iter().all(|pid| {
+                        run.steps
+                            .iter()
+                            .find(|st| &st.id == pid)
+                            .map(|p| {
+                                p.status == "done" || p.status == "skipped" || p.status == "error"
+                            })
+                            .unwrap_or(false)
+                    })
             })
             .map(|s| s.id.clone())
             .collect();
@@ -2121,7 +2168,11 @@ pub async fn rerun_step_and_dispatch(
     // Build the new task with appended feedback.
     let new_task = match feedback {
         Some(fb) if !fb.trim().is_empty() => {
-            format!("{}\n\n[Operator feedback for rerun]\n{}", step.task, fb.trim())
+            format!(
+                "{}\n\n[Operator feedback for rerun]\n{}",
+                step.task,
+                fb.trim()
+            )
         }
         _ => step.task.clone(),
     };
@@ -2182,8 +2233,14 @@ pub fn router() -> Router<()> {
         .route("/api/workflows/{id}/abort", post(abort_handler))
         .route("/api/workflows/{id}/execute", post(execute_handler))
         .route("/api/workflows/{id}/resume", post(resume_handler))
-        .route("/api/workflows/{id}/step/{step_id}/rerun", post(rerun_step_handler))
-        .route("/api/workflows/{id}/step/{step_id}/patch", post(patch_step_handler))
+        .route(
+            "/api/workflows/{id}/step/{step_id}/rerun",
+            post(rerun_step_handler),
+        )
+        .route(
+            "/api/workflows/{id}/step/{step_id}/patch",
+            post(patch_step_handler),
+        )
         .route("/api/workflows/{id}/insert", post(insert_steps_handler))
 }
 
@@ -2553,8 +2610,21 @@ mod tests {
     fn active_count_returns_store_size() {
         with_tmp_workflows_file(|| {
             let baseline = active_count();
-            let run = create(None, None, "count".into(), None, 3, &[step("a", "A", None)], None).unwrap();
-            assert_eq!(active_count(), baseline + 1, "active_count should include the new run");
+            let run = create(
+                None,
+                None,
+                "count".into(),
+                None,
+                3,
+                &[step("a", "A", None)],
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                active_count(),
+                baseline + 1,
+                "active_count should include the new run"
+            );
 
             // Abort marks the run terminal but keeps it in the active map (eviction only happens
             // when the cap is exceeded), so the count stays elevated.
@@ -2586,7 +2656,8 @@ mod tests {
             let count = active_count();
             let guard = store_guard();
             assert_eq!(
-                count, guard.len(),
+                count,
+                guard.len(),
                 "active_count and store_guard must agree after recovering from a poisoned mutex"
             );
         });
@@ -2599,16 +2670,15 @@ mod tests {
         with_tmp_workflows_file(|| {
             let mut rx = subscribe_events();
 
-            let inputs = vec![
-                step("a", "A", None),
-                step("b", "B", Some(vec![json!(0)])),
-            ];
+            let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(0)]))];
             let run = create(None, None, "events".into(), None, 3, &inputs, None).unwrap();
             let child_id = run.steps[1].id.clone();
 
             // start() emits workflow_start.
             let started = start(&run.id).unwrap();
-            let start_frame = rx.try_recv().expect("workflow_start event should be broadcast");
+            let start_frame = rx
+                .try_recv()
+                .expect("workflow_start event should be broadcast");
             assert_eq!(start_frame["kind"], "workflow");
             assert_eq!(start_frame["runId"], started.id);
             assert_eq!(start_frame["event"]["type"], "workflow_start");
@@ -2674,7 +2744,10 @@ mod tests {
                 }
             }
             assert!(seen_child_done, "child done step_state should be broadcast");
-            assert!(seen_end, "workflow_end should be broadcast when run finishes");
+            assert!(
+                seen_end,
+                "workflow_end should be broadcast when run finishes"
+            );
         });
     }
 
@@ -2710,7 +2783,11 @@ mod tests {
                     seen_end = true;
                 }
             }
-            assert_eq!(swept, updated.steps.len(), "every swept step should emit step_state");
+            assert_eq!(
+                swept,
+                updated.steps.len(),
+                "every swept step should emit step_state"
+            );
             assert!(seen_end, "abort should emit workflow_end");
         });
     }
@@ -2722,11 +2799,7 @@ mod tests {
     #[test]
     fn auto_repair_spawns_worker_and_reviewer_children_on_findings() {
         with_tmp_workflows_file(|| {
-            let review_step = step_with_auto_repair(
-                "reviewer",
-                "Review the implementation",
-                None,
-            );
+            let review_step = step_with_auto_repair("reviewer", "Review the implementation", None);
             let inputs = vec![review_step];
             let run = create(None, None, "auto-repair".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
@@ -2749,7 +2822,10 @@ mod tests {
             .unwrap();
 
             // The run must still be running (not done), with 3 steps: review + repair + re-review.
-            assert_eq!(updated.status, "running", "run should stay running when repair is pending");
+            assert_eq!(
+                updated.status, "running",
+                "run should stay running when repair is pending"
+            );
             assert_eq!(updated.steps.len(), 3, "review + repair + re-review steps");
             assert_eq!(updated.repair_rounds, 1);
 
@@ -2790,11 +2866,7 @@ mod tests {
     #[test]
     fn auto_repair_does_not_trigger_on_clean_review() {
         with_tmp_workflows_file(|| {
-            let review_step = step_with_auto_repair(
-                "reviewer",
-                "Review the implementation",
-                None,
-            );
+            let review_step = step_with_auto_repair("reviewer", "Review the implementation", None);
             let inputs = vec![review_step];
             let run = create(None, None, "clean-review".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
@@ -2825,11 +2897,7 @@ mod tests {
         with_tmp_workflows_file(|| {
             // max_repair_rounds = 1: one repair attempt, then the re-review's findings must
             // NOT spawn another cycle.
-            let review_step = step_with_auto_repair(
-                "reviewer",
-                "Review the implementation",
-                None,
-            );
+            let review_step = step_with_auto_repair("reviewer", "Review the implementation", None);
             let inputs = vec![review_step];
             let run = create(None, None, "capped-repair".into(), None, 1, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
@@ -2900,11 +2968,7 @@ mod tests {
     #[test]
     fn auto_repair_completes_when_re_review_passes() {
         with_tmp_workflows_file(|| {
-            let review_step = step_with_auto_repair(
-                "reviewer",
-                "Review the implementation",
-                None,
-            );
+            let review_step = step_with_auto_repair("reviewer", "Review the implementation", None);
             let inputs = vec![review_step];
             let run = create(None, None, "passing-repair".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
@@ -2969,22 +3033,12 @@ mod tests {
     /// review_has_findings heuristic: detects actionable findings in review output.
     #[test]
     fn review_has_findings_detects_critical_and_warnings() {
-        assert!(review_has_findings(Some(
-            "## Critical\n- bug in foo\n"
-        )));
-        assert!(review_has_findings(Some(
-            "## Warnings\n- magic number\n"
-        )));
-        assert!(review_has_findings(Some(
-            "## Must Fix\n- security issue\n"
-        )));
-        assert!(review_has_findings(Some(
-            "## Should Fix\n- code smell\n"
-        )));
+        assert!(review_has_findings(Some("## Critical\n- bug in foo\n")));
+        assert!(review_has_findings(Some("## Warnings\n- magic number\n")));
+        assert!(review_has_findings(Some("## Must Fix\n- security issue\n")));
+        assert!(review_has_findings(Some("## Should Fix\n- code smell\n")));
         // Numbered list.
-        assert!(review_has_findings(Some(
-            "## Critical\n1. bug\n"
-        )));
+        assert!(review_has_findings(Some("## Critical\n1. bug\n")));
     }
 
     /// review_has_findings heuristic: rejects clean reviews.
@@ -2993,21 +3047,11 @@ mod tests {
         assert!(!review_has_findings(None));
         assert!(!review_has_findings(Some("")));
         assert!(!review_has_findings(Some("   ")));
-        assert!(!review_has_findings(Some(
-            "No critical issues found."
-        )));
-        assert!(!review_has_findings(Some(
-            "No issues found."
-        )));
-        assert!(!review_has_findings(Some(
-            "No findings."
-        )));
-        assert!(!review_has_findings(Some(
-            "Looks good."
-        )));
-        assert!(!review_has_findings(Some(
-            "LGTM"
-        )));
+        assert!(!review_has_findings(Some("No critical issues found.")));
+        assert!(!review_has_findings(Some("No issues found.")));
+        assert!(!review_has_findings(Some("No findings.")));
+        assert!(!review_has_findings(Some("Looks good.")));
+        assert!(!review_has_findings(Some("LGTM")));
         // A section header with no bullets after it is not actionable.
         assert!(!review_has_findings(Some(
             "## Critical\n\n## Summary\nAll good."
@@ -3083,7 +3127,10 @@ mod tests {
                     let _ = agent;
                 }
             }
-            assert!(seen_repair_ready, "repair step ready event should be broadcast");
+            assert!(
+                seen_repair_ready,
+                "repair step ready event should be broadcast"
+            );
             assert!(
                 seen_re_review_pending,
                 "re-review step pending event should be broadcast"
@@ -3141,7 +3188,11 @@ mod tests {
             assert!(interrupted_step.ended_at.is_some());
 
             // Non-running steps are untouched.
-            let s1 = after.steps.iter().find(|s| s.id == run.steps[1].id).unwrap();
+            let s1 = after
+                .steps
+                .iter()
+                .find(|s| s.id == run.steps[1].id)
+                .unwrap();
             assert_eq!(s1.status, "pending");
             assert!(s1.error.is_none());
         });
@@ -3190,7 +3241,10 @@ mod tests {
                 let mut active = store_guard();
                 active.remove(&run_id);
             }
-            assert!(get_active(&run_id).is_none(), "active map should be empty after remove");
+            assert!(
+                get_active(&run_id).is_none(),
+                "active map should be empty after remove"
+            );
 
             // But it's still in history.
             let in_history = list_history(None).into_iter().find(|r| r.id == run_id);
@@ -3200,7 +3254,10 @@ mod tests {
             let restored = restore_for_resume(&run_id).unwrap();
             assert_eq!(restored.id, run_id);
             assert_eq!(restored.status, "running");
-            assert!(get_active(&run_id).is_some(), "run should be back in active map");
+            assert!(
+                get_active(&run_id).is_some(),
+                "run should be back in active map"
+            );
         });
     }
 
@@ -3233,10 +3290,7 @@ mod tests {
     #[test]
     fn resume_resets_interrupted_steps_to_ready() {
         with_tmp_workflows_file(|| {
-            let inputs = vec![
-                step("a", "A", None),
-                step("b", "B", Some(vec![json!(0)])),
-            ];
+            let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(0)]))];
             let run = create(None, None, "resume-test".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
 
@@ -3264,13 +3318,23 @@ mod tests {
 
             // Step 0 should be ready (reset from interrupted).
             let s0 = resumed.steps.iter().find(|s| s.id == step0_id).unwrap();
-            assert_eq!(s0.status, "ready", "interrupted step should be reset to ready");
+            assert_eq!(
+                s0.status, "ready",
+                "interrupted step should be reset to ready"
+            );
             assert!(s0.error.is_none(), "error should be cleared on resume");
             assert!(s0.ended_at.is_none(), "endedAt should be cleared on resume");
-            assert!(s0.started_at.is_none(), "startedAt should be cleared on resume");
+            assert!(
+                s0.started_at.is_none(),
+                "startedAt should be cleared on resume"
+            );
 
             // Step 1 (was pending) should still be pending.
-            let s1 = resumed.steps.iter().find(|s| s.id == run.steps[1].id).unwrap();
+            let s1 = resumed
+                .steps
+                .iter()
+                .find(|s| s.id == run.steps[1].id)
+                .unwrap();
             assert_eq!(s1.status, "pending");
         });
     }
@@ -3537,7 +3601,10 @@ mod tests {
             let after = get_active(&run.id).unwrap();
             let s = after.steps.iter().find(|s| s.id == step_id).unwrap();
             assert_eq!(s.status, "ready");
-            assert_eq!(s.task, original_task, "no-feedback rerun should preserve task");
+            assert_eq!(
+                s.task, original_task,
+                "no-feedback rerun should preserve task"
+            );
         });
     }
 
@@ -3546,10 +3613,7 @@ mod tests {
     #[test]
     fn patch_parents_empty_makes_ready() {
         with_tmp_workflows_file(|| {
-            let inputs = vec![
-                step("a", "A", None),
-                step("b", "B", Some(vec![json!(0)])),
-            ];
+            let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(0)]))];
             let run = create(None, None, "patch-empty".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let child_id = run.steps[1].id.clone();
@@ -3559,7 +3623,10 @@ mod tests {
             let updated = super::patch_parents(&run.id, &child_id, vec![]).unwrap();
             let child = updated.steps.iter().find(|s| s.id == child_id).unwrap();
             assert_eq!(child.parents, Vec::<String>::new());
-            assert_eq!(child.status, "ready", "child with no parents should be ready");
+            assert_eq!(
+                child.status, "ready",
+                "child with no parents should be ready"
+            );
         });
     }
 
@@ -3583,7 +3650,11 @@ mod tests {
             assert_eq!(c.parents, vec![b_id.clone()]);
 
             // B should now have C as a child; A should not.
-            let a = updated.steps.iter().find(|s| s.id == run.steps[0].id).unwrap();
+            let a = updated
+                .steps
+                .iter()
+                .find(|s| s.id == run.steps[0].id)
+                .unwrap();
             assert!(!a.children.contains(&c_id));
             let b = updated.steps.iter().find(|s| s.id == b_id).unwrap();
             assert!(b.children.contains(&c_id));
@@ -3594,10 +3665,7 @@ mod tests {
     #[test]
     fn patch_parents_cycle_is_rejected() {
         with_tmp_workflows_file(|| {
-            let inputs = vec![
-                step("a", "A", None),
-                step("b", "B", Some(vec![json!(0)])),
-            ];
+            let inputs = vec![step("a", "A", None), step("b", "B", Some(vec![json!(0)]))];
             let run = create(None, None, "patch-cycle".into(), None, 3, &inputs, None).unwrap();
             let run = start(&run.id).unwrap();
             let a_id = run.steps[0].id.clone();
@@ -3635,7 +3703,10 @@ mod tests {
             // Should have 2 steps now.
             assert_eq!(updated.steps.len(), 2);
             let b = updated.steps.iter().find(|s| s.agent == "b").unwrap();
-            assert_eq!(b.status, "ready", "new step with done parent should be ready");
+            assert_eq!(
+                b.status, "ready",
+                "new step with done parent should be ready"
+            );
             assert_eq!(b.parents, vec![a_id]);
         });
     }
@@ -3645,7 +3716,16 @@ mod tests {
     fn insert_step_no_parents_is_ready() {
         with_tmp_workflows_file(|| {
             let inputs = vec![step("a", "A", None)];
-            let run = create(None, None, "insert-noparents".into(), None, 3, &inputs, None).unwrap();
+            let run = create(
+                None,
+                None,
+                "insert-noparents".into(),
+                None,
+                3,
+                &inputs,
+                None,
+            )
+            .unwrap();
             let run = start(&run.id).unwrap();
 
             // Insert a root step.
@@ -3686,7 +3766,10 @@ mod tests {
             input.model = Some("anthropic/claude-sonnet-4-20250514".to_string());
             let run = create(None, None, "model-persist".into(), None, 3, &[input], None).unwrap();
             let s = &run.steps[0];
-            assert_eq!(s.model, Some("anthropic/claude-sonnet-4-20250514".to_string()));
+            assert_eq!(
+                s.model,
+                Some("anthropic/claude-sonnet-4-20250514".to_string())
+            );
         });
     }
 
@@ -3713,7 +3796,11 @@ mod tests {
             };
             let updated = super::step_state(&run.id, &step_id, patch).unwrap();
             let s = updated.steps.iter().find(|s| s.id == step_id).unwrap();
-            assert_eq!(s.artifact, Some(diff), "artifact must round-trip through step_state");
+            assert_eq!(
+                s.artifact,
+                Some(diff),
+                "artifact must round-trip through step_state"
+            );
         });
     }
 

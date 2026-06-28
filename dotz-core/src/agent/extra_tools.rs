@@ -520,7 +520,8 @@ fn gates() -> &'static Mutex<HashMap<String, oneshot::Sender<(bool, Option<Strin
 /// Lock the human-gate mutex, recovering from a poisoned lock. A panic while holding the gates
 /// lock (e.g. inside a gate resolution callback) must not permanently brick the `human_gate`
 /// tool or the /ws `gate.approve` / `gate.reject` handler.
-fn gates_guard() -> std::sync::MutexGuard<'static, HashMap<String, oneshot::Sender<(bool, Option<String>)>>> {
+fn gates_guard(
+) -> std::sync::MutexGuard<'static, HashMap<String, oneshot::Sender<(bool, Option<String>)>>> {
     gates()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -576,6 +577,409 @@ impl Tool for HumanGateTool {
     }
 }
 
+// ---- OpenSpec-native tools ----
+struct OpenSpecStatusTool;
+#[async_trait]
+impl Tool for OpenSpecStatusTool {
+    fn name(&self) -> &'static str {
+        "openspec_status"
+    }
+    fn description(&self) -> &'static str {
+        "Inspect native OpenSpec-compatible spec state for this project. Args: {}."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        Ok(crate::specs::status_for_cwd(&ctx.cwd).to_string())
+    }
+}
+
+struct OpenSpecExploreTool;
+#[async_trait]
+impl Tool for OpenSpecExploreTool {
+    fn name(&self) -> &'static str {
+        "openspec_explore"
+    }
+    fn description(&self) -> &'static str {
+        "Explore active/archived OpenSpec changes, artifacts, readiness, and optional CLI import availability. Args: {}."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        Ok(crate::specs::status_for_cwd(&ctx.cwd).to_string())
+    }
+}
+
+struct OpenSpecProposeTool;
+#[async_trait]
+impl Tool for OpenSpecProposeTool {
+    fn name(&self) -> &'static str {
+        "openspec_propose"
+    }
+    fn description(&self) -> &'static str {
+        "Create an OpenSpec-compatible change at openspec/changes/<slug>/ with proposal.md, design.md, tasks.md, specs/, and readiness.md. Args: {title, description?, slug?}."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "description": { "type": "string" },
+                "slug": { "type": "string" }
+            },
+            "required": ["title"]
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        let req = crate::specs::CreateSpecChange {
+            project_id: None,
+            title: args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            description: args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            slug: args
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+        let change = crate::specs::create_change(&ctx.cwd, req)?;
+        Ok(serde_json::to_string(&json!({ "change": change })).unwrap_or_default())
+    }
+}
+
+macro_rules! openspec_action_tool {
+    ($name:ident, $tool_name:literal, $desc:literal, $func:path) => {
+        struct $name;
+        #[async_trait]
+        impl Tool for $name {
+            fn name(&self) -> &'static str {
+                $tool_name
+            }
+            fn description(&self) -> &'static str {
+                $desc
+            }
+            fn parameters(&self) -> Value {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "Spec change id/slug" }
+                    },
+                    "required": ["id"]
+                })
+            }
+            async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id is required")?;
+                let result = $func(&ctx.cwd, id)?;
+                Ok(result.to_string())
+            }
+        }
+    };
+}
+
+openspec_action_tool!(
+    OpenSpecApplyTool,
+    "openspec_apply",
+    "Mark a spec change as applying and return its task list. Args: {id}.",
+    crate::specs::apply_change
+);
+openspec_action_tool!(
+    OpenSpecVerifyTool,
+    "openspec_verify",
+    "Verify a spec change has required artifacts, completed tasks, and completed readiness gates. Args: {id}.",
+    crate::specs::verify_change
+);
+openspec_action_tool!(
+    OpenSpecSyncTool,
+    "openspec_sync",
+    "Sync change-local specs into openspec/specs/ and mark the change ready. Args: {id}.",
+    crate::specs::sync_change
+);
+openspec_action_tool!(
+    OpenSpecArchiveTool,
+    "openspec_archive",
+    "Archive a completed spec change under openspec/changes/archive/. Args: {id}.",
+    crate::specs::archive_change
+);
+
+// ---- living-doc tools ----
+struct LivingDocsReadTool;
+#[async_trait]
+impl Tool for LivingDocsReadTool {
+    fn name(&self) -> &'static str {
+        "living_docs_read"
+    }
+    fn description(&self) -> &'static str {
+        "Read project or global living docs. Args: {scope?:\"project\"|\"global\"}."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "scope": { "type": "string", "enum": ["project", "global"] }
+            }
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        let scope = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("project");
+        let docs = crate::living_docs::list_docs(
+            scope,
+            if scope == "project" {
+                Some(ctx.cwd.as_path())
+            } else {
+                None
+            },
+        );
+        Ok(serde_json::to_string(&json!({ "docs": docs })).unwrap_or_default())
+    }
+}
+
+struct LivingDocsUpdateTool;
+#[async_trait]
+impl Tool for LivingDocsUpdateTool {
+    fn name(&self) -> &'static str {
+        "living_docs_update"
+    }
+    fn description(&self) -> &'static str {
+        "Replace one living-doc file. Args: {scope?:\"project\"|\"global\", kind, content}; kind is anti_patterns, non_inferables, context_scope, or living_docs."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "scope": { "type": "string", "enum": ["project", "global"] },
+                "kind": { "type": "string", "enum": ["anti_patterns", "non_inferables", "context_scope", "living_docs"] },
+                "content": { "type": "string" }
+            },
+            "required": ["kind", "content"]
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        let scope = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("project");
+        let kind_value = args.get("kind").cloned().ok_or("kind is required")?;
+        let kind: crate::types::LivingDocKind =
+            serde_json::from_value(kind_value).map_err(|e| format!("invalid kind: {e}"))?;
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or("content is required")?;
+        let doc = crate::living_docs::write_doc(
+            scope,
+            if scope == "project" {
+                Some(ctx.cwd.as_path())
+            } else {
+                None
+            },
+            &kind,
+            content,
+        )?;
+        Ok(serde_json::to_string(&json!({ "doc": doc })).unwrap_or_default())
+    }
+}
+
+struct LivingDocsSuggestTool;
+#[async_trait]
+impl Tool for LivingDocsSuggestTool {
+    fn name(&self) -> &'static str {
+        "living_docs_suggest"
+    }
+    fn description(&self) -> &'static str {
+        "Queue an ambiguous living-doc suggestion for operator review. Args: {scope?, kind, text, confidence?}."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "scope": { "type": "string", "enum": ["project", "global"] },
+                "kind": { "type": "string", "enum": ["anti_patterns", "non_inferables", "context_scope", "living_docs"] },
+                "text": { "type": "string" },
+                "confidence": { "type": "number" }
+            },
+            "required": ["kind", "text"]
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        let scope = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("project");
+        let kind_value = args.get("kind").cloned().ok_or("kind is required")?;
+        let kind: crate::types::LivingDocKind =
+            serde_json::from_value(kind_value).map_err(|e| format!("invalid kind: {e}"))?;
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or("text is required")?
+            .to_string();
+        let confidence = args
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0) as f32;
+        let suggestion = crate::living_docs::add_suggestion(
+            scope,
+            if scope == "project" {
+                Some(ctx.cwd.as_path())
+            } else {
+                None
+            },
+            kind,
+            text,
+            confidence,
+            "agent_tool".to_string(),
+        )?;
+        Ok(serde_json::to_string(&json!({ "suggestion": suggestion })).unwrap_or_default())
+    }
+}
+
+// ---- VCS tools ----
+struct VcsStatusTool;
+#[async_trait]
+impl Tool for VcsStatusTool {
+    fn name(&self) -> &'static str {
+        "vcs_status"
+    }
+    fn description(&self) -> &'static str {
+        "Inspect git status, branch, upstream, dirty state, and GitHub CLI readiness for this project. Args: {}."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        Ok(
+            serde_json::to_string(&json!({ "status": crate::vcs::status_for_cwd(&ctx.cwd) }))
+                .unwrap_or_default(),
+        )
+    }
+}
+
+struct VcsBranchTool;
+#[async_trait]
+impl Tool for VcsBranchTool {
+    fn name(&self) -> &'static str {
+        "vcs_branch"
+    }
+    fn description(&self) -> &'static str {
+        "Create or reuse a dotz/<slug> branch for a spec change. Args: {slug|name}."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "slug": { "type": "string" },
+                "name": { "type": "string" }
+            }
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        let branch = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("slug").and_then(|v| v.as_str()));
+        Ok(crate::vcs::create_or_checkout_branch(&ctx.cwd, branch)?.to_string())
+    }
+}
+
+struct VcsAtomicCommitTool;
+#[async_trait]
+impl Tool for VcsAtomicCommitTool {
+    fn name(&self) -> &'static str {
+        "vcs_atomic_commit"
+    }
+    fn description(&self) -> &'static str {
+        "Stage and commit one logical verified task. Args: {message, body?, files?}. Omitting files stages all changes."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "message": { "type": "string" },
+                "body": { "type": "string" },
+                "files": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["message"]
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        let mut req: crate::types::AtomicCommitRequest =
+            serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+        req.project_id = None;
+        Ok(crate::vcs::atomic_commit(&ctx.cwd, req)?.to_string())
+    }
+}
+
+struct VcsPrTool;
+#[async_trait]
+impl Tool for VcsPrTool {
+    fn name(&self) -> &'static str {
+        "vcs_pr"
+    }
+    fn description(&self) -> &'static str {
+        "Create a GitHub PR with gh when installed and logged in. Args: {title?, body?, base?, draft?}. Fails closed if gh auth is unavailable."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "body": { "type": "string" },
+                "base": { "type": "string" },
+                "draft": { "type": "boolean" }
+            }
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        let mut req: crate::vcs::PrRequest =
+            serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+        req.project_id = None;
+        Ok(crate::vcs::create_pr(&ctx.cwd, req)?.to_string())
+    }
+}
+
+struct VcsRollbackTool;
+#[async_trait]
+impl Tool for VcsRollbackTool {
+    fn name(&self) -> &'static str {
+        "vcs_rollback"
+    }
+    fn description(&self) -> &'static str {
+        "Rollback by checkpoint, git revert, or confirmed git reset. Args: {target, mode:\"checkpoint\"|\"revert\"|\"reset\", confirm?}."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "target": { "type": "string" },
+                "mode": { "type": "string", "enum": ["checkpoint", "revert", "reset"] },
+                "confirm": { "type": "boolean" }
+            },
+            "required": ["target"]
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        let mut target: crate::types::RollbackTarget =
+            serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+        target.project_id = None;
+        Ok(crate::vcs::rollback(&ctx.cwd, target)?.to_string())
+    }
+}
+
 /// Register all the extra tools into a registry's add-closure.
 pub fn register(add: &mut dyn FnMut(Box<dyn Tool>)) {
     add(Box::new(AgentsMdTool));
@@ -584,6 +988,21 @@ pub fn register(add: &mut dyn FnMut(Box<dyn Tool>)) {
     add(Box::new(RsiBaselineTool));
     add(Box::new(RsiCompareTool));
     add(Box::new(HumanGateTool));
+    add(Box::new(OpenSpecStatusTool));
+    add(Box::new(OpenSpecExploreTool));
+    add(Box::new(OpenSpecProposeTool));
+    add(Box::new(OpenSpecApplyTool));
+    add(Box::new(OpenSpecVerifyTool));
+    add(Box::new(OpenSpecSyncTool));
+    add(Box::new(OpenSpecArchiveTool));
+    add(Box::new(LivingDocsReadTool));
+    add(Box::new(LivingDocsUpdateTool));
+    add(Box::new(LivingDocsSuggestTool));
+    add(Box::new(VcsStatusTool));
+    add(Box::new(VcsBranchTool));
+    add(Box::new(VcsAtomicCommitTool));
+    add(Box::new(VcsPrTool));
+    add(Box::new(VcsRollbackTool));
 }
 
 #[cfg(test)]
@@ -892,7 +1311,10 @@ mod tests {
         }
 
         let value = baselines_guard().get(&key).cloned();
-        assert_eq!(value.and_then(|v| v.get("passed").and_then(|x| x.as_i64())), Some(7));
+        assert_eq!(
+            value.and_then(|v| v.get("passed").and_then(|x| x.as_i64())),
+            Some(7)
+        );
     }
 
     /// A panic while holding the human-gate mutex must not permanently brick the gate UI or the
@@ -916,7 +1338,9 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         gates_guard().insert("recover-gate".to_string(), tx);
         resolve_gate("recover-gate", false, Some("needs work".to_string()));
-        let result = rx.try_recv().expect("gate resolution should deliver after poison recovery");
+        let result = rx
+            .try_recv()
+            .expect("gate resolution should deliver after poison recovery");
         assert_eq!(result, (false, Some("needs work".to_string())));
     }
 
@@ -968,8 +1392,9 @@ mod tests {
     #[tokio::test]
     async fn create_skill_tool_persists_async_and_reloads_index() {
         let _guard = TOOL_ENV_TEST_LOCK.lock().await;
-        let prev_config =
-            std::env::var("DOTZ_CONFIG_DIR").ok().map(std::path::PathBuf::from);
+        let prev_config = std::env::var("DOTZ_CONFIG_DIR")
+            .ok()
+            .map(std::path::PathBuf::from);
         let tmp = tmp_dir();
         std::env::set_var("DOTZ_CONFIG_DIR", &tmp);
 

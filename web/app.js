@@ -11,7 +11,7 @@
 const THINK_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const LAYOUT_KEY = "dotz.layout.v1";
 const BRAIN_FLOAT_KEY = "dotz.brainFloat.v1";
-const PANEL_NAMES = ["chat", "graph", "brain", "browser", "memory", "files", "sandbox", "skills", "templates", "design", "connections", "doctrine"];
+const PANEL_NAMES = ["chat", "graph", "brain", "browser", "memory", "files", "sandbox", "skills", "templates", "design", "spec", "living-docs", "vcs", "connections", "doctrine"];
 const PANEL_META = {
   chat: { icon: "▓", label: "CHAT" },
   graph: { icon: "◐", label: "WORKFLOW GRAPH" },
@@ -26,6 +26,9 @@ const PANEL_META = {
   connections: { icon: "⊕", label: "CONNECTIONS" },
   doctrine: { icon: "◈", label: "DOCTRINE" },
 };
+PANEL_META.spec = { icon: "◇", label: "SPEC" };
+PANEL_META["living-docs"] = { icon: "◧", label: "LIVING DOCS" };
+PANEL_META.vcs = { icon: "⌁", label: "VCS" };
 
 const state = {
   sessionId: null,
@@ -46,6 +49,11 @@ const state = {
   memory: [],
   skills: [],
   templates: [],
+  specs: [],
+  specStatus: null,
+  activeSpecId: null,
+  livingDocs: { docs: [], suggestions: [] },
+  vcsStatus: null,
   commands: [],
   projectFiles: [],
   sandbox: { languages: [], runs: new Map(), activeRunId: null, mode: "terminal" },
@@ -312,6 +320,9 @@ function mountPanel(name) {
   else if (name === "skills") wireSkillsPanel(node);
   else if (name === "templates") wireTemplatesPanel(node);
   else if (name === "design") wireDesignPanel(node);
+  else if (name === "spec") wireSpecPanel(node);
+  else if (name === "living-docs") wireLivingDocsPanel(node);
+  else if (name === "vcs") wireVcsPanel(node);
   else if (name === "browser") wireBrowserPanel(node);
   else if (name === "files") wireFilesPanel(node);
   else if (name === "connections") wireConnectionsPanel(node);
@@ -2041,6 +2052,39 @@ function showNodeDetail(run, step) {
   body.appendChild(makeNdRow("AGENT", step.agent));
   body.appendChild(makeNdRow("TASK", step.task));
   body.appendChild(makeNdRow("STATUS", step.status));
+  const specId = step.specChangeId || step.specId || step.changeId;
+  const taskId = step.specTaskId || step.taskId;
+  const commitId = step.commitId || step.commitSha;
+  const readinessStatus = step.readinessStatus || step.readiness;
+  if (specId) body.appendChild(makeNdRow("SPEC", specId));
+  if (taskId) body.appendChild(makeNdRow("SPEC TASK", taskId));
+  if (commitId) {
+    const row = makeNdRow("COMMIT", "");
+    const link = el("span", "nd-link", String(commitId).slice(0, 12));
+    link.onclick = () => {
+      openPanel("vcs");
+      setTimeout(() => {
+        const input = $("vcs-rollback-target");
+        if (input) input.value = commitId;
+      }, 0);
+    };
+    row.querySelector(".val").appendChild(link);
+    body.appendChild(row);
+  }
+  if (readinessStatus) body.appendChild(makeNdRow("READINESS", readinessStatus));
+  if (step.rollbackTarget || commitId) {
+    const row = makeNdRow("ROLLBACK", "");
+    const btn = el("button", "btn-mini btn-stop", "OPEN VCS");
+    btn.onclick = () => {
+      openPanel("vcs");
+      setTimeout(() => {
+        const input = $("vcs-rollback-target");
+        if (input) input.value = step.rollbackTarget || commitId || "";
+      }, 0);
+    };
+    row.querySelector(".val").appendChild(btn);
+    body.appendChild(row);
+  }
 
   // ---- ARTIFACT: the primary, inspectable result of a worker step ----
   // Rendered ABOVE the prose output so the operator sees the concrete
@@ -2247,7 +2291,7 @@ function rerunStep(step, feedback) {
     stepId: step.id,
     feedback: feedback || null,
   }));
-  logBrain(`rerunning step ${step.agent}${feedback ? " with feedback"}`);
+  logBrain(`rerunning step ${step.agent}${feedback ? " with feedback" : ""}`);
 }
 
 /* ---------- human gate ---------- */
@@ -2618,6 +2662,279 @@ async function connectionLogout(provider) {
     if (r && r.ok === false) pushError("logout failed: " + (r.output || provider));
     refreshConnections();
   } catch (e) { pushError("connection logout: " + e.message); }
+}
+
+/* ---------- spec / living docs / vcs ---------- */
+function projectQs(extra) {
+  const q = new URLSearchParams();
+  if (state.activeProjectId) q.set("projectId", state.activeProjectId);
+  Object.entries(extra || {}).forEach(([k, v]) => {
+    if (v != null && v !== "") q.set(k, v);
+  });
+  const s = q.toString();
+  return s ? "?" + s : "";
+}
+
+function wireSpecPanel(node) {
+  node.querySelector("#spec-refresh").onclick = refreshSpecs;
+  node.querySelector("#spec-create").onclick = async () => {
+    const input = node.querySelector("#spec-title");
+    const title = input.value.trim();
+    if (!title) { pushError("spec title is required"); return; }
+    try {
+      const { change } = await post("/api/specs/changes", {
+        projectId: state.activeProjectId || undefined,
+        title,
+      });
+      input.value = "";
+      state.activeSpecId = change.id;
+      await refreshSpecs();
+      showToast(`spec proposed: ${change.id}`);
+    } catch (e) { pushError("spec propose: " + e.message); }
+  };
+  refreshSpecs();
+}
+
+async function refreshSpecs() {
+  const panel = document.querySelector('.panel[data-panel="spec"]');
+  if (!panel) return;
+  const status = panel.querySelector("#spec-status");
+  status.textContent = "loading...";
+  try {
+    const data = await api("/api/specs/status" + projectQs());
+    state.specStatus = data;
+    state.specs = data.changes || [];
+    status.textContent = `${data.active || 0} active / ${state.specs.length} changes`;
+    renderSpecPanel(panel);
+  } catch (e) {
+    status.textContent = "load failed";
+    pushError("spec status: " + e.message);
+  }
+}
+
+function renderSpecPanel(panel) {
+  const list = panel.querySelector("#spec-list");
+  const detail = panel.querySelector("#spec-detail");
+  list.innerHTML = "";
+  const changes = state.specs || [];
+  if (!changes.length) {
+    list.appendChild(el("div", "dim mono", "no spec changes"));
+    detail.innerHTML = '<div class="dim mono">create a proposal to begin</div>';
+    return;
+  }
+  if (!state.activeSpecId || !changes.some((c) => c.id === state.activeSpecId)) {
+    state.activeSpecId = changes[0].id;
+  }
+  changes.forEach((change) => {
+    const item = el("button", "ops-item" + (change.id === state.activeSpecId ? " active" : ""));
+    item.type = "button";
+    item.innerHTML = `<span class="ops-item-title">${esc(change.id)}</span><span class="ops-pill ${esc(change.status)}">${esc(change.status)}</span><span class="ops-item-sub">${esc(truncate(change.title, 64))}</span>`;
+    item.onclick = () => { state.activeSpecId = change.id; renderSpecPanel(panel); };
+    list.appendChild(item);
+  });
+  renderSpecDetail(detail, changes.find((c) => c.id === state.activeSpecId));
+}
+
+function renderSpecDetail(detail, change) {
+  if (!change) {
+    detail.innerHTML = '<div class="dim mono">select a change</div>';
+    return;
+  }
+  detail.innerHTML = "";
+  detail.appendChild(el("div", "ops-title", change.title || change.id));
+  detail.appendChild(el("div", "ops-sub mono", change.path || ""));
+  const actions = el("div", "ops-actions");
+  ["apply", "verify", "sync", "archive"].forEach((action) => {
+    const btn = el("button", "btn-mini" + (action === "archive" ? " btn-stop" : action === "verify" ? " btn-go" : ""), action.toUpperCase());
+    btn.onclick = () => specAction(change.id, action);
+    actions.appendChild(btn);
+  });
+  detail.appendChild(actions);
+  detail.appendChild(el("div", "sb-pane-head", "ARTIFACTS"));
+  (change.artifacts || []).forEach((a) => {
+    detail.appendChild(el("div", "ops-kv-row", `${a.exists ? "ok" : "missing"} ${a.kind}: ${a.path}`));
+  });
+  detail.appendChild(el("div", "sb-pane-head", "READINESS"));
+  const readiness = change.readiness || [];
+  if (!readiness.length) detail.appendChild(el("div", "dim mono", "no readiness checklist"));
+  readiness.forEach((r) => {
+    detail.appendChild(el("div", "ops-kv-row", `${r.status === "complete" ? "done" : "open"} ${r.title}`));
+  });
+}
+
+async function specAction(id, action) {
+  try {
+    const result = await post(`/api/specs/changes/${encodeURIComponent(id)}/${action}`, {
+      projectId: state.activeProjectId || undefined,
+    });
+    if (result.change && result.change.id) state.activeSpecId = result.change.id;
+    await refreshSpecs();
+    showToast(`spec ${action} complete`);
+  } catch (e) { pushError(`spec ${action}: ` + e.message); }
+}
+
+function wireLivingDocsPanel(node) {
+  node.querySelector("#ld-refresh").onclick = refreshLivingDocs;
+  node.querySelector("#ld-scope").onchange = refreshLivingDocs;
+  node.querySelector("#ld-kind").onchange = () => renderLivingDocsPanel(node);
+  node.querySelector("#ld-save").onclick = saveLivingDoc;
+  refreshLivingDocs();
+}
+
+async function refreshLivingDocs() {
+  const panel = document.querySelector('.panel[data-panel="living-docs"]');
+  if (!panel) return;
+  const status = panel.querySelector("#ld-status");
+  const scope = panel.querySelector("#ld-scope").value;
+  status.textContent = "loading...";
+  try {
+    const data = await api("/api/living-docs" + projectQs({ scope }));
+    state.livingDocs = { docs: data.docs || [], suggestions: data.suggestions || [] };
+    status.textContent = `${state.livingDocs.docs.length} docs / ${state.livingDocs.suggestions.length} suggestions`;
+    renderLivingDocsPanel(panel);
+  } catch (e) {
+    status.textContent = "load failed";
+    pushError("living docs: " + e.message);
+  }
+}
+
+function renderLivingDocsPanel(panel) {
+  const kind = panel.querySelector("#ld-kind").value;
+  const editor = panel.querySelector("#ld-editor");
+  const suggestions = panel.querySelector("#ld-suggestions");
+  const doc = (state.livingDocs.docs || []).find((d) => d.kind === kind);
+  editor.value = doc ? (doc.content || "") : "";
+  suggestions.innerHTML = "";
+  const items = state.livingDocs.suggestions || [];
+  if (!items.length) {
+    suggestions.appendChild(el("div", "dim mono", "no suggestions"));
+    return;
+  }
+  items.forEach((s) => {
+    const item = el("div", "ops-suggestion");
+    item.appendChild(el("div", "ops-item-title", `${s.kind} / ${Math.round((s.confidence || 0) * 100)}%`));
+    item.appendChild(el("div", "ops-item-sub", s.text));
+    const actions = el("div", "ops-actions");
+    const accept = el("button", "btn-mini btn-go", "ACCEPT");
+    accept.onclick = () => livingSuggestionAction(s.id, "accept");
+    const reject = el("button", "btn-mini", "REJECT");
+    reject.onclick = () => livingSuggestionAction(s.id, "reject");
+    actions.appendChild(accept);
+    actions.appendChild(reject);
+    item.appendChild(actions);
+    suggestions.appendChild(item);
+  });
+}
+
+async function saveLivingDoc() {
+  const panel = document.querySelector('.panel[data-panel="living-docs"]');
+  if (!panel) return;
+  const scope = panel.querySelector("#ld-scope").value;
+  const kind = panel.querySelector("#ld-kind").value;
+  const content = panel.querySelector("#ld-editor").value;
+  try {
+    await patch("/api/living-docs" + projectQs({ scope }), { kind, content });
+    await refreshLivingDocs();
+    showToast("living doc saved");
+  } catch (e) { pushError("living doc save: " + e.message); }
+}
+
+async function livingSuggestionAction(id, action) {
+  const panel = document.querySelector('.panel[data-panel="living-docs"]');
+  const scope = panel ? panel.querySelector("#ld-scope").value : "project";
+  try {
+    await post(`/api/living-docs/suggestions/${encodeURIComponent(id)}/${action}` + projectQs({ scope }));
+    await refreshLivingDocs();
+    showToast(`suggestion ${action}ed`);
+  } catch (e) { pushError(`suggestion ${action}: ` + e.message); }
+}
+
+function wireVcsPanel(node) {
+  node.querySelector("#vcs-refresh").onclick = refreshVcs;
+  node.querySelector("#vcs-branch").onclick = createVcsBranch;
+  node.querySelector("#vcs-commit").onclick = createVcsCommit;
+  node.querySelector("#vcs-pr").onclick = createVcsPr;
+  node.querySelector("#vcs-rollback").onclick = runVcsRollback;
+  refreshVcs();
+}
+
+async function refreshVcs() {
+  const panel = document.querySelector('.panel[data-panel="vcs"]');
+  if (!panel) return;
+  const chip = panel.querySelector("#vcs-status-chip");
+  chip.textContent = "loading...";
+  try {
+    const { status } = await api("/api/vcs/status" + projectQs());
+    state.vcsStatus = status;
+    chip.textContent = status.insideWorktree ? (status.dirty ? "dirty" : "clean") : "not git";
+    renderVcsPanel(panel, status);
+  } catch (e) {
+    chip.textContent = "load failed";
+    pushError("vcs status: " + e.message);
+  }
+}
+
+function renderVcsPanel(panel, status) {
+  const box = panel.querySelector("#vcs-status");
+  box.innerHTML = "";
+  const rows = [
+    ["cwd", status.cwd],
+    ["branch", status.branch || "-"],
+    ["head", truncate(status.headSha || "-", 12)],
+    ["dirty", status.dirty ? "yes" : "no"],
+    ["staged", status.staged ? "yes" : "no"],
+    ["untracked", status.untracked ? "yes" : "no"],
+    ["upstream", status.upstream || "-"],
+    ["ahead/behind", `${status.ahead || 0}/${status.behind || 0}`],
+    ["gh", status.ghInstalled ? (status.ghLoggedIn ? "ready" : "login needed") : "not installed"],
+  ];
+  rows.forEach(([k, v]) => {
+    const row = el("div", "ops-kv-row");
+    row.innerHTML = `<span>${esc(k)}</span><b>${esc(v)}</b>`;
+    box.appendChild(row);
+  });
+}
+
+async function createVcsBranch() {
+  const panel = document.querySelector('.panel[data-panel="vcs"]');
+  const name = panel.querySelector("#vcs-branch-name").value.trim() || (state.activeSpecId || "spec-change");
+  try {
+    await post("/api/vcs/branch", { projectId: state.activeProjectId || undefined, slug: name });
+    await refreshVcs();
+    showToast("branch ready");
+  } catch (e) { pushError("vcs branch: " + e.message); }
+}
+
+async function createVcsCommit() {
+  const panel = document.querySelector('.panel[data-panel="vcs"]');
+  const message = panel.querySelector("#vcs-commit-msg").value.trim();
+  if (!message) { pushError("commit message is required"); return; }
+  try {
+    await post("/api/vcs/commit", { projectId: state.activeProjectId || undefined, message });
+    panel.querySelector("#vcs-commit-msg").value = "";
+    await refreshVcs();
+    showToast("commit created");
+  } catch (e) { pushError("vcs commit: " + e.message); }
+}
+
+async function createVcsPr() {
+  try {
+    const r = await post("/api/vcs/pr", { projectId: state.activeProjectId || undefined, draft: true });
+    showToast(r.url ? `PR created: ${r.url}` : "PR created");
+  } catch (e) { pushError("vcs pr: " + e.message); }
+}
+
+async function runVcsRollback() {
+  const panel = document.querySelector('.panel[data-panel="vcs"]');
+  const target = panel.querySelector("#vcs-rollback-target").value.trim();
+  if (!target) { pushError("rollback target is required"); return; }
+  const mode = panel.querySelector("#vcs-rollback-mode").value;
+  const confirm = panel.querySelector("#vcs-rollback-confirm").checked;
+  try {
+    await post("/api/vcs/rollback", { projectId: state.activeProjectId || undefined, target, mode, confirm });
+    await refreshVcs();
+    showToast("rollback complete");
+  } catch (e) { pushError("vcs rollback: " + e.message); }
 }
 
 /* ---------- doctrine (AGENTS.md editor) ---------- */

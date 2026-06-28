@@ -8,13 +8,13 @@
 use super::event::*;
 use super::provider::{self, ChatRequest, StreamDelta};
 use super::tools::{ToolCtx, ToolRegistry};
-use crate::{config, memory, profiles, projects, skills, types};
+use crate::{config, living_docs, memory, profiles, projects, skills, types};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
@@ -178,6 +178,10 @@ fn build_system_prompt(
             block.push_str(&format!("- {}\n", m.memory));
         }
         parts.push(block);
+    }
+    let living = living_docs::render_prompt_block(seed_cwd);
+    if !living.is_empty() {
+        parts.push(living);
     }
 
     // Project block — the working directory the tools already operate in.
@@ -835,8 +839,11 @@ async fn execute_tool(
                         m.clone()
                     }
                     None => {
-                        let mut m =
-                            super::event::Message::assistant_shell("subagent", "subagent", now_ms());
+                        let mut m = super::event::Message::assistant_shell(
+                            "subagent",
+                            "subagent",
+                            now_ms(),
+                        );
                         apply_subagent_delta(&mut m, delta);
                         acc = Some(m.clone());
                         m
@@ -1069,7 +1076,10 @@ fn apply_subagent_delta(msg: &mut super::event::Message, delta: StreamDelta) {
         StreamDelta::ToolCallStart { id, name, index: _ } => {
             // Track tool calls so the final snapshot is coherent, but don't emit a
             // progress event for them (handled by the workflow graph).
-            let already = msg.content.iter().any(|b| matches!(b, ContentBlock::ToolCall { id: id2, .. } if id2 == &id));
+            let already = msg
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolCall { id: id2, .. } if id2 == &id));
             if !already {
                 msg.content.push(ContentBlock::ToolCall {
                     id,
@@ -1168,6 +1178,7 @@ fn finish_turn(
                 Some(cwd.as_str())
             };
             crate::memory::capture_exchange(&user_text, &assistant_text, cwd_opt).await;
+            let _ = crate::living_docs::capture_exchange(cwd_opt, &user_text, &assistant_text);
         });
     }
 }
@@ -1434,7 +1445,10 @@ mod tests {
         let sess = get(&sid).unwrap();
 
         let before = tx(&sid);
-        assert!(before.is_some(), "tx must return a sender for an active session");
+        assert!(
+            before.is_some(),
+            "tx must return a sender for an active session"
+        );
 
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = sess.lock().unwrap();
@@ -1646,20 +1660,17 @@ mod tests {
             .get("available")
             .and_then(|v| v.as_array())
             .expect("available must be an array");
+        assert!(!available.is_empty(), "available catalog must not be empty");
         assert!(
-            !available.is_empty(),
-            "available catalog must not be empty"
-        );
-        assert!(
-            available.iter().any(|v| {
-                v.get("provider").and_then(|p| p.as_str()) == Some("anthropic")
-            }),
+            available
+                .iter()
+                .any(|v| { v.get("provider").and_then(|p| p.as_str()) == Some("anthropic") }),
             "available must include anthropic entries for fixed-provider dropdowns"
         );
         assert!(
-            available.iter().any(|v| {
-                v.get("provider").and_then(|p| p.as_str()) == Some("ollama")
-            }),
+            available
+                .iter()
+                .any(|v| { v.get("provider").and_then(|p| p.as_str()) == Some("ollama") }),
             "available must include ollama suggestions for free-form datalist"
         );
         // Each entry must carry the modelId field the UI consumes.
@@ -1787,10 +1798,7 @@ mod tests {
                 found = true;
             }
         }
-        assert!(
-            found,
-            "run_turn should emit a disposed-session error frame"
-        );
+        assert!(found, "run_turn should emit a disposed-session error frame");
     }
 
     /// An abort sent while the session is idle must not be silently lost. Before the
@@ -2217,10 +2225,8 @@ mod tests {
         std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "10000");
 
         // Point DOTZ_PI at a temp dir with a real agent definition so discovery finds it.
-        let pi_dir = std::env::temp_dir().join(format!(
-            "dotz-progress-test-pi-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let pi_dir =
+            std::env::temp_dir().join(format!("dotz-progress-test-pi-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(pi_dir.join("agents")).unwrap();
         std::fs::write(
             pi_dir.join("agents").join("progress-agent.md"),

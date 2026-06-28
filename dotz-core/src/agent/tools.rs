@@ -745,6 +745,21 @@ impl ToolRegistry {
             "rsi_baseline",
             "rsi_compare",
             "human_gate",
+            "openspec_status",
+            "openspec_explore",
+            "openspec_propose",
+            "openspec_apply",
+            "openspec_verify",
+            "openspec_sync",
+            "openspec_archive",
+            "living_docs_read",
+            "living_docs_update",
+            "living_docs_suggest",
+            "vcs_status",
+            "vcs_branch",
+            "vcs_atomic_commit",
+            "vcs_pr",
+            "vcs_rollback",
             "context_read",
             "context_write",
         ]
@@ -1034,8 +1049,7 @@ mod tests {
     /// The `read` tool must return small files unchanged.
     #[tokio::test]
     async fn read_tool_returns_small_file_unchanged() {
-        let base =
-            std::env::temp_dir().join(format!("dotz-read-small-{}" , uuid::Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("dotz-read-small-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("note.txt"), "hello world").unwrap();
 
@@ -1058,8 +1072,7 @@ mod tests {
     /// the runtime, returning a leading chunk plus a clear truncation marker.
     #[tokio::test]
     async fn read_tool_truncates_oversized_file() {
-        let base =
-            std::env::temp_dir().join(format!("dotz-read-large-{}" , uuid::Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("dotz-read-large-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
         // Build a file larger than READ_CAP (200 KiB). The leading bytes are ASCII so the
         // char-boundary truncation is deterministic; the trailing multi-byte char tests boundary
@@ -1105,8 +1118,7 @@ mod tests {
     /// The `read` tool must still reject paths that escape the project directory.
     #[tokio::test]
     async fn read_tool_rejects_escaping_paths() {
-        let base =
-            std::env::temp_dir().join(format!("dotz-read-escape-{}" , uuid::Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("dotz-read-escape-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
 
         let mut registry = ToolRegistry::new();
@@ -1119,7 +1131,10 @@ mod tests {
             .run("read", &json!({"file_path": "../secret.txt"}), &ctx)
             .await
             .unwrap_err();
-        assert!(err.contains("escapes"), "escaping path should be rejected, got: {err}");
+        assert!(
+            err.contains("escapes"),
+            "escaping path should be rejected, got: {err}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1178,8 +1193,7 @@ mod tests {
     /// tokio::fs path introduced to avoid blocking the async runtime on directory creation and I/O.
     #[tokio::test]
     async fn write_tool_creates_nested_parent_directories_async() {
-        let base =
-            std::env::temp_dir().join(format!("dotz-write-nested-{}", uuid::Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("dotz-write-nested-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
 
         let mut registry = ToolRegistry::new();
@@ -1203,7 +1217,11 @@ mod tests {
         assert!(out.contains("wrote"), "write should report success: {out}");
 
         let text = registry
-            .run("read", &json!({"file_path": "src/agent/nested/note.txt"}), &ctx)
+            .run(
+                "read",
+                &json!({"file_path": "src/agent/nested/note.txt"}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert_eq!(text, "nested hello");
@@ -1220,10 +1238,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(edited.contains("edited"), "edit should report success: {edited}");
+        assert!(
+            edited.contains("edited"),
+            "edit should report success: {edited}"
+        );
 
         let text = registry
-            .run("read", &json!({"file_path": "src/agent/nested/note.txt"}), &ctx)
+            .run(
+                "read",
+                &json!({"file_path": "src/agent/nested/note.txt"}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert_eq!(text, "nested world");

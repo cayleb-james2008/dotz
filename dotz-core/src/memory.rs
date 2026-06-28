@@ -744,10 +744,7 @@ pub async fn capture_exchange(
 /// memory.ts maybeAutoConsolidate while keeping scope cadences independent.
 pub fn maybe_auto_consolidate(cwd: Option<&str>) {
     let scopes: Vec<String> = match cwd {
-        Some(c) => vec![
-            scope_user("project", Some(c)),
-            GLOBAL_USER.to_string(),
-        ],
+        Some(c) => vec![scope_user("project", Some(c)), GLOBAL_USER.to_string()],
         None => vec![GLOBAL_USER.to_string()],
     };
     let mut fired = false;
@@ -1075,7 +1072,8 @@ mod tests {
     /// silently discarded.
     #[test]
     fn parse_facts_falls_back_to_non_empty_lines_for_prose() {
-        let content = "Use cargo test -p dotz-core for the gate.\n\nThe project root is /home/user/dotz.";
+        let content =
+            "Use cargo test -p dotz-core for the gate.\n\nThe project root is /home/user/dotz.";
         let facts = parse_facts(content);
         assert_eq!(
             facts,
