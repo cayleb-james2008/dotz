@@ -54,6 +54,36 @@ impl ContextBus {
         }
     }
 
+    /// Pre-populate a (fresh, empty) bus from a resumed run's completed-step outputs.
+    ///
+    /// On server restart the in-memory bus is gone (it lived only in the prior process).
+    /// Re-creating it empty means a resumed worker step can't see what the scout found
+    /// before the shutdown — context-bearing chains (scout → planner → worker → reviewer)
+    /// silently regress to "every agent starts from scratch". This method restores the
+    /// bus contents the executor expects by replaying every terminal step's `output`
+    /// onto the bus under the same keys the executor's own auto-population path writes
+    /// (`step:<id>:output` + `step:<id>:summary`), so downstream subagents read the
+    /// exact data shape they would have seen without a restart.
+    pub fn preload_from_run(&self, run: &crate::workflows::WorkflowRun) {
+        for step in &run.steps {
+            if step.status != "done" && step.status != "error" {
+                continue;
+            }
+            let Some(ref out) = step.output else {
+                continue;
+            };
+            self.write(
+                &format!("step:{}:output", step.id),
+                serde_json::Value::String(out.clone()),
+            );
+            let summary = out.lines().next().unwrap_or("").to_string();
+            self.write(
+                &format!("step:{}:summary", step.id),
+                serde_json::Value::String(summary),
+            );
+        }
+    }
+
     /// Destroy a run's bus (called when the run terminates). A missing bus is a no-op.
     pub fn destroy(run_id: &str) {
         let mut guard = global_buses()
@@ -323,5 +353,196 @@ mod tests {
         ContextBus::destroy("test-9");
         ContextBus::destroy("test-9"); // second destroy is a no-op
         assert!(bus.read("k").is_none());
+    }
+
+    /// `preload_from_run` must populate the bus with completed steps' outputs
+    /// under the same keys the executor auto-population path uses.
+    #[test]
+    fn preload_from_run_populates_bus_from_completed_steps() {
+        let bus = isolated_bus("test-preload");
+
+        // Construct a minimal WorkflowRun with two completed steps.
+        let run = crate::workflows::WorkflowRun {
+            id: "run-1".into(),
+            project_id: None,
+            session_id: None,
+            label: "test".into(),
+            steps: vec![
+                crate::workflows::WorkflowStep {
+                    id: "step-0".into(),
+                    agent: "scout".into(),
+                    task: "explore".into(),
+                    status: "done".into(),
+                    parents: vec![],
+                    children: vec!["step-1".into()],
+                    output: Some("files found\n- src/lib.rs\n- src/main.rs".into()),
+                    error: None,
+                    usage: None,
+                    sandbox_run_id: None,
+                    browser_session_id: None,
+                    tool_call_ids: None,
+                    thinking: None,
+                    started_at: Some(1000),
+                    ended_at: Some(2000),
+                    auto_repair: false,
+                    repair_round: 0,
+                    budget: None,
+                    actual_cost: None,
+                    actual_tokens: None,
+                },
+                crate::workflows::WorkflowStep {
+                    id: "step-1".into(),
+                    agent: "planner".into(),
+                    task: "plan".into(),
+                    status: "done".into(),
+                    parents: vec!["step-0".into()],
+                    children: vec![],
+                    output: Some("plan:\n1. add tests".into()),
+                    error: None,
+                    usage: None,
+                    sandbox_run_id: None,
+                    browser_session_id: None,
+                    tool_call_ids: None,
+                    thinking: None,
+                    started_at: Some(2000),
+                    ended_at: Some(3000),
+                    auto_repair: false,
+                    repair_round: 0,
+                    budget: None,
+                    actual_cost: None,
+                    actual_tokens: None,
+                },
+                // A pending step (not yet run) — must NOT be preloaded.
+                crate::workflows::WorkflowStep {
+                    id: "step-2".into(),
+                    agent: "worker".into(),
+                    task: "implement".into(),
+                    status: "pending".into(),
+                    parents: vec!["step-1".into()],
+                    children: vec![],
+                    output: None,
+                    error: None,
+                    usage: None,
+                    sandbox_run_id: None,
+                    browser_session_id: None,
+                    tool_call_ids: None,
+                    thinking: None,
+                    started_at: None,
+                    ended_at: None,
+                    auto_repair: false,
+                    repair_round: 0,
+                    budget: None,
+                    actual_cost: None,
+                    actual_tokens: None,
+                },
+            ],
+            status: "running".into(),
+            origin: None,
+            created_at: 0,
+            updated_at: 0,
+            started_at: Some(1000),
+            ended_at: None,
+            max_repair_rounds: 3,
+            repair_rounds: 0,
+            budget: None,
+            actual_cost: None,
+            actual_tokens: None,
+        };
+
+        bus.preload_from_run(&run);
+
+        // Both completed steps must be on the bus.
+        let step0_out = bus.read("step:step-0:output");
+        assert!(
+            step0_out.is_some(),
+            "step-0 output should be preloaded on the bus"
+        );
+        assert_eq!(
+            step0_out.unwrap().as_str().unwrap(),
+            "files found\n- src/lib.rs\n- src/main.rs"
+        );
+
+        let step0_summary = bus.read("step:step-0:summary").unwrap();
+        assert_eq!(
+            step0_summary.as_str().unwrap(),
+            "files found",
+            "summary must be the first line of the output"
+        );
+
+        let step1_out = bus.read("step:step-1:output");
+        assert!(
+            step1_out.is_some(),
+            "step-1 output should be preloaded on the bus"
+        );
+        assert_eq!(
+            step1_out.unwrap().as_str().unwrap(),
+            "plan:\n1. add tests"
+        );
+
+        // The pending step must NOT appear on the bus.
+        assert!(
+            bus.read("step:step-2:output").is_none(),
+            "pending step must not be preloaded"
+        );
+        assert!(
+            bus.read("step:step-2:summary").is_none(),
+            "pending step summary must not be preloaded"
+        );
+    }
+
+    /// `preload_from_run` must skip steps with no output (e.g. errored steps
+    /// that failed before producing output) without crashing.
+    #[test]
+    fn preload_from_run_skips_steps_without_output() {
+        let bus = isolated_bus("test-preload-empty");
+        let run = crate::workflows::WorkflowRun {
+            id: "run-2".into(),
+            project_id: None,
+            session_id: None,
+            label: "test".into(),
+            steps: vec![
+                crate::workflows::WorkflowStep {
+                    id: "step-err".into(),
+                    agent: "worker".into(),
+                    task: "fail".into(),
+                    status: "error".into(),
+                    parents: vec![],
+                    children: vec![],
+                    output: None,
+                    error: Some("something went wrong".into()),
+                    usage: None,
+                    sandbox_run_id: None,
+                    browser_session_id: None,
+                    tool_call_ids: None,
+                    thinking: None,
+                    started_at: Some(1000),
+                    ended_at: Some(2000),
+                    auto_repair: false,
+                    repair_round: 0,
+                    budget: None,
+                    actual_cost: None,
+                    actual_tokens: None,
+                },
+            ],
+            status: "error".into(),
+            origin: None,
+            created_at: 0,
+            updated_at: 0,
+            started_at: Some(1000),
+            ended_at: Some(2000),
+            max_repair_rounds: 3,
+            repair_rounds: 0,
+            budget: None,
+            actual_cost: None,
+            actual_tokens: None,
+        };
+
+        bus.preload_from_run(&run);
+
+        // Errored step with no output must not appear on the bus.
+        assert!(
+            bus.read("step:step-err:output").is_none(),
+            "errored step with no output must not be preloaded"
+        );
     }
 }
