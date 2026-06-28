@@ -125,13 +125,15 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
             }
         }
 
-        // Collect ready steps (status == "ready").
-        // If the run budget is already exhausted, skip all remaining ready steps
-        // and abort the run — prevents a fan-out from burning the balance.
+        // Collect ready steps (status == "ready" or "interrupted").
+        // "interrupted" steps are in-flight steps that were running when the server
+        // shut down — they must be re-dispatched to complete the run. If the run
+        // budget is already exhausted, skip all remaining ready steps and abort
+        // the run — prevents a fan-out from burning the balance.
         let ready_ids: Vec<(String, String, String)> = run
             .steps
             .iter()
-            .filter(|s| s.status == "ready")
+            .filter(|s| s.status == "ready" || s.status == "interrupted")
             .map(|s| (s.id.clone(), s.agent.clone(), s.task.clone()))
             .collect();
 

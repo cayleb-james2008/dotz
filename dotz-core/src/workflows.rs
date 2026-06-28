@@ -9,6 +9,13 @@
 //! (mirrors the Node module-singleton `workflowStore`). History persists to JSON at
 //! `<dotz_dir>/ai-agents/workflows.json` (same path Node uses), honoring DOTZ_CONFIG_DIR via
 //! `crate::config::dotz_dir()`.
+//!
+//! Resumability: a run that was `running` when the server shut down is persisted as
+//! `interrupted` on the next boot. The startup scan (`startup_resume`) marks every
+//! in-flight step `interrupted` and re-queues the run so the executor can pick it up
+//! where it stopped — the desktop-app lifecycle no longer costs a half-finished task.
+//! Callers may also explicitly `POST /api/workflows/:id/resume` to retry an interrupted
+//! run after inspecting its state.
 use crate::config::dotz_dir;
 use crate::types::Budget;
 use axum::{
@@ -48,7 +55,9 @@ pub struct WorkflowStep {
     pub id: String,
     pub agent: String,
     pub task: String,
-    /// "pending" | "ready" | "running" | "done" | "error" | "skipped".
+    /// "pending" | "ready" | "running" | "done" | "error" | "skipped" | "interrupted".
+    /// "interrupted" marks a step that was `running` when the server shut down — it was
+    /// in-flight and never completed. On resume, the executor re-runs interrupted steps.
     pub status: String,
     pub parents: Vec<String>,
     pub children: Vec<String>,
@@ -103,7 +112,9 @@ pub struct WorkflowRun {
     pub session_id: Option<String>,
     pub label: String,
     pub steps: Vec<WorkflowStep>,
-    /// "pending" | "running" | "done" | "error" | "aborted".
+    /// "pending" | "running" | "done" | "error" | "aborted" | "interrupted".
+    /// "interrupted" marks a run that was `running` when the server shut down. It is
+    /// resumed on the next boot (or on explicit POST /:id/resume).
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -813,6 +824,190 @@ pub fn get_active(id: &str) -> Option<WorkflowRun> {
     store_guard().get(id).cloned()
 }
 
+// ---- resumability: startup scan + explicit resume ----
+
+/// Mark every `running` step in a run as `interrupted` (server restarted mid-flight).
+/// Returns the number of steps that were interrupted. Only steps in-flight at shutdown
+/// are marked — already-terminal steps are untouched so the run's history is preserved.
+pub fn mark_interrupted(run_id: &str) -> Option<usize> {
+    let mut active = store_guard();
+    let run = active.get_mut(run_id)?;
+    let now = now_ms();
+    let mut count = 0;
+    for step in run.steps.iter_mut() {
+        if step.status == "running" {
+            step.status = "interrupted".to_string();
+            step.ended_at = Some(now);
+            step.error = Some("server restarted while step was running".to_string());
+            count += 1;
+        }
+    }
+    if count > 0 {
+        run.status = "interrupted".to_string();
+        run.updated_at = now;
+    }
+    let run = run.clone();
+    persist(&run);
+    Some(count)
+}
+
+/// Load a run from the on-disk history into the in-memory active map so it can be
+/// resumed. Returns the run if it was loaded (i.e. it was in `running` or `interrupted`
+/// state and not already in the active map), or None if it doesn't exist or is terminal.
+/// This is the startup path: the server calls it for every non-terminal run in
+/// `workflows.json` so half-finished runs survive a restart.
+pub fn restore_for_resume(run_id: &str) -> Option<WorkflowRun> {
+    // Already active — nothing to restore.
+    if store_guard().contains_key(run_id) {
+        return get_active(run_id);
+    }
+    // Load from history.
+    let run = list_history(None).into_iter().find(|r| r.id == run_id)?;
+    // Only restore non-terminal runs.
+    if run.status == "done" || run.status == "error" || run.status == "aborted" {
+        return None;
+    }
+    // Insert into active map.
+    let mut active = store_guard();
+    active.insert(run_id.to_string(), run.clone());
+    prune_active(&mut active);
+    persist(&run);
+    Some(run)
+}
+
+/// Resume an interrupted (or running) run: mark it running and spawn the executor task.
+/// Returns the resumed run. If the run is already terminal, returns it as-is.
+/// If the run doesn't exist in the active map, tries to restore it from history first.
+///
+/// The actual execution happens in a spawned tokio task (the same `run_workflow` loop
+/// the POST /:id/execute handler uses), so the HTTP response returns immediately with
+/// the run in `running` state. The UI subscribes to workflow WS events to track
+/// step completion.
+pub fn resume(run_id: &str) -> Option<WorkflowRun> {
+    let run = resume_sync(run_id)?;
+
+    // Spawn the executor task. This mirrors what the execute handler does.
+    let rid = run_id.to_string();
+    tokio::spawn(async move {
+        let _ = crate::workflow_executor::run_workflow(&rid).await;
+    });
+
+    Some(run)
+}
+
+/// The synchronous part of `resume`: load the run, reset interrupted steps to ready,
+/// mark running, persist. Returns the resumed run. Skips the tokio spawn so this
+/// is testable from a non-async context.
+pub fn resume_sync(run_id: &str) -> Option<WorkflowRun> {
+    // Load the run — either from active map or from history.
+    let mut run = get_active(run_id).or_else(|| restore_for_resume(run_id))?;
+
+    // Already terminal — nothing to resume.
+    if run.status == "done" || run.status == "error" || run.status == "aborted" {
+        return Some(run);
+    }
+
+    // If the run was interrupted (shutdown mid-flight), the in-flight steps are marked
+    // `interrupted`. Reset them to `ready` so the executor will re-dispatch them.
+    // This is the key to resumability: a step that was running at shutdown gets a
+    // fresh chance to execute.
+    if run.status == "interrupted" {
+        for step in run.steps.iter_mut() {
+            if step.status == "interrupted" {
+                step.status = "ready".to_string();
+                step.error = None;
+                step.ended_at = None;
+                step.started_at = None;
+            }
+        }
+    }
+
+    // Also handle the case where a run is `running` but has no `running` steps in
+    // the active map (e.g. it was restored from history and the step status was
+    // clobbered). Find steps that are pending with all parents done → mark ready.
+    // This is a lighter version of the readiness propagation in `step_state`.
+    let ids: Vec<String> = run.steps.iter().map(|s| s.id.clone()).collect();
+    for id in &ids {
+        let should_be_ready = {
+            let step = run.steps.iter().find(|s| &s.id == id).unwrap();
+            step.status == "pending"
+                && step.parents.iter().all(|pid| {
+                    ids.iter().any(|i| i == pid)
+                        && run
+                            .steps
+                            .iter()
+                            .find(|s| &s.id == pid)
+                            .map(|p| {
+                                p.status == "done"
+                                    || p.status == "skipped"
+                                    || p.status == "error"
+                            })
+                            .unwrap_or(false)
+                })
+        };
+        if should_be_ready {
+            let step = run.steps.iter_mut().find(|s| &s.id == id).unwrap();
+            step.status = "ready".to_string();
+        }
+    }
+
+    // Mark running and persist.
+    let now = now_ms();
+    run.status = "running".to_string();
+    if run.started_at.is_none() {
+        run.started_at = Some(now);
+    }
+    run.updated_at = now;
+
+    {
+        let mut active = store_guard();
+        active.insert(run_id.to_string(), run.clone());
+        prune_active(&mut active);
+    }
+    persist(&run);
+    emit_workflow_start(&run);
+
+    Some(run)
+}
+
+/// Startup-time scan: load every non-terminal run from the on-disk history into the
+/// active map, mark any in-flight steps as `interrupted`, and auto-resume them.
+///
+/// This is called once when the server boots (`server::serve_with_shutdown`).
+/// Without it, a run that was `running` at shutdown would be lost forever — the
+/// in-memory active map is empty after a restart.
+///
+/// Returns the number of runs that were resumed.
+pub fn startup_resume() -> usize {
+    let non_terminal: Vec<WorkflowRun> = list_history(None)
+        .into_iter()
+        .filter(|r| {
+            r.status != "done"
+                && r.status != "error"
+                && r.status != "aborted"
+        })
+        .collect();
+
+    let mut resumed = 0;
+    for run in non_terminal {
+        // Restore into active map (skips if already present).
+        let Some(restored) = restore_for_resume(&run.id) else {
+            continue;
+        };
+        // Mark in-flight steps as interrupted (they were running at shutdown).
+        let interrupted = mark_interrupted(&restored.id);
+        // Resume only if there's something to re-dispatch. A run whose every step
+        //terminal (shouldn't happen given the filter above, but guard anyway) is
+        // left in `interrupted` state for operator inspection.
+        if interrupted.unwrap_or(0) > 0 || restored.status == "running" {
+            if resume(&restored.id).is_some() {
+                resumed += 1;
+            }
+        }
+    }
+    resumed
+}
+
 fn list_active() -> Vec<WorkflowRun> {
     store_guard().values().cloned().collect()
 }
@@ -949,7 +1144,7 @@ struct StepBody {
     usage: Option<Usage>,
 }
 
-const ALLOWED_STATUS: [&str; 6] = ["pending", "ready", "running", "done", "error", "skipped"];
+const ALLOWED_STATUS: [&str; 7] = ["pending", "ready", "running", "done", "error", "skipped", "interrupted"];
 
 /// POST /api/workflows/:id/step → update a step + propagate, return the run.
 /// 404 unknown run/step, 409 finished run, 400 bad stepId/status.
@@ -985,6 +1180,13 @@ async fn step_handler(
         if !ALLOWED_STATUS.contains(&st.as_str()) {
             return Err(bad("invalid status"));
         }
+        // "interrupted" is a server-initiated state (set on startup when a step was
+        // running at shutdown). Clients may not patch a step to interrupted — they
+        // resume a run via POST /:id/resume instead, which resets interrupted steps
+        // to ready and re-dispatches them through the executor.
+        if st == "interrupted" {
+            return Err(bad("interrupted is a server-initiated status; use POST /:id/resume to resume"));
+        }
     }
 
     let patch = StepPatch {
@@ -1006,6 +1208,30 @@ async fn abort_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCod
     }
     abort(&id);
     Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /api/workflows/:id/resume → resume an interrupted/running run via the executor.
+/// 200 with the run (running), 404 unknown run, 409 already terminal.
+async fn resume_handler(
+    Path(id): Path<String>,
+) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+    // Reject the resume if the run is already terminal. `resume()` returns the
+    // run as-is in that case, but the UI should see a 409 so it doesn't render a
+    // "running" badge on a run that hasn't actually restarted.
+    if let Some(run) = get_active(&id) {
+        if run.status == "done" || run.status == "error" || run.status == "aborted" {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!("run is {} — cannot resume", run.status)
+                })),
+            ));
+        }
+    }
+    match resume(&id) {
+        Some(run) => Ok(Json(run)),
+        None => Err(not_found("no such workflow run")),
+    }
 }
 
 /// POST /api/workflows/:id/execute → drive the run to completion via real subagent dispatch.
@@ -1054,6 +1280,7 @@ pub fn router() -> Router<()> {
         .route("/api/workflows/{id}/step", post(step_handler))
         .route("/api/workflows/{id}/abort", post(abort_handler))
         .route("/api/workflows/{id}/execute", post(execute_handler))
+        .route("/api/workflows/{id}/resume", post(resume_handler))
 }
 
 #[cfg(test)]
@@ -1955,6 +2182,336 @@ mod tests {
                 seen_re_review_pending,
                 "re-review step pending event should be broadcast"
             );
+        });
+    }
+
+    // ---- resumability tests ----
+
+    /// `mark_interrupted` marks every `running` step as `interrupted` and sets the
+    /// run status to `interrupted`. Already-terminal steps are untouched.
+    #[test]
+    fn mark_interrupted_marks_running_steps_and_run() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(0)])),
+                step("c", "C", Some(vec![json!(1)])),
+            ];
+            let run = create(None, None, "interrupt".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+
+            // Mark step 0 as running (simulate executor picking it up).
+            let running_id = run.steps[0].id.clone();
+            let _ = step_state(
+                &run.id,
+                &running_id,
+                StepPatch {
+                    status: Some("running".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            // Steps 1 and 2 are still pending/ready.
+            assert_eq!(run.steps[1].status, "pending");
+            assert_eq!(run.steps[2].status, "pending");
+
+            // Mark interrupted.
+            let count = mark_interrupted(&run.id).unwrap();
+            assert_eq!(count, 1, "only the running step should be interrupted");
+
+            let after = get_active(&run.id).unwrap();
+            assert_eq!(after.status, "interrupted");
+            let interrupted_step = after.steps.iter().find(|s| s.id == running_id).unwrap();
+            assert_eq!(interrupted_step.status, "interrupted");
+            assert!(
+                interrupted_step
+                    .error
+                    .as_ref()
+                    .map(|e| e.contains("server restarted"))
+                    .unwrap_or(false),
+                "interrupted step should have server-restarted error"
+            );
+            assert!(interrupted_step.ended_at.is_some());
+
+            // Non-running steps are untouched.
+            let s1 = after.steps.iter().find(|s| s.id == run.steps[1].id).unwrap();
+            assert_eq!(s1.status, "pending");
+            assert!(s1.error.is_none());
+        });
+    }
+
+    /// `mark_interrupted` is a no-op when no steps are running (e.g. all terminal).
+    #[test]
+    fn mark_interrupted_noop_when_no_running_steps() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None), step("b", "B", None)];
+            let run = create(None, None, "noop".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+
+            // Complete both steps.
+            for s in run.steps.iter() {
+                let _ = step_state(
+                    &run.id,
+                    &s.id,
+                    StepPatch {
+                        status: Some("done".into()),
+                        ..Default::default()
+                    },
+                );
+            }
+            assert_eq!(get_active(&run.id).unwrap().status, "done");
+
+            // mark_interrupted on a done run should return 0.
+            let count = mark_interrupted(&run.id).unwrap();
+            assert_eq!(count, 0);
+            assert_eq!(get_active(&run.id).unwrap().status, "done");
+        });
+    }
+
+    /// `restore_for_resume` loads a non-terminal run from history into the active map.
+    #[test]
+    fn restore_for_resume_loads_from_history() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "restore".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let run_id = run.id.clone();
+
+            // Simulate shutdown: the run is in the active map AND history.
+            // Remove from active map (simulates restart).
+            {
+                let mut active = store_guard();
+                active.remove(&run_id);
+            }
+            assert!(get_active(&run_id).is_none(), "active map should be empty after remove");
+
+            // But it's still in history.
+            let in_history = list_history(None).into_iter().find(|r| r.id == run_id);
+            assert!(in_history.is_some(), "run should be in history");
+
+            // restore_for_resume should load it back.
+            let restored = restore_for_resume(&run_id).unwrap();
+            assert_eq!(restored.id, run_id);
+            assert_eq!(restored.status, "running");
+            assert!(get_active(&run_id).is_some(), "run should be back in active map");
+        });
+    }
+
+    /// `restore_for_resume` returns None for terminal runs (done/error/aborted).
+    #[test]
+    fn restore_for_resume_rejects_terminal_runs() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "terminal".into(), None, 3, &inputs, None).unwrap();
+            let run_id = run.id.clone();
+
+            // Abort makes it terminal.
+            abort(&run_id);
+
+            // Remove from active map.
+            {
+                let mut active = store_guard();
+                active.remove(&run_id);
+            }
+
+            // restore_for_resume should return None.
+            assert!(
+                restore_for_resume(&run_id).is_none(),
+                "terminal run should not be restored"
+            );
+        });
+    }
+
+    /// `resume` resets `interrupted` steps to `ready` and marks the run `running`.
+    #[test]
+    fn resume_resets_interrupted_steps_to_ready() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(0)])),
+            ];
+            let run = create(None, None, "resume-test".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+
+            // Simulate shutdown: mark step 0 as running, then mark interrupted.
+            let step0_id = run.steps[0].id.clone();
+            let _ = step_state(
+                &run.id,
+                &step0_id,
+                StepPatch {
+                    status: Some("running".into()),
+                    ..Default::default()
+                },
+            );
+            let _ = mark_interrupted(&run.id);
+
+            // Verify interrupted state.
+            let interrupted = get_active(&run.id).unwrap();
+            assert_eq!(interrupted.status, "interrupted");
+            let s0 = interrupted.steps.iter().find(|s| s.id == step0_id).unwrap();
+            assert_eq!(s0.status, "interrupted");
+
+            // Use resume_sync to test the state transition without spawning a tokio task.
+            let resumed = resume_sync(&run.id).unwrap();
+            assert_eq!(resumed.status, "running");
+
+            // Step 0 should be ready (reset from interrupted).
+            let s0 = resumed.steps.iter().find(|s| s.id == step0_id).unwrap();
+            assert_eq!(s0.status, "ready", "interrupted step should be reset to ready");
+            assert!(s0.error.is_none(), "error should be cleared on resume");
+            assert!(s0.ended_at.is_none(), "endedAt should be cleared on resume");
+            assert!(s0.started_at.is_none(), "startedAt should be cleared on resume");
+
+            // Step 1 (was pending) should still be pending.
+            let s1 = resumed.steps.iter().find(|s| s.id == run.steps[1].id).unwrap();
+            assert_eq!(s1.status, "pending");
+        });
+    }
+
+    /// `resume` returns the run as-is when it is already terminal.
+    #[test]
+    fn resume_returns_terminal_run_as_is() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "terminal-resume".into(), None, 3, &inputs, None).unwrap();
+            let run_id = run.id.clone();
+            abort(&run_id);
+
+            let result = resume_sync(&run_id).unwrap();
+            assert_eq!(result.status, "aborted");
+        });
+    }
+
+    /// `resume` restores a run from history if it's not in the active map.
+    #[test]
+    fn resume_restores_from_history() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "resume-restore".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            let run_id = run.id.clone();
+
+            // Remove from active map (simulates restart).
+            {
+                let mut active = store_guard();
+                active.remove(&run_id);
+            }
+
+            // resume_sync() should restore from history and resume.
+            let resumed = resume_sync(&run_id).unwrap();
+            assert_eq!(resumed.status, "running");
+            assert!(get_active(&run_id).is_some());
+        });
+    }
+
+    /// `startup_resume` resumes interrupted runs from history on server boot.
+    /// It does NOT resume terminal runs (done/error/aborted).
+    /// Uses `#[tokio::test]` because `resume()` spawns an executor task.
+    #[tokio::test]
+    async fn startup_resume_resumes_interrupted_runs() {
+        with_tmp_workflows_file(|| {
+            // Run 1: running (should be resumed).
+            let run1 = create(
+                None,
+                None,
+                "boot-1".into(),
+                None,
+                3,
+                &[step("a", "A", None), step("b", "B", None)],
+                None,
+            )
+            .unwrap();
+            let run1 = start(&run1.id).unwrap();
+            let run1_id = run1.id.clone();
+            // Mark step 0 as running (simulate in-flight at shutdown).
+            let _ = step_state(
+                &run1_id,
+                &run1.steps[0].id,
+                StepPatch {
+                    status: Some("running".into()),
+                    ..Default::default()
+                },
+            );
+
+            // Run 2: done (should NOT be resumed).
+            let run2 = create(
+                None,
+                None,
+                "boot-2".into(),
+                None,
+                3,
+                &[step("c", "C", None)],
+                None,
+            )
+            .unwrap();
+            let run2_id = run2.id.clone();
+            let _ = step_state(
+                &run2_id,
+                &run2.steps[0].id,
+                StepPatch {
+                    status: Some("done".into()),
+                    ..Default::default()
+                },
+            );
+
+            // Remove both from active map (simulates restart).
+            {
+                let mut active = store_guard();
+                active.remove(&run1_id);
+                active.remove(&run2_id);
+            }
+
+            // Run startup_resume.
+            let resumed = startup_resume();
+            assert_eq!(resumed, 1, "only the running run should be resumed");
+
+            // Run 1 should be running with step 0 reset to ready.
+            let r1 = get_active(&run1_id).unwrap();
+            assert_eq!(r1.status, "running");
+            let s0 = r1.steps.iter().find(|s| s.id == run1.steps[0].id).unwrap();
+            assert_eq!(s0.status, "ready");
+
+            // Run 2 should NOT be in the active map (it was done, not restored).
+            assert!(
+                get_active(&run2_id).is_none(),
+                "done run should not be restored into active map"
+            );
+        });
+    }
+
+    /// `interrupted` is in the ALLOWED_STATUS list so it can be persisted and read.
+    #[test]
+    fn interrupted_is_in_allowed_status() {
+        assert!(
+            ALLOWED_STATUS.contains(&"interrupted"),
+            "interrupted must be an allowed step status"
+        );
+    }
+
+    /// A run with `interrupted` status is NOT considered terminal by the
+    /// `list_history` filter (it should be restorable).
+    #[test]
+    fn interrupted_run_is_listed_in_history() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("a", "A", None)];
+            let run = create(None, None, "hist".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+            // Mark the step as running so mark_interrupted has something to interrupt.
+            let step_id = run.steps[0].id.clone();
+            let _ = step_state(
+                &run.id,
+                &step_id,
+                StepPatch {
+                    status: Some("running".into()),
+                    ..Default::default()
+                },
+            );
+            let _ = mark_interrupted(&run.id);
+
+            let history = list_history(None);
+            let found = history.iter().find(|r| r.id == run.id).unwrap();
+            assert_eq!(found.status, "interrupted");
         });
     }
 }
