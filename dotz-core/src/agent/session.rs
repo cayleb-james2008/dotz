@@ -724,7 +724,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             // Execute without holding the session lock (the registry is stateless).
             // subagent is special-cased so its SubagentDetails reach result.details (the workflow bridge reads it).
             let (result_value, is_error, result_text) =
-                execute_tool(&session, &name, &args, &ctx).await;
+                execute_tool(&session, &name, &args, &ctx, &call_id).await;
             {
                 let mut s = session_guard(&session);
                 emit(
@@ -787,6 +787,7 @@ async fn execute_tool(
     name: &str,
     args: &Value,
     ctx: &ToolCtx,
+    tool_call_id: &str,
 ) -> (Value, bool, String) {
     if name == "subagent" {
         let active = {
@@ -802,7 +803,68 @@ async fn execute_tool(
             );
         }
         let cwd = ctx.cwd.to_string_lossy().to_string();
-        let d = super::subagent::dispatch(args, &cwd).await;
+
+        // Build a channel that carries the subagent's streamed deltas. The receiver task
+        // forwards each delta to the lead session's broadcast as a `subagent_progress`
+        // event so the operator (and the orchestrator) see the subagent's reasoning as it
+        // happens instead of only after it finishes.
+        let (progress_tx, mut progress_rx) = mpsc::channel::<StreamDelta>(256);
+        let session_for_progress = session.clone();
+        let sess_id_for_progress = {
+            let s = session_guard(&session);
+            s.id.clone()
+        };
+        let tcid = tool_call_id.to_string();
+        let progress_handle = tokio::spawn(async move {
+            // Accumulate the subagent's streamed message so we can attach a coherent
+            // `partial` snapshot to each event.
+            let mut acc: Option<super::event::Message> = None;
+            while let Some(delta) = progress_rx.recv().await {
+                // Skip pure tool-call deltas in the live stream BEFORE moving `delta` —
+                // the workflow bridge records tool calls into the graph; surfacing them
+                // as interleaved thinking bubbles would be noise.
+                let skip = matches!(
+                    &delta,
+                    StreamDelta::ToolCallStart { .. } | StreamDelta::ToolCallArgs { .. }
+                );
+                // Apply the delta to the running accumulator so the partial snapshot
+                // the UI renders stays coherent across deltas.
+                let partial = match acc.as_mut() {
+                    Some(m) => {
+                        apply_subagent_delta(m, delta);
+                        m.clone()
+                    }
+                    None => {
+                        let mut m =
+                            super::event::Message::assistant_shell("subagent", "subagent", now_ms());
+                        apply_subagent_delta(&mut m, delta);
+                        acc = Some(m.clone());
+                        m
+                    }
+                };
+                if skip {
+                    continue;
+                }
+                let _ = session_guard(&session_for_progress).tx.send(ws_frame(
+                    &sess_id_for_progress,
+                    &super::event::AgentEvent::SubagentProgress {
+                        tool_call_id: tcid.clone(),
+                        agent: "subagent".to_string(),
+                        task: String::new(),
+                        partial,
+                    },
+                ));
+            }
+        });
+
+        let d = super::subagent::dispatch_with_progress(args, &cwd, progress_tx).await;
+        // `progress_tx` is dropped when `dispatch_with_progress` returns, so the
+        // progress task's `recv()` will return None once the subagent's stream is fully
+        // drained and the task exits. Await it to flush every `subagent_progress` event
+        // before the tool result is emitted — otherwise the final thinking snapshot
+        // could race behind the `tool_execution_end` and never render.
+        let _ = progress_handle.await;
+
         let rv = json!({
             "content": [{ "type": "text", "text": d.text.clone() }],
             "details": d.details_json(),
@@ -960,6 +1022,83 @@ fn apply_delta(
                 message: acc.msg.clone(),
             },
         ));
+    }
+}
+
+/// Apply a `StreamDelta` to a subagent-progress accumulator message (no WS emit). Mirrors the
+/// content-block bookkeeping in `apply_delta` so `subagent_progress` events carry a coherent
+/// partial snapshot the inspector panel can render.
+fn apply_subagent_delta(msg: &mut super::event::Message, delta: StreamDelta) {
+    use super::event::ContentBlock;
+    match delta {
+        StreamDelta::Thinking(t) => {
+            let thinking_idx = msg
+                .content
+                .iter()
+                .position(|b| matches!(b, ContentBlock::Thinking { .. }));
+            match thinking_idx {
+                Some(i) => {
+                    if let ContentBlock::Thinking { thinking, .. } = &mut msg.content[i] {
+                        thinking.push_str(&t);
+                    }
+                }
+                None => {
+                    msg.content.push(ContentBlock::Thinking {
+                        thinking: t,
+                        thinking_signature: "reasoning".into(),
+                    });
+                }
+            }
+        }
+        StreamDelta::Text(t) => {
+            let text_idx = msg
+                .content
+                .iter()
+                .position(|b| matches!(b, ContentBlock::Text { .. }));
+            match text_idx {
+                Some(i) => {
+                    if let ContentBlock::Text { text } = &mut msg.content[i] {
+                        text.push_str(&t);
+                    }
+                }
+                None => {
+                    msg.content.push(ContentBlock::Text { text: t });
+                }
+            }
+        }
+        StreamDelta::ToolCallStart { id, name, index: _ } => {
+            // Track tool calls so the final snapshot is coherent, but don't emit a
+            // progress event for them (handled by the workflow graph).
+            let already = msg.content.iter().any(|b| matches!(b, ContentBlock::ToolCall { id: id2, .. } if id2 == &id));
+            if !already {
+                msg.content.push(ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments: json!({}),
+                });
+            }
+        }
+        StreamDelta::ToolCallArgs { json: frag, .. } => {
+            // Try to find the most recent tool call without arguments and update it.
+            if let Some(last) = msg
+                .content
+                .iter_mut()
+                .rev()
+                .find(|b| matches!(b, ContentBlock::ToolCall { arguments, .. } if arguments.is_object() && arguments.as_object().map_or(false, |m| m.is_empty())))
+            {
+                if let ContentBlock::ToolCall { arguments, .. } = last {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&frag) {
+                        *arguments = parsed;
+                    }
+                }
+            }
+        }
+        StreamDelta::Usage(u) => {
+            msg.usage = Some(u);
+        }
+        StreamDelta::Stop(reason) => {
+            msg.stop_reason = Some(reason);
+        }
     }
 }
 
@@ -2015,6 +2154,7 @@ mod tests {
             "subagent",
             &json!({ "agent": "scout", "task": "explore" }),
             &ctx,
+            "call_test_1",
         )
         .await;
 
@@ -2028,6 +2168,155 @@ mod tests {
             "error should explain the tool is inactive: {text}"
         );
         assert_eq!(rv["isError"], true, "result JSON should mark the error");
+    }
+
+    /// When the subagent tool streams deltas from its provider, the lead session must
+    /// forward them as `subagent_progress` events on its broadcast channel so the
+    /// orchestrator (and the operator) can see a drifting scout/planner's reasoning
+    /// mid-run. This test wires a fake local provider that streams a few text deltas
+    /// and asserts the lead session emits a `subagent_progress` event carrying a
+    /// coherent partial snapshot.
+    #[tokio::test]
+    async fn execute_tool_streams_subagent_progress_events() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let _guard = SSE_TEST_LOCK.lock().await;
+
+        // A fake SSE server that streams a handful of text deltas then ends.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::with_capacity(8192);
+            loop {
+                let mut tmp = [0u8; 1024];
+                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Stream a few text deltas, then stop.
+            let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"scout-sees-\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"42-files\"}}]}\n\ndata: [DONE]\n\n";
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(response).await;
+            let _ = stream.write_all(body).await;
+            let _ = done_rx.recv().await;
+        });
+
+        let prev_url = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
+        let prev_timeout = std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS").ok();
+        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "10000");
+
+        // Point DOTZ_PI at a temp dir with a real agent definition so discovery finds it.
+        let pi_dir = std::env::temp_dir().join(format!(
+            "dotz-progress-test-pi-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(pi_dir.join("agents")).unwrap();
+        std::fs::write(
+            pi_dir.join("agents").join("progress-agent.md"),
+            "---\nname: progress-agent\ndescription: test\nmodel: local/test\n---\nYou are the progress test agent.\n",
+        )
+        .unwrap();
+        let prev_pi = std::env::var("DOTZ_PI").ok();
+        std::env::set_var("DOTZ_PI", &pi_dir);
+
+        let summary = create(CreateOpts::default()).unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+        let sess = get(&sid).unwrap();
+        let mut rx = sess.lock().unwrap().tx.subscribe();
+
+        let ctx = tools::ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: Some(sess.lock().unwrap().tx.clone()),
+        };
+
+        // Dispatch a single subagent against the fake provider. The agent exists
+        // and the model is "local/test" which routes to our fake SSE server.
+        let (rv, _is_error, _text) = execute_tool(
+            &sess,
+            "subagent",
+            &json!({ "agent": "progress-agent", "task": "explore the repo" }),
+            &ctx,
+            "call_progress_1",
+        )
+        .await;
+
+        // Drain the broadcast channel and collect subagent_progress events.
+        let mut progress_events = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    let kind = frame
+                        .get("event")
+                        .and_then(|e| e.get("type"))
+                        .and_then(|t| t.as_str())
+                        .map(String::from);
+                    if kind.as_deref() == Some("subagent_progress") {
+                        progress_events.push(frame);
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        dispose(&sid);
+        let _ = done_tx.send(()).await;
+        let _ = std::fs::remove_dir_all(&pi_dir);
+
+        match prev_url {
+            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
+            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+        }
+        match prev_timeout {
+            Some(p) => std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS"),
+        }
+        match prev_pi {
+            Some(p) => std::env::set_var("DOTZ_PI", p),
+            None => std::env::remove_var("DOTZ_PI"),
+        }
+
+        // The subagent must have streamed at least one progress event.
+        assert!(
+            !progress_events.is_empty(),
+            "expected at least one subagent_progress event, got none"
+        );
+        // The progress event must carry the tool_call_id of the parent subagent call.
+        let first = &progress_events[0];
+        assert_eq!(
+            first
+                .get("event")
+                .and_then(|e| e.get("toolCallId"))
+                .and_then(|v| v.as_str()),
+            Some("call_progress_1"),
+            "progress event must carry the parent tool_call_id"
+        );
+        // The partial snapshot must contain the streamed text.
+        let partial = first.get("event").and_then(|e| e.get("partial"));
+        assert!(
+            partial.is_some(),
+            "progress event must carry a partial assistant message"
+        );
+        let partial_str = serde_json::to_string(partial.unwrap()).unwrap();
+        assert!(
+            partial_str.contains("scout-sees-") || partial_str.contains("42-files"),
+            "partial snapshot should contain streamed text: {partial_str}"
+        );
+        // The tool result JSON must still be present (the feature must not break
+        // the existing execute_tool contract). tool_execution_end itself is
+        // emitted by execute_tool's caller in the turn loop, not here.
+        assert!(!rv.is_null(), "tool result must be present");
     }
 
     #[test]

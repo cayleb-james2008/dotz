@@ -188,6 +188,27 @@ pub enum AgentEvent {
         is_error: bool,
         result: Value,
     },
+    #[serde(rename = "tool_execution_update")]
+    ToolExecutionUpdate {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        #[serde(rename = "partialResult")]
+        partial_result: Value,
+    },
+    /// A subagent's streaming reasoning/findings, forwarded live to the lead's WebSocket so the
+    /// operator (and the orchestrator) can see a drifting scout/planner's thinking as it happens
+    /// rather than only after the subagent finishes.
+    #[serde(rename = "subagent_progress")]
+    SubagentProgress {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        agent: String,
+        task: String,
+        /// The assistant message the subagent is building, mid-stream.
+        partial: Message,
+    },
 }
 
 /// Wrap an agent event as the WS frame the server pushes: `{kind:"event", sessionId, event}`.
