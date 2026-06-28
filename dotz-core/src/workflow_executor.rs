@@ -130,6 +130,19 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
         // shut down — they must be re-dispatched to complete the run. If the run
         // budget is already exhausted, skip all remaining ready steps and abort
         // the run — prevents a fan-out from burning the balance.
+        //
+        // For interrupted steps, build a resume-context prefix from completed
+        // siblings' messages and inject it into the task prompt so the subagent
+        // inherits prior conversation instead of re-executing already-completed
+        // tool calls.
+        let resume_context = if run.steps.iter().any(|s| s.status == "interrupted") {
+            // Only build context once — it's the same for every interrupted step
+            // in this loop iteration (it's built from completed siblings).
+            workflows::build_resume_context(&run, 8192)
+        } else {
+            None
+        };
+
         let ready_ids: Vec<(String, String, String)> = run
             .steps
             .iter()
@@ -215,6 +228,15 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                 },
             );
 
+            // For interrupted steps, inject the resume-context prefix so the
+            // subagent inherits prior conversation from completed siblings
+            // instead of re-executing already-completed tool calls.
+            let effective_task = if let Some(ref ctx) = resume_context {
+                format!("{}\n\n[RESUME CONTEXT — prior conversation from completed step in this workflow]\n{}\n\n[END RESUME CONTEXT]", task, ctx)
+            } else {
+                task
+            };
+
             let sem = sem.clone();
             let cwd = cwd.clone();
             let rid = run_id.to_string();
@@ -227,20 +249,27 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 let result = tokio::time::timeout(
                     step_timeout(),
-                    run_single_agent_with_bus(&agent, &task, None, &cwd, Some(&bus)),
+                    run_single_agent_with_bus(&agent, &effective_task, None, &cwd, Some(&bus)),
                 )
                 .await;
 
-                let (status, output, error) = match result {
+                let (status, output, error, messages) = match result {
                     Ok(result) => {
+                        let messages = result.messages.clone();
                         if result.is_failed() {
                             (
                                 "error".to_string(),
                                 Some(result.result_output()),
                                 Some(result.result_output()),
+                                Some(messages),
                             )
                         } else {
-                            ("done".to_string(), Some(result.final_output()), None)
+                            (
+                                "done".to_string(),
+                                Some(result.final_output()),
+                                None,
+                                Some(messages),
+                            )
                         }
                     }
                     Err(_) => {
@@ -252,6 +281,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                                 "step '{sid}' timed out after {:?}",
                                 step_timeout()
                             )),
+                            None,
                         )
                     }
                 };
@@ -268,6 +298,15 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                         ..Default::default()
                     },
                 );
+
+                // Persist the subagent's full conversation history (tool calls, tool
+                // results, thinking blocks) so the UI step-detail drawer can render
+                // them and a resumed interrupted step can re-inherit prior context.
+                if let Some(msgs) = messages {
+                    if !msgs.is_empty() {
+                        let _ = workflows::step_messages(&rid, &sid, msgs);
+                    }
+                }
             });
             handles.push(handle);
         }
@@ -344,6 +383,9 @@ mod tests {
     /// deadlock the Semaphore; an enormous value would spawn unbounded LLM streams.
     #[test]
     fn concurrency_clamps_to_sane_bounds() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Default when unset.
         std::env::remove_var("DOTZ_WF_CONCURRENCY");
         let c = concurrency();
@@ -373,6 +415,9 @@ mod tests {
     /// the provider stream starts; an enormous value defeats the purpose of the cap.
     #[test]
     fn step_timeout_clamps_to_sane_bounds() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
         let t = step_timeout();
         assert_eq!(t.as_secs(), 300, "default step timeout is 5 minutes");
