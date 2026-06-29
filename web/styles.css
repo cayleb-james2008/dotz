@@ -211,6 +211,7 @@ code { font-family: var(--mono); color: var(--peach); }
 .chip-on { color: var(--green); border-color: var(--green); }
 .chip-off { color: var(--dim); border-color: var(--border); }
 .chip-err { color: var(--red); border-color: var(--red); }
+.chip-warn { color: var(--amber, #e5a000); border-color: var(--amber, #e5a000); }
 
 /* ---- MAIN STAGE ---- */
 .stage {

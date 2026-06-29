@@ -120,6 +120,7 @@ async function init() {
   await loadProviders();
   await loadDotzConfig();
   primeTopbarFromConfig();
+  await refreshProviderHealth();
   await loadProjects();
   await loadSandboxLanguages();
   showCommandCenter();
@@ -611,6 +612,7 @@ function connectWS() {
     else if (m.kind === "browser") renderBrowserObservation(m.event);
     else if (m.kind === "gate") showGateCard(m.gateId, m.plan);
     else if (m.kind === "memory_recall") handleMemoryRecall(m);
+    else if (m.kind === "provider_health") handleProviderHealthEvent(m);
     else if (m.kind === "panel_open") { if (m.panelName) openPanel(m.panelName); }
     else if (m.kind === "error") {
       // A dead session (the server/exe restarted, so this sessionId no longer exists) will never
@@ -633,6 +635,62 @@ function setConn(kind, txt) {
   // Surface the transient detail (connecting…/reconnecting…/ws closed/✓ host) as a tooltip so the
   // three "off" sub-states aren't all flattened to a static OFFLINE label.
   c.title = txt || "";
+}
+
+// ---- provider health + automatic failover ----
+// state.providerHealth: { providers: { [id]: { status, consecutive_failures, failures, successes, last_error, ... } }, failoverPairs: { [id]: { primary, backup } } }
+state.providerHealth = { providers: {}, failoverPairs: {} };
+
+// Update the conn-chip to reflect provider health. A degraded primary shows a "VIA BACKUP" badge
+// so the operator knows failover is active without digging into a panel.
+function renderProviderHealthChip() {
+  const c = $("conn-chip");
+  if (!c) return;
+  const ph = state.providerHealth && state.providerHealth.providers;
+  if (!ph) return;
+  // Find the active provider's health (fall back to the configured provider).
+  const active = state.activeProvider || (state.config && state.config.provider) || "ollama";
+  const h = ph[active];
+  if (h && h.status === "degraded") {
+    const pair = (state.providerHealth.failoverPairs || {})[active];
+    const backup = pair && pair.backup ? pair.backup.provider : "backup";
+    c.classList.add("chip-warn");
+    c.innerHTML = '<span class="blk">▲</span> ' + active.toUpperCase() + " → " + backup.toUpperCase();
+    c.title = active + " degraded (auto-failover active): " + (h.last_error || "consecutive failures");
+  } else if (h && h.status === "healthy") {
+    // Healthy: clear any degraded styling but keep the normal WS conn state.
+    c.classList.remove("chip-warn");
+  }
+}
+
+// Handle a provider_health WS event: merge the single-provider update into state, re-render the
+// chip, and surface a toast on the transition.
+function handleProviderHealthEvent(m) {
+  const ph = state.providerHealth.providers || (state.providerHealth.providers = {});
+  const prev = ph[m.provider] && ph[m.provider].status;
+  ph[m.provider] = Object.assign({}, ph[m.provider], { status: m.status });
+  if (prev !== m.status) {
+    const pair = (state.providerHealth.failoverPairs || {})[m.provider];
+    const backup = pair && pair.backup ? pair.backup.provider : "backup";
+    if (m.status === "degraded") {
+      pushError("provider " + m.provider + " degraded — auto-failing over to " + backup);
+    } else if (m.status === "healthy" && prev === "degraded") {
+      // Recover: a success cleared the degraded flag.
+      const c = $("conn-chip");
+      if (c) { c.classList.remove("chip-warn"); }
+      if (typeof pushInfo === "function") pushInfo("provider " + m.provider + " recovered");
+    }
+  }
+  renderProviderHealthChip();
+}
+
+// Fetch the full health snapshot (REST) and merge into state. Called on load + on demand.
+async function refreshProviderHealth() {
+  try {
+    const h = await api("/api/provider-health");
+    if (h && h.providers) state.providerHealth = h;
+    renderProviderHealthChip();
+  } catch (e) { /* best-effort; chip just won't show health */ }
 }
 
 /* ---------- event handling ---------- */
