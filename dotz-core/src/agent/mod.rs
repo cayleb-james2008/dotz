@@ -12,6 +12,7 @@ pub mod extra_tools;
 pub mod provider;
 pub mod provider_anthropic;
 pub mod provider_google;
+pub mod provider_health;
 pub mod session;
 pub mod subagent;
 pub mod tools;
@@ -264,6 +265,11 @@ async fn get_commands(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode
     Ok(Json(json!({ "commands": commands() })))
 }
 
+/// GET /api/provider-health — live health snapshot + failover pairs for the conn-chip.
+async fn get_provider_health() -> Json<Value> {
+    Json(provider_health::health_snapshot_json().await)
+}
+
 /// Build the composer slash-palette: bundled workflow presets (`.pi/prompts/*.md`) plus discovered
 /// skills. Presets come first so workflow presets win on name collisions in the UI deduper.
 pub fn commands() -> Vec<Value> {
@@ -489,6 +495,12 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
     // UI filters by runId/sessionId/projectId, so a session-specific subscription is not needed.
     let mut wf_rx = crate::workflows::subscribe_events();
 
+    // Provider-health state-change events are broadcast globally so every client's conn-chip
+    // updates when a provider degrades or recovers. The UI filters by provider id.
+    let mut health_rx = crate::agent::provider_health::subscribe_health_events();
+    // The health receiver is always available (the channel never closes); the subscribe fn
+    // returns a Receiver directly now, so no Option handling is needed.
+
     // ready frame.
     let _ = sink
         .send(WsMessage::Text(
@@ -561,6 +573,18 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                             }
                         }
                         // The global workflow channel never closes; a lag-only path just means
+                        // this socket skipped some frames and will resume from the newest one.
+                        None => break Some(None),
+                    }
+                }
+                frame = recv_broadcast(&mut health_rx) => {
+                    match frame {
+                        Some(f) => {
+                            if sink.send(WsMessage::Text(f.to_string().into())).await.is_err() {
+                                break Some(None);
+                            }
+                        }
+                        // The global health channel never closes; a lag-only path just means
                         // this socket skipped some frames and will resume from the newest one.
                         None => break Some(None),
                     }
@@ -833,6 +857,7 @@ pub fn router() -> Router<()> {
         .route("/api/sessions/{id}/commands", get(get_commands))
         .route("/api/sessions/{id}/abort", post(post_abort))
         .route("/api/sessions/{id}/reload-context", post(post_reload))
+        .route("/api/provider-health", get(get_provider_health))
         .route("/ws", get(ws_handler))
 }
 

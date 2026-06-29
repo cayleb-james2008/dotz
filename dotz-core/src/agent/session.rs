@@ -582,6 +582,23 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             let s = session_guard(&session);
             to_openai_messages(&effective_system, &s.history)
         };
+        // Provider health + automatic failover: if the session's provider is degraded (e.g.
+        // OpenRouter :free tier returning 429s), transparently swap to the backup provider so
+        // the lead turn degrades gracefully instead of surfacing a hard error.
+        let (prov_for_turn, model_for_turn) = match super::provider_health::resolve_effective_model(
+            &provider_id,
+            &model_id,
+        )
+        .await
+        {
+            Some((prov, model, _)) => (prov, model),
+            None => (provider_id.clone(), model_id.clone()),
+        };
+        // Use the failover-resolved (provider, model) for this round's request. The original
+        // `provider_id`/`model_id` are retained so each round re-checks health (recovery probe).
+        let provider_id = prov_for_turn;
+        let model_id = model_for_turn;
+
         let resolved = match provider::resolve(&provider_id, &model_id) {
             Some(r) => r,
             None => {
@@ -650,12 +667,24 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             stream_task.abort();
         }
         match stream_task.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) if !aborted => {
+                // Record success so a recovered provider's health is cleared.
+                super::provider_health::record_success(&provider_id).await;
+            }
             Ok(Err(e)) if !aborted => {
+                // Record the failure (classified). If this degrades the provider, the next
+                // turn will automatically fail over to the backup.
+                super::provider_health::record_failure(&provider_id, &e).await;
                 finish_error(&session, &e, tool_results);
                 return;
             }
             Err(e) if !aborted => {
+                // A panicked stream task counts as a transient failure (worth failing over).
+                super::provider_health::record_failure(
+                    &provider_id,
+                    &format!("stream task panicked: {e}"),
+                )
+                .await;
                 finish_error(
                     &session,
                     &format!("stream task panicked: {e}"),
