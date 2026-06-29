@@ -500,6 +500,23 @@ async fn run_single_agent_inner(
     let registry = build_subagent_registry(agent);
     let tool_specs = registry.active_specs();
 
+    // Provider health + automatic failover: if the configured provider is degraded (e.g.
+    // OpenRouter :free tier returning 429s), transparently swap to the backup provider so the
+    // fan-out degrades gracefully instead of failing the task. The effective (provider, model)
+    // is recorded so the result's `model` field reflects what actually ran.
+    let (provider_id, model_id) = match crate::agent::provider_health::resolve_effective_model(
+        &provider_id,
+        &model_id,
+    )
+    .await
+    {
+        Some((prov, model, _)) => {
+            result.model = Some(format!("{prov}/{model}"));
+            (prov, model)
+        }
+        None => (provider_id, model_id),
+    };
+
     let resolved = match provider::resolve(&provider_id, &model_id) {
         Some(r) => r,
         None => {
@@ -574,14 +591,26 @@ async fn run_single_agent_inner(
         }
 
         match stream_task.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                // Record success so a recovered provider's health is cleared.
+                crate::agent::provider_health::record_success(&provider_id).await;
+            }
             Ok(Err(e)) => {
+                // Record the failure (classified). If this degrades the provider, the next
+                // subagent call will automatically fail over to the backup.
+                crate::agent::provider_health::record_failure(&provider_id, &e).await;
                 result.exit_code = 1;
                 result.stop_reason = Some("error".into());
                 result.error_message = Some(e);
                 return result;
             }
             Err(e) => {
+                // A panicked stream task counts as a transient failure (worth failing over).
+                crate::agent::provider_health::record_failure(
+                    &provider_id,
+                    &format!("stream task panicked: {e}"),
+                )
+                .await;
                 result.exit_code = 1;
                 result.stop_reason = Some("error".into());
                 result.error_message = Some(format!("stream task panicked: {e}"));
