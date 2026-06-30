@@ -1348,6 +1348,33 @@ fn not_found(msg: &str) -> (StatusCode, Json<Value>) {
     (StatusCode::NOT_FOUND, Json(json!({ "error": msg })))
 }
 
+/// GET /api/workflows/:id/record → the full reproducible run record (prompt + model +
+/// thinking + tools + skill set + provider response messages per step). 404 when no
+/// record was captured (the run predates recording, or recording failed). The UI
+/// renders this in a "Run Record" drawer alongside the graph so the operator can
+/// inspect exactly what each agent saw, thought, called, and got back — without
+/// re-running the workflow.
+async fn record_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match crate::run_record::load(&id) {
+        Some(record) => Ok(Json(serde_json::to_value(&record).unwrap_or_else(|_| json!({})))),
+        None => Err(not_found("no run record for this workflow")),
+    }
+}
+
+/// POST /api/workflows/:id/replay → rebuild a fresh run from the captured record
+/// (same agent/task/model/parents/thinking/auto_repair/budget) and re-execute it.
+/// Returns the newly-created (pending) run; the executor is spawned so the UI
+/// watches the live `pending → running → …` transition over WebSocket. 404 when
+/// no record exists or it has no steps. This is the orchestration-regression bisect:
+/// replay a recorded run after a code/provider/config change and diff the new
+/// record against the old to localize which step drifted.
+async fn replay_handler(Path(id): Path<String>) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+    match crate::run_record::replay(&id) {
+        Some(run) => Ok(Json(run)),
+        None => Err(not_found("no replayable run record (missing or empty)")),
+    }
+}
+
 // ---- live-editable handlers ----
 
 /// Input for rerunning a failed step with optional feedback appended to its task.
@@ -2242,6 +2269,12 @@ pub fn router() -> Router<()> {
             post(patch_step_handler),
         )
         .route("/api/workflows/{id}/insert", post(insert_steps_handler))
+        // Reproducible run record: GET the captured record, POST to replay it
+        // into a fresh run (debugging + orchestration-regression bisect).
+        .route(
+            "/api/workflows/{id}/record",
+            get(record_handler).post(replay_handler),
+        )
 }
 
 #[cfg(test)]

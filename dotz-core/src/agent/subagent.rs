@@ -67,6 +67,7 @@ fn timeout_result(agent_name: &str, task: &str, step: Option<usize>) -> SingleRe
             subagent_timeout()
         )),
         step,
+        skill_set: Vec::new(),
     }
 }
 
@@ -296,6 +297,12 @@ pub struct SingleResult {
     pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step: Option<usize>,
+    /// The agent's declared skill set — the active tool list the subagent ran with.
+    /// Populated from the agent's `tools` frontmatter (or the default active set
+    /// minus `subagent`) so the run record can reproduce the exact capability
+    /// surface a step had. Empty for unknown-agent / timeout results.
+    #[serde(rename = "skillSet", default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_set: Vec<String>,
 }
 
 /// The tool-result `details` payload the workflow bridge consumes.
@@ -387,6 +394,7 @@ fn unknown_agent_result(
             "Unknown agent: \"{agent_name}\". Available agents: {list}."
         )),
         step,
+        skill_set: Vec::new(),
     }
 }
 
@@ -495,12 +503,16 @@ async fn run_single_agent_inner(
         stop_reason: None,
         error_message: None,
         step,
+        skill_set: Vec::new(),
     };
 
     // Restricted tool set: the agent's declared tools (validated against the registry) or the default
     // active set with subagent recursion removed. An explicit agent.tools listing `subagent` is
     // still honored — the oracle places no special guard beyond the bounded round/task/chain caps.
     let registry = build_subagent_registry(agent);
+    // Capture the active tool names as the step's skill set — the run record
+    // reproduces this exact capability surface on replay.
+    result.skill_set = registry.active_names();
     let tool_specs = registry.active_specs();
 
     // Provider health + automatic failover: if the configured provider is degraded (e.g.

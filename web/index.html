@@ -205,6 +205,17 @@
       </div>
     </div>
 
+    <!-- RUN RECORD: the full reproducible capture of one workflow run (prompt + model + thinking + tools + skill set + provider responses per step). Surfaced by the RECORD toolbar button so agent behavior is debuggable and orchestration regressions are bisectable via the REPLAY button. -->
+    <div id="run-record" class="node-detail hidden">
+      <div class="node-detail-inner">
+        <div class="node-detail-head">
+          <span>RUN RECORD</span>
+          <button id="run-record-close" class="node-detail-close" aria-label="Close"><span aria-hidden="true">×</span></button>
+        </div>
+        <div id="run-record-body" class="node-detail-body"></div>
+      </div>
+    </div>
+
     <div id="brain-float" class="brain-float hidden">
       <div class="bf-row"><span class="bf-label">TOKENS</span><span id="bf-tok" class="bf-val">0</span></div>
       <div class="bf-row"><span class="bf-label">COST</span><span id="bf-cost" class="bf-val">$0.00</span></div>
@@ -258,6 +269,8 @@
           <div id="wf-toolbar" class="wf-toolbar">
             <button id="wf-fit" class="btn-mini" title="fit graph">FIT</button>
             <button id="wf-reset" class="btn-mini" title="reset view">RESET</button>
+            <button id="wf-record" class="btn-mini" title="view the full reproducible run record (prompt + model + thinking + tools + provider responses)">RECORD</button>
+            <button id="wf-replay" class="btn-mini" title="replay this run into a fresh run with the same prompts/models/skills (bisect orchestration regressions)">↻ REPLAY</button>
             <span id="wf-status" class="wf-status dim mono"></span>
           </div>
           <svg id="wf-svg" class="wf-svg" xmlns="http://www.w3.org/2000/svg">

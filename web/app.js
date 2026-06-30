@@ -1435,6 +1435,19 @@ function pushError(msg) {
   scrollBottom(true);
 }
 
+/// A non-error system notice in the chat transcript (used by the run-record/replay UI).
+function pushInfo(msg) {
+  const t = document.querySelector('.panel[data-panel="chat"] [data-role="transcript"]');
+  if (!t) { showToast(msg); return; }
+  const m = el("div", "msg assistant");
+  m.appendChild(el("div", "msg-role", "system"));
+  const b = el("div", "bubble");
+  b.appendChild(el("div", "msg-info", msg));
+  m.appendChild(b);
+  t.appendChild(m);
+  scrollBottom(true);
+}
+
 /* ---------- model + provider controls ---------- */
 // Populate #provider-select from a provider-meta list (shared by loadModels + primeTopbarFromConfig).
 function populateProviderSelect(providerMeta) {
@@ -2149,6 +2162,9 @@ function wireGraphPanel(node) {
   });
   node.querySelector("#wf-fit").onclick = fitGraph;
   node.querySelector("#wf-reset").onclick = resetGraph;
+  node.querySelector("#wf-record").onclick = openRunRecord;
+  node.querySelector("#wf-replay").onclick = replayActiveRun;
+  node.querySelector("#run-record-close").onclick = () => $("run-record").classList.add("hidden");
   refreshWorkflowGraph();
 }
 
@@ -2611,6 +2627,86 @@ function rerunStep(step, feedback) {
     feedback: feedback || null,
   }));
   logBrain(`rerunning step ${step.agent}${feedback ? " with feedback" : ""}`);
+}
+
+/* ---------- run record + replay ---------- */
+
+/// POST /api/workflows/:id/replay — rebuild a fresh run from the captured record
+/// (same agent/task/model/parents/thinking/auto_repair/budget) and switch the
+/// graph to it. The executor is spawned server-side, so the new run transitions
+/// live over WebSocket just like the original. This is the orchestration-
+/// regression bisect: replay a recorded run after a code/provider/config change
+/// and diff the new record against the old to localize which step drifted.
+async function replayActiveRun() {
+  const runId = state.activeWfId || [...state.workflows.keys()][0];
+  if (!runId) { pushError("no active workflow to replay"); return; }
+  try {
+    const run = await post(`/api/workflows/${runId}/replay`);
+    state.workflows.set(run.id, run);
+    state.activeWfId = run.id;
+    refreshWorkflowGraph();
+    pushInfo(`replaying run as “${run.label}”`);
+  } catch (e) {
+    pushError("replay failed: " + e.message);
+  }
+}
+
+/// GET /api/workflows/:id/record — render the full reproducible run record
+/// (prompt + model + thinking + skill set + provider response messages per step)
+/// in a side drawer so the operator can debug exactly what each agent saw,
+/// thought, called, and got back — without re-running the workflow.
+async function openRunRecord() {
+  const runId = state.activeWfId || [...state.workflows.keys()][0];
+  if (!runId) { pushError("no active workflow"); return; }
+  const body = $("run-record-body");
+  if (!body) return;
+  body.innerHTML = `<div class="dim mono" style="padding:8px">loading run record…</div>`;
+  $("run-record").classList.remove("hidden");
+  try {
+    const rec = await api(`/api/workflows/${runId}/record`);
+    renderRunRecord(rec, body);
+  } catch (e) {
+    body.innerHTML = `<div class="nd-error" style="padding:8px">${esc(e.message)}</div>`;
+  }
+}
+
+function renderRunRecord(rec, body) {
+  const parts = [];
+  parts.push(`<div class="nd-control-row"><span class="dim mono">${esc(rec.label)} · ${esc(rec.status)} · ${rec.steps.length} steps</span></div>`);
+  for (const s of rec.steps) {
+    const skill = (s.skillSet || []).join(", ") || "(default active set)";
+    const msgs = Array.isArray(s.messages) ? s.messages : [];
+    const blocks = [];
+    for (const m of msgs) {
+      const role = esc(m.role || "");
+      const c = Array.isArray(m.content) ? m.content : [];
+      const inner = c.map((b) => {
+        const t = b.type || "";
+        if (t === "thinking") return `<div class="nd-thinking"><span class="dim mono">thinking:</span> ${esc(b.thinking || "")}</div>`;
+        if (t === "text") return `<div>${esc(b.text || "")}</div>`;
+        if (t === "toolCall") return `<div class="nd-toolcall"><span class="mono">${esc(b.name)}</span>(${esc(JSON.stringify(b.arguments || {}))})</div>`;
+        return `<div class="dim mono">[${esc(t)}]</div>`;
+      }).join("");
+      const meta = [m.provider, m.model, m.stopReason].filter(Boolean).map(esc).join(" · ");
+      blocks.push(`<div class="nd-msg"><div class="dim mono">${role}${meta ? " · " + meta : ""}</div>${inner}</div>`);
+    }
+    parts.push(`
+      <details class="nd-step">
+        <summary class="nd-step-summary ${esc(s.status)}">${esc(s.agent)} · ${esc(s.status)} · ${esc(s.task.slice(0, 80))}</summary>
+        <div class="nd-step-body">
+          <div class="nd-kv"><span class="dim mono">task:</span> ${esc(s.task)}</div>
+          <div class="nd-kv"><span class="dim mono">model:</span> ${esc(s.model || "—")}${s.modelOverride && s.modelOverride !== s.model ? " (override: " + esc(s.modelOverride) + ")" : ""}</div>
+          <div class="nd-kv"><span class="dim mono">thinking:</span> ${esc(s.thinking || "—")}</div>
+          <div class="nd-kv"><span class="dim mono">skill set:</span> ${esc(skill)}</div>
+          <div class="nd-kv"><span class="dim mono">exit/stop:</span> ${esc(String(s.exitCode))} / ${esc(s.stopReason || "—")}</div>
+          ${s.errorMessage ? `<div class="nd-error">${esc(s.errorMessage)}</div>` : ""}
+          ${s.output ? `<div class="nd-kv"><span class="dim mono">output:</span> ${esc(s.output.slice(0, 400))}${s.output.length > 400 ? "…" : ""}</div>` : ""}
+          <div class="nd-kv"><span class="dim mono">provider responses:</span></div>
+          ${blocks.join("") || `<div class="dim mono">(no provider calls — step did not run)</div>`}
+        </div>
+      </details>`);
+  }
+  body.innerHTML = parts.join("");
 }
 
 /* ---------- human gate ---------- */
