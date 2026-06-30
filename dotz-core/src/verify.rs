@@ -384,6 +384,7 @@ mod tests {
     // ---- kind parsing ----
 
     #[test]
+    #[allow(non_snake_case)]
     fn kind_from_str_accepts_camelCase_and_alias() {
         assert_eq!(
             VerificationKind::from_str("typeCheck"),
