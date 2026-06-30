@@ -460,11 +460,16 @@ fn spawn_sandbox_end_poller(session_id: String, run_id: String, tx: broadcast::S
         while tokio::time::Instant::now() < deadline {
             if let Some(run) = crate::sandbox::lookup(&run_id) {
                 if run.status != "running" {
-                    emit_sandbox_event(
-                        &tx,
-                        &session_id,
-                        json!({ "type": "sandbox_end", "runId": run_id, "run": run }),
-                    );
+                    // Dedup against the sandbox.kill handler: only the first caller to claim
+                    // the end emission should emit, so a killed run delivers exactly one
+                    // sandbox_end to the UI instead of two.
+                    if crate::sandbox::try_mark_end_emitted(&run_id) {
+                        emit_sandbox_event(
+                            &tx,
+                            &session_id,
+                            json!({ "type": "sandbox_end", "runId": run_id, "run": run }),
+                        );
+                    }
                     return;
                 }
             }
@@ -730,16 +735,21 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                                         tokio::time::sleep(std::time::Duration::from_millis(200))
                                             .await;
                                     }
-                                    let run = crate::sandbox::lookup(&rid);
-                                    emit_sandbox_event(
-                                        &tx,
-                                        &sid,
-                                        json!({
-                                            "type": "sandbox_end",
-                                            "runId": rid,
-                                            "run": run,
-                                        }),
-                                    );
+                                    // Dedup against the sandbox-start poller: only the first
+                                    // caller to claim the end emission should emit, so a killed
+                                    // run delivers exactly one sandbox_end instead of two.
+                                    if crate::sandbox::try_mark_end_emitted(&rid) {
+                                        let run = crate::sandbox::lookup(&rid);
+                                        emit_sandbox_event(
+                                            &tx,
+                                            &sid,
+                                            json!({
+                                                "type": "sandbox_end",
+                                                "runId": rid,
+                                                "run": run,
+                                            }),
+                                        );
+                                    }
                                 });
                             }
                         }
@@ -1700,6 +1710,156 @@ mod tests {
             run.unwrap().status,
             "running",
             "run should reach a terminal status before sandbox_end"
+        );
+
+        // Clean up the process-global run record so later tests see a stable store.
+        crate::sandbox::remove_test_run(&rid);
+        session::dispose(&sid);
+
+        let _ = tx.send(());
+        assert!(
+            handle.await.unwrap().is_ok(),
+            "server should shut down cleanly"
+        );
+    }
+
+
+    /// A killed sandbox run must deliver exactly one `sandbox_end` event, not two. Before the
+    /// `try_mark_end_emitted` dedup, both the sandbox-start poller and the sandbox-kill handler
+    /// emitted `sandbox_end` for the same run, so the UI received a redundant terminal event on
+    /// every manual kill. This test starts a long-lived run, kills it via the WebSocket, and
+    /// counts the `sandbox_end` frames for that run id.
+    #[tokio::test]
+    async fn websocket_sandbox_kill_emits_exactly_one_sandbox_end() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        let _guard = WS_TEST_LOCK.lock().await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(crate::server::serve_with_shutdown(
+            listener,
+            std::path::PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/sessions"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let summary = resp.json::<Value>().await.unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let url = format!("ws://127.0.0.1:{port}/ws?sessionId={sid}");
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(
+            ready.to_text().unwrap().contains("\"ready\""),
+            "first WS frame should be ready: {ready:?}"
+        );
+
+        // Start a long-lived run so it is still running when we kill it.
+        let (language, code) = if cfg!(windows) {
+            ("powershell", "Start-Sleep -Seconds 30")
+        } else {
+            ("bash", "sleep 30")
+        };
+        ws.send(Message::Text(
+            json!({
+                "kind": "sandbox.start",
+                "language": language,
+                "code": code,
+                "mode": "terminal",
+                "projectId": null,
+                "timeoutMs": 60000,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        // Collect the sandbox_start to get the run id.
+        let mut run_id: Option<String> = None;
+        let start_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < start_deadline {
+            match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let frame: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if frame.get("kind").and_then(|k| k.as_str()) == Some("sandbox") {
+                        let event = frame.get("event").cloned().unwrap_or_default();
+                        if event.get("type").and_then(|t| t.as_str()) == Some("sandbox_start") {
+                            run_id = event
+                                .get("runId")
+                                .and_then(|r| r.as_str())
+                                .map(String::from);
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        let rid = run_id.expect("sandbox_start event should set runId");
+
+        // Wait for execute_run to spawn the child and record its pid. The sandbox_start event
+        // fires as soon as the run is created, before execute_run has necessarily spawned the
+        // child — if we kill before the pid is set, kill_run_by_id returns false (no-op) and
+        // the poller never sees a terminal status, so the dedup path isn't exercised.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Kill the run via the WebSocket.
+        ws.send(Message::Text(
+            json!({ "kind": "sandbox.kill", "runId": rid })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+        // Count sandbox_end events for this run id over a generous window.
+        let mut end_count = 0usize;
+        let end_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < end_deadline {
+            match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let frame: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if frame.get("kind").and_then(|k| k.as_str()) == Some("sandbox") {
+                        let event = frame.get("event").cloned().unwrap_or_default();
+                        if event.get("type").and_then(|t| t.as_str()) == Some("sandbox_end") {
+                            let eid = event
+                                .get("runId")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or("");
+                            if eid == rid {
+                                end_count += 1;
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+
+        assert_eq!(
+            end_count, 1,
+            "killed run should deliver exactly one sandbox_end, got {end_count}"
         );
 
         // Clean up the process-global run record so later tests see a stable store.
