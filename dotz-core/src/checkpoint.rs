@@ -276,10 +276,18 @@ pub fn git_diff_artifact(cwd: &str) -> Option<workflows::Artifact> {
     })
 }
 
-/// Run `git diff --shortstat` and return a human-readable title like
+/// Run `git diff --shortstat HEAD` and return a human-readable title like
 /// "3 files changed, 42 insertions(+), 7 deletions(-)". Returns None on error.
+///
+/// Uses `HEAD` as the base so the stat covers BOTH staged (index vs HEAD) and
+/// unstaged (working tree vs index) changes — matching the two sections
+/// `git_diff_artifact` concatenates for its `content`. The previous
+/// `git diff --shortstat` (no base) reported unstaged changes only, so a
+/// staged-only edit produced a non-empty `content` with a `None` title: the UI
+/// rendered a diff with no stat header. `git diff HEAD --shortstat` gives the
+/// combined count, which always matches the rendered content.
 fn git_diff_stat(cwd: &str) -> Option<String> {
-    match git(cwd, &["diff", "--shortstat"]) {
+    match git(cwd, &["diff", "--shortstat", "HEAD"]) {
         Ok((stdout, _, 0)) => {
             let s = stdout.trim();
             if s.is_empty() {
@@ -796,6 +804,57 @@ mod tests {
         assert!(
             art.content.contains("README.md"),
             "staged diff should mention the file"
+        );
+        // Regression: staged-only changes must still produce a stat title. The old
+        // `git diff --shortstat` (no base) reported unstaged changes only, so this
+        // case had content but a `None` title — the UI rendered a header-less diff.
+        assert!(
+            art.title.is_some(),
+            "staged-only changes must yield a stat title (got None)"
+        );
+        assert!(
+            art.title.as_deref().unwrap_or("").contains("changed"),
+            "staged-only title should be a shortstat line, got {:?}",
+            art.title
+        );
+    }
+
+    /// `git_diff_artifact` title must reflect BOTH staged and unstaged changes combined
+    /// (the union `git diff HEAD` reports), not just the unstaged subset. Before the
+    /// `git diff --shortstat HEAD` fix, a tree with one staged and one unstaged edit
+    /// produced a title counting only the unstaged file — under-reporting the very
+    /// change set the content section below it displayed.
+    #[test]
+    fn git_diff_artifact_title_counts_staged_and_unstaged_combined() {
+        let _guard = test_lock();
+        let dir = init_git_repo();
+        let cwd = dir.to_str().unwrap();
+
+        // Add a second tracked file so we have two files to edit independently.
+        std::fs::write(dir.join("NOTES.md"), "initial notes\n").unwrap();
+        git(cwd, &["add", "NOTES.md"]).unwrap();
+        git(cwd, &["commit", "-m", "add notes"]).unwrap();
+
+        // Staged change to README.md (index vs HEAD).
+        std::fs::write(dir.join("README.md"), "staged edit\n").unwrap();
+        git(cwd, &["add", "README.md"]).unwrap();
+        // Unstaged change to NOTES.md (working tree vs index).
+        std::fs::write(dir.join("NOTES.md"), "unstaged edit\n").unwrap();
+
+        let art = git_diff_artifact(cwd).expect("dirty tree → Some artifact");
+        assert!(
+            art.content.contains("README.md"),
+            "content should include the staged file"
+        );
+        assert!(
+            art.content.contains("NOTES.md"),
+            "content should include the unstaged file"
+        );
+        let title = art.title.expect("combined staged+unstaged → Some title");
+        // `git diff HEAD --shortstat` reports both files; the old code reported only NOTES.md.
+        assert!(
+            title.contains("2 files changed"),
+            "title should count both staged and unstaged files, got {title}"
         );
     }
 }
