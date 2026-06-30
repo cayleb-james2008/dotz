@@ -187,15 +187,19 @@ pub fn catalog() -> Vec<Command> {
 }
 
 /// Validate a catalog batch: unique ids, known categories, non-empty label/description/action,
-/// and that every declared category has at least one command (no empty palette headings).
-/// Returns the first problem found, or `Ok(())`.
+/// unique non-`None` keybindings (no two commands share the same accelerator), and that every
+/// declared category has at least one command (no empty palette headings). Returns the first
+/// problem found, or `Ok(())`.
 pub fn validate(cmds: &[Command]) -> Result<(), String> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    // Track keybindings; only `Some(key)` entries collide — a `None` key means "no accelerator",
+    // so any number of commands may legitimately have no keybinding.
+    let mut seen_keys = std::collections::HashSet::new();
     for c in cmds {
         if c.id.is_empty() {
             return Err("command with empty id".to_string());
         }
-        if !seen.insert(&c.id) {
+        if !seen_ids.insert(&c.id) {
             return Err(format!("duplicate command id: {}", c.id));
         }
         if !is_known_category(c.category) {
@@ -209,6 +213,14 @@ pub fn validate(cmds: &[Command]) -> Result<(), String> {
         }
         if c.action.is_empty() {
             return Err(format!("empty action on {}", c.id));
+        }
+        if let Some(k) = &c.key {
+            if k.is_empty() {
+                return Err(format!("empty keybinding on {}", c.id));
+            }
+            if !seen_keys.insert(k.clone()) {
+                return Err(format!("duplicate keybinding '{}' on {}", k, c.id));
+            }
         }
     }
     for cat in CATEGORIES {
@@ -346,6 +358,42 @@ mod tests {
         assert_eq!(title("ollama"), "Ollama");
         assert_eq!(title("xhigh"), "Xhigh");
         assert_eq!(title("open-router"), "Open-Router");
+    }
+
+    #[test]
+    fn catalog_keybindings_are_unique() {
+        // Regression: no two registered commands may share the same accelerator. A collision
+        // would silently shadow one of them in the palette, so this must fail loudly. `None` keys
+        // are intentionally allowed to repeat — "no keybinding" is not a binding.
+        let cmds = catalog();
+        // validate() now enforces this, so the canonical contract catches it first.
+        validate(&cmds).expect("catalog must be valid (incl. unique keybindings)");
+        // Belt-and-suspenders: scan explicitly so a future refactor of validate() can't quietly
+        // drop the assertion without this test going red.
+        let mut keys: Vec<&str> = cmds.iter().filter_map(|c| c.key.as_deref()).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "duplicate keybindings: {keys:?}");
+    }
+
+    #[test]
+    fn validate_catches_duplicate_keybinding() {
+        let mut cmds = catalog();
+        // Pin two commands to the same non-`None` accelerator.
+        let dup = "Ctrl+X".to_string();
+        cmds[0].key = Some(dup.clone());
+        cmds[1].key = Some(dup.clone());
+        let err = validate(&cmds).expect_err("duplicate keybinding should be rejected");
+        assert!(err.contains("duplicate keybinding"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_catches_empty_keybinding() {
+        let mut cmds = catalog();
+        cmds[0].key = Some(String::new());
+        let err = validate(&cmds).expect_err("empty keybinding string should be rejected");
+        assert!(err.contains("empty keybinding"), "unexpected error: {err}");
     }
 
     #[test]
