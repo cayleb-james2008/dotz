@@ -17,9 +17,10 @@
 //!
 //! Bounded concurrency: a tokio Semaphore (default 4, configurable via DOTZ_WF_CONCURRENCY)
 //! gates how many steps execute in parallel, matching the subagent fan-out pool.
-use crate::agent::subagent::run_single_agent_with_bus;
+use crate::agent::subagent::{run_single_agent_with_bus, SingleResult};
 use crate::checkpoint::git_diff_artifact;
 use crate::context_bus::ContextBus;
+use crate::run_record;
 use crate::workflows;
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,7 +81,10 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
     }
 
     // Mark started (emits workflow_start event).
-    let _run = workflows::start(run_id)?;
+    let started = workflows::start(run_id)?;
+    // Initialize the reproducible run record so every captured step lands in
+    // one persistent file the operator can inspect / replay later.
+    run_record::init_run(&started);
 
     // Create the shared context bus for this run. Subagents inherit it so scout findings,
     // planner plans, and reviewer gap-lists flow between steps as structured data.
@@ -275,8 +279,15 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                 )
                 .await;
 
-                let (status, output, error) = match result {
-                    Ok(result) => {
+                // Keep the SingleResult (if any) so the run record can capture
+                // the full provider response stream, skill set, and effective
+                // model. The executor-level timeout arm yields None.
+                let single: Option<SingleResult> = match result {
+                    Ok(r) => Some(r),
+                    Err(_) => None,
+                };
+                let (status, output, error) = match &single {
+                    Some(result) => {
                         if result.is_failed() {
                             (
                                 "error".to_string(),
@@ -287,7 +298,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                             ("done".to_string(), Some(result.final_output()), None)
                         }
                     }
-                    Err(_) => {
+                    None => {
                         // Timeout.
                         (
                             "error".to_string(),
@@ -322,6 +333,11 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                         ..Default::default()
                     },
                 );
+                // Capture the full reproducible step record (prompt + model +
+                // thinking + tools + skill set + provider response messages) so
+                // the run is debuggable offline and bisectable via replay. Best-
+                // effort: a recording failure must never break the run.
+                run_record::capture_step(&rid, &sid, single.as_ref());
             });
             handles.push(handle);
         }
@@ -337,8 +353,29 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
         // ready steps can read them via context_read without parsing raw text. We
         // write under `step:<id>:output` (full text) and `step:<id>:summary` (first
         // line) so downstream agents can choose granularity.
+        //
+        // Also backfill the run record for any step that reached a terminal
+        // state WITHOUT going through the spawn path above — most importantly
+        // siblings skipped by an error sweep (a failed parent cascades `skipped`
+        // to its children inside `step_state`, so the executor never dispatched
+        // them and never captured their record). Without this backfill, a
+        // replay's DAG would be missing those skipped nodes, and the record
+        // would not faithfully reproduce the run's shape. These steps had no
+        // provider call, so they get a `result = None` entry; `build_step_record`
+        // derives a truthful `agent_source`/`stop_reason` from the step's actual
+        // status (`skipped` vs `error`/timeout).
         if let Some(run) = workflows::get_active(run_id) {
+            let recorded: std::collections::HashSet<String> =
+                run_record::load(run_id)
+                    .map(|r| r.steps.into_iter().map(|s| s.step_id).collect())
+                    .unwrap_or_default();
             for step in &run.steps {
+                let terminal = step.status == "done"
+                    || step.status == "error"
+                    || step.status == "skipped";
+                if terminal && !recorded.contains(&step.id) {
+                    run_record::capture_step(run_id, &step.id, None);
+                }
                 if step.status == "done" || step.status == "error" {
                     if let Some(ref out) = step.output {
                         bus.write(
