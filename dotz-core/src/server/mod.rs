@@ -471,4 +471,242 @@ mod tests {
             "binding to an in-use port should return an error: {result:?}"
         );
     }
+
+    // ---- Offline font bundle ------------------------------------------------------
+    //
+    // The desktop app must be genuinely offline-excellent: it must NOT depend on
+    // fonts.googleapis.com / fonts.gstatic.com at runtime. These tests guard the
+    // locally-bundled font stack (web/fonts.css + web/fonts/*.woff2) that replaced
+    // the Google Fonts <link> in index.html. If someone re-introduces a Google
+    // Fonts <link> or forgets to bundle the woff2 files, these tests fail.
+
+    /// Resolve the `web/` dir the way the server does in the existing tests: the cargo
+    /// workspace root (CARGO_MANIFEST_DIR is dotz-core, so the web dir is one level up).
+    fn web_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("web")
+    }
+
+    /// `index.html` must not reach out to Google Fonts at runtime and must load the local
+    /// `fonts.css` instead. Catches a regression where the Google Fonts <link> is restored.
+    #[test]
+    fn index_html_has_no_google_fonts_runtime_dependency() {
+        let html = std::fs::read_to_string(web_dir().join("index.html"))
+            .expect("web/index.html must exist alongside the crate");
+        assert!(
+            !html.contains("fonts.googleapis.com"),
+            "index.html must not depend on fonts.googleapis.com at runtime (offline app)"
+        );
+        assert!(
+            !html.contains("fonts.gstatic.com"),
+            "index.html must not preconnect to fonts.gstatic.com (offline app)"
+        );
+        assert!(
+            html.contains("/fonts.css"),
+            "index.html must load the locally-bundled /fonts.css stylesheet"
+        );
+    }
+
+    /// `fonts.css` must be fully self-contained: every `src: url(...)` must point at a local
+    /// file under `fonts/`, with no `https://` (and specifically no gstatic) reference left.
+    #[test]
+    fn fonts_css_references_only_local_files() {
+        let css = std::fs::read_to_string(web_dir().join("fonts.css"))
+            .expect("web/fonts.css must be bundled alongside the UI");
+        assert!(
+            !css.contains("https://"),
+            "fonts.css must not reference any remote URL (offline app): {css}"
+        );
+        assert!(
+            css.contains("font-family: 'Chakra Petch';"),
+            "fonts.css must declare the Chakra Petch family used by --display"
+        );
+        assert!(
+            css.contains("font-family: 'JetBrains Mono';"),
+            "fonts.css must declare the JetBrains Mono family used by --mono"
+        );
+        assert!(
+            css.contains("font-family: 'Pixelify Sans';"),
+            "fonts.css must declare the Pixelify Sans family used by --pixel"
+        );
+        // Every src: url(...) must be a local path.
+        for line in css.lines() {
+            if line.contains("src: url(") {
+                assert!(
+                    line.contains("url(fonts/"),
+                    "fonts.css src line must point at a local fonts/ file, got: {line}"
+                );
+            }
+        }
+    }
+
+    /// The `web/fonts/` directory must contain real woff2 binaries (valid `wOF2` magic) for
+    /// each declared family/weight. Without these the @font-face rules point at 404s and the
+    /// app silently falls back to system fonts — defeating the whole point of the bundle.
+    #[test]
+    fn bundled_font_files_are_valid_woff2() {
+        let dir = web_dir().join("fonts");
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("web/fonts must exist and be readable: {e}"));
+        let mut saw_chakra = false;
+        let mut saw_jetbrains = false;
+        let mut saw_pixelify = false;
+        let mut count = 0usize;
+        for ent in entries.flatten() {
+            let path = ent.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+            ;
+            if !name.ends_with(".woff2") {
+                continue;
+            }
+            count += 1;
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("failed to read font {name}: {e}"));
+            // woff2 magic: b"wOF2".
+            assert_eq!(
+                &bytes[..4.min(bytes.len())],
+                b"wOF2",
+                "{name} is not a valid woff2 file (bad magic)"
+            );
+            assert!(
+                bytes.len() > 100,
+                "{name} is suspiciously small ({} bytes), likely a 404/HTML error page",
+                bytes.len()
+            );
+        }
+        // Cross-check coverage against fonts.css: each family declared there must have at
+        // least one bundled woff2. We can't map subset files back to families by name (Google's
+        // opaque filenames), so we re-parse fonts.css and, for each family, assert at least one
+        // of its `src: url(fonts/<file>)` files exists on disk.
+        let css = std::fs::read_to_string(web_dir().join("fonts.css")).unwrap();
+        for family in ["Chakra Petch", "JetBrains Mono", "Pixelify Sans"] {
+            let mut found = false;
+            let mut in_block = false;
+            for line in css.lines() {
+                if line.contains(&format!("font-family: '{family}';")) {
+                    in_block = true;
+                }
+                if in_block && line.contains("url(fonts/") {
+                    let f = line
+                        .split("url(fonts/")
+                        .nth(1)
+                        .and_then(|s| s.split(')').next())
+                        .unwrap_or("");
+                    if f.contains(".woff2") && std::fs::exists(dir.join(f)).unwrap_or(false) {
+                        found = true;
+                    }
+                }
+                if in_block && line.trim() == "}" {
+                    in_block = false;
+                }
+            }
+            assert!(
+                found,
+                "no bundled woff2 file on disk is referenced by the {family} @font-face block"
+            );
+            match family {
+                "Chakra Petch" => saw_chakra = true,
+                "JetBrains Mono" => saw_jetbrains = true,
+                "Pixelify Sans" => saw_pixelify = true,
+                _ => {}
+            }
+        }
+        assert!(saw_chakra && saw_jetbrains && saw_pixelify);
+        assert!(
+            count >= 3,
+            "expected at least 3 bundled woff2 files, found {count}"
+        );
+    }
+
+    /// The running server must serve `fonts.css` (as text/css) and a real woff2 file (as a font
+    /// content-type) from the static `web/` fallback. This proves the bundle is reachable over
+    /// HTTP exactly the way the WebView2 shell loads it — not just present on disk.
+    #[tokio::test]
+    async fn server_serves_bundled_fonts_locally() {
+        // Pick a real woff2 file from the bundle to request over HTTP.
+        let fonts_dir = web_dir().join("fonts");
+        let a_woff2 = std::fs::read_dir(&fonts_dir)
+            .expect("web/fonts must exist")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .find(|n| n.ends_with(".woff2"))
+            .expect("at least one bundled .woff2 file");
+
+        let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dummy.local_addr().unwrap();
+        drop(dummy);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(serve_with_shutdown_addr(
+            addr,
+            web_dir(),
+            shutdown,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        // fonts.css must be served as text/css.
+        let css_resp = client
+            .get(format!("{base}/fonts.css"))
+            .send()
+            .await
+            .expect("GET /fonts.css");
+        assert!(
+            css_resp.status().is_success(),
+            "/fonts.css should be 200, got {}",
+            css_resp.status()
+        );
+        let css_ct = css_resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        assert!(
+            css_ct.contains("css"),
+            "/fonts.css should be served as text/css, got content-type {css_ct}"
+        );
+        let css_body = css_resp.text().await.unwrap();
+        assert!(
+            css_body.contains("font-family: 'Chakra Petch';"),
+            "served /fonts.css body must contain the @font-face declarations"
+        );
+
+        // The woff2 file must be served with a font content-type, not as a 404.
+        let font_resp = client
+            .get(format!("{base}/fonts/{a_woff2}"))
+            .send()
+            .await
+            .expect("GET /fonts/<woff2>");
+        assert!(
+            font_resp.status().is_success(),
+            "/fonts/{a_woff2} should be 200, got {}",
+            font_resp.status()
+        );
+        let font_ct = font_resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        assert!(
+            font_ct.contains("woff2") || font_ct.contains("font"),
+            "/fonts/{a_woff2} should be served with a font content-type, got {font_ct}"
+        );
+        let font_bytes = font_resp.bytes().await.unwrap();
+        assert_eq!(
+            &font_bytes[..4.min(font_bytes.len())],
+            b"wOF2",
+            "served woff2 must have valid magic bytes"
+        );
+
+        let _ = tx.send(());
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "server should exit cleanly: {:?}", result.err());
+    }
 }
