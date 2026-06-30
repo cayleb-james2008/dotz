@@ -1045,6 +1045,55 @@ code { font-family: var(--mono); color: var(--peach); }
 .palette-item .pi-glyph { font-size: 24px; color: var(--peach); display: block; margin-bottom: 6px; }
 .palette-item .pi-label { font-family: var(--mono); font-size: 11px; color: var(--text); letter-spacing: 1px; }
 
+/* ---- KEYBOARD COMMAND PALETTE (Ctrl/Cmd+K) ----
+ * Sits above the panel palette (z-index 115) so a power user's single keyboard surface wins over
+ * the mouse-driven panel grid. Mirrors the .palette/.cmd-palette visual language so it reads as the
+ * same family of overlay, not a foreign widget.
+ */
+.kb-palette {
+  position: fixed; inset: 0; background: rgba(13,13,18,0.78);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 14vh; z-index: 115;
+  backdrop-filter: blur(5px);
+}
+.kb-palette-card {
+  width: 92%; max-width: 640px;
+  background: var(--crust); border: 1px solid var(--border-bright);
+  border-radius: var(--radius);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+  overflow: hidden;
+}
+.kb-palette-bar { display: flex; align-items: center; border-bottom: 1px solid var(--border); }
+.kb-palette-input {
+  flex: 1; background: var(--bg); color: var(--text); border: none;
+  padding: 13px 14px; font-family: var(--mono); font-size: 14px; outline: none;
+}
+.kb-palette-hint { padding: 0 14px; font-size: 11px; letter-spacing: 1px; }
+.kb-palette-list { max-height: 56vh; overflow-y: auto; }
+.kb-palette-cat {
+  font-size: 10px; letter-spacing: 2px; color: var(--lav);
+  padding: 8px 14px 4px; position: sticky; top: 0; background: var(--crust);
+  border-bottom: 1px solid var(--border);
+}
+.kb-palette-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 9px 14px; cursor: pointer; border-bottom: 1px solid var(--border);
+  transition: background 0.06s;
+}
+.kb-palette-row:hover { background: var(--glass-2); }
+.kb-palette-row.sel { background: var(--glass-2); border-left: 2px solid var(--lav); padding-left: 12px; }
+.kb-palette-label { color: var(--text); font-size: 13px; }
+.kb-palette-key {
+  font-size: 10px; letter-spacing: 1px; color: var(--peach);
+  border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 1px 6px;
+  white-space: nowrap; flex-shrink: 0;
+}
+.kb-palette-empty { padding: 18px 14px; text-align: center; }
+.kb-palette-foot { font-size: 10px; letter-spacing: 1px; padding: 8px 14px; border-top: 1px solid var(--border); }
+@media (prefers-reduced-motion: reduce) {
+  .kb-palette-row { transition: none; }
+}
+
 /* ---- REASONING SEG ---- */
 .seg-mini { display: flex; gap: 2px; }
 .seg-mini button {
