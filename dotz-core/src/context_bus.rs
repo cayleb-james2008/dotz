@@ -137,7 +137,14 @@ pub fn inject_context_into_task(task: &str, bus: &ContextBus) -> String {
     for (k, v) in &entries {
         let val_str = serde_json::to_string(v).unwrap_or_default();
         let trimmed = if val_str.len() > 8192 {
-            format!("{}…[truncated]", &val_str[..8192])
+            // Back up to the nearest UTF-8 char boundary at or before byte 8192 so the slice
+            // doesn't panic when a multi-byte character straddles the cut point — which is
+            // the common case for real agent output (code comments, non-ASCII docs, emoji).
+            let mut end = 8192;
+            while !val_str.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…[truncated]", &val_str[..end])
         } else {
             val_str
         };
@@ -532,6 +539,32 @@ mod tests {
         assert!(
             bus.read("step:step-err:output").is_none(),
             "errored step with no output must not be preloaded"
+        );
+    }
+
+    /// `inject_context_into_task` truncates each bus value's JSON representation to 8 KB.
+    /// The old code used `&val_str[..8192]`, which panics when byte 8192 falls inside a
+    /// multi-byte UTF-8 character — the common case for real agent output (code comments,
+    /// non-ASCII docs, emoji). This test plants a value whose JSON serialization places the
+    /// second byte of a 2-byte char exactly at byte 8192 and confirms the injection no
+    /// longer panics and still emits the `[truncated]` marker.
+    #[test]
+    fn inject_context_truncates_multibyte_value_without_panicking() {
+        let bus = isolated_bus("test-trunc-mb");
+        // 8190 ASCII chars + "é" (U+00E9, 2 UTF-8 bytes 0xC3 0xA9). JSON wraps the string
+        // in quotes, so the serialized form is: `"` + 8190·'a' + 0xC3 0xA9 + `"` = 8194
+        // bytes. Byte 8192 is 0xA9 — the second byte of "é" — which is NOT a char
+        // boundary, so `&val_str[..8192]` panics without char-boundary handling.
+        let big = format!("{}é", "a".repeat(8190));
+        bus.write("scout:big", json!(big));
+        let injected = inject_context_into_task("do the thing", &bus);
+        assert!(
+            injected.contains("[truncated]"),
+            "truncated value must carry the [truncated] marker"
+        );
+        assert!(
+            injected.contains("## Task\ndo the thing"),
+            "injection must still include the task section"
         );
     }
 }
