@@ -416,7 +416,13 @@ fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
     } else {
-        format!("{}…", &s[..n])
+        // Back up to the nearest UTF-8 char boundary at or before byte `n` so the slice
+        // doesn't panic when a multi-byte character straddles the cut point.
+        let mut end = n;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     }
 }
 

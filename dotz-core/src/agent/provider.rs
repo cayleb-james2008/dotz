@@ -410,7 +410,14 @@ fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
     } else {
-        format!("{}…", &s[..n])
+        // Back up to the nearest UTF-8 char boundary at or before byte `n` so the slice
+        // doesn't panic when a multi-byte character straddles the cut point — the common
+        // case for real provider error bodies (JSON with Unicode, non-English messages).
+        let mut end = n;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     }
 }
 
@@ -754,5 +761,39 @@ mod tests {
     fn resolve_accepts_any_model_id_for_native_adapter_providers() {
         assert!(resolve("anthropic", "any-model-id").is_some());
         assert!(resolve("google", "any-model-id").is_some());
+    }
+
+    /// `truncate` is called on upstream provider error bodies in every adapter's stream error
+    /// path. The old `&s[..n]` panics when byte `n` falls inside a multi-byte UTF-8 character —
+    /// the common case for real provider error responses (JSON with Unicode, non-English
+    /// messages). This test plants a string whose `n`-th byte is the second byte of a 2-byte
+    /// character and confirms `truncate` no longer panics and still emits the ellipsis marker.
+    #[test]
+    fn truncate_handles_multibyte_char_boundary_without_panicking() {
+        // 399 ASCII chars + "é" (U+00E9, 2 UTF-8 bytes 0xC3 0xA9). Byte 400 is 0xA9 — the
+        // second byte of "é" — which is NOT a char boundary, so `&s[..400]` panics.
+        let input = format!("{}é", "a".repeat(399));
+        let truncated = truncate(&input, 400);
+        assert!(
+            truncated.ends_with('…'),
+            "truncated string should end with the ellipsis marker"
+        );
+        // The 399 ASCII chars must survive; only the split multi-byte char is dropped.
+        assert!(
+            truncated.starts_with(&"a".repeat(399)),
+            "ASCII prefix before the cut should be preserved"
+        );
+        // Must not contain the raw bytes of the split character.
+        assert!(
+            !truncated.contains('é'),
+            "the split multi-byte character must not appear in the truncated output"
+        );
+    }
+
+    /// `truncate` must return the input unchanged when it fits within the cap.
+    #[test]
+    fn truncate_returns_input_unchanged_when_within_cap() {
+        assert_eq!(truncate("hello", 400), "hello");
+        assert_eq!(truncate("", 400), "");
     }
 }
