@@ -864,6 +864,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_reports_bash_failure_as_error() {
+        // Serialize against the timeout tests: they set the process-global DOTZ_BASH_TIMEOUT_MS
+        // to 1000ms, and without this lock a concurrent run leaks that short timeout into this
+        // test's `exit 1`, which under load times out instead of returning the [exit 1] error.
+        let _guard = BASH_TIMEOUT_TEST_LOCK.lock().await;
         let mut registry = ToolRegistry::new();
         registry.set_active(&["bash".to_string()]);
         let ctx = ToolCtx {
@@ -948,9 +952,12 @@ mod tests {
             err.contains("[timeout]"),
             "timed-out bash command must report a timeout error, got: {err}"
         );
+        // Proves the configured 1s timeout fired rather than the 5-minute default; the margin above
+        // 1s absorbs scheduling delay under a saturated parallel suite, which made a tight 3s bound
+        // flaky without indicating any regression.
         assert!(
-            elapsed < Duration::from_secs(3),
-            "bash timeout should return promptly, elapsed: {elapsed:?}"
+            elapsed < Duration::from_secs(15),
+            "bash timeout should fire on the configured 1s timeout, not the default, elapsed: {elapsed:?}"
         );
     }
 

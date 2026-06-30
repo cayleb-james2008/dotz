@@ -369,6 +369,13 @@ pub async fn health_snapshot_json() -> serde_json::Value {
 mod tests {
     use super::*;
 
+    /// Serialize tests that touch the process-global `HEALTH` map. `reset()` calls `m.clear()`,
+    /// which wipes EVERY provider's state, not just the test's own key — so two of these tests
+    /// running concurrently let one's `reset()` erase the other's accumulated failures mid-test
+    /// (e.g. clearing a provider between its `record_failure` calls and its `is_degraded` check).
+    /// A unique provider name does not help, because the clear is global. This lock serializes them.
+    static HEALTH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn classify_error_detects_rate_limit() {
         assert_eq!(
@@ -460,7 +467,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_failure_degrades_after_threshold() {
-        // Isolate this test: reset the global state first.
+        // Isolate this test: serialize against other global-state tests, then reset.
+        let _guard = HEALTH_TEST_LOCK.lock().await;
         reset().await;
         let provider = "test-degrade-provider";
 
@@ -478,6 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_worthy_failure_does_not_degrade() {
+        let _guard = HEALTH_TEST_LOCK.lock().await;
         reset().await;
         let provider = "test-nonworthy-provider";
 
@@ -489,6 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn success_resets_consecutive_failures() {
+        let _guard = HEALTH_TEST_LOCK.lock().await;
         reset().await;
         let provider = "test-reset-provider";
 
@@ -509,8 +519,8 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_effective_model_failover_and_recovery() {
-        // Use a unique provider name so concurrent tests sharing the global health map
-        // cannot wipe this test's state via their own reset() calls.
+        let _guard = HEALTH_TEST_LOCK.lock().await;
+        reset().await;
         let primary_provider = "test-failover-recovery-provider";
         let primary_model = "nex-agi/nex-n2-pro:free";
 
@@ -549,6 +559,7 @@ mod tests {
     /// verify that a known-free-form provider returns Some.
     #[tokio::test]
     async fn resolve_effective_model_returns_some_for_free_form_providers() {
+        let _guard = HEALTH_TEST_LOCK.lock().await;
         reset().await;
         assert!(
             resolve_effective_model("openrouter", "nex-agi/nex-n2-pro:free")
@@ -567,6 +578,7 @@ mod tests {
     /// UI can render the chip + a tooltip.
     #[tokio::test]
     async fn health_snapshot_json_includes_pairs_and_providers() {
+        let _guard = HEALTH_TEST_LOCK.lock().await;
         reset().await;
         record_failure("openrouter", "returned 429: rate limit").await;
         let json = health_snapshot_json().await;
