@@ -10,6 +10,10 @@ path = "src/lib.rs"
 name = "serve"
 path = "src/bin/serve.rs"
 
+[[bin]]
+name = "selfeval"
+path = "src/bin/selfeval.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "process", "fs", "io-util", "time"] }
 axum = { version = "0.8", features = ["ws"] }

@@ -16,6 +16,7 @@ pub mod profiles;
 pub mod projects;
 pub mod run_record;
 pub mod sandbox;
+pub mod self_eval;
 pub mod server;
 pub mod skills;
 pub mod specs;
