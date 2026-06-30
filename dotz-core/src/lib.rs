@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod browser;
 pub mod checkpoint;
+pub mod commands;
 pub mod config;
 pub mod connections;
 pub mod context_bus;
