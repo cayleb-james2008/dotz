@@ -300,8 +300,23 @@ fn write_unlocked(record: &RunRecord) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(s) = serde_json::to_string_pretty(record) {
-        let _ = std::fs::write(&path, s);
+    let Ok(s) = serde_json::to_string_pretty(record) else {
+        return;
+    };
+    // Atomic write: serialize to a sibling temp file in the same directory, then rename over the
+    // destination. `std::fs::write` truncates the target before writing, so a crash mid-write would
+    // leave a truncated JSON that `load` silently drops — losing the durable run record (the very
+    // source of truth for replay/resume). The temp-then-rename dance means a crash at worst leaves
+    // the previous complete record intact; the rename is atomic on both Unix and Windows (the
+    // std impl uses MoveFileExW with MOVEFILE_REPLACE_EXISTING, confirmed on the target host).
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &s).is_ok() {
+        if std::fs::rename(&tmp, &path).is_err() {
+            // Exotic cross-device / permission edge: fall back to a direct write so the record is
+            // still persisted, accepting the non-atomic window only on that path.
+            let _ = std::fs::write(&path, &s);
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -847,5 +862,75 @@ mod tests {
         let _rec = TmpDir::new();
         let _wf = wf_file();
         assert!(load("no-such-run-id").is_none());
+    }
+
+    /// `write_unlocked` must be atomic: a crash mid-write previously left a truncated JSON that
+    /// `load` silently dropped, losing the durable run record. Guard the contract by asserting that
+    /// (a) a truncated on-disk file is the exact failure mode (proves the gap the fix closes),
+    /// (b) a normal write round-trips through `load`, and (c) no `.json.tmp` sibling litters the
+    /// record directory afterward — i.e. the temp file was consumed by the rename.
+    #[test]
+    fn write_unlocked_is_atomic_and_leaves_no_temp_sibling() {
+        let _rec = TmpDir::new();
+        let _wf = wf_file();
+        let run = workflows::create(
+            None,
+            None,
+            "atomic".into(),
+            None,
+            1,
+            &[step("scout", "map files", None)],
+            None,
+        )
+        .unwrap();
+        init_run(&run);
+        let path = record_path(&run.id);
+
+        // (a) A truncated destination file is the failure mode the atomic write prevents:
+        // simulate a crash mid-write and confirm `load` returns None (not a panic).
+        std::fs::write(&path, "{\"runId\":\"atomic\",\"steps\":[").unwrap();
+        assert!(
+            load(&run.id).is_none(),
+            "a truncated record file must surface as None, proving the gap the atomic write closes"
+        );
+
+        // (b) A clean write round-trips: the destination file parses back to the same record.
+        {
+            let _g = lock().lock().unwrap();
+            let mut r = load_unlocked(&run.id).unwrap_or_else(|| RunRecord {
+                run_id: run.id.clone(),
+                label: run.label.clone(),
+                created_at: run.created_at,
+                started_at: run.started_at,
+                ended_at: run.ended_at,
+                status: run.status.clone(),
+                budget: run.budget.clone(),
+                max_repair_rounds: run.max_repair_rounds,
+                steps: Vec::new(),
+            });
+            r.status = "completed".to_string();
+            write_unlocked(&r);
+        }
+        let loaded = load(&run.id).expect("atomic write round-trips through load");
+        assert_eq!(loaded.run_id, run.id);
+        assert_eq!(loaded.status, "completed");
+        // The on-disk content is well-formed (no truncation).
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.trim_end().ends_with('}'), "record file is complete JSON");
+
+        // (c) The temp sibling is gone — the rename consumed it, so a future write never races a
+        // stale temp and the record dir is not polluted.
+        let dir = path.parent().expect("record path has a parent");
+        let temps: Vec<_> = std::fs::read_dir(dir)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".json.tmp"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            temps.is_empty(),
+            "write_unlocked must not leave a .json.tmp sibling behind (leftover: {temps:?})"
+        );
     }
 }
