@@ -427,8 +427,17 @@ mod tests {
 
     /// The step timeout must clamp to sane bounds. A zero value would time out before
     /// the provider stream starts; an enormous value defeats the purpose of the cap.
+    ///
+    /// Takes ENV_LOCK like every other DOTZ_WF_STEP_TIMEOUT_MS test in this file: this test
+    /// mutates the process-global env var, and without the lock it races under the parallel
+    /// suite against the other tests below that set DOTZ_WF_STEP_TIMEOUT_MS=5000 — observed
+    /// as a flaky `left: 5, right: 300` failure (read back another test's 5000ms instead of
+    /// the unset default) when this test ran unlocked.
     #[test]
     fn step_timeout_clamps_to_sane_bounds() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
         let t = step_timeout();
         assert_eq!(t.as_secs(), 300, "default step timeout is 5 minutes");
