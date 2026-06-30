@@ -539,7 +539,6 @@ pub fn router() -> Router<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use uuid::Uuid;
 
     /// Create a throwaway temp dir with a git repo containing an initial file.

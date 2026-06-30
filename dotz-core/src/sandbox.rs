@@ -17,7 +17,7 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -109,6 +109,25 @@ fn runs_guard() -> std::sync::MutexGuard<'static, HashMap<String, RunEntry>> {
 /// Live sandbox run count, for the `/api/health` merge.
 pub fn run_count() -> usize {
     runs_guard().len()
+}
+
+/// Set of run ids for which `sandbox_end` has already been emitted over the WebSocket. Both the
+/// sandbox-start poller and the sandbox-kill handler emit `sandbox_end`, so without dedup a
+/// killed run would deliver two end events to the UI. `try_mark_end_emitted` atomically records
+/// that an end was emitted and returns `true` only for the first caller, so exactly one end
+/// event is delivered per run.
+static END_EMITTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+fn end_emitted_set() -> &'static Mutex<HashSet<String>> {
+    END_EMITTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Atomically claim the `sandbox_end` emission for a run. Returns `true` if this caller is the
+/// first to claim it (and should emit), `false` if another caller already did.
+pub fn try_mark_end_emitted(id: &str) -> bool {
+    end_emitted_set()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(id.to_string())
 }
 
 pub fn router() -> Router<()> {
@@ -253,6 +272,10 @@ pub fn lookup(id: &str) -> Option<SandboxRun> {
 /// clean up the process-global runs map.
 pub fn remove_test_run(id: &str) {
     runs_guard().remove(id);
+    let _ = end_emitted_set()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(id);
 }
 
 /// Spawn the child for `language`, capture stdout+stderr, apply the timeout, then update the run.
@@ -705,6 +728,26 @@ fn not_found(msg: &str) -> (StatusCode, Json<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `try_mark_end_emitted` must return true only for the first caller so the sandbox-start
+    /// poller and the sandbox-kill handler don't both emit `sandbox_end` for the same run.
+    #[test]
+    fn try_mark_end_emitted_is_one_shot() {
+        let id = format!("test-end-dedup-{}", uuid::Uuid::new_v4());
+        assert!(
+            try_mark_end_emitted(&id),
+            "first call for a fresh id must claim the emission"
+        );
+        assert!(
+            !try_mark_end_emitted(&id),
+            "second call for the same id must not re-claim the emission"
+        );
+        // Clean up the process-global set.
+        end_emitted_set()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+    }
 
     #[test]
     fn run_count_reflects_store_entries() {
