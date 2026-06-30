@@ -4,7 +4,10 @@
 //! per subagent (isolated context window). The Rust runtime is in-process, so a subagent is instead
 //! a fresh, self-contained agent loop: a child "session" with the agent's system prompt + the
 //! configured subagent model (DOTZ_SUBAGENT_MODEL, default `ollama/minimax-m3`), run to completion
-//! with NO memory/recall autonomy (just the agent's own prompt) and a restricted tool set.
+//! with a RESTRICTED tool set and no memory-CAPTURE autonomy. Query-relevant RECALL is injected
+//! into every subagent's system prompt (project conventions, prior decisions, scout notes) so a
+//! planner/worker does not plan against the project's conventions it cannot see. Capture stays
+//! disabled (only the main session writes durable memory).
 //!
 //! Three modes, mirroring the oracle:
 //!   - single:   one {agent, task}
@@ -529,12 +532,23 @@ async fn run_single_agent_inner(
         }
     };
 
-    // System prompt: the agent's own prompt only (no doctrine/memory seed/recall — restricted context).
-    let system_prompt = if agent.system_prompt.trim().is_empty() {
+    // System prompt: the agent's own prompt, PLUS query-relevant durable-memory recall. A
+    // subagent that cannot see the project's conventions / prior decisions / scout notes will plan
+    // or act against them. The lead session does the same per-turn recall (session.rs run_turn);
+    // mirroring it here means every fan-out worker starts with the same durable context the lead
+    // has. Best-effort: any embedder/db error yields an empty recall list (no injection). Capture
+    // stays disabled for subagents (memory::capture_exchange gates on is_autonomy_enabled), so a
+    // subagent reads durable memory but never writes it — the main session remains the single
+    // author of the shared memory store.
+    let base_prompt = if agent.system_prompt.trim().is_empty() {
         format!("You are the \"{}\" subagent.", agent.name)
     } else {
         agent.system_prompt.clone()
     };
+    // Query with the task (the most relevant signal) so the recall surfaces the conventions /
+    // decisions that actually bear on this subagent's work, not a generic project dump.
+    let recall = crate::memory::recall(task, Some(cwd));
+    let system_prompt = system_prompt_with_recall(&base_prompt, &recall);
 
     let ctx = ToolCtx {
         cwd: PathBuf::from(cwd),
@@ -688,6 +702,22 @@ async fn run_single_agent_inner(
 
     // Hit the round cap — return whatever we have (stopReason stays as the last assistant's).
     result
+}
+
+// ---- subagent system-prompt memory recall injection ----
+
+/// Append a recalled-memory block to a subagent's base system prompt. Mirrors the lead
+/// session's per-turn recall injection (session.rs run_turn): the durable-memory recall is
+/// rendered under a `# Relevant memory (recalled for this turn)` heading and appended to the
+/// agent's own prompt. An empty recall list leaves the prompt unchanged (no tokens wasted).
+/// Pure over the rendered block so it is unit-testable without the embedder/DB.
+fn system_prompt_with_recall(base_prompt: &str, recall: &[crate::memory::MemoryView]) -> String {
+    let block = crate::memory::render_recall(recall);
+    if block.is_empty() {
+        base_prompt.to_string()
+    } else {
+        format!("{base_prompt}\n\n{block}")
+    }
 }
 
 /// Public single-agent entry (the name the workstream contract names). Discovers agents for `cwd`
@@ -1327,6 +1357,60 @@ mod tests {
                 "nex-agi/nex-n2-pro:free".to_string()
             ),
             "uppercase provider segment with a redundant lowercase prefix must still be normalized"
+        );
+    }
+
+    // ---- memory recall injection into the subagent system prompt ----
+
+    fn mk_memory(text: &str) -> crate::memory::MemoryView {
+        crate::memory::MemoryView {
+            id: format!("id-{text}"),
+            memory: text.into(),
+            scope: "project".into(),
+            category: None,
+            folder: None,
+            score: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// An empty recall list must leave the agent's own system prompt unchanged — a subagent
+    /// working in a project with no durable memory (or where the embedder/db is unavailable)
+    /// should not pay a token cost or see a misleading "memory" header.
+    #[test]
+    fn system_prompt_with_recall_empty_leaves_prompt_unchanged() {
+        let base = "You are the \"planner\" subagent.\nPlan the work.";
+        assert_eq!(system_prompt_with_recall(base, &[]), base);
+    }
+
+    /// A non-empty recall list must append the rendered memory block to the agent's own prompt,
+    /// so the planner/worker inherits the project's conventions / prior decisions / scout notes
+    /// before it plans or acts. The agent's own prompt must remain intact (prepended, not
+    /// replaced) so the agent still knows its role.
+    #[test]
+    fn system_prompt_with_recall_appends_memory_block() {
+        let base = "You are the \"planner\" subagent.";
+        let recall = vec![
+            mk_memory("Always run `cargo test -p dotz-core` before declaring a change done."),
+            mk_memory("The agent runtime is in-process; subagents do not spawn child processes."),
+        ];
+        let out = system_prompt_with_recall(base, &recall);
+        assert!(
+            out.starts_with(base),
+            "the agent's own prompt must be prepended unchanged"
+        );
+        assert!(
+            out.contains("# Relevant memory (recalled for this turn)"),
+            "the recall block heading must be present"
+        );
+        assert!(
+            out.contains("cargo test -p dotz-core"),
+            "the first recalled convention must appear"
+        );
+        assert!(
+            out.contains("subagents do not spawn child processes"),
+            "the second recalled fact must appear"
         );
     }
 
