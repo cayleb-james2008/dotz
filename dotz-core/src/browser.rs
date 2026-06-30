@@ -625,24 +625,33 @@ async fn run(
 }
 
 /// Kill a pid and its descendant tree — taskkill /T /F on win32, kill -9 on posix. Best-effort.
+///
+/// The kill is dispatched on a blocking thread (spawn_blocking) and not awaited: `CreateProcess`
+/// for taskkill.exe is a synchronous syscall that can take several hundred ms under load, and
+/// running it inline on the timeout path would stall a tokio worker thread for that whole time
+/// (and let the caller's wall-clock timeout balloon past its budget). Fire-and-forget keeps the
+/// kill semantics identical (best-effort, never waited on) while freeing the timeout path to
+/// return promptly.
 fn kill_pid(pid: Option<u32>) {
     let Some(pid) = pid else { return };
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
+    tokio::task::spawn_blocking(move || {
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+    });
 }
 
 // ---- clamping helpers ----
@@ -2112,9 +2121,13 @@ mod tests {
             err.contains("timed out"),
             "error should mention timeout, got: {err}"
         );
+        // The configured timeout (clamped up to the 1s floor) must fire instead of the 75s default;
+        // any bound far below 75s proves that. The margin above ~1s absorbs the Windows kill path
+        // (taskkill launch, dispatched off-thread) and scheduling delay under a saturated suite,
+        // which made a tight 3s bound flaky without indicating a regression.
         assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "browser timeout should return promptly, elapsed: {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(30),
+            "browser timeout should fire on the configured short timeout, not the 75s default, elapsed: {elapsed:?}"
         );
 
         #[cfg(unix)]

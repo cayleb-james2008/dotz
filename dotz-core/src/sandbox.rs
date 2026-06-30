@@ -1259,11 +1259,16 @@ mod tests {
             );
         }
 
-        // Reap the child; it should exit quickly after being killed.
-        let reaped = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+        // The killed child must actually exit (be reaped), not leak as a zombie/handle. The budget
+        // is generous on purpose: on win32 the kill shells out to `taskkill.exe`, whose process
+        // launch + tree-walk can take 10s+ on machines with aggressive AV real-time scanning (the
+        // termination itself is instant once taskkill runs). `child.wait()` returns the moment the
+        // process dies, so this cap costs nothing on fast machines and only guards against that
+        // worst case — what we assert is "the child is reaped", not a specific speed.
+        let reaped = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
         assert!(
             reaped.is_ok(),
-            "killed child process should exit within 5 seconds"
+            "killed child process should be reaped (exit), not leak"
         );
 
         {

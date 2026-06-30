@@ -1192,9 +1192,13 @@ mod tests {
             error.contains("[timeout]"),
             "timed-out gate must report a timeout error, got: {error}"
         );
+        // The point is that the configured 1s timeout fired, not the 10-minute default — so any
+        // bound far below the default proves it. Keep margin above 1s: under a saturated parallel
+        // test suite the timeout future + kill/reap can be scheduled several seconds late, which
+        // made a tight 3s bound flaky without ever indicating a real regression.
         assert!(
-            elapsed < Duration::from_secs(3),
-            "gate timeout should return promptly, elapsed: {elapsed:?}"
+            elapsed < Duration::from_secs(15),
+            "gate timeout should fire on the configured 1s timeout, not the default, elapsed: {elapsed:?}"
         );
     }
 
