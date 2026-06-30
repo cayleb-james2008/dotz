@@ -55,6 +55,7 @@ const state = {
   livingDocs: { docs: [], suggestions: [] },
   vcsStatus: null,
   commands: [],
+  kbCommands: [],
   projectFiles: [],
   sandbox: { languages: [], runs: new Map(), activeRunId: null, mode: "terminal" },
   workflows: new Map(),
@@ -107,6 +108,7 @@ async function init() {
   bindProjectSelector();
   bindComposer();
   bindPalette();
+  bindKbPalette();
   bindKeyboard();
   bindBrainFloat();
   bindGateCard();
@@ -124,6 +126,9 @@ async function init() {
   await loadProjects();
   await loadSandboxLanguages();
   showCommandCenter();
+  // Prime the command-palette catalog (cached in localStorage; refreshed here on each boot so a
+  // new provider/thinking level lands without waiting for the first Ctrl+K).
+  loadKbCommands();
 }
 
 function loadLayout() {
@@ -447,17 +452,29 @@ function togglePalette() {
 
 function bindKeyboard() {
   document.addEventListener("keydown", (e) => {
+    // Global command-palette toggle (Ctrl/Cmd+K). Checked before the panel-palette Ctrl+P so a
+    // browser Ctrl+K (often a focus-search hotkey) never leaks while the dashboard is focused.
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      toggleKbPalette();
+      return;
+    }
     if (e.ctrlKey && e.key.toLowerCase() === "p") { e.preventDefault(); togglePalette(); }
     // Modal-aware Escape routing + Tab focus trap. A visible dialog takes priority.
     const modal = visibleModal();
     if (modal) {
       if (e.key === "Escape") {
         e.preventDefault();
+        // The command palette owns its own dismissal; closing it here would double-handle.
+        if (modal.id === "kb-palette") { hideKbPalette(); return; }
         // Gate stays modal until an explicit choice; settings/update get a close path.
         if (modal.id === "settings-card") $("settings-close").click();
         else if (modal.id === "update-card") $("update-later").click();
         return;
       }
+      // The command palette input owns its own arrow/Tab/Enter navigation; let it handle those so the
+      // global Tab-trap below doesn't fight the palette's selection cycling.
+      if (modal.id === "kb-palette" && (e.key === "Tab" || e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "Enter")) return;
       if (e.key === "Tab") trapFocus(e, modal);
       return;
     }
@@ -471,7 +488,9 @@ function bindKeyboard() {
 
 // Returns the topmost visible modal dialog element, or null.
 function visibleModal() {
-  for (const id of ["update-card", "settings-card", "gate-card"]) {
+  // The keyboard command palette sits above the panel palette but below the human gate — a gate
+  // must never be dismissable by accident, so it wins when both are up.
+  for (const id of ["kb-palette", "update-card", "settings-card", "gate-card"]) {
     const card = $(id);
     if (card && !card.classList.contains("hidden")) return card;
   }
@@ -489,6 +508,248 @@ function trapFocus(e, modal) {
   const last = visible[visible.length - 1];
   if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
   else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
+/* ---------- keyboard command palette (Ctrl/Cmd+K) ----------
+ * A single keyboard surface for graph navigation, panel toggle, model/reasoning switching,
+ * and step re-run — built on top of the backend `/api/commands` catalog (the single source of
+ * truth for the action taxonomy) merged with UI-only panel-toggle entries (panel names live in
+ * web/app.js, not the backend, so they are NOT duplicated server-side). The list is fuzzy-filtered,
+ * arrow-navigable, and Enter fires the highlighted action. A power user never reaches for the mouse.
+ */
+const KB_PALLETTE_KEY = "dotz.kbCommands.v1";
+
+function bindKbPalette() {
+  const card = $("kb-palette");
+  // Click on the backdrop (not the card) closes — same idiom as the panel palette.
+  card.onclick = (e) => { if (e.target.id === "kb-palette") hideKbPalette(); };
+  const input = $("kb-palette-input");
+  input.addEventListener("input", () => renderKbPalette(input.value));
+  input.addEventListener("keydown", (e) => {
+    // Arrow/Tab cycle the list; Enter runs; Esc closes. Handled here (not in the global handler) so
+    // the palette keeps working even if focus somehow leaves the input while the overlay is up.
+    if (e.key === "ArrowDown" || (e.key === "Tab" && !e.shiftKey)) { e.preventDefault(); moveKbSelection(1); }
+    else if (e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey)) { e.preventDefault(); moveKbSelection(-1); }
+    else if (e.key === "Enter") { e.preventDefault(); runKbSelection(); }
+    else if (e.key === "Escape") { e.preventDefault(); hideKbPalette(); }
+  });
+}
+
+// Fetch + cache the backend catalog. Cached in localStorage so the palette opens instantly on
+// repeat invocations (the catalog is effectively static per build); a stale cache is refreshed in
+// the background and replaced on next open without blocking the first keystroke.
+async function loadKbCommands() {
+  const cached = (() => { try { return JSON.parse(localStorage.getItem(KB_PALLETTE_KEY) || "null"); } catch { return null; } })();
+  if (cached && Array.isArray(cached) && cached.length) state.kbCommands = cached;
+  try {
+    const { commands } = await api("/api/commands");
+    if (Array.isArray(commands) && commands.length) {
+      state.kbCommands = commands;
+      try { localStorage.setItem(KB_PALLETTE_KEY, JSON.stringify(commands)); } catch {}
+    }
+  } catch (e) { pushError("command palette: " + e.message); }
+}
+
+// The full palette list: backend action commands + UI-only panel-toggle commands (one per panel,
+// toggle = open if absent, close if present). Panels are a UI concern so they live here, not backend.
+function kbPaletteItems() {
+  const items = (state.kbCommands || []).map((c) => ({ ...c, source: "api" }));
+  PANEL_NAMES.forEach((name) => {
+    const meta = PANEL_META[name] || { icon: "", label: name };
+    const open = state.layout.open.includes(name);
+    items.push({
+      id: "panel.toggle." + name,
+      category: "panel",
+      label: (open ? "Close panel: " : "Open panel: ") + meta.label,
+      description: open ? "Remove the " + meta.label + " panel from the bento." : "Add the " + meta.label + " panel to the bento.",
+      key: null,
+      action: "panel:toggle",
+      arg: name,
+      requiresSession: false,
+      source: "ui",
+    });
+  });
+  return items;
+}
+
+let _kbFiltered = [];
+let _kbIndex = 0;
+
+function toggleKbPalette() {
+  const card = $("kb-palette");
+  if (!card.classList.contains("hidden")) { hideKbPalette(); return; }
+  card.classList.remove("hidden");
+  const input = $("kb-palette-input");
+  input.value = "";
+  renderKbPalette("");
+  // Refresh the catalog in the background; the cached list paints immediately so there's no
+  // first-open latency, and a new provider/thinking level added server-side shows up next time.
+  loadKbCommands().then(() => renderKbPalette(input.value));
+  input.focus();
+}
+
+function hideKbPalette() {
+  $("kb-palette").classList.add("hidden");
+  _kbFiltered = [];
+  _kbIndex = 0;
+}
+
+// Fuzzy subset match: each char of the query must appear in order (case-insensitive). Cheap and
+// good enough for ~40 entries; no need for a scoring library.
+function kbMatches(hay, q) {
+  if (!q) return true;
+  hay = String(hay || "").toLowerCase();
+  let i = 0;
+  for (const ch of q.toLowerCase()) {
+    i = hay.indexOf(ch, i);
+    if (i < 0) return false;
+    i++;
+  }
+  return true;
+}
+
+function renderKbPalette(query) {
+  const list = $("kb-palette-list");
+  const all = kbPaletteItems();
+  // Filter on id/label/description/category; keep category grouping stable by preserving order.
+  _kbFiltered = all.filter((c) =>
+    kbMatches(c.label, query) || kbMatches(c.id, query) || kbMatches(c.description, query) || kbMatches(c.category, query)
+  );
+  _kbIndex = _kbFiltered.length ? 0 : -1;
+  list.innerHTML = "";
+  if (!_kbFiltered.length) {
+    list.appendChild(el("div", "kb-palette-empty mono dim", "no commands match “" + query + "”"));
+    return;
+  }
+  // Group by category in catalog order (categories appear as the items stream, no pre-sort).
+  let lastCat = null;
+  _kbFiltered.forEach((c, i) => {
+    if (c.category !== lastCat) {
+      lastCat = c.category;
+      const head = el("div", "kb-palette-cat mono", c.category.toUpperCase());
+      list.appendChild(head);
+    }
+    const row = el("div", "kb-palette-row" + (i === _kbIndex ? " sel" : ""));
+    row.setAttribute("role", "option");
+    row.dataset.idx = String(i);
+    const label = el("span", "kb-palette-label", c.label);
+    if (c.requiresSession && !state.sessionId) label.classList.add("dim");
+    row.appendChild(label);
+    if (c.key) row.appendChild(el("span", "kb-palette-key mono", c.key));
+    row.title = c.description;
+    row.onclick = () => { _kbIndex = i; runKbSelection(); };
+    list.appendChild(row);
+  });
+}
+
+function moveKbSelection(dir) {
+  if (!_kbFiltered.length) return;
+  _kbIndex = (_kbIndex + dir + _kbFiltered.length) % _kbFiltered.length;
+  const list = $("kb-palette-list");
+  list.querySelectorAll(".kb-palette-row").forEach((r) => r.classList.toggle("sel", Number(r.dataset.idx) === _kbIndex));
+  const sel = list.querySelector(".kb-palette-row.sel");
+  if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: "nearest" });
+}
+
+function runKbSelection() {
+  const c = _kbFiltered[_kbIndex];
+  if (!c) return;
+  // Guard session-required actions so a pre-session keystroke can't fire a graph/step command
+  // into a void (the command center has no workflow run / open node).
+  if (c.requiresSession && !state.sessionId) { pushError("“" + c.label + "” needs an active session"); return; }
+  hideKbPalette();
+  dispatchKbCommand(c);
+}
+
+// The dispatch table: maps a backend/UI action tag to a side-effecting handler. Adding a new
+// action means one branch here + one command in commands.rs — the palette lists it automatically.
+function dispatchKbCommand(c) {
+  switch (c.action) {
+    case "model:provider":
+      if (c.arg) onProviderChange(c.arg);
+      return;
+    case "model:set-id": {
+      const id = window.prompt("Executive model id:", $("model-input").value || "");
+      if (id && id.trim()) { $("model-input").value = id.trim(); submitModel(); }
+      return;
+    }
+    case "reasoning:set":
+      if (c.arg) setReasoningLevel(c.arg);
+      return;
+    case "graph:fit":
+      ensureGraphPanel();
+      fitGraph();
+      return;
+    case "graph:reset":
+      ensureGraphPanel();
+      resetGraph();
+      return;
+    case "graph:focus-step":
+      focusGraphStep();
+      return;
+    case "step:rerun":
+      rerunOpenStep("");
+      return;
+    case "step:rerun-feedback": {
+      const fb = window.prompt("Feedback for re-run:") || "";
+      rerunOpenStep(fb);
+      return;
+    }
+    case "view:panels":
+      togglePalette();
+      return;
+    case "panel:toggle":
+      if (c.arg) togglePanel(c.arg);
+      return;
+  }
+}
+
+// Apply a reasoning level from the keyboard. Mirrors renderReasoning's button onclick but without
+// depending on the seg being rendered/visible — works pre-session (persists config) and live.
+function setReasoningLevel(lvl) {
+  if (state.sessionId) {
+    post(`/api/sessions/${state.sessionId}/thinking`, { level: lvl })
+      .then((r) => { state.summary = Object.assign({}, state.summary, r); renderReasoning(state.summary); persistConfig({ thinkingLevel: lvl }); })
+      .catch((e) => pushError("thinking: " + e.message));
+  } else {
+    persistConfig({ thinkingLevel: lvl });
+    renderReasoning({ thinkingLevel: lvl, availableThinkingLevels: THINK_LEVELS, supportsThinking: true });
+  }
+}
+
+// Open the graph panel if it isn't already, then run a callback after the DOM settles. Graph
+// commands are no-ops without the panel mounted (the SVG lives inside it).
+function ensureGraphPanel() {
+  if (!document.querySelector('.panel[data-panel="graph"]')) openPanel("graph");
+}
+
+// Focus a step in the active workflow run: opens the graph panel, picks the first step (or the one
+// already shown in the node drawer), and surfaces its detail. Falls back gracefully when there's
+// no run yet — better a truthful no-op than a fabricated navigation.
+function focusGraphStep() {
+  ensureGraphPanel();
+  const run = state.workflows.get(state.activeWfId) || [...state.workflows.values()][0];
+  if (!run || !run.steps || !run.steps.length) { pushError("no workflow steps to focus"); return; }
+  let step = null;
+  if (state.openNodeDetail) step = run.steps.find((s) => s.id === state.openNodeDetail.stepId);
+  if (!step) step = run.steps.find((s) => s.status === "running") || run.steps[0];
+  showNodeDetail(run, step);
+}
+
+// Re-run the step currently open in the node-detail drawer. Requires the drawer to be open so the
+// palette isn't guessing which step the operator means.
+function rerunOpenStep(feedback) {
+  if (!state.openNodeDetail) { pushError("open a step in the graph first"); return; }
+  const run = state.workflows.get(state.openNodeDetail.runId);
+  if (!run) { pushError("workflow run not found"); return; }
+  const step = run.steps.find((s) => s.id === state.openNodeDetail.stepId);
+  if (!step) { pushError("step not found"); return; }
+  rerunStep(step, feedback);
+}
+
+function togglePanel(name) {
+  if (state.layout.open.includes(name)) unmountPanel(name);
+  else openPanel(name);
 }
 
 /* ---------- profiles ---------- */

@@ -212,6 +212,18 @@
       <button id="brain-float-toggle" class="bf-toggle" title="toggle brain float" aria-label="Toggle stats overlay"><span aria-hidden="true">◆</span></button>
     </div>
 
+    <!-- KEYBOARD COMMAND PALETTE (Ctrl/Cmd+K overlay) -->
+    <div id="kb-palette" class="kb-palette hidden" role="dialog" aria-modal="true" aria-label="Command palette">
+      <div class="kb-palette-card">
+        <div class="kb-palette-bar">
+          <input id="kb-palette-input" class="kb-palette-input" placeholder="command palette — type to filter · ↑↓ navigate · ↵ run · Esc close" autocomplete="off" spellcheck="false" aria-label="Command palette filter" />
+          <span id="kb-palette-hint" class="kb-palette-hint mono dim">Ctrl+K</span>
+        </div>
+        <div id="kb-palette-list" class="kb-palette-list" role="listbox" aria-label="Commands"></div>
+        <div class="kb-palette-foot mono dim">panel · model · reasoning · graph · step · view</div>
+      </div>
+    </div>
+
     <!-- PANEL PALETTE (Ctrl+P overlay) -->
     <div id="palette" class="palette hidden">
       <div class="palette-card">
