@@ -27,6 +27,24 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Maximum number of messages retained in a session's in-memory transcript (`history`). Without
+/// a cap, a long-running session's `history` Vec grows without bound — one Message per turn-round
+/// per tool call — and eventually exhausts memory. The cap is generous (well beyond a typical
+/// multi-agent workflow turn count) and drops the OLDEST entries, keeping the newest context.
+pub const MAX_HISTORY_LEN: usize = 512;
+
+/// Drop-oldest prune: if `history` exceeds `MAX_HISTORY_LEN`, truncate to the newest entries so
+/// the per-session transcript buffer never grows unbounded. Returns the number of entries dropped.
+pub fn prune_history(history: &mut Vec<Message>) -> usize {
+    if history.len() > MAX_HISTORY_LEN {
+        let drop = history.len() - MAX_HISTORY_LEN;
+        history.drain(0..drop);
+        drop
+    } else {
+        0
+    }
+}
+
 /// Test-only hook: deterministic pause between the two `run_turn` lock acquisitions so the
 /// abort-race regression test can call abort() inside that window.
 #[cfg(test)]
@@ -534,6 +552,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             },
         );
         s.history.push(user_msg);
+        prune_history(&mut s.history);
         (
             s.id.clone(),
             s.system_prompt.clone(),
@@ -720,6 +739,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
                 },
             );
             s.history.push(assistant_msg.clone());
+            prune_history(&mut s.history);
         }
 
         // Collect tool calls from this assistant message.
@@ -785,6 +805,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
                     timestamp: now_ms(),
                     response_id: Some(call_id.clone()),
                 });
+                prune_history(&mut s.history);
             }
             tool_results.push(ToolResult {
                 tool_call_id: call_id,
@@ -1274,6 +1295,7 @@ fn finish_error(
         },
     );
     s.history.push(msg.clone());
+    prune_history(&mut s.history);
     emit(
         &s,
         &AgentEvent::TurnEnd {
@@ -1413,6 +1435,56 @@ mod tests {
     /// Serializes the hung-SSE tests below so they don't race on the
     /// process-global `DOTZ_LOCAL_BASE_URL` env var.
     use super::SSE_TEST_LOCK;
+
+    #[test]
+    fn prune_history_caps_at_max_and_keeps_newest() {
+        // A transcript that exceeds MAX_HISTORY_LEN must be truncated to exactly the cap,
+        // keeping the NEWEST entries (drop-oldest) so the most recent context survives.
+        let mut history: Vec<Message> = (0..MAX_HISTORY_LEN + 50)
+            .map(|i| Message::user(&format!("msg-{i}"), i as i64))
+            .collect();
+        let dropped = prune_history(&mut history);
+        assert_eq!(dropped, 50, "should report exactly 50 dropped entries");
+        assert_eq!(history.len(), MAX_HISTORY_LEN, "should be capped at MAX_HISTORY_LEN");
+        // The oldest 50 entries (msg-0 .. msg-49) must be gone; msg-50 must be first.
+        assert_eq!(
+            first_text(&history[0]),
+            "msg-50",
+            "drop-oldest must retain the newest tail, not the head"
+        );
+        // The very last entry must still be the newest one pushed.
+        assert_eq!(first_text(&history[history.len() - 1]), "msg-561");
+    }
+
+    #[test]
+    fn prune_history_noop_when_under_cap() {
+        let mut history: Vec<Message> = vec![Message::user("a", 0), Message::user("b", 1)];
+        let dropped = prune_history(&mut history);
+        assert_eq!(dropped, 0);
+        assert_eq!(history.len(), 2, "under-cap history must be untouched");
+    }
+
+    #[test]
+    fn prune_history_exact_cap_is_noop() {
+        // Exactly at the cap — must NOT drop anything (only > cap triggers pruning).
+        let mut history: Vec<Message> = (0..MAX_HISTORY_LEN)
+            .map(|i| Message::user(&format!("m{i}"), i as i64))
+            .collect();
+        let dropped = prune_history(&mut history);
+        assert_eq!(dropped, 0);
+        assert_eq!(history.len(), MAX_HISTORY_LEN);
+    }
+
+    /// Helper: extract the text of the first Text content block from a Message.
+    fn first_text(m: &Message) -> &str {
+        m.content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("")
+    }
 
     #[test]
     fn turn_guard_clears_flag_on_drop() {
