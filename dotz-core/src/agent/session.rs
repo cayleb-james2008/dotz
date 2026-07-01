@@ -35,14 +35,24 @@ pub const MAX_HISTORY_LEN: usize = 512;
 
 /// Drop-oldest prune: if `history` exceeds `MAX_HISTORY_LEN`, truncate to the newest entries so
 /// the per-session transcript buffer never grows unbounded. Returns the number of entries dropped.
+///
+/// After draining the oldest entries, the remaining history may begin with one or more orphaned
+/// `tool` messages — their preceding assistant (carrying the matching `tool_call`) was just
+/// dropped. `to_openai_messages` would then emit a `tool` message with no preceding assistant
+/// `tool_calls`, which OpenAI-compatible (and Anthropic/Google) APIs reject with a 400, failing
+/// the entire turn. Drop leading `tool` messages so the truncated boundary stays provider-valid.
 pub fn prune_history(history: &mut Vec<Message>) -> usize {
-    if history.len() > MAX_HISTORY_LEN {
-        let drop = history.len() - MAX_HISTORY_LEN;
-        history.drain(0..drop);
-        drop
-    } else {
-        0
+    if history.len() <= MAX_HISTORY_LEN {
+        return 0;
     }
+    let drop = history.len() - MAX_HISTORY_LEN;
+    history.drain(0..drop);
+    let mut orphaned = 0usize;
+    while history.first().map(|m| m.role.as_str()) == Some("tool") {
+        history.remove(0);
+        orphaned += 1;
+    }
+    drop + orphaned
 }
 
 /// Test-only hook: deterministic pause between the two `run_turn` lock acquisitions so the
@@ -1475,6 +1485,123 @@ mod tests {
         let dropped = prune_history(&mut history);
         assert_eq!(dropped, 0);
         assert_eq!(history.len(), MAX_HISTORY_LEN);
+    }
+
+    /// Helper: build an assistant message carrying one tool_call block.
+    fn assistant_with_tool_call(id: &str, ts: i64) -> Message {
+        Message {
+            role: "assistant".into(),
+            content: vec![ContentBlock::ToolCall {
+                id: id.to_string(),
+                name: "bash".to_string(),
+                arguments: json!({}),
+            }],
+            api: None,
+            provider: None,
+            model: None,
+            usage: None,
+            stop_reason: None,
+            error_message: None,
+            timestamp: ts,
+            response_id: None,
+        }
+    }
+
+    /// Helper: build a `tool` result message whose `response_id` carries the tool_call_id.
+    fn tool_result(call_id: &str, text: &str, ts: i64) -> Message {
+        Message {
+            role: "tool".into(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            api: None,
+            provider: None,
+            model: None,
+            usage: None,
+            stop_reason: None,
+            error_message: None,
+            timestamp: ts,
+            response_id: Some(call_id.to_string()),
+        }
+    }
+
+    /// When drop-oldest removes an assistant that carried a `tool_call`, the following `tool`
+    /// result messages become orphaned — they reference a tool_call_id whose assistant is gone.
+    /// `to_openai_messages` would then emit a `tool` message with no preceding assistant
+    /// `tool_calls`, which OpenAI-compatible (and Anthropic/Google) APIs reject with a 400.
+    /// `prune_history` must drop those leading orphaned `tool` messages so the truncated
+    /// boundary stays provider-valid.
+    #[test]
+    fn prune_history_drops_orphaned_tool_messages_at_boundary() {
+        // Build a transcript that starts with: user, assistant(call_1), tool(call_1), user, ...pad...
+        // The drain will remove the user + assistant(call_1), leaving tool(call_1) orphaned at the
+        // front. The repair must drop it so the remaining history starts with a `user` message.
+        let mut history: Vec<Message> = vec![
+            Message::user("first user", 0),
+            assistant_with_tool_call("call_1", 1),
+            tool_result("call_1", "result", 2),
+        ];
+        // Pad with user messages to exceed MAX_HISTORY_LEN so the prune actually fires.
+        for i in 3..(MAX_HISTORY_LEN + 5) {
+            history.push(Message::user(&format!("pad-{i}"), i as i64));
+        }
+        let original = history.len();
+        let dropped = prune_history(&mut history);
+
+        // The history must NOT start with a `tool` message — that would be an orphaned result
+        // whose preceding assistant was drained.
+        assert_ne!(
+            history.first().map(|m| m.role.as_str()),
+            Some("tool"),
+            "prune_history must not leave an orphaned tool message at the front"
+        );
+        // Every remaining `tool` message must have a preceding assistant carrying its tool_call_id.
+        let mut seen_tool_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for m in &history {
+            match m.role.as_str() {
+                "assistant" => {
+                    for b in &m.content {
+                        if let ContentBlock::ToolCall { id, .. } = b {
+                            seen_tool_calls.insert(id.clone());
+                        }
+                    }
+                }
+                "tool" => {
+                    let call_id = m.response_id.as_deref().unwrap_or("");
+                    assert!(
+                        seen_tool_calls.contains(call_id),
+                        "orphaned tool result {call_id} has no preceding assistant tool_call"
+                    );
+                }
+                _ => {}
+            }
+        }
+        // Dropped count includes both the drained entries and the orphaned tool messages.
+        assert_eq!(dropped, original - history.len());
+    }
+
+    /// When the drain leaves a complete assistant + tool-result group at the front (i.e. the
+    /// boundary falls between conversational units), no repair is needed and no extra messages
+    /// are dropped. This guards against the repair over-deleting valid tool messages.
+    #[test]
+    fn prune_history_preserves_tool_group_when_assistant_survives() {
+        let mut history: Vec<Message> = vec![
+            Message::user("first user", 0),
+            assistant_with_tool_call("call_1", 1),
+            tool_result("call_1", "result", 2),
+        ];
+        // Pad so the drain removes only the leading `user` message (total = MAX + 1 → drop = 1),
+        // keeping the assistant + tool group intact at the front.
+        for i in 3..(MAX_HISTORY_LEN + 1) {
+            history.push(Message::user(&format!("pad-{i}"), i as i64));
+        }
+        let dropped = prune_history(&mut history);
+        // The front should now be the assistant(call_1) with its tool(call_1) response following.
+        assert_eq!(history[0].role, "assistant");
+        assert_eq!(history[1].role, "tool");
+        assert_eq!(history[1].response_id.as_deref(), Some("call_1"));
+        // Only one entry (the leading user) was drained; no orphan repair was needed.
+        assert_eq!(dropped, 1);
     }
 
     /// Helper: extract the text of the first Text content block from a Message.
