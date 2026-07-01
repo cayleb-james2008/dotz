@@ -422,8 +422,24 @@ fn write_all(runs: &[WorkflowRun]) {
     if let Some(parent) = file.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(s) = serde_json::to_string_pretty(runs) {
-        let _ = std::fs::write(&file, s);
+    let Ok(s) = serde_json::to_string_pretty(runs) else {
+        return;
+    };
+    // Atomic write: serialize to a sibling temp file in the same directory, then rename over the
+    // destination. `std::fs::write` truncates the target before writing, so a crash mid-write
+    // would leave a truncated `workflows.json` that `read_all` silently drops — permanently
+    // losing every workflow run's history and breaking `startup_resume` (which replays from this
+    // file). The temp-then-rename dance means a crash at worst leaves the previous complete
+    // history intact; the rename is atomic on both Unix and Windows (the std impl uses
+    // MoveFileExW with MOVEFILE_REPLACE_EXISTING). Mirrors `run_record::write_unlocked`.
+    let tmp = file.with_extension("json.tmp");
+    if std::fs::write(&tmp, &s).is_ok() {
+        if std::fs::rename(&tmp, &file).is_err() {
+            // Exotic cross-device / permission edge: fall back to a direct write so the history
+            // is still persisted, accepting the non-atomic window only on that path.
+            let _ = std::fs::write(&file, &s);
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -4090,6 +4106,50 @@ mod tests {
             assert_eq!(s.completed, 1, "one step done after transition");
             assert_eq!(s.ready, 2, "both children ready after parent done");
             assert_eq!(s.pending, 0);
+        });
+    }
+
+    /// `write_all` must atomically persist workflow history via a temp-then-rename so a crash
+    /// mid-write never leaves a truncated `workflows.json` that `read_all` silently drops
+    /// (permanently losing all run history and breaking `startup_resume`). This test verifies
+    /// the round-trip is intact AND that no stale `.tmp` file is left behind after a successful
+    /// write — the observable contract of the atomic-write dance.
+    #[test]
+    fn write_all_is_atomic_and_round_trips_without_leaving_tmp() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![step("scout", "explore", None)];
+            let run = create(
+                None,
+                None,
+                "atomic-write-test".into(),
+                None,
+                3,
+                &inputs,
+                None,
+            )
+            .unwrap();
+
+            // persist() calls write_all() under the hood.
+            persist(&run);
+
+            // The history file must be valid JSON that read_all can parse back.
+            let all = read_all();
+            assert_eq!(all.len(), 1, "persisted run should be readable");
+            assert_eq!(all[0].id, run.id);
+            assert_eq!(all[0].label, "atomic-write-test");
+
+            // No stale .tmp file should remain after a successful atomic rename.
+            let file = workflows_file();
+            let tmp = file.with_extension("json.tmp");
+            assert!(
+                !tmp.exists(),
+                "atomic write must not leave a stale .tmp file after success"
+            );
+
+            // A second persist (upsert path) must also be atomic and leave no .tmp.
+            persist(&run);
+            assert_eq!(read_all().len(), 1, "upsert should not duplicate");
+            assert!(!tmp.exists(), "upsert atomic write must not leave .tmp");
         });
     }
 }
