@@ -1906,7 +1906,7 @@ mod tests {
         let summary = create(CreateOpts {
             model: Some(types::ModelRef {
                 provider: "anthropic".into(),
-                model_id: "claude-3-5-sonnet-latest".into(),
+                model_id: "claude-opus-4-8".into(),
             }),
             ..Default::default()
         })
