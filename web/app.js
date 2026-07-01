@@ -2199,7 +2199,10 @@ function wireGraphPanel(node) {
   node.querySelector("#wf-reset").onclick = resetGraph;
   node.querySelector("#wf-record").onclick = openRunRecord;
   node.querySelector("#wf-replay").onclick = replayActiveRun;
-  node.querySelector("#run-record-close").onclick = () => $("run-record").classList.add("hidden");
+  // run-record-close lives in the global body (the run-record overlay), NOT inside the graph panel
+  // template — scope this lookup to the document, else node.querySelector returns null and the
+  // ".onclick" throws, aborting the rest of wireGraphPanel (incl. refreshWorkflowGraph) on every open.
+  $("run-record-close").onclick = () => $("run-record").classList.add("hidden");
   refreshWorkflowGraph();
 }
 
