@@ -3561,7 +3561,16 @@ function handleSandboxEvent(e) {
     }
     case "sandbox_end": {
       const rec = state.sandbox.runs.get(e.runId);
-      if (rec) { rec.run = e.run; rec.status = e.run.status; }
+      if (rec) {
+        rec.run = e.run;
+        rec.status = e.run.status;
+        // REST-started runs (panel RUN button) never stream sandbox_output lines — the end
+        // event's run record carries the whole captured output, so sync + render it here.
+        if ((e.run.output || "") && rec.output !== e.run.output) {
+          rec.output = e.run.output;
+          if (e.runId === state.sandbox.activeRunId) showRunOutput(rec);
+        }
+      }
       if (e.runId === state.sandbox.activeRunId) {
         const panel = document.querySelector('.panel[data-panel="sandbox"]');
         const st = panel ? panel.querySelector("#sb-status") : $("sb-status");
