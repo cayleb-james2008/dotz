@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dotz-serve",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "-p", "dotz-core", "--bin", "serve"],
+      "port": 4317
+    }
+  ]
+}
