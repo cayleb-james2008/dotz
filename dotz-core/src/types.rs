@@ -409,11 +409,7 @@ pub fn available_models() -> Vec<ModelRef> {
     let fixed: &[(&str, &[&str])] = &[
         (
             "anthropic",
-            &[
-                "claude-3-5-sonnet-latest",
-                "claude-3-opus-latest",
-                "claude-3-5-haiku-latest",
-            ],
+            &["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"],
         ),
         ("openai", &["gpt-4o", "gpt-4o-mini", "o3-mini"]),
         (
