@@ -40,6 +40,40 @@ impl Budget {
                 .max_input_tokens
                 .map_or(false, |max| input_tokens > max)
     }
+
+    /// The highest consumption ratio (0.0..) across whichever of `max_cost`,
+    /// `max_tokens`, and `max_input_tokens` are set. Returns `0.0` when the budget
+    /// is unbounded (no limit on any dimension) — so callers can treat a `0.0`
+    /// result as "no headroom signal to act on".
+    ///
+    /// Unlike `is_exceeded` (a hard boolean at 100%), this gives the runtime a
+    /// *headroom* signal: e.g. `>= 0.8` means "near the cap, downgrade before the
+    /// hard abort fires". Ratios can exceed `1.0` when a limit is already blown
+    /// past (the hard-abort path owns that case); callers comparing against a
+    /// threshold like `0.8` should use a plain `>=`.
+    pub fn fraction_used(&self, cost: f64, input_tokens: u64, output_tokens: u64) -> f64 {
+        let total = input_tokens.saturating_add(output_tokens);
+        let mut max_ratio = 0.0_f64;
+        if let Some(max_cost) = self.max_cost {
+            if max_cost > 0.0 {
+                max_ratio = max_ratio.max(cost / max_cost);
+            }
+        }
+        if let Some(max_tokens) = self.max_tokens {
+            // Guard against the degenerate max_tokens == 0 config.
+            if max_tokens > 0 {
+                max_ratio =
+                    max_ratio.max(total as f64 / max_tokens as f64);
+            }
+        }
+        if let Some(max_input_tokens) = self.max_input_tokens {
+            if max_input_tokens > 0 {
+                max_ratio =
+                    max_ratio.max(input_tokens as f64 / max_input_tokens as f64);
+            }
+        }
+        max_ratio
+    }
 }
 
 pub const THINKING_LEVELS: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
@@ -724,6 +758,77 @@ mod tests {
         assert!(b.is_exceeded(5.0, 600, 10));
         // Cost over, tokens OK, input OK.
         assert!(b.is_exceeded(20.0, 100, 100));
+    }
+
+    #[test]
+    fn budget_fraction_used_unbounded_is_zero() {
+        // No limits set → there is no ratio to compute; 0.0 means "nothing to act on".
+        let b = Budget::default();
+        assert_eq!(b.fraction_used(1_000_000.0, 9_999_999, 9_999_999), 0.0);
+    }
+
+    #[test]
+    fn budget_fraction_used_cost_ratio() {
+        let b = Budget {
+            max_cost: Some(1.0),
+            ..Default::default()
+        };
+        assert_eq!(b.fraction_used(0.8, 0, 0), 0.8);
+        assert_eq!(b.fraction_used(0.5, 0, 0), 0.5);
+        // Exactly at the limit → 1.0 (still not "exceeded" per is_exceeded, but the
+        // headroom signal is maxed).
+        assert_eq!(b.fraction_used(1.0, 0, 0), 1.0);
+        // Already blown past → ratio > 1.0 (the hard-abort path owns this case).
+        assert_eq!(b.fraction_used(1.5, 0, 0), 1.5);
+    }
+
+    #[test]
+    fn budget_fraction_used_tokens_ratio() {
+        let b = Budget {
+            max_tokens: Some(1_000),
+            ..Default::default()
+        };
+        // 400 input + 400 output = 800 total → 0.8.
+        assert_eq!(b.fraction_used(0.0, 400, 400), 0.8);
+        // Input-only counts toward the total-token cap too.
+        assert_eq!(b.fraction_used(0.0, 1_000, 0), 1.0);
+    }
+
+    #[test]
+    fn budget_fraction_used_input_tokens_ratio() {
+        let b = Budget {
+            max_input_tokens: Some(500),
+            ..Default::default()
+        };
+        // 400 of 500 input → 0.8, regardless of output.
+        assert_eq!(b.fraction_used(0.0, 400, 100_000), 0.8);
+    }
+
+    #[test]
+    fn budget_fraction_used_takes_max_across_dims() {
+        // Two limits set; the input-token dim is closer to its cap → that wins.
+        let b = Budget {
+            max_cost: Some(10.0),
+            max_input_tokens: Some(500),
+            ..Default::default()
+        };
+        // cost 5.0/10.0 = 0.5; input 400/500 = 0.8 → max is 0.8.
+        assert_eq!(b.fraction_used(5.0, 400, 0), 0.8);
+        // Flip it: cost dim now closer.
+        assert_eq!(b.fraction_used(9.0, 100, 0), 0.9);
+    }
+
+    #[test]
+    fn budget_fraction_used_zero_max_cost_is_no_signal() {
+        // A degenerate max_cost:Some(0.0) config would otherwise divide by zero;
+        // treat it as "no signal on that dim" rather than +inf.
+        let b = Budget {
+            max_cost: Some(0.0),
+            max_tokens: Some(1_000),
+            ..Default::default()
+        };
+        // 500/1000 total → 0.5; the 0.0 cost dim contributes nothing.
+        assert_eq!(b.fraction_used(100.0, 250, 250), 0.5);
     }
 
     #[test]
