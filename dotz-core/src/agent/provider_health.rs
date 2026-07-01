@@ -31,7 +31,7 @@ pub enum FailKind {
     Timeout,
     /// Stream reset / connection closed mid-stream. Often transient; failover may help.
     StreamInterrupted,
-    /// Anything else (auth, model-not-found, 5xx, ...). Not failover-worthy on its own.
+    /// Anything else (auth, model-not-found, ...). Not failover-worthy on its own.
     Other,
 }
 
@@ -69,6 +69,19 @@ pub fn classify_error(err: &str) -> FailKind {
     }
     if lower.contains("timed out") || lower.contains("timeout") {
         return FailKind::Timeout;
+    }
+    // HTTP 5xx — server-side errors (500/502/503/504). Often transient (provider outage,
+    // overloaded upstream); failover to a different provider may succeed. Reuses
+    // `StreamInterrupted` (already failover-worthy) so a provider-side outage trips failover
+    // instead of failing the task.
+    if contains_status_code(&lower, "500")
+        || contains_status_code(&lower, "502")
+        || contains_status_code(&lower, "503")
+        || contains_status_code(&lower, "504")
+        || lower.contains("service unavailable")
+        || lower.contains("bad gateway")
+    {
+        return FailKind::StreamInterrupted;
     }
     if lower.contains("stream error")
         || lower.contains("connection")
@@ -445,11 +458,37 @@ mod tests {
         assert_eq!(classify_error("broken pipe"), FailKind::StreamInterrupted);
     }
 
+    /// HTTP 5xx and equivalent server-side messages must classify as a failover-worthy kind so
+    /// a provider-side outage trips failover (e.g. OpenRouter 503 → Ollama) instead of failing
+    /// the task. Before the fix, a 5xx fell into `Other` and never triggered failover.
+    #[test]
+    fn classify_error_detects_5xx_as_failover_worthy() {
+        // Numeric status codes via the standalone-token helper.
+        assert_eq!(classify_error("openrouter returned 500: internal server error"), FailKind::StreamInterrupted);
+        assert_eq!(classify_error("openrouter returned 502: bad gateway"), FailKind::StreamInterrupted);
+        assert_eq!(classify_error("openrouter returned 503: service unavailable"), FailKind::StreamInterrupted);
+        // 504 "gateway timeout" contains "timeout" which is checked first → Timeout (still
+        // failover-worthy, so failover trips correctly).
+        assert_eq!(classify_error("openrouter returned 504: gateway timeout"), FailKind::Timeout);
+        // Textual server-side messages without an explicit code.
+        assert_eq!(classify_error("service unavailable"), FailKind::StreamInterrupted);
+        assert_eq!(classify_error("bad gateway"), FailKind::StreamInterrupted);
+        // The failover-worthy invariant the task requires.
+        assert!(
+            classify_error("openrouter returned 503: service unavailable").is_failover_worthy(),
+            "a 503 service unavailable must be failover-worthy"
+        );
+        // A bare numeric body (no status code, no transport keyword) is still Other.
+        assert_eq!(classify_error("14293"), FailKind::Other);
+    }
+
     #[test]
     fn classify_error_falls_back_to_other() {
         assert_eq!(classify_error("returned 401: invalid api key"), FailKind::Other);
         assert_eq!(classify_error("model not found"), FailKind::Other);
-        assert_eq!(classify_error("500 internal server error"), FailKind::Other);
+        // A bare numeric body (e.g. a request id) with no recognizable status code or
+        // transport-error substring must still classify as Other.
+        assert_eq!(classify_error("14293"), FailKind::Other);
     }
 
     /// A status-code substring embedded in the response body detail (a request id, port number,
@@ -459,10 +498,12 @@ mod tests {
     #[test]
     fn classify_error_does_not_match_status_code_substring_in_body() {
         // "429" inside a request id in the response body of a 500 error.
+        // The 500 itself is now failover-worthy (StreamInterrupted), but the point of this
+        // assertion is that the "429" substring inside the body must NOT classify as RateLimit.
         assert_eq!(
             classify_error("openrouter returned 500: {\"request_id\":\"req_14293abc\",\"error\":\"internal\"}"),
-            FailKind::Other,
-            "a 429 substring inside the body must not classify as RateLimit"
+            FailKind::StreamInterrupted,
+            "a 429 substring inside the body must not classify as RateLimit; the 500 status is the real signal"
         );
         // "402" inside a port number in the response body of a 500 error.
         assert_eq!(
