@@ -449,12 +449,44 @@ fn emit_sandbox_event(tx: &broadcast::Sender<Value>, session_id: &str, event: Va
     let _ = tx.send(sandbox_event(session_id, event));
 }
 
+/// The grace window added to the run's timeout when computing the poller deadline. After the
+/// timeout watchdog fires (or the process exits normally) the executor still needs time to kill
+/// the child tree, drain the output pipes, and call `finish()` — the terminal status lands a few
+/// seconds after the timeout itself. 10 s is generous for process teardown on any platform.
+const SANDBOX_POLL_GRACE_MS: u64 = 10_000;
+
+/// The minimum poller deadline, used when the run's timeout is very short or zero. Keeps a
+/// reasonable observation window even for instant-exit runs whose `finish()` may still lag the
+/// `sandbox_start` broadcast by a scheduling tick.
+const SANDBOX_POLL_MIN_DEADLINE_MS: u64 = 30_000;
+
+/// Compute the poller deadline for a sandbox run given its configured timeout. The deadline must
+/// exceed the run's timeout (otherwise a long run finishes after the poller gives up and the UI
+/// never sees `sandbox_end`). We add a grace window for process teardown/output drain and floor at
+/// the minimum so short/zero-timeout runs are still observed. Exposed for unit testing.
+fn sandbox_poll_deadline_ms(timeout_ms: i64) -> u64 {
+    let base = if timeout_ms > 0 {
+        timeout_ms as u64 + SANDBOX_POLL_GRACE_MS
+    } else {
+        SANDBOX_POLL_MIN_DEADLINE_MS
+    };
+    base.max(SANDBOX_POLL_MIN_DEADLINE_MS)
+}
+
 /// Poll a sandbox run until it reaches a terminal status, then broadcast `sandbox_end`. This gives
 /// the UI the run lifecycle events it expects without requiring the executor task to know about
-/// sessions or WebSockets. Bounded by a 30s deadline so a stuck run can't leak the poller.
-fn spawn_sandbox_end_poller(session_id: String, run_id: String, tx: broadcast::Sender<Value>) {
+/// sessions or WebSockets. The deadline scales with the run's `timeout_ms` (plus a grace window)
+/// so a long-timeout run is still observed to completion; a stuck run can't leak the poller past
+/// `timeout_ms + grace`.
+fn spawn_sandbox_end_poller(
+    session_id: String,
+    run_id: String,
+    tx: broadcast::Sender<Value>,
+    timeout_ms: i64,
+) {
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(sandbox_poll_deadline_ms(timeout_ms));
         while tokio::time::Instant::now() < deadline {
             if let Some(run) = crate::sandbox::lookup(&run_id) {
                 if run.status != "running" {
@@ -704,7 +736,7 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                                                 "run": run,
                                             }),
                                         );
-                                        spawn_sandbox_end_poller(sid, run_id, tx);
+                                        spawn_sandbox_end_poller(sid, run_id, tx, timeout_ms);
                                     }
                                     Err(e) => {
                                         emit_sandbox_event(
@@ -1596,6 +1628,50 @@ mod tests {
             Some(p) => std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p),
             None => std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS"),
         }
+    }
+
+    /// `sandbox_poll_deadline_ms` must scale with the run's timeout so a long-timeout run is
+    /// observed to completion instead of the poller giving up at a fixed 30 s and the UI never
+    /// seeing `sandbox_end`. Before the fix the deadline was hardcoded at 30 s, so a run with
+    /// `timeoutMs: 60_000` would finish *after* the poller exited — the sandbox panel hung on
+    /// "running" forever.
+    #[test]
+    fn sandbox_poll_deadline_scales_with_timeout() {
+        // Short timeout: the grace window lifts the deadline above the 30 s floor.
+        assert_eq!(
+            sandbox_poll_deadline_ms(5_000),
+            30_000,
+            "5 s timeout + 10 s grace (15 s) is below the 30 s floor"
+        );
+        // Exactly at the floor boundary: 20 s + 10 s grace = 30 s.
+        assert_eq!(
+            sandbox_poll_deadline_ms(20_000),
+            30_000,
+            "20 s timeout + 10 s grace hits the 30 s floor exactly"
+        );
+        // Long timeout: deadline must exceed the timeout so the poller is still alive when the
+        // run finishes. This is the regression case — the old fixed 30 s deadline would expire
+        // 30 s before a 60 s run completes.
+        let d60 = sandbox_poll_deadline_ms(60_000);
+        assert_eq!(
+            d60, 70_000,
+            "60 s timeout + 10 s grace = 70 s deadline (must exceed the run timeout)"
+        );
+        assert!(d60 > 60_000, "deadline must outlive the run timeout");
+        // Very long timeout: scales linearly, no hidden cap that would re-introduce the bug.
+        let d_h = sandbox_poll_deadline_ms(3_600_000);
+        assert_eq!(d_h, 3_610_000, "1 h timeout + 10 s grace");
+        // Zero / negative (defensive — the WS path always sends > 0): floor at the minimum.
+        assert_eq!(
+            sandbox_poll_deadline_ms(0),
+            SANDBOX_POLL_MIN_DEADLINE_MS,
+            "zero timeout falls back to the minimum deadline"
+        );
+        assert_eq!(
+            sandbox_poll_deadline_ms(-1),
+            SANDBOX_POLL_MIN_DEADLINE_MS,
+            "negative timeout falls back to the minimum deadline"
+        );
     }
 
     /// A `sandbox.start` WebSocket message must create a sandbox run and emit `sandbox_start`
