@@ -179,26 +179,38 @@ fn build_file_tree(cwd: &FsPath, depth: usize) -> Vec<Value> {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
-    let mut result = Vec::new();
+    // Collect + sort entries so the file tree renders in a stable, predictable order
+    // (directories first, then files, alphabetically within each group) instead of the
+    // arbitrary filesystem iteration order, which differs per platform and per call and
+    // makes the operator's file panel jump around on refresh.
+    let mut collected: Vec<(String, std::path::PathBuf, bool)> = Vec::new();
     for ent in entries.flatten() {
         let name = ent.file_name();
-        let name = name.to_string_lossy();
+        let name = name.to_string_lossy().to_string();
         if name == "node_modules" || name == ".git" {
             continue;
         }
-        let full = cwd.join(&*name);
+        let full = cwd.join(&name);
         let ft = match ent.file_type() {
             Ok(ft) => ft,
             Err(_) => continue,
         };
-        if ft.is_dir() {
+        let is_dir = ft.is_dir();
+        if is_dir || ft.is_file() || ft.is_symlink() {
+            collected.push((name, full, is_dir));
+        }
+    }
+    collected.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    let mut result = Vec::new();
+    for (_name, full, is_dir) in collected {
+        if is_dir {
             let children = build_file_tree(&full, depth + 1);
             result.push(json!({
                 "path": full.to_string_lossy(),
                 "type": "dir",
                 "children": children,
             }));
-        } else if ft.is_file() || ft.is_symlink() {
+        } else {
             result.push(json!({
                 "path": full.to_string_lossy(),
                 "type": "file",
@@ -988,5 +1000,66 @@ mod tests {
             let patched = patch_project(Path(id), Some(body)).await.unwrap().0;
             assert_eq!(patched["name"], "renamed");
         });
+    }
+
+    /// `build_file_tree` must return entries in a stable, predictable order: directories
+    /// first, then files, alphabetically within each group. Without sorting the order is the
+    /// filesystem's arbitrary iteration order, which differs per platform and per call and
+    /// makes the operator's file panel jump around on every refresh. Hidden dirs (.git,
+    /// node_modules) must be skipped.
+    #[test]
+    fn build_file_tree_sorts_dirs_before_files_alphabetically() {
+        let dir = std::env::temp_dir().join(format!(
+            "dotz-filetree-sort-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Mix of dirs + files with names that are NOT already in sorted order, so a pass
+        // through an unsorted iterator would produce a different sequence.
+        std::fs::write(dir.join("zebra.txt"), b"").unwrap();
+        std::fs::create_dir_all(dir.join("alpha_dir")).unwrap();
+        std::fs::write(dir.join("mango.rs"), b"").unwrap();
+        std::fs::create_dir_all(dir.join("beta_dir")).unwrap();
+        std::fs::write(dir.join("apple.txt"), b"").unwrap();
+        // Hidden / skipped entries must not appear.
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+
+        let tree = build_file_tree(&dir, 0);
+
+        // Extract (name, type) pairs in output order for assertion clarity.
+        let order: Vec<(String, String)> = tree
+            .iter()
+            .map(|n| {
+                let path = n["path"].as_str().unwrap_or("");
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let ty = n["type"].as_str().unwrap_or("").to_string();
+                (name, ty)
+            })
+            .collect();
+
+        // Directories first (alpha_dir, beta_dir), then files (apple.txt, mango.rs, zebra.txt).
+        assert_eq!(
+            order,
+            vec![
+                ("alpha_dir".into(), "dir".into()),
+                ("beta_dir".into(), "dir".into()),
+                ("apple.txt".into(), "file".into()),
+                ("mango.rs".into(), "file".into()),
+                ("zebra.txt".into(), "file".into()),
+            ],
+            "file tree must be sorted: dirs first, then files, alphabetically within each group"
+        );
+
+        // Skipped dirs must not appear anywhere in the tree.
+        assert!(
+            !order.iter().any(|(n, _)| n == ".git" || n == "node_modules"),
+            ".git and node_modules must be excluded from the file tree"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
