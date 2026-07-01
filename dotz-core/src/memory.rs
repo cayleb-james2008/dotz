@@ -262,6 +262,21 @@ fn list(cwd: Option<&str>) -> Vec<MemoryView> {
     out
 }
 
+/// Maximum number of memory results a single search can return. Bounds the per-scope
+/// `top_k * 2` candidate window so a runaway `topK` (e.g. `1e308` from a REST client,
+/// which saturates to `usize::MAX` as a `usize`) cannot overflow the `top_k * 2`
+/// arithmetic — a debug panic that kills the request task, or a silent wrap in release
+/// that defeats the `take()` bound. 100 is generous for a recall dropdown.
+const MAX_TOP_K: usize = 100;
+
+/// Resolve a caller-supplied `top_k` to a safe value, preserving the default of 8 when
+/// `None` and clamping the upper bound to `MAX_TOP_K`. A `0` is left as-is (an explicit
+/// "return nothing" request). This is the single chokepoint that prevents the
+/// `top_k * 2` overflow in `search`.
+fn clamp_top_k(top_k: Option<usize>) -> usize {
+    top_k.unwrap_or(8).min(MAX_TOP_K)
+}
+
 fn search(
     query: &str,
     cwd: Option<&str>,
@@ -275,7 +290,7 @@ fn search(
         return Ok(vec![]);
     }
     let threshold = threshold.unwrap_or(0.3);
-    let top_k = top_k.unwrap_or(8);
+    let top_k = clamp_top_k(top_k);
     let scopes: Vec<&str> = match scope {
         Some(s) => vec![s],
         None => {
@@ -1043,6 +1058,37 @@ mod tests {
         let a = vec![0.0f32; 4];
         let b = vec![1.0f32, 0.0, 0.0, 0.0];
         assert!(cosine(&a, &b).abs() < 1e-6);
+    }
+
+    /// `clamp_top_k` must preserve the default of 8 for `None`, leave an explicit 0
+    /// untouched (a valid "return nothing" request), and clamp an enormous value
+    /// (e.g. `usize::MAX` from a `topK: 1e308` REST payload that saturates as a
+    /// `usize`) to `MAX_TOP_K`. Without the clamp, `top_k * 2` in `search` overflows
+    /// `usize` — a debug panic that kills the request task.
+    #[test]
+    fn clamp_top_k_prevents_overflow_and_preserves_default() {
+        assert_eq!(clamp_top_k(None), 8, "None must keep the default of 8");
+        assert_eq!(clamp_top_k(Some(0)), 0, "explicit 0 is a valid 'return nothing' request");
+        assert_eq!(clamp_top_k(Some(1)), 1);
+        assert_eq!(clamp_top_k(Some(50)), 50);
+        assert_eq!(
+            clamp_top_k(Some(MAX_TOP_K)),
+            MAX_TOP_K,
+            "exactly MAX_TOP_K is allowed"
+        );
+        assert_eq!(
+            clamp_top_k(Some(MAX_TOP_K + 1)),
+            MAX_TOP_K,
+            "above MAX_TOP_K must be clamped"
+        );
+        assert_eq!(
+            clamp_top_k(Some(usize::MAX)),
+            MAX_TOP_K,
+            "usize::MAX (the saturating-cast result of 1e308) must be clamped, not panic"
+        );
+        // The critical invariant: the clamped value must never overflow when doubled.
+        let clamped = clamp_top_k(Some(usize::MAX));
+        let _ = clamped.checked_mul(2).expect("clamped top_k * 2 must not overflow");
     }
 
     #[test]
