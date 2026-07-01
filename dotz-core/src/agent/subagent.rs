@@ -565,6 +565,7 @@ async fn run_single_agent_inner(
     let ctx = ToolCtx {
         cwd: PathBuf::from(cwd),
         tx: None,
+        run_id: bus.map(|b| b.run_id().to_string()),
     };
 
     // Conversation history (rich Messages, like the executive session).
