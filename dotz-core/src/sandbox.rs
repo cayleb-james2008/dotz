@@ -1746,7 +1746,14 @@ mod tests {
             ("bash", format!("echo '{marker}'; sleep 30"))
         };
 
-        // Drive execute_run in a spawned task so we can kill mid-flight.
+        // Drive execute_run in a spawned task with a broadcast sender so we can observe the
+        // child's stdout line-by-line as it is produced, rather than guessing with a fixed
+        // sleep.  The previous version waited a hard-coded 300ms after the pid appeared and
+        // then killed — which raced PowerShell's slow stdout flush under parallel test load
+        // (the marker had not yet reached the pipe when taskkill /F struck, so the final
+        // record showed only "\n[killed]\n" and the test failed intermittently).  Waiting for
+        // the actual `sandbox_output` event carrying the marker makes the kill deterministic.
+        let (tx, mut rx) = broadcast::channel::<Value>(16);
         let id_for_task = id.clone();
         let run_task = tokio::spawn(async move {
             execute_run(
@@ -1755,27 +1762,41 @@ mod tests {
                 code,
                 60_000, // long timeout so the watchdog doesn't fire first
                 "terminal".to_string(),
-                None,
+                Some(tx),
             )
             .await;
         });
 
-        // Give the child a moment to print the marker line.  We poll the run's pid to know
-        // the child has spawned, then sleep briefly for the echo to land.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if runs_guard().get(&id).and_then(|e| e.pid).is_some() {
-                break;
+        // Wait until the child has actually produced the marker line on its stdout pipe —
+        // observed via the streamed `sandbox_output` event — before issuing the kill.  This
+        // replaces the racy fixed-delay sleep and makes the test deterministic.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut saw_marker = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_output")
+                        && frame
+                            .get("line")
+                            .and_then(|l| l.as_str())
+                            .is_some_and(|l| l.contains(marker))
+                    {
+                        saw_marker = true;
+                        break;
+                    }
+                }
+                // Sender dropped (run finished) or channel closed — fall through to the
+                // assertion below, which will then fail with a clear message.
+                Ok(Err(_)) => break,
+                Err(_) => break,
             }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("child did not spawn within 5s");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        // Allow the echo to be captured.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            saw_marker,
+            "child did not stream the marker within 15s; kill would race stdout flush"
+        );
 
-        // Kill the run mid-execution.
+        // Kill the run mid-execution, now that we know the marker is already in the pipe.
         assert!(
             kill_run_by_id(&id),
             "kill_run_by_id should signal a live run"

@@ -118,13 +118,7 @@ const PLAN_TOOLS: &[&str] = &[
 pub fn is_valid(id: &str) -> bool {
     matches!(
         id,
-        "workflow"
-            | "solo"
-            | "plan"
-            | "frontend"
-            | "backend"
-            | "design"
-            | "new-model-new-project"
+        "workflow" | "solo" | "plan" | "frontend" | "backend" | "design" | "new-model-new-project"
     )
 }
 
