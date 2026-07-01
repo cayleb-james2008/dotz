@@ -443,7 +443,19 @@ async fn execute_run(
         Ok(es) => {
             let code_n = es.code().map(|c| c as i64);
             if killed_by_us {
-                output.push_str(&format!("\n[timeout] killed after {timeout_ms}ms\n"));
+                // Distinguish a manual kill (kill_run_by_id already set status to
+                // "killed" for immediate UI feedback) from a timeout kill (the watchdog
+                // only set killed_by_us; the status is still "running").  Without this
+                // check a manual kill would be mislabelled as a timeout.
+                let already_killed = runs_guard()
+                    .get(&id)
+                    .map(|e| e.run.status == "killed")
+                    .unwrap_or(false);
+                if already_killed {
+                    output.push_str("\n[killed]\n");
+                } else {
+                    output.push_str(&format!("\n[timeout] killed after {timeout_ms}ms\n"));
+                }
                 finish(&id, "killed", None, &cap(&output));
             } else if es.success() {
                 finish(&id, "done", code_n, &cap(&output));
@@ -589,16 +601,27 @@ fn cap(s: &str) -> String {
 
 /// Set the terminal state on a run: status, exitCode, output, endedAt; clear the pid.
 fn finish(id: &str, status: &str, exit_code: Option<i64>, output: &str) {
-    if let Some(e) = runs_guard().get_mut(id) {
-        // Don't clobber a run already moved to a terminal state (e.g. kill raced the timeout).
-        if e.run.status != "running" {
-            return;
+    // All mutations happen inside this block so the runs mutex guard is dropped before
+    // prune_finished_runs() re-locks it (std::sync::Mutex is not reentrant).
+    {
+        let mut guard = runs_guard();
+        if let Some(e) = guard.get_mut(id) {
+            // Don't clobber a run already moved to a terminal state (e.g. kill raced the
+            // timeout).  A manual kill (kill_run_by_id) already set the terminal state and
+            // a "[killed]" marker for immediate UI feedback — but the exit path's collected
+            // stdout/stderr would be silently lost without writing it here.
+            if e.run.status != "running" {
+                if !output.is_empty() {
+                    e.run.output = output.to_string();
+                }
+            } else {
+                e.run.status = status.to_string();
+                e.run.exit_code = exit_code;
+                e.run.output = output.to_string();
+                e.run.ended_at = Some(now_ms());
+                e.pid = None;
+            }
         }
-        e.run.status = status.to_string();
-        e.run.exit_code = exit_code;
-        e.run.output = output.to_string();
-        e.run.ended_at = Some(now_ms());
-        e.pid = None;
     }
     // A run just became terminal — sweep oldest finished runs so the store stays bounded.
     prune_finished_runs();
@@ -1515,5 +1538,118 @@ mod tests {
             let mut store = runs_guard();
             store.remove(&id);
         }
+    }
+
+    /// When a sandbox run is manually killed mid-execution, the child's captured stdout/stderr
+    /// must survive in the final run record.  Before the fix, `kill_run_by_id` set the terminal
+    /// state (status="killed", output="\n[killed]\n") for immediate UI feedback, and the later
+    /// `execute_run` exit path's `finish()` was a no-op (status already terminal), so the actual
+    /// process output was silently lost — the run record showed only "\n[killed]\n".
+    ///
+    /// This test starts a real `execute_run` that prints a marker line then sleeps, kills it
+    /// after the marker has been produced, waits for `execute_run` to finish, and asserts the
+    /// final record contains BOTH the marker AND the "[killed]" marker — not just the latter.
+    #[tokio::test]
+    async fn manual_kill_preserves_child_output_in_final_record() {
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut store = runs_guard();
+            store.insert(
+                id.clone(),
+                RunEntry {
+                    run: SandboxRun {
+                        id: id.clone(),
+                        project_id: None,
+                        language: "bash".to_string(),
+                        code: String::new(),
+                        status: "running".to_string(),
+                        output: String::new(),
+                        exit_code: None,
+                        started_at: now_ms(),
+                        ended_at: None,
+                    },
+                    pid: None,
+                    killed_by_us: false,
+                    mode: "terminal".to_string(),
+                    port: None,
+                },
+            );
+        }
+
+        // Print a unique marker immediately, then sleep long enough for the kill to arrive
+        // mid-execution.  The marker is what we assert survives in the final output.
+        let marker = "dotz-kill-output-survives";
+        let (language, code) = if cfg!(windows) {
+            (
+                "powershell",
+                format!("Write-Output '{marker}'; Start-Sleep -Seconds 30"),
+            )
+        } else {
+            ("bash", format!("echo '{marker}'; sleep 30"))
+        };
+
+        // Drive execute_run in a spawned task so we can kill mid-flight.
+        let id_for_task = id.clone();
+        let run_task = tokio::spawn(async move {
+            execute_run(
+                id_for_task,
+                language.to_string(),
+                code,
+                60_000, // long timeout so the watchdog doesn't fire first
+                "terminal".to_string(),
+                None,
+            )
+            .await;
+        });
+
+        // Give the child a moment to print the marker line.  We poll the run's pid to know
+        // the child has spawned, then sleep briefly for the echo to land.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if runs_guard().get(&id).and_then(|e| e.pid).is_some() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("child did not spawn within 5s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Allow the echo to be captured.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Kill the run mid-execution.
+        assert!(
+            kill_run_by_id(&id),
+            "kill_run_by_id should signal a live run"
+        );
+
+        // Wait for execute_run to finish reaping the child and writing the final record.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), run_task).await;
+
+        // The final run record must contain BOTH the child's actual output AND the
+        // "[killed]" marker — not just the latter.
+        let final_output = {
+            let store = runs_guard();
+            store
+                .get(&id)
+                .map(|e| e.run.output.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            final_output.contains(marker),
+            "final output must preserve the child's stdout marker, got: {final_output}"
+        );
+        assert!(
+            final_output.contains("[killed]"),
+            "final output must contain the [killed] marker, got: {final_output}"
+        );
+        // The timeout message must NOT appear — this was a manual kill, not a timeout.
+        assert!(
+            !final_output.contains("[timeout]"),
+            "manual kill must not be mislabelled as a timeout, got: {final_output}"
+        );
+
+        // Clean up the process-global store.
+        remove_test_run(&id);
     }
 }
