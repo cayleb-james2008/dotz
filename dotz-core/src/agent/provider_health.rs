@@ -200,8 +200,22 @@ pub fn effective_model(pair: &FailoverPair, primary_healthy: bool) -> (String, S
 /// :free tier that 429s twice in a row is almost certainly saturated, and we want fast failover.
 const DEGRADE_THRESHOLD: u32 = 2;
 /// After a provider is degraded, allow a single probe call to it after this cooldown. If the probe
-/// succeeds, the provider recovers. Long enough to let a rate-limit window pass.
+/// succeeds, the provider recovers. Long enough to let a rate-limit window pass. Overridable for
+/// tests via `DOTZ_RECOVERY_COOLDOWN_MS` (clamped to [0, 1h]); defaults to 60s.
 const RECOVERY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Resolve the recovery cooldown, honoring the `DOTZ_RECOVERY_COOLDOWN_MS` override (mainly for
+/// tests that need to exercise the probe path without waiting a real minute). Mirrors the
+/// `ws_ping_interval` env-override pattern in `agent::mod`.
+fn recovery_cooldown() -> Duration {
+    const MAX_MS: u64 = 3_600_000; // 1 hour
+    std::env::var("DOTZ_RECOVERY_COOLDOWN_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .filter(|d| d.as_millis() <= MAX_MS as u128)
+        .unwrap_or(RECOVERY_COOLDOWN)
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -291,6 +305,15 @@ pub async fn record_failure(provider: &str, error: &str) -> HealthStatus {
             h.status = HealthStatus::Degraded;
             h.degraded_at = Some(now_ms());
             transitioned = true;
+        } else if h.status == HealthStatus::Degraded {
+            // A failover-worthy failure while already degraded (most importantly: a recovery
+            // probe that found the primary STILL down) must restart the recovery cooldown.
+            // Without this, the original `degraded_at` stays frozen at the first degradation,
+            // the cooldown stays "elapsed", and `resolve_effective_model` routes EVERY
+            // subsequent call to the primary as a probe — permanently abandoning the backup
+            // even though the primary is still broken. Refreshing the timestamp sends the next
+            // call back to the backup until another cooldown window passes.
+            h.degraded_at = Some(now_ms());
         }
     }
     // A non-failover-worthy error (401/404/4xx) does NOT reset the consecutive counter — the
@@ -336,7 +359,7 @@ pub async fn resolve_effective_model(
                 .and_then(|h| h.degraded_at)
                 .map(|at| {
                     let elapsed = Duration::from_millis((now_ms() - at).max(0) as u64);
-                    elapsed >= RECOVERY_COOLDOWN
+                    elapsed >= recovery_cooldown()
                 })
                 .unwrap_or(false)
         };
@@ -615,6 +638,65 @@ mod tests {
             resolve_effective_model(primary_provider, primary_model).await.unwrap();
         assert_eq!(prov, primary_provider);
         assert_eq!(model, "nex-agi/nex-n2-pro:free");
+        reset().await;
+    }
+
+    /// A failed recovery probe must restart the cooldown so the NEXT call goes back to the
+    /// backup instead of permanently hammering the (still-dead) primary. Before the fix,
+    /// `degraded_at` was frozen at the first degradation, so once the cooldown elapsed every
+    /// subsequent call was routed to the primary as a probe — the backup was abandoned even
+    /// though the primary never recovered.
+    #[tokio::test]
+    async fn failed_probe_restarts_cooldown_and_routes_back_to_backup() {
+        let _guard = HEALTH_TEST_LOCK.lock().await;
+        reset().await;
+
+        // Use a tiny cooldown so the probe path is exercisable without a real 60s wait.
+        // Save/restore the env var; HEALTH_TEST_LOCK serializes these tests so no other test
+        // sees the override.
+        let prev = std::env::var("DOTZ_RECOVERY_COOLDOWN_MS").ok();
+        std::env::set_var("DOTZ_RECOVERY_COOLDOWN_MS", "400");
+
+        let primary_provider = "test-failed-probe-provider";
+        let primary_model = "nex-agi/nex-n2-pro:free";
+
+        // Degrade the primary with two consecutive failover-worthy failures.
+        record_failure(primary_provider, "returned 429: rate limit").await;
+        record_failure(primary_provider, "returned 429: rate limit").await;
+        assert!(is_degraded(primary_provider).await);
+
+        // Immediately (cooldown NOT elapsed) → backup, not a probe.
+        let (prov, _, probe) =
+            resolve_effective_model(primary_provider, primary_model).await.unwrap();
+        assert_eq!(prov, "ollama", "before cooldown the call must go to the backup");
+        assert!(!probe);
+
+        // Wait for the cooldown to elapse → the next call is a probe to the primary.
+        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+        let (prov, _, probe) =
+            resolve_effective_model(primary_provider, primary_model).await.unwrap();
+        assert_eq!(prov, primary_provider, "after cooldown the call must probe the primary");
+        assert!(probe);
+
+        // The probe FAILS — the primary is still down. This must restart the cooldown.
+        record_failure(primary_provider, "returned 429: rate limit").await;
+
+        // Immediately after the failed probe (cooldown just restarted) → backup, NOT primary.
+        // Without the fix this would return the primary (probe) again, permanently abandoning
+        // the backup.
+        let (prov, _, probe) =
+            resolve_effective_model(primary_provider, primary_model).await.unwrap();
+        assert_eq!(
+            prov, "ollama",
+            "a failed probe must route the next call back to the backup, got {prov}"
+        );
+        assert!(!probe, "the next call after a failed probe must not be another probe");
+
+        // Restore env + state.
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_RECOVERY_COOLDOWN_MS", p),
+            None => std::env::remove_var("DOTZ_RECOVERY_COOLDOWN_MS"),
+        }
         reset().await;
     }
 
