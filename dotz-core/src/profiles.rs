@@ -69,6 +69,26 @@ const BACKEND_DOMAIN: &str = "\n\n## Domain: back-end, data & infra\nPrefer bori
 /// render time with the resolved design-systems dir, matching profiles.ts's interpolation.
 const DESIGN_DOMAIN: &str = "\n\n## Domain: graphic & visual design — Open Design (native to dotz)\ndotz ships Open Design natively. For ANY graphic/design artifact (UI, landing page, poster, logo, brand, deck, social card, illustration):\n\n1. PICK a design system. 150+ are bundled at {SYS}/<slug>/ (e.g. stripe, linear, apple, notion, vercel, figma). READ that system's DESIGN.md and tokens.css FIRST and honor its tokens — never invent off-brand colors/spacing. Browse them in the DESIGN panel or via GET /api/design/systems.\n2. USE design skills. 150+ Open Design skills are in the skill pool (source: design) — load the relevant one with the `skill` tool (e.g. canvas-design, brand-guidelines, ad-creative, article-magazine, algorithmic-art).\n3. AUTHOR a real, self-contained HTML/CSS artifact: paste the chosen system's :root tokens FIRST, then build everything with var(...). Avoid AI-slop (no purple gradients, fake glassmorphism, generic SaaS cards); meet WCAG contrast, real focus states, 44px touch targets.\n4. PREVIEW & EXPORT in the DESIGN panel — render the artifact, then export HTML or PDF.";
 
+/// The "New Model, New Project" domain doctrine (NEW-MODEL-NEW-PROJECT profile). Appended to
+/// WORKFLOW_DOCTRINE: one-line idea in, a complete open-source repo shipped to GitHub out.
+const NEW_MODEL_NEW_PROJECT_DOMAIN: &str = r#"
+
+## Domain: New Model, New Project — one line in, a shipped GitHub repo out
+
+You are the star of a build-in-one-session open-source series. The user gives ONE line — a project idea — and you autonomously PLAN -> BUILD -> TEST -> PUBLISH a complete, genuinely-useful app to a NEW public GitHub repo. Own the entire arc; do not stop to ask unless you are truly blocked (a missing capability, or a real safety/scope ambiguity). Choose an execution that lets a strong model shine — whole-repo reasoning and long-horizon build/verify/repair, the kind of work a weaker model fumbles.
+
+HARD CONSTRAINTS (non-negotiable): GitHub-only — the app must run from a fresh `git clone`. Allowed shapes: CLI, library, desktop (GitHub Releases), browser/VS Code extension, static SPA (GitHub Pages). NOT allowed: anything that needs a server you host or a managed database. MIT licensed. Keep CI green from the first commit. If the app calls a model at runtime it is bring-your-own-key — never commit a key.
+
+PIPELINE — decompose and disperse via the `subagent` tool; run an adversarial reviewer before you claim done:
+1. PLAN — from the one-liner, pick an UNUSED mythological codename (check the pool + used list in C:/Users/Cayleb/Desktop/workspace/projects/NewModelNewProjectSeries/pantheon/README.md and the existing day*- folders) and a kebab slug; choose the stack honoring the GitHub-only rule; determine the next episode number N (highest existing dayN + 1). Use the currently-configured executive model id as the model tag.
+2. SCAFFOLD — run the pantheon generator through `bash` (it creates the folder in the series conventions, git-inits with a repo-local identity, tags episode/N, and creates + pushes the public GitHub repo):
+   powershell -ExecutionPolicy Bypass -File C:/Users/Cayleb/Desktop/workspace/projects/NewModelNewProjectSeries/pantheon/scripts/new-episode.ps1 -Codename <codename> -Episode <N> -Model "<exec-model>" -Serve "Ollama Cloud" -Slug "<slug>" -Idea "<idea>" -DevPort 8090 -UpdateHub
+3. BUILD — cd into the created day<N>-<model>-<codename> folder, read its AGENTS.md, and implement the app to that file's definition of done. Disperse independent parts to worker subagents in parallel; you stay the orchestrator.
+4. TEST — run the project's real build/tests, replace the generic CI with real build/test steps for the stack and keep it green, then spawn a reviewer subagent to hunt bugs and missed requirements and treat its findings as required work.
+5. PUBLISH — commit with `rsi:` / `fix(scope):` prefixes and push to the origin the scaffolder created; confirm the live GitHub URL and that a fresh clone follows the README quickstart.
+
+`gh` and the PowerShell scaffolder are invoked through `bash` (they are not wrapped tools). Never run destructive git/gh (force-push, repo delete) without the operator. When the ship checklist passes, report the repo URL and a one-paragraph recap."#;
+
 /// A profile's id, default tool allowlist, and doctrine — the runtime needs the doctrine + tools.
 pub struct Profile {
     pub id: &'static str,
@@ -98,7 +118,13 @@ const PLAN_TOOLS: &[&str] = &[
 pub fn is_valid(id: &str) -> bool {
     matches!(
         id,
-        "workflow" | "solo" | "plan" | "frontend" | "backend" | "design"
+        "workflow"
+            | "solo"
+            | "plan"
+            | "frontend"
+            | "backend"
+            | "design"
+            | "new-model-new-project"
     )
 }
 
@@ -135,6 +161,12 @@ pub fn get(id: Option<&str>) -> Profile {
             workflow: true,
             tools: None,
         },
+        "new-model-new-project" => Profile {
+            id: "new-model-new-project",
+            thinking_level: "high",
+            workflow: true,
+            tools: None,
+        },
         _ => Profile {
             id: "workflow",
             thinking_level: "high",
@@ -156,6 +188,7 @@ pub fn doctrine(id: &str, design_systems_dir: &str) -> String {
             "{WORKFLOW_DOCTRINE}{}",
             DESIGN_DOMAIN.replace("{SYS}", design_systems_dir)
         ),
+        "new-model-new-project" => format!("{WORKFLOW_DOCTRINE}{NEW_MODEL_NEW_PROJECT_DOMAIN}"),
         _ => WORKFLOW_DOCTRINE.to_string(),
     }
 }
@@ -223,6 +256,14 @@ pub fn summaries() -> Vec<ProfileSummary> {
             thinking_level: "high",
             model: m(),
         },
+        ProfileSummary {
+            id: "new-model-new-project",
+            name: "NEW MODEL NEW PROJECT",
+            tagline: "One line in → plan · build · test · shipped to GitHub",
+            workflow: true,
+            thinking_level: "high",
+            model: m(),
+        },
     ]
 }
 
@@ -232,7 +273,15 @@ mod tests {
 
     #[test]
     fn is_valid_accepts_known_profiles() {
-        for id in ["workflow", "solo", "plan", "frontend", "backend", "design"] {
+        for id in [
+            "workflow",
+            "solo",
+            "plan",
+            "frontend",
+            "backend",
+            "design",
+            "new-model-new-project",
+        ] {
             assert!(is_valid(id), "{id} should be valid");
         }
     }
