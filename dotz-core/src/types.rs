@@ -411,16 +411,13 @@ pub fn available_models() -> Vec<ModelRef> {
             "anthropic",
             &["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"],
         ),
-        ("openai", &["gpt-4o", "gpt-4o-mini", "o3-mini"]),
-        (
-            "google",
-            &["gemini-1.5-pro-latest", "gemini-1.5-flash-latest"],
-        ),
-        ("groq", &["llama-3.3-70b-versatile", "mixtral-8x7b-32768"]),
+        ("openai", &["gpt-5.5", "gpt-5.4-mini", "gpt-5.1"]),
+        ("google", &["gemini-3.1-pro", "gemini-3.5-flash"]),
+        ("groq", &["openai/gpt-oss-120b", "openai/gpt-oss-20b"]),
         ("mistral", &["mistral-large-latest", "mistral-small-latest"]),
-        ("xai", &["grok-2-1212", "grok-2-vision-1212"]),
+        ("xai", &["grok-4.3", "grok-build-0.1"]),
         ("deepseek", &["deepseek-chat", "deepseek-reasoner"]),
-        ("cohere", &["command-r", "command-r-plus"]),
+        ("cohere", &["command-a-plus-05-2026", "command-a-03-2025"]),
     ];
     for (provider, ids) in fixed {
         for id in *ids {
