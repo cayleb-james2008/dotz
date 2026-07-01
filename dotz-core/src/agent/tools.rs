@@ -259,14 +259,25 @@ impl Tool for BashTool {
         let cwd = ctx.cwd.clone();
         let timeout = bash_timeout();
 
-        let mut c = if cfg!(windows) {
-            let mut c = tokio::process::Command::new("cmd");
-            c.arg("/C").arg(&cmd);
-            c
-        } else {
-            let mut c = tokio::process::Command::new("sh");
-            c.arg("-c").arg(&cmd);
-            c
+        let mut c = {
+            #[cfg(windows)]
+            {
+                let mut c = tokio::process::Command::new("cmd");
+                c.arg("/C").arg(&cmd);
+                c
+            }
+            #[cfg(not(windows))]
+            {
+                // Build a std Command so we can place the child in its own process group
+                // (tokio's Command doesn't expose process_group). The group lets a timeout
+                // tree-kill the shell AND every descendant (cargo/npm/sleep …) with
+                // `kill -9 -<pgrp>`. Without this, `start_kill` only terminates the shell
+                // and leaves the real workload running as an orphan that keeps consuming CPU.
+                use std::os::unix::process::CommandExt;
+                let mut sc = std::process::Command::new("sh");
+                sc.arg("-c").arg(&cmd).process_group(0);
+                tokio::process::Command::from(sc)
+            }
         };
         c.current_dir(&cwd);
         #[cfg(windows)]
@@ -306,9 +317,37 @@ impl Tool for BashTool {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err(format!("exec: {e}")),
             Err(_) => {
-                let _ = child.start_kill();
-                // Reap the killed child so it does not become a zombie (Unix) or leak a process
-                // handle (Windows) after the timeout path returns.
+                // Tree-kill the child AND its descendants so a timed-out
+                // `cargo test` / `npm run build` does not leak orphaned processes
+                // that keep consuming CPU. `start_kill` only terminates the direct
+                // child (the shell), leaving the spawned workload alive.
+                //
+                // Windows: `taskkill /PID <pid> /T /F` kills the whole process tree
+                // (matching the sandbox's kill_pid).  POSIX: the child was placed in
+                // its own process group at spawn, so `kill -9 -<pgrp>` reaps the
+                // entire group — shell + every descendant.
+                #[cfg(windows)]
+                {
+                    if let Some(pid) = child.id() {
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/PID", &pid.to_string(), "/T", "/F"])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn();
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    if let Some(pid) = child.id() {
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &format!("-{pid}")])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn();
+                    }
+                }
+                // Reap the killed child so it does not become a zombie (Unix) or
+                // leak a process handle (Windows) after the timeout path returns.
                 let _ = child.wait().await;
                 return Err(format!("[timeout] killed after {}ms", timeout.as_millis()));
             }
@@ -988,7 +1027,10 @@ mod tests {
         let command = if cfg!(windows) {
             "ping -n 3 127.0.0.1".to_string()
         } else {
-            format!("echo $$ > {} ; sleep 30", pidfile.to_string_lossy())
+            // Spawn `sleep 30` as a background child of the shell, write its PID to
+            // the pidfile, then `wait` so the shell stays alive until the timeout.
+            // The tree-kill must reach this `sleep` child, not just the shell.
+            format!("sleep 30 & echo $! > {} ; wait", pidfile.to_string_lossy())
         };
 
         let mut registry = ToolRegistry::new();
@@ -1016,6 +1058,11 @@ mod tests {
 
         #[cfg(unix)]
         {
+            // The pidfile holds the PID of the `sleep 30` background child (not the
+            // shell). The old `start_kill` only killed the shell, leaving this child
+            // running as an orphan; the process-group tree-kill must reach it too.
+            // Give the tree-kill a moment to propagate before checking.
+            std::thread::sleep(std::time::Duration::from_millis(200));
             let pid_text = std::fs::read_to_string(&pidfile).unwrap_or_default();
             let pid: i32 = pid_text.trim().parse().unwrap_or(-1);
             assert!(pid > 0, "test should have captured a valid child pid");
