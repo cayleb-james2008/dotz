@@ -1118,17 +1118,43 @@ fn apply_subagent_delta(msg: &mut super::event::Message, delta: StreamDelta) {
                 });
             }
         }
-        StreamDelta::ToolCallArgs { json: frag, .. } => {
-            // Try to find the most recent tool call without arguments and update it.
-            if let Some(last) = msg
+        StreamDelta::ToolCallArgs { index, json: frag } => {
+            // Providers stream tool-call arguments as partial JSON fragments (e.g.
+            // `{"path": "/sr` then `c/main.rs"}`). Parsing each fragment independently
+            // always fails for partial JSON, so the previous code left `arguments`
+            // permanently `{}` — the `subagent_progress` partial snapshot showed every
+            // tool call with empty arguments, defeating the live inspector.
+            //
+            // Fix: buffer the raw fragment string in the `arguments` field (as a
+            // `Value::String` while accumulating) and try to parse the accumulated
+            // buffer each time, replacing with the parsed value when complete. The
+            // `index` maps to the Nth ToolCall content block (ToolCallStart pushes
+            // them in index order), which is more reliable than the old "find the
+            // most recent empty-args tool call" heuristic that broke when multiple
+            // tool calls were streamed concurrently.
+            let tc_indices: Vec<usize> = msg
                 .content
-                .iter_mut()
-                .rev()
-                .find(|b| matches!(b, ContentBlock::ToolCall { arguments, .. } if arguments.is_object() && arguments.as_object().map_or(false, |m| m.is_empty())))
-            {
-                if let ContentBlock::ToolCall { arguments, .. } = last {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&frag) {
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| matches!(b, ContentBlock::ToolCall { .. }).then_some(i))
+                .collect();
+            let block_idx = tc_indices
+                .get(index)
+                .copied()
+                .or_else(|| tc_indices.last().copied());
+            if let Some(bi) = block_idx {
+                if let ContentBlock::ToolCall { arguments, .. } = &mut msg.content[bi] {
+                    let buf = match arguments {
+                        Value::String(s) => {
+                            s.push_str(&frag);
+                            s.clone()
+                        }
+                        _ => frag.clone(),
+                    };
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
                         *arguments = parsed;
+                    } else {
+                        *arguments = Value::String(buf);
                     }
                 }
             }
@@ -2896,5 +2922,137 @@ mod tests {
 
         assert!(dispose(&sid), "dispose must succeed after lock poison");
         assert!(get(&sid).is_none(), "session must be removed after dispose");
+    }
+
+    /// `apply_subagent_delta` must accumulate streamed tool-call argument fragments
+    /// into the final parsed JSON, not try to parse each fragment independently.
+    /// Providers stream arguments as partial JSON (e.g. `{"path": "/sr` then
+    /// `c/main.rs"}`); the old code `serde_json::from_str`'d each fragment alone,
+    /// which always failed and left `arguments` permanently `{}` — the
+    /// `subagent_progress` partial snapshot showed every tool call with empty
+    /// arguments, defeating the live inspector.
+    #[test]
+    fn apply_subagent_delta_accumulates_streamed_tool_call_args() {
+        let mut msg = Message::assistant_shell("subagent", "subagent", 0);
+
+        // ToolCallStart for index 0.
+        apply_subagent_delta(
+            &mut msg,
+            StreamDelta::ToolCallStart {
+                index: 0,
+                id: "call_1".into(),
+                name: "read_file".into(),
+            },
+        );
+        // Stream the arguments in three partial-JSON fragments.
+        apply_subagent_delta(
+            &mut msg,
+            StreamDelta::ToolCallArgs {
+                index: 0,
+                json: "{\"path\": ".into(),
+            },
+        );
+        // After the first fragment the buffer is not valid JSON yet — arguments
+        // must be the raw string buffer, not {} (the old bug).
+        let tc = msg
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolCall { arguments, .. } => Some(arguments.clone()),
+                _ => None,
+            })
+            .expect("tool call block should exist");
+        assert_ne!(
+            tc, json!({}),
+            "arguments must not stay {{}} after a partial fragment — the old bug"
+        );
+
+        apply_subagent_delta(
+            &mut msg,
+            StreamDelta::ToolCallArgs {
+                index: 0,
+                json: "\"/src/main.rs\"".into(),
+            },
+        );
+        // Still not complete (missing closing brace).
+        apply_subagent_delta(
+            &mut msg,
+            StreamDelta::ToolCallArgs {
+                index: 0,
+                json: "}".into(),
+            },
+        );
+
+        // Now the accumulated buffer `{"path": "/src/main.rs"}` is valid JSON.
+        let tc = msg
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolCall { arguments, .. } => Some(arguments.clone()),
+                _ => None,
+            })
+            .expect("tool call block should exist");
+        assert_eq!(
+            tc,
+            json!({ "path": "/src/main.rs" }),
+            "streamed argument fragments must accumulate into the parsed JSON value"
+        );
+    }
+
+    /// `apply_subagent_delta` must route argument fragments to the correct tool
+    /// call block by `index` when multiple tool calls are streamed, not blindly
+    /// update the most recent empty-args one.
+    #[test]
+    fn apply_subagent_delta_routes_args_by_index_for_concurrent_tool_calls() {
+        let mut msg = Message::assistant_shell("subagent", "subagent", 0);
+
+        // Two tool calls started in index order.
+        apply_subagent_delta(
+            &mut msg,
+            StreamDelta::ToolCallStart {
+                index: 0,
+                id: "call_a".into(),
+                name: "read_file".into(),
+            },
+        );
+        apply_subagent_delta(
+            &mut msg,
+            StreamDelta::ToolCallStart {
+                index: 1,
+                id: "call_b".into(),
+                name: "write_file".into(),
+            },
+        );
+        // Stream args for index 1 first (interleaved), then index 0.
+        apply_subagent_delta(
+            &mut msg,
+            StreamDelta::ToolCallArgs {
+                index: 1,
+                json: "{\"path\": \"/b.txt\"}".into(),
+            },
+        );
+        apply_subagent_delta(
+            &mut msg,
+            StreamDelta::ToolCallArgs {
+                index: 0,
+                json: "{\"path\": \"/a.txt\"}".into(),
+            },
+        );
+
+        let tool_calls: Vec<(String, Value)> = msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolCall { id, arguments, .. } => {
+                    Some((id.clone(), arguments.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].0, "call_a");
+        assert_eq!(tool_calls[0].1, json!({ "path": "/a.txt" }));
+        assert_eq!(tool_calls[1].0, "call_b");
+        assert_eq!(tool_calls[1].1, json!({ "path": "/b.txt" }));
     }
 }
