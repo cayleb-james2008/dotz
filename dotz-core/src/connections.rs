@@ -188,7 +188,13 @@ fn parse_github(r: &CmdResult) -> Parsed {
 
 /// Equivalent of /account\s+([A-Za-z0-9-]+)/i — find "account" then the next run of [A-Za-z0-9-].
 fn extract_account(out: &str) -> Option<String> {
-    let lower = out.to_lowercase();
+    // Use to_ascii_lowercase (not to_lowercase) so the lowercased string has the SAME byte
+    // length as `out`. to_lowercase can change the byte length of non-ASCII characters (e.g.
+    // 'İ' U+0130 → 'i̇' U+0069+U+0307, 2 bytes → 3 bytes), which would misalign the byte
+    // indices computed on `lower` when they are used to index into `out.as_bytes()` below —
+    // silently missing or misreading the account name. "account" is an ASCII keyword and
+    // `gh auth status` output is ASCII, so ASCII case-insensitive matching is correct here.
+    let lower = out.to_ascii_lowercase();
     let mut search_from = 0usize;
     while let Some(rel) = lower[search_from..].find("account") {
         let kw_start = search_from + rel;
@@ -405,6 +411,28 @@ mod tests {
         // "accountable" should not match because there's no whitespace after "account".
         let out = "Accountable behavior is required";
         assert_eq!(extract_account(out), None);
+    }
+
+    /// `extract_account` searches for the ASCII keyword "account" in a lowercased copy of
+    /// the output, then uses those byte indices to read the account token from the ORIGINAL
+    /// string. The old code used `to_lowercase()`, which can change the byte length of
+    /// non-ASCII characters (e.g. 'İ' U+0130 → 'i̇' U+0069+U+0307, 2 bytes → 3 bytes). When
+    /// such a character appears before "account" in `gh auth status` output, the byte
+    /// indices computed on the lowercased string are misaligned with the original, and the
+    /// account name is silently missed. `to_ascii_lowercase()` preserves byte length so the
+    /// indices stay valid.
+    #[test]
+    fn extract_account_handles_non_ascii_before_keyword() {
+        // 'İ' (U+0130) lowercases to a 3-byte sequence under to_lowercase but is unchanged
+        // (2 bytes) under to_ascii_lowercase. Placing it before "account" triggers the
+        // misalignment: with to_lowercase the post-keyword index points into the middle of
+        // "foo-bar" (not the space), so the account is missed.
+        let out = "İ account foo-bar";
+        assert_eq!(
+            extract_account(out),
+            Some("foo-bar".into()),
+            "non-ASCII before 'account' must not misalign the byte index"
+        );
     }
 
     #[test]
