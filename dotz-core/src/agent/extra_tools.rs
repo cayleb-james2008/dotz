@@ -312,14 +312,15 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
         .unwrap_or_else(|| default_gate_command(&cwd));
     let timeout = gate_timeout();
 
-    let (program, args): (&str, Vec<String>) = if cfg!(windows) {
-        ("cmd", vec!["/C".into(), command.clone()])
-    } else {
-        ("sh", vec!["-c".into(), command.clone()])
-    };
-
-    let mut child = match tokio::process::Command::new(program)
-        .args(&args)
+    // Build the command with the child placed in its OWN process group (POSIX) so a timeout
+    // can tree-kill the shell AND every descendant (cargo/npm/sleep …) with `kill -9 -<pgrp>`.
+    // Without this, `start_kill` only terminates the shell and leaves the real workload running
+    // as an orphan that keeps consuming CPU — the exact bug already fixed in the `bash` tool.
+    // tokio's Command doesn't expose process_group, so build a std Command and convert.
+    #[cfg(windows)]
+    let mut child = match tokio::process::Command::new("cmd")
+        .arg("/C")
+        .arg(&command)
         .current_dir(&cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -333,6 +334,28 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
                 "passed": 0,
                 "failed": 0,
             });
+        }
+    };
+    #[cfg(not(windows))]
+    let mut child = {
+        use std::os::unix::process::CommandExt;
+        let mut sc = std::process::Command::new("sh");
+        sc.arg("-c")
+            .arg(&command)
+            .current_dir(&cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        match tokio::process::Command::from(sc).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return json!({
+                    "error": format!("gate run failed: {e}"),
+                    "ok": false,
+                    "passed": 0,
+                    "failed": 0,
+                });
+            }
         }
     };
 
@@ -381,7 +404,33 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
             "failed": 0,
         }),
         Err(_) => {
-            let _ = child.start_kill();
+            // Tree-kill the child AND its descendants so a timed-out `cargo test` / `npm run
+            // build` does not leak orphaned processes that keep consuming CPU. `start_kill`
+            // only terminates the direct child (the shell), leaving the spawned workload alive.
+            //
+            // Windows: `taskkill /PID <pid> /T /F` kills the whole process tree.  POSIX: the
+            // child was placed in its own process group at spawn, so `kill -9 -<pgrp>` reaps
+            // the entire group — shell + every descendant.
+            #[cfg(windows)]
+            {
+                if let Some(pid) = child.id() {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                if let Some(pid) = child.id() {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &format!("-{pid}")])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn();
+                }
+            }
             // Reap the killed child so it does not become a zombie (Unix) or leak handles
             // (Windows) after the timeout path returns.
             let _ = child.wait().await;
@@ -1202,26 +1251,37 @@ mod tests {
         );
     }
 
-    /// A timed-out gate child must be reaped, not left as a zombie (Unix) or leaking handles
-    /// (Windows). We verify the reap on Unix by checking `kill -0 <pid>` after the timeout path
-    /// returns; on Windows we still verify the timeout result shape.
+    /// A timed-out gate child must be tree-killed, not just have its shell reaped while the
+    /// real workload (the descendant) keeps running as an orphan. Before the process-group fix,
+    /// `start_kill` only terminated the shell (`sh`); the `sleep 30` grandchild survived and
+    /// kept consuming CPU until it naturally exited — a real orphaned-process leak on every
+    /// timed-out RSI gate run.
+    ///
+    /// We verify the tree-kill on Unix by spawning `sleep 30` as a *background child* of the
+    /// shell, writing the `sleep` process's PID (not the shell's `$$`) to a file, and confirming
+    /// that PID is gone after `run_gate` returns. On Windows we verify the timeout result shape.
     #[tokio::test]
     async fn run_gate_reaps_child_after_timeout() {
         let _guard = GATE_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_GATE_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "500");
+        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "1000");
 
         let dir = tmp_dir();
         let pidfile = dir.join("pid");
 
-        // Long enough that the 500ms timeout fires first; the child writes its own PID so we can
-        // confirm it no longer exists after run_gate returns.
+        // `sleep 30 & echo $! > pidfile; wait` — the shell forks `sleep 30` as a background
+        // child, writes the *sleep*'s PID ($!) to the pidfile, then waits. The 1s timeout fires
+        // during the `wait`; the process-group kill (`kill -9 -<pgrp>`) must reap both the shell
+        // AND the `sleep 30` grandchild. Before the fix, only the shell was killed and `sleep 30`
+        // survived as an orphan.
         let command = if cfg!(windows) {
-            // ~2s of wall-clock time; the 500ms timeout fires first. Short enough that even if the
-            // wrapper process outlives the killed cmd, it finishes quickly.
-            "ping -n 3 127.0.0.1".to_string()
+            // ~3s of wall-clock time; the 1s timeout fires first.
+            "ping -n 4 127.0.0.1".to_string()
         } else {
-            format!("echo $$ > {} ; sleep 30", pidfile.to_string_lossy())
+            format!(
+                "sleep 30 & echo $! > {} ; wait",
+                pidfile.to_string_lossy()
+            )
         };
 
         let result = run_gate(&dir, Some(&command)).await;
@@ -1230,7 +1290,6 @@ mod tests {
             Some(p) => std::env::set_var("DOTZ_GATE_TIMEOUT_MS", p),
             None => std::env::remove_var("DOTZ_GATE_TIMEOUT_MS"),
         }
-        let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(
             result.get("ok").and_then(|v| v.as_bool()),
@@ -1245,18 +1304,42 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let pid_text = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            // The pidfile contains the PID of the `sleep 30` descendant, NOT the shell. Give the
+            // shell a moment to have forked `sleep` and written the pidfile before we read it.
+            let mut pid_text = String::new();
+            for _ in 0..20 {
+                pid_text = std::fs::read_to_string(&pidfile).unwrap_or_default();
+                if !pid_text.trim().is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let _ = fs::remove_dir_all(&dir);
             let pid: i32 = pid_text.trim().parse().unwrap_or(-1);
-            assert!(pid > 0, "test should have captured a valid child pid");
-            let gone = std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .output()
-                .map(|o| !o.status.success())
-                .unwrap_or(true);
+            assert!(pid > 0, "test should have captured the descendant pid: '{pid_text}'");
+            // `kill -0` is a non-destructive probe: success means the process still exists. The
+            // process-group kill must have reaped the `sleep 30` grandchild, so this must fail.
+            // Give the kernel a moment to reap the killed process.
+            let mut gone = false;
+            for _ in 0..20 {
+                gone = std::process::Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .output()
+                    .map(|o| !o.status.success())
+                    .unwrap_or(true);
+                if gone {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             assert!(
                 gone,
-                "timed-out gate child (pid {pid}) should have been killed and reaped, not still running"
+                "timed-out gate descendant (sleep pid {pid}) should have been tree-killed, not still running as an orphan"
             );
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fs::remove_dir_all(&dir);
         }
     }
 
