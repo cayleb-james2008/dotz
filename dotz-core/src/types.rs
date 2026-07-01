@@ -335,17 +335,43 @@ pub fn provider_default(id: &str) -> Option<(&'static str, &'static str)> {
 /// provider datalist suggestions. Free-form providers (ollama/openrouter/local) get their
 /// known defaults + low-cost suggestions; fixed providers get a small set of common current
 /// model ids so the model selector is usable instead of empty.
+///
+/// Every provider that has a registered default (`provider_default`) contributes BOTH its
+/// default executive and subagent model ids, so the picker's datalist always contains the model
+/// dotz boots with (e.g. `ollama/glm-5.2`). Without this, the ollama catalog listed only the
+/// low-cost workers (`minimax-m3`, `kimi-k2.7-code`) and the operator's current executive model
+/// was missing from the suggestions — clearing the input or switching providers and back lost
+/// the default executive as a selectable option. The result is deduplicated by
+/// `(provider, model_id)` so a default that already overlaps a low-cost suggestion (e.g. the
+/// openrouter default `nex-agi/nex-n2-pro:free`) is not listed twice.
 pub fn available_models() -> Vec<ModelRef> {
-    let mut out = Vec::new();
+    let mut out: Vec<ModelRef> = Vec::new();
+    // Deduplicate by (provider, model_id) while preserving first-seen order.
+    let mut seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut push = |out: &mut Vec<ModelRef>, provider: &str, model_id: &str| {
+        let key = (provider.to_string(), model_id.to_string());
+        if seen.insert(key) {
+            out.push(ModelRef {
+                provider: provider.into(),
+                model_id: model_id.into(),
+            });
+        }
+    };
 
     // Free-form provider suggestions (datalist). These model ids are validated by the upstream
     // provider's catalog; the suggestions are the same ones dotz already recommends elsewhere.
-    out.extend(low_cost_models());
-    if let Some((exec, _sub)) = provider_default("local") {
-        out.push(ModelRef {
-            provider: "local".into(),
-            model_id: exec.into(),
-        });
+    for m in low_cost_models() {
+        push(&mut out, &m.provider, &m.model_id);
+    }
+
+    // Each provider with a registered default contributes its default executive AND subagent model
+    // ids, so the picker always offers the model dotz boots with (not just the low-cost workers).
+    for pid in provider_ids() {
+        if let Some((exec, sub)) = provider_default(pid) {
+            push(&mut out, pid, exec);
+            push(&mut out, pid, sub);
+        }
     }
 
     // Fixed-provider dropdown entries. The UI hides the free-form input for these providers, so
@@ -373,10 +399,7 @@ pub fn available_models() -> Vec<ModelRef> {
     ];
     for (provider, ids) in fixed {
         for id in *ids {
-            out.push(ModelRef {
-                provider: (*provider).into(),
-                model_id: (*id).into(),
-            });
+            push(&mut out, provider, id);
         }
     }
 
@@ -600,6 +623,51 @@ mod tests {
             models.iter().any(|m| m.provider == "local"),
             "catalog must include local suggestions"
         );
+    }
+
+    /// The catalog must include each provider's default executive model so the UI's model picker
+    /// always offers the model dotz boots with as a selectable suggestion. Before this fix the
+    /// ollama catalog listed only the low-cost workers (`minimax-m3`, `kimi-k2.7-code`) and the
+    /// default executive `glm-5.2` was missing — clearing the input or switching providers and
+    /// back lost the boot default as a pickable option.
+    #[test]
+    fn available_models_includes_default_executive_for_each_provider() {
+        let models = available_models();
+        for pid in provider_ids() {
+            if let Some((exec, _sub)) = provider_default(pid) {
+                assert!(
+                    models
+                        .iter()
+                        .any(|m| m.provider == pid && m.model_id == exec),
+                    "catalog must include the default executive for {pid}: {exec}"
+                );
+            }
+        }
+        // Specifically assert the previously-missing ollama boot default.
+        assert!(
+            models
+                .iter()
+                .any(|m| m.provider == "ollama" && m.model_id == "glm-5.2"),
+            "catalog must include ollama/glm-5.2 (the boot default executive)"
+        );
+    }
+
+    /// The catalog must not contain duplicate `(provider, model_id)` pairs. A default that
+    /// overlaps a low-cost suggestion (e.g. openrouter's `nex-agi/nex-n2-pro:free`, or local's
+    /// executive == subagent `qwen2.5-coder`) must be listed once, not twice.
+    #[test]
+    fn available_models_has_no_duplicates() {
+        let models = available_models();
+        let mut seen = std::collections::HashSet::new();
+        for m in &models {
+            let key = (m.provider.clone(), m.model_id.clone());
+            assert!(
+                seen.insert(key),
+                "duplicate catalog entry for {}/{}",
+                m.provider,
+                m.model_id
+            );
+        }
     }
 
     #[test]
