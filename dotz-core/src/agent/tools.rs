@@ -344,6 +344,11 @@ impl Tool for BashTool {
                 // (matching the sandbox's kill_pid).  POSIX: the child was placed in
                 // its own process group at spawn, so `kill -9 -<pgrp>` reaps the
                 // entire group — shell + every descendant.
+                //
+                // Use .status() (not .spawn()) so the kill/taskkill subprocess is reaped.
+                // Dropping a spawned std::process::Child without waiting leaves a zombie
+                // that accumulates over a long-lived server with many timed-out bash
+                // commands — the exact reliability gap sandbox.rs::kill_pid already fixed.
                 #[cfg(windows)]
                 {
                     if let Some(pid) = child.id() {
@@ -351,7 +356,7 @@ impl Tool for BashTool {
                             .args(["/PID", &pid.to_string(), "/T", "/F"])
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
-                            .spawn();
+                            .status();
                     }
                 }
                 #[cfg(not(windows))]
@@ -361,7 +366,7 @@ impl Tool for BashTool {
                             .args(["-9", &format!("-{pid}")])
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
-                            .spawn();
+                            .status();
                     }
                 }
                 // Reap the killed child so it does not become a zombie (Unix) or
@@ -1098,6 +1103,77 @@ mod tests {
                 "timed-out bash child (pid {pid}) should have been killed and reaped, not still running"
             );
         }
+    }
+
+    /// The timeout-kill path must use `.status()` (not `.spawn()`) for the `kill`/`taskkill`
+    /// subprocess so the kill command itself is reaped — not leaked as a zombie. Before the
+    /// fix, every timed-out bash command leaked a zombie `kill` process; on a long-lived
+    /// server with frequent agent timeouts (e.g. running slow `cargo test`), these
+    /// accumulated without bound. This test verifies that after a bash timeout, no zombie
+    /// `kill` subprocess remains as a child of the current process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bash_timeout_reaps_kill_subprocess_no_zombie() {
+        let _guard = BASH_TIMEOUT_TEST_LOCK.lock().await;
+        let prev = std::env::var("DOTZ_BASH_TIMEOUT_MS").ok();
+        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "500");
+
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["bash".to_string()]);
+        let ctx = ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: None,
+            run_id: None,
+        };
+
+        let err = registry
+            .run("bash", &json!({"command": "sleep 2"}), &ctx)
+            .await
+            .unwrap_err();
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p),
+            None => std::env::remove_var("DOTZ_BASH_TIMEOUT_MS"),
+        }
+
+        assert!(
+            err.contains("[timeout]"),
+            "timed-out bash command must report a timeout error, got: {err}"
+        );
+
+        // Scan the process table for zombie (`Z` state) `kill` processes whose parent
+        // is this test process. With `.spawn()` the kill subprocess would be dropped
+        // without reaping, leaving a zombie; with `.status()` it is fully reaped before
+        // the timeout path returns. `ps -eo` is portable across Linux and macOS.
+        let our_pid = std::process::id().to_string();
+        let ps = std::process::Command::new("ps")
+            .args(["-eo", "pid,ppid,stat,comm"])
+            .output();
+        if let Ok(out) = ps {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let zombie_kills: Vec<&str> = text
+                .lines()
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    if f.len() >= 4 {
+                        Some((f[1], f[2], f[3]))
+                    } else {
+                        None
+                    }
+                })
+                .filter(|(ppid, stat, comm)| {
+                    *ppid == our_pid && stat.contains('Z') && comm.contains("kill")
+                })
+                .map(|(_, _, comm)| comm)
+                .collect();
+            assert_eq!(
+                zombie_kills.len(),
+                0,
+                "no zombie `kill` subprocess should remain after bash timeout; found zombies: {zombie_kills:?}\nps output:\n{text}"
+            );
+        }
+        // If `ps` itself fails (unlikely on any normal Unix), the test still validates
+        // the timeout error shape above — the zombie guard is best-effort defense-in-depth.
     }
 
     /// The file-tool sandbox must reject paths that escape the session cwd, whether via `..`
