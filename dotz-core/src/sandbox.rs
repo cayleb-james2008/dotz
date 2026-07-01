@@ -638,20 +638,26 @@ fn kill_pid(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     #[cfg(windows)]
     {
+        // Use .status() (not .spawn()) so the taskkill subprocess is reaped. Dropping a spawned
+        // std::process::Child without waiting leaves a zombie that accumulates over a long-lived
+        // server with many sandbox kills.
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .status();
     }
     #[cfg(not(windows))]
     {
         // SIGKILL via libc-free path: the standard `kill` binary.
+        // Use .status() (not .spawn()) so the kill subprocess is reaped. Dropping a spawned
+        // std::process::Child without waiting leaves a zombie that accumulates over a long-lived
+        // server with many sandbox kills.
         let _ = std::process::Command::new("kill")
             .args(["-9", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .status();
     }
 }
 
@@ -1537,6 +1543,56 @@ mod tests {
         {
             let mut store = runs_guard();
             store.remove(&id);
+        }
+    }
+
+    /// `kill_pid` must deliver a signal to the target process AND reap its own
+    /// `kill`/`taskkill` subprocess. The old code used `.spawn()` and immediately dropped the
+    /// `Child` handle — in Rust's std, dropping a `Child` does NOT call `waitpid`, so the
+    /// `kill`/`taskkill` subprocess became a zombie that persisted until the dotz-core process
+    /// exited. Over a long-lived server with many sandbox kills (timeouts + manual kills),
+    /// zombies accumulated. The fix uses `.status()` which runs the signal-delivery command to
+    /// completion and reaps it. This test verifies `kill_pid` still kills the target and returns
+    /// only after the signal-delivery subprocess has been reaped (i.e., `.status()` completed).
+    #[test]
+    fn kill_pid_kills_target_and_reaps_kill_subprocess() {
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+                .spawn()
+                .expect("powershell should be available")
+        } else {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("sleep should be available")
+        };
+        // On Windows `std::process::Child::id()` returns `u32` directly; on Unix it returns
+        // `Option<u32>`. Normalize to a plain u32.
+        #[cfg(windows)]
+        let pid = child.id();
+        #[cfg(not(windows))]
+        let pid = child.id().expect("child should have a pid");
+
+        // kill_pid must kill the target. With .status() it also blocks until the kill/taskkill
+        // subprocess exits and is reaped, so by the time kill_pid returns no zombie lingers.
+        kill_pid(Some(pid));
+
+        // The target process must have been killed. Poll with try_wait — the signal was already
+        // delivered, so this resolves quickly. A generous deadline guards against slow taskkill
+        // on AV-heavy Windows machines.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break, // child exited — killed and reaped
+                Ok(None) => {
+                    if std::time::Instant::now() > deadline {
+                        panic!("kill_pid did not kill the target process within 15s");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => panic!("try_wait failed: {e}"),
+            }
         }
     }
 
