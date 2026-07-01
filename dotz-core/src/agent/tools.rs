@@ -224,6 +224,21 @@ impl Tool for EditTool {
     }
 }
 
+/// Configurable file-scan budget for the `grep` tool. Caps how many files are read so a huge
+/// directory tree doesn't blow up the agent's context or stall the blocking pool. Defaults to
+/// 5000; override with `DOTZ_GREP_FILE_BUDGET` (clamped to [1, 100_000]) — primarily a test
+/// affordance so the budget-exhaustion path can be exercised without creating thousands of files.
+fn grep_file_budget() -> usize {
+    const DEFAULT: usize = 5000;
+    const MIN: usize = 1;
+    const MAX: usize = 100_000;
+    std::env::var("DOTZ_GREP_FILE_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(MIN, MAX))
+        .unwrap_or(DEFAULT)
+}
+
 /// Configurable wall-clock timeout for `bash` tool executions. A hung command (interactive prompt,
 /// infinite loop, long sleep) otherwise blocks the agent turn forever. Defaults to 5 minutes;
 /// override with `DOTZ_BASH_TIMEOUT_MS` (clamped to [1s, 1h]).
@@ -429,7 +444,7 @@ impl Tool for GrepTool {
         let out = tokio::task::spawn_blocking(move || {
             let mut hits = Vec::new();
             let mut stack = vec![root];
-            let mut budget = 5000usize; // cap files scanned
+            let mut budget = grep_file_budget();
             while let Some(dir) = stack.pop() {
                 let rd = match std::fs::read_dir(&dir) {
                     Ok(r) => r,
@@ -449,7 +464,11 @@ impl Tool for GrepTool {
                         stack.push(path);
                     } else if ft.is_file() {
                         if budget == 0 {
-                            break;
+                            // Budget exhausted: stop scanning entirely, not just the
+                            // current directory. Without this outer-loop break the
+                            // traversal keeps pushing/popping directories (wasting CPU
+                            // in large trees) even though no more files will be read.
+                            return hits;
                         }
                         budget -= 1;
                         if let Ok(content) = std::fs::read_to_string(&path) {
@@ -1324,6 +1343,95 @@ mod tests {
             .unwrap();
         assert_eq!(text, "nested world");
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `grep_file_budget` must default to 5000, honor `DOTZ_GREP_FILE_BUDGET`, and clamp to
+    /// [1, 100_000]. This is the unit test for the configurable budget that makes the
+    /// grep-budget-exhaustion path testable without creating thousands of files.
+    #[test]
+    fn grep_file_budget_is_configurable_and_clamped() {
+        static GREP_BUDGET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = GREP_BUDGET_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let prev = std::env::var("DOTZ_GREP_FILE_BUDGET").ok();
+
+        std::env::remove_var("DOTZ_GREP_FILE_BUDGET");
+        assert_eq!(grep_file_budget(), 5000, "default budget should be 5000");
+
+        std::env::set_var("DOTZ_GREP_FILE_BUDGET", "100");
+        assert_eq!(grep_file_budget(), 100, "valid override preserved");
+
+        std::env::set_var("DOTZ_GREP_FILE_BUDGET", "0");
+        assert_eq!(grep_file_budget(), 1, "zero clamped to minimum");
+
+        std::env::set_var("DOTZ_GREP_FILE_BUDGET", "999999");
+        assert_eq!(grep_file_budget(), 100_000, "too-large clamped to maximum");
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_GREP_FILE_BUDGET", p),
+            None => std::env::remove_var("DOTZ_GREP_FILE_BUDGET"),
+        }
+    }
+
+    /// The `grep` tool must respect the file-scan budget: when `DOTZ_GREP_FILE_BUDGET` is set
+    /// low enough that the matching file is never reached, the tool returns "(no matches)"
+    /// instead of reading past the budget. This also verifies the budget-exhaustion `return`
+    /// (which replaced the old inner-loop-only `break` that left the outer loop traversing
+    /// directories uselessly) terminates the scan cleanly.
+    #[tokio::test]
+    async fn grep_respects_file_budget_and_terminates_cleanly() {
+        static GREP_BUDGET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = GREP_BUDGET_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let base =
+            std::env::temp_dir().join(format!("dotz-grep-budget-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Create a single directory with files. The first file is a decoy (consumes the
+        // budget), and the second file contains the needle. With budget=1, only the first
+        // file is read — the needle in the second file must NOT be found. This is
+        // deterministic because both files are in the same directory and `read_dir` returns
+        // them in a stable per-filesystem order; we name them so `decoy.txt` sorts before
+        // `match.txt` to ensure the decoy is scanned first on all platforms.
+        std::fs::write(base.join("a_decoy.txt"), "nothing interesting").unwrap();
+        std::fs::write(base.join("z_match.txt"), "unique-needle-here").unwrap();
+
+        let prev_budget = std::env::var("DOTZ_GREP_FILE_BUDGET").ok();
+
+        // budget=1: only the first file (`a_decoy.txt`) is read; the needle must NOT be found.
+        std::env::set_var("DOTZ_GREP_FILE_BUDGET", "1");
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["grep".to_string()]);
+        let ctx = ToolCtx {
+            cwd: base.clone(),
+            tx: None,
+            run_id: None,
+        };
+        let result = registry
+            .run("grep", &json!({"pattern": "unique-needle-here"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            result, "(no matches)",
+            "with budget=1 the needle in the second file must not be found, got: {result}"
+        );
+
+        // budget=10: both files are read; the needle MUST be found.
+        std::env::set_var("DOTZ_GREP_FILE_BUDGET", "10");
+        let found = registry
+            .run("grep", &json!({"pattern": "unique-needle-here"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            found.contains("unique-needle-here"),
+            "with a generous budget the needle must be found, got: {found}"
+        );
+
+        match prev_budget {
+            Some(p) => std::env::set_var("DOTZ_GREP_FILE_BUDGET", p),
+            None => std::env::remove_var("DOTZ_GREP_FILE_BUDGET"),
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 }
