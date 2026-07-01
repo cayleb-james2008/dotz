@@ -18,7 +18,6 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const GLOBAL_USER: &str = "__global__";
 const RECENCY_HALFLIFE_MS: f64 = 1000.0 * 60.0 * 60.0 * 24.0 * 30.0; // 30 days
@@ -46,13 +45,6 @@ pub struct MemoryView {
     pub created_at: Option<i64>,
     #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
 }
 
 /// Scope → mem0 userId. global / no-cwd → "__global__"; project → "proj:<norm cwd>"
@@ -233,7 +225,7 @@ fn add(
     let user_id = scope_user(scope, cwd);
     let emb = embed_text(text)?;
     let id = uuid::Uuid::new_v4().to_string();
-    let ts = now_ms();
+    let ts = crate::util::now_ms();
     {
         let conn = db_guard();
         conn.execute(
@@ -319,7 +311,7 @@ fn search(
 
 /// Combine semantic score with recency decay + folder-match (mirror memory.ts rerank).
 fn rerank(items: Vec<MemoryView>, folder: Option<&str>) -> Vec<MemoryView> {
-    let now = now_ms() as f64;
+    let now = crate::util::now_ms() as f64;
     let f = folder.map(norm_folder);
     let mut scored: Vec<(f64, MemoryView)> = items
         .into_iter()
@@ -428,7 +420,7 @@ fn get_row(conn: &Connection, id: &str) -> Option<Row> {
 
 fn update(id: &str, text: &str, cwd: Option<&str>) -> Option<MemoryView> {
     let emb = embed_text(text).ok()?;
-    let ts = now_ms();
+    let ts = crate::util::now_ms();
     let row = {
         let conn = db_guard();
         let n = conn

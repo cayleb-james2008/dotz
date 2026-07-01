@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::broadcast;
 
@@ -43,13 +43,6 @@ const OUTPUT_CAP: usize = 50 * 1024;
 /// captured output (up to `OUTPUT_CAP` each) and its `end_emitted` dedup flag forever. Running
 /// runs are never evicted — only finished ones.
 const MAX_RETAINED_RUNS: usize = 64;
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
 
 /// Per-language { file, command } mapping, mirroring LANGUAGES in sandbox.ts.
 fn lang_spec(language: &str) -> Option<(&'static str, Vec<&'static str>)> {
@@ -273,7 +266,7 @@ pub async fn start_run(
         status: "running".to_string(),
         output: String::new(),
         exit_code: None,
-        started_at: now_ms(),
+        started_at: crate::util::now_ms(),
         ended_at: None,
     };
     let id = run.id.clone();
@@ -618,7 +611,7 @@ fn finish(id: &str, status: &str, exit_code: Option<i64>, output: &str) {
                 e.run.status = status.to_string();
                 e.run.exit_code = exit_code;
                 e.run.output = output.to_string();
-                e.run.ended_at = Some(now_ms());
+                e.run.ended_at = Some(crate::util::now_ms());
                 e.pid = None;
             }
         }
@@ -675,7 +668,7 @@ pub fn kill_run_by_id(id: &str) -> bool {
             Some(e) if e.pid.is_some() && e.run.status == "running" => {
                 e.killed_by_us = true;
                 e.run.status = "killed".to_string();
-                e.run.ended_at = Some(now_ms());
+                e.run.ended_at = Some(crate::util::now_ms());
                 e.run.output.push_str("\n[killed]\n");
                 e.pid.take()
             }
@@ -843,7 +836,7 @@ mod tests {
                         status: "running".to_string(),
                         output: String::new(),
                         exit_code: None,
-                        started_at: now_ms(),
+                        started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
                     pid: None,
@@ -874,7 +867,7 @@ mod tests {
     /// run's captured output / flag over a long-lived server.
     ///
     /// This test drives the prune path directly with runs whose `started_at` values are far
-    /// below any real `now_ms()`, so they are always the oldest entries in the shared store and
+    /// below any real `crate::util::now_ms()`, so they are always the oldest entries in the shared store and
     /// are evicted before any other test's runs — making the assertions deterministic without a
     /// global test serialization lock. Running runs use `started_at` 1..3 and terminal runs use
     /// 100..(100+N); only terminal runs are eviction candidates, so the running runs' lower
@@ -887,7 +880,7 @@ mod tests {
             .map(|_| uuid::Uuid::new_v4().to_string())
             .collect();
 
-        // Insert with started_at far below now_ms() so these are always the oldest entries in
+        // Insert with started_at far below crate::util::now_ms() so these are always the oldest entries in
         // the shared store and are evicted first, never touching other tests' runs.
         {
             let mut store = runs_guard();
@@ -1104,7 +1097,7 @@ mod tests {
                         status: "running".to_string(),
                         output: String::new(),
                         exit_code: None,
-                        started_at: now_ms(),
+                        started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
                     pid: None,
@@ -1179,7 +1172,7 @@ mod tests {
                         status: "running".to_string(),
                         output: String::new(),
                         exit_code: None,
-                        started_at: now_ms(),
+                        started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
                     pid: None,
@@ -1262,7 +1255,7 @@ mod tests {
                         status: "running".to_string(),
                         output: String::new(),
                         exit_code: None,
-                        started_at: now_ms(),
+                        started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
                     pid: None,
@@ -1306,7 +1299,7 @@ mod tests {
                         status: "running".to_string(),
                         output: String::new(),
                         exit_code: None,
-                        started_at: now_ms(),
+                        started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
                     pid: None,
@@ -1388,7 +1381,7 @@ mod tests {
                         status: "running".to_string(),
                         output: String::new(),
                         exit_code: None,
-                        started_at: now_ms(),
+                        started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
                     pid: None,
@@ -1491,7 +1484,7 @@ mod tests {
                         status: "running".to_string(),
                         output: String::new(),
                         exit_code: None,
-                        started_at: now_ms(),
+                        started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
                     pid: Some(pid),
@@ -1621,7 +1614,7 @@ mod tests {
                         status: "running".to_string(),
                         output: String::new(),
                         exit_code: None,
-                        started_at: now_ms(),
+                        started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
                     pid: None,

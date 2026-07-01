@@ -22,6 +22,7 @@ pub mod skills;
 pub mod specs;
 pub mod templates;
 pub mod types;
+pub mod util;
 pub mod vcs;
 pub mod verify;
 pub mod workflow_executor;

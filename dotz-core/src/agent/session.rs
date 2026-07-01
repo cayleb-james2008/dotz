@@ -16,16 +16,8 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
 
 /// Maximum number of messages retained in a session's in-memory transcript (`history`). Without
 /// a cap, a long-running session's `history` Vec grows without bound — one Message per turn-round
@@ -545,7 +537,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         let mut s = session_guard(&session);
         // Cancellation token was already reset in the first critical section; do not replace it
         // here or an abort that arrived in the gap would be silently lost.
-        let ts = now_ms();
+        let ts = crate::util::now_ms();
         let user_msg = Message::user(&prompt, ts);
         emit(&s, &AgentEvent::AgentStart);
         emit(&s, &AgentEvent::TurnStart);
@@ -656,7 +648,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         let stream_task = tokio::spawn(async move { adapter.stream(req, delta_tx).await });
 
         // message_start (assistant shell).
-        let start_ts = now_ms();
+        let start_ts = crate::util::now_ms();
         {
             let s = session_guard(&session);
             emit(
@@ -814,7 +806,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
                     usage: None,
                     stop_reason: None,
                     error_message: None,
-                    timestamp: now_ms(),
+                    timestamp: crate::util::now_ms(),
                     response_id: Some(call_id.clone()),
                 });
                 prune_history(&mut s.history);
@@ -905,7 +897,7 @@ async fn execute_tool(
                         let mut m = super::event::Message::assistant_shell(
                             "subagent",
                             "subagent",
-                            now_ms(),
+                            crate::util::now_ms(),
                         );
                         apply_subagent_delta(&mut m, delta);
                         acc = Some(m.clone());
@@ -1289,7 +1281,7 @@ fn finish_error(
     tool_results: Vec<ToolResult>,
 ) {
     let mut s = session_guard(&session);
-    let mut msg = Message::assistant_shell(&s.provider, &s.model_id, now_ms());
+    let mut msg = Message::assistant_shell(&s.provider, &s.model_id, crate::util::now_ms());
     msg.stop_reason = Some("error".into());
     msg.error_message = Some(detail.to_string());
     // The UI contract expects a message_start before every message_end; the error path was
@@ -2601,7 +2593,7 @@ mod tests {
         let sess = get(&sid).unwrap();
         let mut rx = sess.lock().unwrap().tx.subscribe();
 
-        let final_msg = Message::assistant_shell("ollama", "glm-5.2", now_ms());
+        let final_msg = Message::assistant_shell("ollama", "glm-5.2", crate::util::now_ms());
         let result = ToolResult {
             tool_call_id: "tc-1".into(),
             tool_name: "bash".into(),
@@ -2689,7 +2681,7 @@ mod tests {
         let sess = get(&sid).unwrap();
         let mut rx = sess.lock().unwrap().tx.subscribe();
 
-        let mut final_msg = Message::assistant_shell("ollama", "glm-5.2", now_ms());
+        let mut final_msg = Message::assistant_shell("ollama", "glm-5.2", crate::util::now_ms());
         final_msg.stop_reason = Some("aborted".into());
         finish_turn(&sess, final_msg, Vec::new());
 
@@ -2727,7 +2719,7 @@ mod tests {
         {
             let mut g = sess.lock().unwrap();
             g.history
-                .push(Message::assistant_shell("ollama", "glm-5.2", now_ms()));
+                .push(Message::assistant_shell("ollama", "glm-5.2", crate::util::now_ms()));
         }
         let mut rx = sess.lock().unwrap().tx.subscribe();
 
