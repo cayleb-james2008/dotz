@@ -21,7 +21,13 @@ const SHIM_TEMPLATE: &str = r#"
   window.dotz = {
     electron: true,
     version: "__DOTZ_VERSION__",
-    pickDirectory: () => invoke('pick_directory'),
+    // Call the dialog PLUGIN command directly (permitted by dialog:default) instead of our custom
+    // `bridge` app-command — app commands are NOT ACL-allowed for this window's remote http origin
+    // (Tauri v2), so invoke('bridge', …) fails with "bridge not allowed. Plugin not found".
+    pickDirectory: async () => {
+      const sel = await window.__TAURI__.core.invoke('plugin:dialog|open', { options: { directory: true, multiple: false, title: 'Select project folder' } });
+      return Array.isArray(sel) ? (sel[0] || null) : (sel || null);
+    },
     update: {
       check: async () => {
         try {
