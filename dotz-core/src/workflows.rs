@@ -178,6 +178,63 @@ pub struct WorkflowRun {
     pub actual_tokens: Option<u64>,
 }
 
+/// Pre-computed progress counts for a workflow run, so the UI can render a progress
+/// bar / status line (`3/7 done · 1 running · 1 failed`) without walking the step DAG
+/// on every render. Surfaced as a `summary` field on every REST response and WebSocket
+/// event that carries a run (or a step-state delta).
+///
+/// `steps` is the total node count; `completed` counts terminal successes (`done`),
+/// `failed` counts `error`, and `running` counts in-flight steps. The remaining counts
+/// (`pending`, `ready`, `skipped`, `interrupted`) are included so the UI can distinguish
+/// "not started" from "skipped" from "interrupted by restart" without iterating steps.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowSummary {
+    pub steps: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub running: usize,
+    pub pending: usize,
+    pub ready: usize,
+    pub skipped: usize,
+    pub interrupted: usize,
+}
+
+/// Compute a `WorkflowSummary` from a run's steps. O(n) over the step list; called once
+/// per REST response or WS event so the UI never has to walk the DAG itself.
+pub fn workflow_summary(run: &WorkflowRun) -> WorkflowSummary {
+    let mut s = WorkflowSummary {
+        steps: run.steps.len(),
+        ..Default::default()
+    };
+    for step in &run.steps {
+        match step.status.as_str() {
+            "done" => s.completed += 1,
+            "error" => s.failed += 1,
+            "running" => s.running += 1,
+            "pending" => s.pending += 1,
+            "ready" => s.ready += 1,
+            "skipped" => s.skipped += 1,
+            "interrupted" => s.interrupted += 1,
+            _ => {}
+        }
+    }
+    s
+}
+
+/// Serialize a run to a JSON object and attach its pre-computed `summary`. Used by every
+/// REST handler that returns a run so the UI gets progress counts in the same payload
+/// — no second round-trip, no client-side DAG walk.
+fn run_with_summary(run: &WorkflowRun) -> Value {
+    let mut val = serde_json::to_value(run).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert(
+            "summary".to_string(),
+            serde_json::to_value(workflow_summary(run)).unwrap_or_else(|_| json!({})),
+        );
+    }
+    val
+}
+
 // ---- create input (POST body steps) ----
 
 #[derive(Debug, Deserialize)]
@@ -237,14 +294,14 @@ fn emit_event(run_id: &str, event: Value) {
 }
 
 fn emit_workflow_start(run: &WorkflowRun) {
-    emit_event(&run.id, json!({ "type": "workflow_start", "run": run }));
+    emit_event(&run.id, json!({ "type": "workflow_start", "run": run_with_summary(run) }));
 }
 
 fn emit_workflow_end(run: &WorkflowRun) {
-    emit_event(&run.id, json!({ "type": "workflow_end", "run": run }));
+    emit_event(&run.id, json!({ "type": "workflow_end", "run": run_with_summary(run) }));
 }
 
-fn emit_step_state(run_id: &str, step: &WorkflowStep) {
+fn emit_step_state(run_id: &str, step: &WorkflowStep, summary: Option<&WorkflowSummary>) {
     let mut event = json!({
         "type": "step_state",
         "stepId": step.id,
@@ -270,6 +327,11 @@ fn emit_step_state(run_id: &str, step: &WorkflowStep) {
     }
     if let Some(t) = &step.thinking {
         event["thinking"] = json!(t);
+    }
+    // Attach the run-level summary so the UI can update its progress bar on every
+    // step-state transition without refetching the run or walking the DAG client-side.
+    if let Some(s) = summary {
+        event["summary"] = serde_json::to_value(s).unwrap_or_else(|_| json!({}));
     }
     emit_event(run_id, event);
 }
@@ -824,9 +886,10 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
         (run, changed, became_terminal)
     };
     persist(&run_snapshot.0);
+    let summary = workflow_summary(&run_snapshot.0);
     for step in &run_snapshot.0.steps {
         if run_snapshot.1.contains(&step.id) {
-            emit_step_state(run_id, step);
+            emit_step_state(run_id, step, Some(&summary));
         }
     }
     if run_snapshot.2 {
@@ -858,9 +921,10 @@ pub fn abort(id: &str) -> Option<WorkflowRun> {
         (run, changed)
     };
     persist(&run.0);
+    let summary = workflow_summary(&run.0);
     for step in &run.0.steps {
         if run.1.contains(&step.id) {
-            emit_step_state(id, step);
+            emit_step_state(id, step, Some(&summary));
         }
     }
     emit_workflow_end(&run.0);
@@ -1079,24 +1143,30 @@ struct HistoryQuery {
 
 /// GET /api/workflows?projectId= → { runs: [...] } (history, optionally filtered).
 async fn list_history_handler(Query(q): Query<HistoryQuery>) -> Json<Value> {
-    let runs = list_history(q.project_id.as_deref());
+    let runs: Vec<Value> = list_history(q.project_id.as_deref())
+        .iter()
+        .map(run_with_summary)
+        .collect();
     Json(json!({ "runs": runs }))
 }
 
 /// GET /api/workflows/active → { runs: [...] } (in-memory active map).
 async fn list_active_handler() -> Json<Value> {
-    Json(json!({ "runs": list_active() }))
+    let runs: Vec<Value> = list_active().iter().map(run_with_summary).collect();
+    Json(json!({ "runs": runs }))
 }
 
 /// GET /api/workflows/:id → run (active, else history fallback) or 404.
+/// The run carries a pre-computed `summary` so the UI can render progress counts
+/// (`3/7 done · 1 running · 1 failed`) without walking the step DAG.
 async fn get_handler(
     Path(id): Path<String>,
-) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(run) = get_active(&id) {
-        return Ok(Json(run));
+        return Ok(Json(run_with_summary(&run)));
     }
     if let Some(run) = list_history(None).into_iter().find(|r| r.id == id) {
-        return Ok(Json(run));
+        return Ok(Json(run_with_summary(&run)));
     }
     Err(not_found("no such workflow run"))
 }
@@ -1104,7 +1174,7 @@ async fn get_handler(
 /// POST /api/workflows → validate DAG (cycle → 400), assign step ids, start, return the run.
 async fn create_handler(
     body: Option<Json<Value>>,
-) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
 
     let steps_val = body.get("steps");
@@ -1182,7 +1252,7 @@ async fn create_handler(
 
     // Mark started (mirrors server.ts: create() then start()).
     let started = start(&run.id).unwrap_or(run);
-    Ok(Json(started))
+    Ok(Json(run_with_summary(&started)))
 }
 
 #[derive(Deserialize)]
@@ -1211,7 +1281,7 @@ const ALLOWED_STATUS: [&str; 7] = [
 async fn step_handler(
     Path(id): Path<String>,
     body: Option<Json<StepBody>>,
-) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let run = match get_active(&id) {
         Some(r) => r,
         None => return Err(not_found("no such workflow run")),
@@ -1259,7 +1329,7 @@ async fn step_handler(
         artifact: body.artifact,
     };
     match step_state(&id, &step_id, patch) {
-        Some(updated) => Ok(Json(updated)),
+        Some(updated) => Ok(Json(run_with_summary(&updated))),
         None => Err(not_found("no such workflow run")),
     }
 }
@@ -1277,7 +1347,7 @@ async fn abort_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCod
 /// 200 with the run (running), 404 unknown run, 409 already terminal.
 async fn resume_handler(
     Path(id): Path<String>,
-) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Reject the resume if the run is already terminal. `resume()` returns the
     // run as-is in that case, but the UI should see a 409 so it doesn't render a
     // "running" badge on a run that hasn't actually restarted.
@@ -1292,7 +1362,7 @@ async fn resume_handler(
         }
     }
     match resume(&id) {
-        Some(run) => Ok(Json(run)),
+        Some(run) => Ok(Json(run_with_summary(&run))),
         None => Err(not_found("no such workflow run")),
     }
 }
@@ -1305,7 +1375,7 @@ async fn execute_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
     // If the run is already terminal, return it directly without re-executing.
     if let Some(run) = get_active(&id) {
         if run.status == "done" || run.status == "error" || run.status == "aborted" {
-            return Ok(Json(json!({ "run": run })));
+            return Ok(Json(json!({ "run": run_with_summary(&run) })));
         }
     } else {
         return Err(not_found("no such workflow run"));
@@ -1328,7 +1398,7 @@ async fn execute_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
     };
 
     match crate::workflow_executor::run_workflow(&id).await {
-        Some(run) => Ok(Json(json!({ "run": run, "checkpoint": checkpoint }))),
+        Some(run) => Ok(Json(json!({ "run": run_with_summary(&run), "checkpoint": checkpoint }))),
         None => Err(not_found("no such workflow run")),
     }
 }
@@ -1368,9 +1438,9 @@ async fn record_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCo
 /// no record exists or it has no steps. This is the orchestration-regression bisect:
 /// replay a recorded run after a code/provider/config change and diff the new
 /// record against the old to localize which step drifted.
-async fn replay_handler(Path(id): Path<String>) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+async fn replay_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match crate::run_record::replay(&id) {
-        Some(run) => Ok(Json(run)),
+        Some(run) => Ok(Json(run_with_summary(&run))),
         None => Err(not_found("no replayable run record (missing or empty)")),
     }
 }
@@ -1394,7 +1464,7 @@ struct RerunBody {
 async fn rerun_step_handler(
     Path((id, step_id)): Path<(String, String)>,
     body: Option<Json<RerunBody>>,
-) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let run = match get_active(&id) {
         Some(r) => r,
         None => return Err(not_found("no such workflow run")),
@@ -1464,12 +1534,13 @@ async fn rerun_step_handler(
             persist(run);
             // Emit a step_state event so the UI reflects the reset + new task.
             let step = run.steps.iter().find(|s| s.id == step_id).cloned().unwrap();
-            emit_step_state(&id, &step);
-            return Ok(Json(run.clone()));
+            let summary = workflow_summary(run);
+            emit_step_state(&id, &step, Some(&summary));
+            return Ok(Json(run_with_summary(run)));
         }
     }
     // Fallback (shouldn't reach): return the step_state result.
-    Ok(Json(updated))
+    Ok(Json(run_with_summary(&updated)))
 }
 
 /// Input for patching a step's parents (re-wiring dependencies).
@@ -1492,7 +1563,7 @@ struct PatchStepBody {
 async fn patch_step_handler(
     Path((id, step_id)): Path<(String, String)>,
     body: Option<Json<PatchStepBody>>,
-) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let body = match body {
         Some(Json(b)) => b,
         None => return Err(bad("body is required")),
@@ -1665,8 +1736,9 @@ async fn patch_step_handler(
         let run = run.clone();
         // Emit step_state for the patched step.
         let step = run.steps.iter().find(|s| s.id == step_id).cloned().unwrap();
-        emit_step_state(&id, &step);
-        run
+        let summary = workflow_summary(&run);
+        emit_step_state(&id, &step, Some(&summary));
+        run_with_summary(&run)
     };
     Ok(Json(updated))
 }
@@ -1688,7 +1760,7 @@ struct InsertStepsBody {
 async fn insert_steps_handler(
     Path(id): Path<String>,
     body: Option<Json<InsertStepsBody>>,
-) -> Result<Json<WorkflowRun>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let body = match body {
         Some(Json(b)) => b,
         None => return Err(bad("steps (non-empty array) is required")),
@@ -1860,12 +1932,13 @@ async fn insert_steps_handler(
         persist(run);
         let run = run.clone();
         // Emit step_state events for every new/changed step so the UI graph updates.
+        let summary = workflow_summary(&run);
         for step in &run.steps {
             if new_step_ids.contains(&step.id) || changed.contains(&step.id) {
-                emit_step_state(&id, step);
+                emit_step_state(&id, step, Some(&summary));
             }
         }
-        run
+        run_with_summary(&run)
     };
     Ok(Json(updated))
 }
@@ -2002,7 +2075,8 @@ pub fn patch_parents(
         run.updated_at = now;
         persist(run);
         let step = run.steps.iter().find(|s| s.id == step_id).cloned().unwrap();
-        emit_step_state(run_id, &step);
+        let summary = workflow_summary(run);
+        emit_step_state(run_id, &step, Some(&summary));
         run.clone()
     };
     Ok(updated)
@@ -2143,9 +2217,10 @@ pub fn insert_steps(run_id: &str, inputs: &[CreateStepInput]) -> Result<Workflow
         }
         run.updated_at = now;
         persist(run);
+        let summary = workflow_summary(run);
         for step in run.steps.iter() {
             if new_step_ids.contains(&step.id) {
-                emit_step_state(run_id, step);
+                emit_step_state(run_id, step, Some(&summary));
             }
         }
         run.clone()
@@ -2169,7 +2244,8 @@ pub fn patch_model(
         run.updated_at = now;
         persist(run);
         let step = run.steps.iter().find(|s| s.id == step_id).cloned().unwrap();
-        emit_step_state(run_id, &step);
+        let summary = workflow_summary(run);
+        emit_step_state(run_id, &step, Some(&summary));
         run.clone()
     };
     Ok(updated)
@@ -2236,7 +2312,8 @@ pub async fn rerun_step_and_dispatch(
         run.updated_at = now;
         persist(run);
         let step = run.steps.iter().find(|s| s.id == step_id).cloned().unwrap();
-        emit_step_state(run_id, &step);
+        let summary = workflow_summary(run);
+        emit_step_state(run_id, &step, Some(&summary));
     }
     // Spawn the executor to drive the run.
     let rid = run_id.to_string();
@@ -3865,6 +3942,154 @@ mod tests {
                 json.get("artifact").is_none(),
                 "artifact field must be absent when None (skip_serializing_if)"
             );
+        });
+    }
+
+    /// Build a `WorkflowRun` with steps in the given statuses — a synthetic workflow for
+    /// summary tests that doesn't require the create/start/step_state lifecycle.
+    fn synthetic_run(statuses: &[&str]) -> WorkflowRun {
+        let now = now_ms();
+        let steps: Vec<WorkflowStep> = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, st)| WorkflowStep {
+                id: format!("s{i}"),
+                agent: "worker".into(),
+                task: format!("task {i}"),
+                status: st.to_string(),
+                parents: if i > 0 { vec![format!("s{}", i - 1)] } else { Vec::new() },
+                children: if i + 1 < statuses.len() { vec![format!("s{}", i + 1)] } else { Vec::new() },
+                output: None,
+                error: None,
+                usage: None,
+                sandbox_run_id: None,
+                browser_session_id: None,
+                tool_call_ids: None,
+                thinking: None,
+                started_at: None,
+                ended_at: None,
+                auto_repair: false,
+                repair_round: 0,
+                budget: None,
+                actual_cost: None,
+                actual_tokens: None,
+                model: None,
+                artifact: None,
+            })
+            .collect();
+        WorkflowRun {
+            id: "synthetic".into(),
+            project_id: None,
+            session_id: None,
+            label: "synthetic".into(),
+            steps,
+            status: "running".into(),
+            origin: None,
+            created_at: now,
+            updated_at: now,
+            started_at: Some(now),
+            ended_at: None,
+            max_repair_rounds: 3,
+            repair_rounds: 0,
+            budget: None,
+            actual_cost: None,
+            actual_tokens: None,
+        }
+    }
+
+    /// `workflow_summary` must count each terminal/in-flight/pending state correctly over a
+    /// synthetic workflow with a mix of every step status, so the UI can render progress
+    /// counts (`3/7 done · 1 running · 1 failed`) without walking the DAG.
+    #[test]
+    fn workflow_summary_counts_mixed_step_states() {
+        let run = synthetic_run(&[
+            "done",        // completed
+            "done",        // completed
+            "done",        // completed
+            "error",       // failed
+            "running",     // running
+            "pending",     // pending
+            "ready",       // ready
+            "skipped",     // skipped
+            "interrupted", // interrupted
+        ]);
+        let s = workflow_summary(&run);
+        assert_eq!(s.steps, 9, "steps must be the total node count");
+        assert_eq!(s.completed, 3, "completed counts done steps");
+        assert_eq!(s.failed, 1, "failed counts error steps");
+        assert_eq!(s.running, 1, "running counts in-flight steps");
+        assert_eq!(s.pending, 1);
+        assert_eq!(s.ready, 1);
+        assert_eq!(s.skipped, 1);
+        assert_eq!(s.interrupted, 1);
+        // All per-status counts must sum to the total step count.
+        assert_eq!(
+            s.completed + s.failed + s.running + s.pending + s.ready + s.skipped + s.interrupted,
+            s.steps,
+            "all per-status counts must sum to the total step count"
+        );
+    }
+
+    /// An empty workflow (no steps) must produce a zeroed summary, not panic.
+    #[test]
+    fn workflow_summary_empty_run() {
+        let run = synthetic_run(&[]);
+        let s = workflow_summary(&run);
+        assert_eq!(s, WorkflowSummary::default());
+    }
+
+    /// `run_with_summary` must attach a `summary` object to the serialized run so the
+    /// REST response carries progress counts the UI can read without walking the DAG.
+    #[test]
+    fn run_with_summary_attaches_summary_field() {
+        let run = synthetic_run(&["done", "running", "pending"]);
+        let val = run_with_summary(&run);
+        let summary = val.get("summary").expect("summary field must be present");
+        assert_eq!(summary["steps"], json!(3));
+        assert_eq!(summary["completed"], json!(1));
+        assert_eq!(summary["running"], json!(1));
+        assert_eq!(summary["pending"], json!(1));
+        assert_eq!(summary["failed"], json!(0));
+        // The run's own fields must still be present (additive, not replacing).
+        assert_eq!(val["id"], json!("synthetic"));
+        assert_eq!(val["label"], json!("synthetic"));
+    }
+
+    /// After a real step-state transition through `step_state`, `workflow_summary` must reflect
+    /// the updated counts — proving the summary stays in sync with the live store.
+    #[test]
+    fn workflow_summary_reflects_step_state_transition() {
+        with_tmp_workflows_file(|| {
+            let inputs = vec![
+                step("a", "A", None),
+                step("b", "B", Some(vec![json!(0)])),
+                step("c", "C", Some(vec![json!(0)])),
+            ];
+            let run = create(None, None, "summary-live".into(), None, 3, &inputs, None).unwrap();
+            let run = start(&run.id).unwrap();
+
+            // Before any step completes: 1 ready (root), 2 pending (children).
+            let s = workflow_summary(&run);
+            assert_eq!(s.steps, 3);
+            assert_eq!(s.completed, 0);
+            assert_eq!(s.ready, 1);
+            assert_eq!(s.pending, 2);
+
+            // Complete step 0 -> it's done, and both children become ready.
+            let parent_id = run.steps[0].id.clone();
+            let updated = step_state(
+                &run.id,
+                &parent_id,
+                StepPatch {
+                    status: Some("done".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let s = workflow_summary(&updated);
+            assert_eq!(s.completed, 1, "one step done after transition");
+            assert_eq!(s.ready, 2, "both children ready after parent done");
+            assert_eq!(s.pending, 0);
         });
     }
 }
