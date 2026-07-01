@@ -205,6 +205,9 @@ impl Tool for EditTool {
         let p = str_arg(args, "file_path").ok_or("file_path is required")?;
         let old = str_arg(args, "old_string").ok_or("old_string is required")?;
         let new = str_arg(args, "new_string").unwrap_or("");
+        if old == new {
+            return Err("old_string and new_string are identical (no-op edit)".into());
+        }
         let path = ctx.resolve_in_cwd(p)?;
         let content = tokio::fs::read_to_string(&path)
             .await
@@ -1342,6 +1345,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(text, "nested world");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A no-op edit (old_string == new_string) must be rejected with a clear error before any
+    /// file read/write, so the agent does not mistake a byte-identical replacement for a
+    /// successful edit and falsely report completion or loop. The file must be left unchanged.
+    #[tokio::test]
+    async fn edit_tool_rejects_noop_edit() {
+        let base = std::env::temp_dir().join(format!("dotz-edit-noop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let original = "hello world\nsecond line\n";
+        std::fs::write(base.join("note.txt"), original).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["edit".to_string(), "read".to_string()]);
+        let ctx = ToolCtx {
+            cwd: base.clone(),
+            tx: None,
+            run_id: None,
+        };
+
+        let err = registry
+            .run(
+                "edit",
+                &json!({
+                    "file_path": "note.txt",
+                    "old_string": "hello world",
+                    "new_string": "hello world"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("identical"),
+            "no-op edit should be rejected, got: {err}"
+        );
+
+        // The file must be untouched.
+        let text = registry
+            .run("read", &json!({"file_path": "note.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(text, original, "no-op edit must leave the file unchanged");
 
         let _ = std::fs::remove_dir_all(&base);
     }
