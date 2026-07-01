@@ -55,7 +55,7 @@ fn shim(version: &str) -> String {
 #[tauri::command]
 async fn bridge(app: tauri::AppHandle, method: String, _args: Vec<Value>) -> Result<Value, String> {
     match method.as_str() {
-        "pick_directory" => Ok(pick_directory(&app)),
+        "pick_directory" => Ok(pick_directory(&app).await),
         "update_status" => Ok(update_status(&app).await),
         "apply_update" => Ok(apply_update(&app).await),
         "version" => Ok(json!(app.package_info().version.to_string())),
@@ -63,13 +63,17 @@ async fn bridge(app: tauri::AppHandle, method: String, _args: Vec<Value>) -> Res
     }
 }
 
-fn pick_directory(app: &tauri::AppHandle) -> Value {
+async fn pick_directory(app: &tauri::AppHandle) -> Value {
     use tauri_plugin_dialog::DialogExt;
-    let (tx, rx) = std::sync::mpsc::channel();
+    // ponytail: the old version did a blocking std::mpsc `rx.recv()` inside this async command, which
+    // parks a Tokio worker thread waiting on the dialog callback — the picker never resolved (rejected
+    // as "folder picker: undefined"). pick_folder is non-blocking and dispatches the native dialog on
+    // the main thread itself; await the result over a oneshot instead of blocking.
+    let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog().file().pick_folder(move |p| {
         let _ = tx.send(p);
     });
-    match rx.recv() {
+    match rx.await {
         Ok(Some(p)) => json!(p.to_string()),
         _ => Value::Null,
     }
