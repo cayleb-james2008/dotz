@@ -285,7 +285,7 @@ pub fn subscribe_events() -> broadcast::Receiver<Value> {
     events_tx().subscribe()
 }
 
-fn emit_event(run_id: &str, event: Value) {
+pub(crate) fn emit_event(run_id: &str, event: Value) {
     let _ = events_tx().send(json!({
         "kind": "workflow",
         "runId": run_id,
