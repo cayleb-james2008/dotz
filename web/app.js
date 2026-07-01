@@ -2151,6 +2151,9 @@ function handleWorkflowEvent(runId, event) {
         if (event.toolCallIds !== undefined) step.toolCallIds = event.toolCallIds;
         if (event.thinking !== undefined) step.thinking = event.thinking;
       }
+      // Update the run-level progress summary from the server-sent counts so the
+      // status line stays live without refetching the run or walking the DAG.
+      if (event.summary !== undefined) run.summary = event.summary;
       refreshWorkflowGraph();
       // Repaint the node-detail drawer in place if it's showing the step that just updated, so the
       // primary live-inspection surface doesn't freeze on the snapshot from when it was opened.
@@ -2242,7 +2245,21 @@ function refreshWorkflowGraph() {
   });
   const run = state.workflows.get(state.activeWfId) || [...state.workflows.values()][0];
   if (!run) return;
-  if (statusEl) statusEl.textContent = `${run.steps.length} steps · ${run.status}`;
+  if (statusEl) {
+    // Prefer the pre-computed `summary` from the server (steps/completed/failed/running)
+    // so we render progress counts without walking the DAG client-side. Fall back to the
+    // raw step count for runs that predate the summary field (e.g. loaded from old history).
+    const s = run.summary;
+    if (s) {
+      const parts = [`${s.completed}/${s.steps} done`];
+      if (s.running) parts.push(`${s.running} running`);
+      if (s.failed) parts.push(`${s.failed} failed`);
+      if (s.skipped) parts.push(`${s.skipped} skipped`);
+      statusEl.textContent = parts.join(" · ") + " · " + run.status;
+    } else {
+      statusEl.textContent = `${run.steps.length} steps · ${run.status}`;
+    }
+  }
   renderWorkflowDag(run, panel);
 }
 
