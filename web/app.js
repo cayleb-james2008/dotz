@@ -8,7 +8,10 @@
  */
 "use strict";
 
+// Thinking levels for the reasoning picker. Populated from GET /api/models so the picker is
+// backend-driven; falls back to the hardcoded list only if the backend hasn't provided one.
 const THINK_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
+let backendThinkingLevels = null;
 const LAYOUT_KEY = "dotz.layout.v1";
 const BRAIN_FLOAT_KEY = "dotz.brainFloat.v1";
 const PANEL_NAMES = ["chat", "graph", "brain", "browser", "memory", "files", "sandbox", "skills", "templates", "design", "spec", "living-docs", "vcs", "connections", "doctrine"];
@@ -714,7 +717,7 @@ function setReasoningLevel(lvl) {
       .catch((e) => pushError("thinking: " + e.message));
   } else {
     persistConfig({ thinkingLevel: lvl });
-    renderReasoning({ thinkingLevel: lvl, availableThinkingLevels: THINK_LEVELS, supportsThinking: true });
+    renderReasoning({ thinkingLevel: lvl, availableThinkingLevels: (backendThinkingLevels || THINK_LEVELS), supportsThinking: true });
   }
 }
 
@@ -787,6 +790,7 @@ async function loadGlobalModels() {
     state.modelCatalog = m.available || [];
     if (m.providerMeta) state.providers = m.providerMeta;
     if (m.providerDefaults) state.providerDefaults = m.providerDefaults;
+    if (m.thinkingLevels) backendThinkingLevels = m.thinkingLevels;
     if (m.current) {
       state.activeProvider = m.current.provider || state.activeProvider || "ollama";
       // Surface the backend's current provider/model so primeTopbarFromConfig renders them.
@@ -1498,7 +1502,8 @@ function primeTopbarFromConfig() {
   if (state.config.executiveModel) { const mi = $("model-input"); if (mi) mi.value = state.config.executiveModel; }
   if (state.config.subagentModel) { const si = $("subagent-input"); if (si) si.value = state.config.subagentModel; }
   // Prime REASONING with a synthesized stub; renderReasoning early-returns the POST when no session exists.
-  renderReasoning({ thinkingLevel: state.config.thinkingLevel, availableThinkingLevels: THINK_LEVELS, supportsThinking: true });
+  // Use the backend-provided thinking levels (from GET /api/models) so the picker is backend-driven.
+  renderReasoning({ thinkingLevel: state.config.thinkingLevel, availableThinkingLevels: (backendThinkingLevels || THINK_LEVELS), supportsThinking: true });
 }
 
 async function loadModels() {
@@ -1593,7 +1598,10 @@ function renderReasoning(summary) {
   const seg = $("reasoning-seg");
   seg.innerHTML = "";
   const avail = summary.availableThinkingLevels || [];
-  THINK_LEVELS.forEach((lvl) => {
+  // Iterate over the backend-provided thinking-level list (from GET /api/models) so the picker
+  // is backend-driven; fall back to the hardcoded constant only if the backend hasn't provided one.
+  const allLevels = backendThinkingLevels || THINK_LEVELS;
+  allLevels.forEach((lvl) => {
     const b = el("button", null, lvl.toUpperCase().slice(0, 3));
     b.title = lvl;
     b.disabled = !summary.supportsThinking || !avail.includes(lvl);
