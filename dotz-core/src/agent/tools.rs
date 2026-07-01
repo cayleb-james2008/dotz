@@ -18,6 +18,12 @@ pub struct ToolCtx {
     pub cwd: PathBuf,
     /// Session WS broadcast sender (for human_gate to emit a gate frame). None in subagent contexts.
     pub tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    /// The workflow run id this tool call belongs to, when invoked from a workflow subagent.
+    /// The inter-agent context-bus tools (`context_read`/`context_write`) use this as the
+    /// authoritative run id so a subagent never needs to be told its run id (which it has no way
+    /// to know) and cannot read or write another run's bus by passing a different id. None for
+    /// the lead session and non-workflow contexts → the bus tools refuse.
+    pub run_id: Option<String>,
 }
 
 impl ToolCtx {
@@ -833,6 +839,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: std::env::temp_dir(),
             tx: None,
+            run_id: None,
         };
         let err = restricted
             .run("bash", &json!({"command": "echo hi"}), &ctx)
@@ -851,6 +858,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: std::env::temp_dir(),
             tx: None,
+            run_id: None,
         };
         let out = registry
             .run("bash", &json!({"command": "echo hello"}), &ctx)
@@ -873,6 +881,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: std::env::temp_dir(),
             tx: None,
+            run_id: None,
         };
         let err = registry
             .run("bash", &json!({"command": "exit 1"}), &ctx)
@@ -928,6 +937,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: std::env::temp_dir(),
             tx: None,
+            run_id: None,
         };
         // A ~2s command with a 1s timeout must be killed mid-run.
         let command = if cfg!(windows) {
@@ -986,6 +996,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: base.clone(),
             tx: None,
+            run_id: None,
         };
         let err = registry
             .run("bash", &json!({"command": command}), &ctx)
@@ -1034,6 +1045,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: base.clone(),
             tx: None,
+            run_id: None,
         };
 
         // Relative paths inside the cwd are fine.
@@ -1065,6 +1077,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: base.clone(),
             tx: None,
+            run_id: None,
         };
         let out = registry
             .run("read", &json!({"file_path": "note.txt"}), &ctx)
@@ -1093,6 +1106,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: base.clone(),
             tx: None,
+            run_id: None,
         };
         let out = registry
             .run("read", &json!({"file_path": "big.txt"}), &ctx)
@@ -1133,6 +1147,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: base.clone(),
             tx: None,
+            run_id: None,
         };
         let err = registry
             .run("read", &json!({"file_path": "../secret.txt"}), &ctx)
@@ -1159,6 +1174,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: base.clone(),
             tx: None,
+            run_id: None,
         };
 
         // write + read round-trip.
@@ -1208,6 +1224,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: base.clone(),
             tx: None,
+            run_id: None,
         };
 
         let out = registry
