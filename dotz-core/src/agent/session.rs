@@ -567,6 +567,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     let ctx = ToolCtx {
         cwd: cwd.clone(),
         tx: Some(session_guard(&session).tx.clone()),
+        run_id: None,
     };
     let cancel = session_guard(&session).cancel.clone();
 
@@ -2127,6 +2128,7 @@ mod tests {
         let ctx = tools::ToolCtx {
             cwd: std::env::temp_dir(),
             tx: Some(sess.lock().unwrap().tx.clone()),
+            run_id: None,
         };
         let err = run_tool(&sess, "bash", &json!({ "command": "echo hi" }), &ctx)
             .await
@@ -2150,6 +2152,7 @@ mod tests {
         let ctx = tools::ToolCtx {
             cwd: std::env::temp_dir(),
             tx: Some(sess.lock().unwrap().tx.clone()),
+            run_id: None,
         };
         let out = run_tool(
             &sess,
@@ -2185,6 +2188,7 @@ mod tests {
         let ctx = tools::ToolCtx {
             cwd: std::env::temp_dir(),
             tx: Some(sess.lock().unwrap().tx.clone()),
+            run_id: None,
         };
         let (rv, is_error, text) = execute_tool(
             &sess,
@@ -2273,6 +2277,7 @@ mod tests {
         let ctx = tools::ToolCtx {
             cwd: std::env::temp_dir(),
             tx: Some(sess.lock().unwrap().tx.clone()),
+            run_id: None,
         };
 
         // Dispatch a single subagent against the fake provider. The agent exists

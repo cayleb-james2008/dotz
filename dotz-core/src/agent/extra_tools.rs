@@ -1361,6 +1361,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: dir.clone(),
             tx: None,
+            run_id: None,
         };
         let tool = AgentsMdTool;
 
@@ -1406,6 +1407,7 @@ mod tests {
         let ctx = ToolCtx {
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             tx: None,
+            run_id: None,
         };
         let name = format!(
             "testskill{}",

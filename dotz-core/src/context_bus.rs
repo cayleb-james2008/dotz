@@ -168,29 +168,28 @@ impl Tool for ContextReadTool {
         "context_read"
     }
     fn description(&self) -> &'static str {
-        "Read a value from the shared inter-agent context bus for this workflow run. Args: {key: string}. Returns the JSON value or an error if the key does not exist."
+        "Read a value from the shared inter-agent context bus for this workflow run. Args: {key: string}. Returns the JSON value or an error if the key does not exist. The run is determined automatically from the calling subagent's context."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "key": { "type": "string", "description": "The key to read from the context bus (e.g. \"scout:files\", \"planner:plan\")" },
-                "runId": { "type": "string", "description": "The workflow run id (must match the current run)" }
+                "key": { "type": "string", "description": "The key to read from the context bus (e.g. \"scout:files\", \"planner:plan\")" }
             },
-            "required": ["key", "runId"]
+            "required": ["key"]
         })
     }
-    async fn execute(&self, args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let key = args
             .get("key")
             .and_then(|v| v.as_str())
             .ok_or("key is required")?;
-        let run_id = args
-            .get("runId")
-            .and_then(|v| v.as_str())
-            .ok_or("runId is required")?;
+        let run_id = ctx
+            .run_id
+            .as_ref()
+            .ok_or("context bus is only available inside a workflow run")?;
         let bus = ContextBus {
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
         };
         match bus.read(key) {
             Some(v) => serde_json::to_string_pretty(&v).map_err(|e| e.to_string()),
@@ -207,31 +206,30 @@ impl Tool for ContextWriteTool {
         "context_write"
     }
     fn description(&self) -> &'static str {
-        "Write a structured value to the shared inter-agent context bus for this workflow run. Args: {key: string, value: any JSON-serializable}. Use this to share findings, plans, gap-lists, file inventories, etc. with other agents in your workflow."
+        "Write a structured value to the shared inter-agent context bus for this workflow run. Args: {key: string, value: any JSON-serializable}. Use this to share findings, plans, gap-lists, file inventories, etc. with other agents in your workflow. The run is determined automatically from the calling subagent's context."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "key": { "type": "string", "description": "The key to write (e.g. \"scout:files\", \"reviewer:gap_list\")" },
-                "value": { "description": "Any JSON-serializable value" },
-                "runId": { "type": "string", "description": "The workflow run id (must match the current run)" }
+                "value": { "description": "Any JSON-serializable value" }
             },
-            "required": ["key", "value", "runId"]
+            "required": ["key", "value"]
         })
     }
-    async fn execute(&self, args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let key = args
             .get("key")
             .and_then(|v| v.as_str())
             .ok_or("key is required")?;
         let value = args.get("value").ok_or("value is required")?;
-        let run_id = args
-            .get("runId")
-            .and_then(|v| v.as_str())
-            .ok_or("runId is required")?;
+        let run_id = ctx
+            .run_id
+            .as_ref()
+            .ok_or("context bus is only available inside a workflow run")?;
         let bus = ContextBus {
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
         };
         bus.write(key, value.clone());
         Ok(format!("wrote '{key}' to context bus"))
@@ -565,6 +563,136 @@ mod tests {
         assert!(
             injected.contains("## Task\ndo the thing"),
             "injection must still include the task section"
+        );
+    }
+
+    // ---- context_read / context_write tool isolation ----
+    //
+    // The bus tools must derive the run id from the ToolCtx (set by the subagent runtime from
+    // its ContextBus), NOT from a `runId` argument supplied by the LLM. A subagent has no way to
+    // learn its run id, so requiring it as an arg made the tools unusable; and trusting it would
+    // let one run read/write another run's bus by passing a foreign id — breaking the
+    // "structural cross-run isolation" the module doc promises.
+
+    use crate::agent::tools::{Tool, ToolCtx};
+    use std::path::PathBuf;
+
+    fn ctx_with_run(run_id: Option<&str>) -> ToolCtx {
+        ToolCtx {
+            cwd: PathBuf::from("."),
+            tx: None,
+            run_id: run_id.map(|s| s.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn context_write_then_read_round_trips_via_ctx_run_id() {
+        // Two distinct runs with the same key must stay isolated — the read sees only its own run.
+        let _a = isolated_bus("tool-rt-a");
+        let _b = isolated_bus("tool-rt-b");
+        let write = ContextWriteTool;
+        let read = ContextReadTool;
+
+        let ctx_a = ctx_with_run(Some("tool-rt-a"));
+        let ctx_b = ctx_with_run(Some("tool-rt-b"));
+
+        write
+            .execute(
+                &json!({"key": "scout:notes", "value": "found a bug"}),
+                &ctx_a,
+            )
+            .await
+            .unwrap();
+        write
+            .execute(
+                &json!({"key": "scout:notes", "value": "all clear"}),
+                &ctx_b,
+            )
+            .await
+            .unwrap();
+
+        let got_a = read
+            .execute(&json!({"key": "scout:notes"}), &ctx_a)
+            .await
+            .unwrap();
+        assert!(got_a.contains("found a bug"), "read A must see A's value: {got_a}");
+
+        let got_b = read
+            .execute(&json!({"key": "scout:notes"}), &ctx_b)
+            .await
+            .unwrap();
+        assert!(got_b.contains("all clear"), "read B must see B's value: {got_b}");
+    }
+
+    #[tokio::test]
+    async fn context_tools_ignore_foreign_run_id_arg() {
+        // A `runId` arg naming a *different* run must NOT override the ctx run id — otherwise
+        // one workflow run could read another's bus by passing a foreign id.
+        let own = isolated_bus("tool-iso-own");
+        let foreign = isolated_bus("tool-iso-foreign");
+        // Plant a secret on the foreign bus.
+        foreign.write("secret", json!("other-run-data"));
+
+        let write = ContextWriteTool;
+        let read = ContextReadTool;
+        let ctx_own = ctx_with_run(Some("tool-iso-own"));
+
+        // Writing with a foreign runId arg must land on the OWN bus, not the foreign one.
+        write
+            .execute(
+                &json!({"key": "k", "value": "mine", "runId": "tool-iso-foreign"}),
+                &ctx_own,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            own.read("k"),
+            Some(json!("mine")),
+            "write must target the ctx run, ignoring the runId arg"
+        );
+        assert_eq!(
+            foreign.read("k"),
+            None,
+            "foreign run bus must be untouched"
+        );
+
+        // Reading with a foreign runId arg must NOT see the foreign run's secret.
+        let err_or_val = read
+            .execute(
+                &json!({"key": "secret", "runId": "tool-iso-foreign"}),
+                &ctx_own,
+            )
+            .await;
+        assert!(
+            err_or_val.is_err() || !err_or_val.unwrap().contains("other-run-data"),
+            "read must not leak the foreign run's data via a runId arg"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_tools_refuse_without_ctx_run_id() {
+        // The lead session / non-workflow contexts have no run id — the bus tools must refuse
+        // rather than silently touching some default or caller-supplied run.
+        let ctx_none = ctx_with_run(None);
+        let write = ContextWriteTool;
+        let read = ContextReadTool;
+
+        let werr = write
+            .execute(&json!({"key": "k", "value": 1, "runId": "anything"}), &ctx_none)
+            .await
+            .unwrap_err();
+        assert!(
+            werr.contains("only available inside a workflow run"),
+            "write without ctx run id must refuse, got: {werr}"
+        );
+
+        let rerr = read
+            .execute(&json!({"key": "k", "runId": "anything"}), &ctx_none)
+            .await
+            .unwrap_err();
+        assert!(
+            rerr.contains("only available inside a workflow run"),
+            "read without ctx run id must refuse, got: {rerr}"
         );
     }
 }
