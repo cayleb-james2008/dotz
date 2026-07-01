@@ -54,22 +54,18 @@ impl FailKind {
 /// classify as `Other`.
 pub fn classify_error(err: &str) -> FailKind {
     let lower = err.to_ascii_lowercase();
-    // HTTP status: "returned 429", "429", "status: 429", etc.
-    if lower.contains("429") || lower.contains("rate limit") {
+    // HTTP status: all three adapters format errors as "{provider} returned {status}: {detail}".
+    // Match the status code as a standalone number so a "429" or "402" appearing inside the
+    // response body detail (a request id, port number, timestamp, …) does not false-positive
+    // into RateLimit / PaymentRequired and pollute the failover tracker.
+    if contains_status_code(&lower, "429") || lower.contains("rate limit") {
         return FailKind::RateLimit;
     }
-    if lower.contains("402") || lower.contains("payment") || lower.contains("insufficient") {
-        return FailKind::PaymentRequired;
-    }
-    if lower.contains("timed out")
-        || lower.contains("timeout")
-        || lower.contains("request to")
+    if contains_status_code(&lower, "402")
+        || lower.contains("payment")
+        || lower.contains("insufficient")
     {
-        // "request to <url> failed: ..." is the adapter's transport-error prefix; only treat as
-        // timeout when a timeout-related cause is present, otherwise fall through to Other.
-        if lower.contains("timeout") || lower.contains("timed out") {
-            return FailKind::Timeout;
-        }
+        return FailKind::PaymentRequired;
     }
     if lower.contains("timed out") || lower.contains("timeout") {
         return FailKind::Timeout;
@@ -83,6 +79,26 @@ pub fn classify_error(err: &str) -> FailKind {
         return FailKind::StreamInterrupted;
     }
     FailKind::Other
+}
+
+/// True when `text` contains `code` as a standalone integer token (not a substring of a larger
+/// number). This prevents a "429" embedded in "14293" or ":4290" from matching. The check is
+/// byte-level and safe because the codes are ASCII digits.
+fn contains_status_code(text: &str, code: &str) -> bool {
+    let bytes = text.as_bytes();
+    let cb = code.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(code) {
+        let idx = from + rel;
+        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_digit();
+        let after = idx + cb.len();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_digit();
+        if before_ok && after_ok {
+            return true;
+        }
+        from = idx + 1;
+    }
+    false
 }
 
 /// Per-provider health record. Failure counters are consecutive: any successful call resets them.
@@ -418,6 +434,55 @@ mod tests {
         assert_eq!(classify_error("returned 401: invalid api key"), FailKind::Other);
         assert_eq!(classify_error("model not found"), FailKind::Other);
         assert_eq!(classify_error("500 internal server error"), FailKind::Other);
+    }
+
+    /// A status-code substring embedded in the response body detail (a request id, port number,
+    /// timestamp, …) must NOT false-positive into RateLimit or PaymentRequired. Before the
+    /// standalone-number fix, `contains("429")` matched the "429" inside "14293" and degraded
+    /// a healthy provider whose actual error was a 500.
+    #[test]
+    fn classify_error_does_not_match_status_code_substring_in_body() {
+        // "429" inside a request id in the response body of a 500 error.
+        assert_eq!(
+            classify_error("openrouter returned 500: {\"request_id\":\"req_14293abc\",\"error\":\"internal\"}"),
+            FailKind::Other,
+            "a 429 substring inside the body must not classify as RateLimit"
+        );
+        // "402" inside a port number in the response body of a 500 error.
+        assert_eq!(
+            classify_error("ollama returned 500: upstream http://10.0.0.1:4020/ timed out"),
+            FailKind::Timeout,
+            "a 402 substring inside a port must not classify as PaymentRequired; the real signal is 'timed out'"
+        );
+        // "429" as part of a larger number in the body.
+        assert_eq!(
+            classify_error("openrouter returned 4290: weird"),
+            FailKind::Other,
+            "4290 is not 429 — must not classify as RateLimit"
+        );
+        // Genuine 429 still works (standalone, preceded by space, followed by colon).
+        assert_eq!(
+            classify_error("openrouter returned 429: rate limit exceeded"),
+            FailKind::RateLimit
+        );
+        // Genuine 402 still works (standalone, preceded by space, followed by space).
+        assert_eq!(
+            classify_error("402 Payment Required"),
+            FailKind::PaymentRequired
+        );
+    }
+
+    /// `contains_status_code` must match the code as a standalone integer token at any position
+    /// in the string (start, middle, end) and reject it when it is a substring of a larger number.
+    #[test]
+    fn contains_status_code_matches_standalone_only() {
+        assert!(contains_status_code("returned 429: detail", "429"));
+        assert!(contains_status_code("429 too many requests", "429"));
+        assert!(contains_status_code("error: 429", "429"));
+        assert!(!contains_status_code("request_id 14293abc", "429"));
+        assert!(!contains_status_code("port 4020", "402"));
+        assert!(!contains_status_code("4290", "429"));
+        assert!(!contains_status_code("", "429"));
     }
 
     #[test]
