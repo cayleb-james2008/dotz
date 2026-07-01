@@ -358,6 +358,14 @@ async fn execute_run(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW); // inherent on tokio::process::Command (no CommandExt import needed)
     }
+    // Place the child in its own process group (pgid == child pid) on posix so `kill_pid` can
+    // tree-kill the whole group — otherwise a sandboxed script that spawns a long-lived child
+    // (e.g. a dev server) leaks that grandchild as an orphan when the sandbox run is killed or
+    // times out. Windows already tree-kills via `taskkill /T /F`.
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
 
     let mut child = match command.spawn() {
         Ok(c) => c,
@@ -658,15 +666,28 @@ fn kill_pid(pid: Option<u32>) {
     }
     #[cfg(not(windows))]
     {
-        // SIGKILL via libc-free path: the standard `kill` binary.
+        // Tree-kill on posix: signal the child's process group (pgid == child pid when spawned
+        // with process_group(0) in execute_run). This kills the child AND any descendants it
+        // spawned (e.g. a dev server a sandboxed script launched), matching Windows' `taskkill
+        // /T /F`. Falls back to a direct signal if the group doesn't exist (e.g. a caller that
+        // spawned the child without its own process group, as some unit tests do).
+        //
         // Use .status() (not .spawn()) so the kill subprocess is reaped. Dropping a spawned
         // std::process::Child without waiting leaves a zombie that accumulates over a long-lived
         // server with many sandbox kills.
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
+        let group = std::process::Command::new("kill")
+            .args(["-9", &format!("-{pid}")])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        let group_ok = matches!(group, Ok(s) if s.success());
+        if !group_ok {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 
@@ -1800,6 +1821,106 @@ mod tests {
         );
 
         // Clean up the process-global store.
+        remove_test_run(&id);
+    }
+
+    /// On posix, `kill_pid` must tree-kill the child's entire process group, not just the direct
+    /// child. A sandboxed script that backgrounds a long-lived grandchild (e.g. `sleep 30 &`)
+    /// would otherwise leak that grandchild as an orphan when the sandbox run is killed or times
+    /// out. This test starts a bash run that backgrounds `sleep 30` and prints the grandchild's
+    /// pid, kills the run, and asserts the grandchild is also dead — proving the process-group
+    /// signal reaches descendants.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_pid_tree_kills_grandchild_on_posix() {
+        let (tx, mut rx) = broadcast::channel::<Value>(64);
+        let run = start_run(
+            "bash",
+            "sleep 30 & echo \"GRANDCHILD_PID=$!\"; sleep 30",
+            "terminal",
+            None,
+            60_000,
+            Some(tx.clone()),
+        )
+        .await
+        .expect("start_run should succeed");
+        let id = run.id.clone();
+
+        // Collect streamed output until we see the grandchild pid line.
+        let mut grandchild_pid: Option<u32> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while grandchild_pid.is_none() && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_output") {
+                        if let Some(line) = frame.get("line").and_then(|l| l.as_str()) {
+                            if let Some(rest) = line.strip_prefix("GRANDCHILD_PID=") {
+                                if let Ok(pid) = rest.trim().parse::<u32>() {
+                                    grandchild_pid = Some(pid);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let grandchild_pid = grandchild_pid
+            .expect("should have received the grandchild pid from sandbox output within 10s");
+
+        // Sanity: the grandchild should be alive right now (it is sleeping for 30s).
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &grandchild_pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            alive,
+            "grandchild should be alive before the sandbox kill"
+        );
+
+        // Kill the sandbox run — this must tree-kill the process group, including the grandchild.
+        assert!(
+            kill_run_by_id(&id),
+            "kill_run_by_id should signal a live run"
+        );
+
+        // Wait for execute_run to reach a terminal state.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if lookup(&id).map(|r| r.status != "running").unwrap_or(true) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("sandbox run did not reach terminal state within 15s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // The grandchild must now be dead — the process-group signal reached it. Poll briefly
+        // since the OS may take a moment to reap after SIGKILL.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &grandchild_pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "grandchild was not killed by the process-group signal within 10s"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
         remove_test_run(&id);
     }
 }
