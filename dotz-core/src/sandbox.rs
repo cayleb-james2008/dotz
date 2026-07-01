@@ -542,12 +542,28 @@ async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
 
 /// Scan the rolling context window plus the newest line for a listener port; if one is reachable,
 /// cache it on the run and emit a `sandbox_port` event at most once.
+///
+/// Short-circuits when a port is already cached or the run was evicted: without this guard every
+/// subsequent output line in web mode would spawn a task that probes each candidate port (400ms
+/// TCP timeout each) and re-locks the runs mutex — wasted work that accumulates fast on a chatty
+/// dev server long after the preview port is known.
 async fn detect_port_in_window(
     id: &str,
     line: &str,
     window: &[String],
     tx: &broadcast::Sender<Value>,
 ) {
+    // Early-return: if a port is already cached or the run was evicted from the store, skip the
+    // scan + TCP probes entirely. The lock is held only for the brief read, then dropped before
+    // any await so there is no contention with the output streaming path.
+    {
+        let store = runs_guard();
+        match store.get(id) {
+            None => return,
+            Some(e) if e.port.is_some() => return,
+            _ => {}
+        }
+    }
     let mut context = window.join("\n");
     if !context.is_empty() {
         context.push('\n');
@@ -1074,6 +1090,91 @@ mod tests {
         let output = "ready\nLocal: http://localhost:3000\nAdmin: http://127.0.0.1:4000\n";
         let ports = scan_ports(output);
         assert_eq!(ports, vec![3000, 4000]);
+    }
+
+    /// `detect_port_in_window` must short-circuit when a port is already cached on the run, so a
+    /// chatty dev server's subsequent output lines don't each spawn a task that does multiple
+    /// 400ms TCP probes and mutex locks for no benefit. Without the early-return the function
+    /// would probe every candidate port even though the cached port is already known.
+    #[tokio::test]
+    async fn detect_port_in_window_short_circuits_when_port_already_cached() {
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut store = runs_guard();
+            store.insert(
+                id.clone(),
+                RunEntry {
+                    run: SandboxRun {
+                        id: id.clone(),
+                        project_id: None,
+                        language: "shell".to_string(),
+                        code: String::new(),
+                        status: "running".to_string(),
+                        output: String::new(),
+                        exit_code: None,
+                        started_at: crate::util::now_ms(),
+                        ended_at: None,
+                    },
+                    pid: None,
+                    killed_by_us: false,
+                    mode: "web".to_string(),
+                    // Port already detected — the function must not re-probe.
+                    port: Some(3000),
+                },
+            );
+        }
+
+        let (tx, _rx) = broadcast::channel::<Value>(4);
+        // A line with a valid port pattern that scan_ports would find. If the early-return is
+        // missing, is_port_open would TCP-probe 5173 (nothing listening => 400ms timeout), making
+        // the call noticeably slow. The short-circuit must return in well under that.
+        let window: Vec<String> = vec!["ready in 300 ms".into()];
+        let start = tokio::time::Instant::now();
+        detect_port_in_window(
+            &id,
+            "  ->  Local:   http://localhost:5173/",
+            &window,
+            &tx,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // The cached port must be unchanged (the function must not overwrite it).
+        let cached = runs_guard().get(&id).and_then(|e| e.port);
+        assert_eq!(cached, Some(3000), "cached port must not be overwritten");
+
+        // Must return near-instantly — far below the 400ms TCP-probe timeout that would fire
+        // without the short-circuit.
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "detect_port_in_window should short-circuit when a port is cached, took {elapsed:?}"
+        );
+
+        // Clean up.
+        runs_guard().remove(&id);
+    }
+
+    /// `detect_port_in_window` must short-circuit when the run was evicted from the store, so a
+    /// spurious late output line doesn't probe ports for a run that no longer exists.
+    #[tokio::test]
+    async fn detect_port_in_window_short_circuits_when_run_evicted() {
+        let id = uuid::Uuid::new_v4().to_string();
+        // Intentionally do NOT insert the run into the store.
+        let (tx, _rx) = broadcast::channel::<Value>(4);
+        let window: Vec<String> = vec!["ready in 300 ms".into()];
+        let start = tokio::time::Instant::now();
+        detect_port_in_window(
+            &id,
+            "  ->  Local:   http://localhost:5173/",
+            &window,
+            &tx,
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "detect_port_in_window should short-circuit when the run is evicted, took {elapsed:?}"
+        );
     }
 
     /// A timed-out sandbox run must reap its child and remove its temp dir. Before the fix the
