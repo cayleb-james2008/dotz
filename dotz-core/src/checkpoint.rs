@@ -374,23 +374,33 @@ pub fn restore_checkpoint(run_id: &str, cwd: &str) -> Result<(), CheckpointError
         return Err(CheckpointError::NotAGitRepo);
     }
 
-    // LIFO check: if there are newer checkpoints than this one, refuse. The
-    // ordering is by created_at (descending); the target must be the newest or
-    // tied-newest.
+    // LIFO check: if there are newer checkpoints than this one IN THE SAME PROJECT,
+    // refuse. The ordering is by created_at (descending); the target must be the
+    // newest or tied-newest among checkpoints sharing its `cwd`.
+    //
+    // The check is scoped to the same project (`cwd`), NOT global. A checkpoint on
+    // a different project has no overlap with this run's working tree — restoring
+    // project X is independent of a newer checkpoint on project Y. A global check
+    // would block cross-project rollbacks (e.g. a long-running run on project B
+    // pinning project A's older checkpoint un-restoreable), defeating the
+    // parallel-runs-across-projects guarantee the module documents.
     {
         let g = checkpoints_guard();
         let target = g.get(run_id);
         if target.is_none() {
             return Err(CheckpointError::UnknownCheckpoint);
         }
-        let target_ts = target.unwrap().created_at;
-        let has_newer = g
-            .values()
-            .any(|other| other.run_id != run_id && other.created_at > target_ts);
+        let target = target.unwrap();
+        let target_ts = target.created_at;
+        let target_cwd = target.cwd.as_str();
+        let has_newer = g.values().any(|other| {
+            other.run_id != run_id && other.cwd == target_cwd && other.created_at > target_ts
+        });
         if has_newer {
-            // Find the newest for the error message.
+            // Find the newest checkpoint in the SAME project for the error message.
             let newest = g
                 .values()
+                .filter(|c| c.cwd == target_cwd)
                 .max_by_key(|c| c.created_at)
                 .map(|c| c.run_id.clone())
                 .unwrap_or_default();
@@ -716,6 +726,55 @@ mod tests {
         // Now there's no checkpoint at all.
         let result = restore_checkpoint("old", cwd);
         assert!(matches!(result, Err(CheckpointError::UnknownCheckpoint)));
+    }
+
+    /// LIFO is scoped per-project (`cwd`), not globally. A newer checkpoint on a
+    /// DIFFERENT project must NOT block restoring an older checkpoint on this
+    /// project — the two working trees are independent, so cross-project rollback
+    /// interference defeats the parallel-runs-across-projects guarantee the module
+    /// documents. Before the fix, the LIFO check scanned every checkpoint globally,
+    // so a long-running run on project B left project A's older checkpoint
+    // un-restoreable.
+    #[test]
+    fn restore_lifo_is_scoped_per_project_not_global() {
+        let _guard = test_lock();
+        reset_checkpoints_for_testing();
+
+        // Two independent git repos = two independent projects.
+        let dir_a = init_git_repo();
+        let dir_b = init_git_repo();
+        let cwd_a = dir_a.to_str().unwrap();
+        let cwd_b = dir_b.to_str().unwrap();
+
+        // Project A: older checkpoint.
+        save_checkpoint("run-a", cwd_a).unwrap();
+        // Project B: NEWER checkpoint (created_at strictly greater than run-a's).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        save_checkpoint("run-b", cwd_b).unwrap();
+
+        // Edit both trees to simulate subagent work.
+        std::fs::write(dir_a.join("README.md"), "edited by A\n").unwrap();
+        std::fs::write(dir_b.join("README.md"), "edited by B\n").unwrap();
+
+        // Restoring the OLDER checkpoint on project A must succeed despite project
+        // B having a newer checkpoint — they are different working trees.
+        restore_checkpoint("run-a", cwd_a)
+            .expect("restoring project A must not be blocked by a newer checkpoint on project B");
+        // Project A's tree is rolled back; project B's tree is untouched.
+        assert_eq!(
+            std::fs::read_to_string(dir_a.join("README.md")).unwrap(),
+            "# hello\n",
+            "project A should be restored to its pre-run state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir_b.join("README.md")).unwrap(),
+            "edited by B\n",
+            "project B must be untouched by project A's rollback"
+        );
+
+        // The cross-project checkpoint on B is still registered and restorable.
+        assert!(get_checkpoint("run-b").is_some());
+        restore_checkpoint("run-b", cwd_b).unwrap();
     }
 
     /// Restore succeeds even if the working tree has staged (added-to-index) changes.
