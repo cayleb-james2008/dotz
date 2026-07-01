@@ -48,8 +48,20 @@ fn config_file() -> PathBuf {
 /// like "openrouter/openrouter/...". Also strips a *mismatched* provider prefix so switching
 /// executive provider (e.g. openrouter -> ollama) does not leave a stale prefix in the env var.
 /// If no subagent model is configured, derives the provider's default so the env var is always valid.
+///
+/// OpenRouter model ids are namespaced by upstream provider (e.g. "anthropic/claude-3.5-sonnet",
+/// "openai/gpt-4o"). Stripping those namespaces would corrupt valid model ids — the "anthropic/"
+/// prefix is a required OpenRouter namespace, not a stale provider prefix. So for OpenRouter we
+/// strip only the *current* provider's prefix (via `strip_matching_provider_prefix`), never a
+/// foreign one. For all other providers model ids are not namespaced, so stripping any known
+/// provider prefix is safe.
 pub fn apply_env(c: &DotzConfig) {
-    let model = strip_any_provider_prefix(&c.subagent_model);
+    // First normalize the current provider's own prefix (idempotent with load/update, but makes
+    // apply_env self-contained so callers and tests don't have to pre-normalize).
+    let model = types::strip_matching_provider_prefix(&c.provider, &c.subagent_model);
+    // Then strip a stale prefix from a DIFFERENT provider — but NOT for OpenRouter, whose model
+    // ids legitimately start with an upstream provider namespace.
+    let model = strip_any_provider_prefix(&model, &c.provider);
     let model = if model.trim().is_empty() {
         default_subagent_model(&c.provider)
     } else {
@@ -62,8 +74,16 @@ pub fn apply_env(c: &DotzConfig) {
 /// surviving a provider change and then being re-prepended by apply_env. The match is
 /// case-insensitive so a persisted value like "OpenRouter/..." is normalized the same way as
 /// "openrouter/...".
-fn strip_any_provider_prefix(model: &str) -> String {
+///
+/// `current_provider` gates the OpenRouter exception: OpenRouter model ids are legitimately
+/// namespaced by upstream provider (e.g. "anthropic/claude-3.5-sonnet"), so stripping a foreign
+/// provider prefix would corrupt a valid id. For every other provider model ids are bare, so
+/// stripping any known-provider prefix is safe.
+fn strip_any_provider_prefix(model: &str, current_provider: &str) -> String {
     let trimmed = model.trim();
+    if current_provider.eq_ignore_ascii_case("openrouter") {
+        return trimmed.to_string();
+    }
     let lower = trimmed.to_lowercase();
     for pid in types::provider_ids() {
         let prefix = format!("{pid}/");
@@ -378,6 +398,64 @@ mod tests {
             assert_eq!(
                 std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
                 "ollama/nvidia/nemotron-3-ultra-550b-a55b:free"
+            );
+        });
+    }
+
+    /// OpenRouter model ids are namespaced by upstream provider (e.g. "anthropic/claude-3.5-sonnet",
+    /// "openai/gpt-4o"). `strip_any_provider_prefix` used to strip those namespaces, corrupting
+    /// valid model ids: under provider "openrouter", "anthropic/claude-3.5-sonnet" became
+    /// "openrouter/claude-3.5-sonnet" (an invalid OpenRouter id that 404s). The fix skips
+    /// foreign-prefix stripping for OpenRouter so the required namespace survives into
+    /// DOTZ_SUBAGENT_MODEL.
+    #[test]
+    fn apply_env_preserves_openrouter_namespaced_model_ids() {
+        with_tmp_dir(|_| {
+            let cfg = DotzConfig {
+                provider: "openrouter".into(),
+                executive_model: "anthropic/claude-3.5-sonnet-latest".into(),
+                subagent_model: "anthropic/claude-3.5-sonnet-latest".into(),
+                thinking_level: "medium".into(),
+            };
+            apply_env(&cfg);
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "openrouter/anthropic/claude-3.5-sonnet-latest",
+                "OpenRouter namespaced model id must keep its upstream-provider namespace"
+            );
+
+            // A different upstream namespace (openai/gpt-4o) must also be preserved.
+            let cfg2 = DotzConfig {
+                subagent_model: "openai/gpt-4o".into(),
+                ..cfg
+            };
+            apply_env(&cfg2);
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "openrouter/openai/gpt-4o",
+                "OpenRouter namespaced model id must keep its upstream-provider namespace"
+            );
+        });
+    }
+
+    /// The OpenRouter exception must NOT silently keep a stale *current-provider* prefix. A
+    /// subagent_model of "openrouter/nvidia/..." under provider "openrouter" must still shed the
+    /// redundant "openrouter/" so the env var is "openrouter/nvidia/...", not the doubled
+    /// "openrouter/openrouter/nvidia/...".
+    #[test]
+    fn apply_env_strips_current_provider_prefix_even_for_openrouter() {
+        with_tmp_dir(|_| {
+            let cfg = DotzConfig {
+                provider: "openrouter".into(),
+                executive_model: "nex-agi/nex-n2-pro:free".into(),
+                subagent_model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free".into(),
+                thinking_level: "medium".into(),
+            };
+            apply_env(&cfg);
+            assert_eq!(
+                std::env::var("DOTZ_SUBAGENT_MODEL").unwrap(),
+                "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+                "the current provider's own prefix must still be stripped for OpenRouter"
             );
         });
     }
