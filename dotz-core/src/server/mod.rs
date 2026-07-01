@@ -108,6 +108,7 @@ async fn models(State(s): State<Shared>) -> Json<Value> {
         "providerDefaults": types::provider_defaults_json(),
         "subagentModel": c.subagent_model,
         "thinkingLevel": c.thinking_level,
+        "thinkingLevels": types::THINKING_LEVELS.to_vec(),
     }))
 }
 
@@ -451,6 +452,17 @@ mod tests {
         assert_eq!(resp["subagentModel"], "minimax-m3");
         assert_eq!(resp["thinkingLevel"], "high");
 
+        // The full thinking-level list is surfaced so the UI's reasoning picker is backend-driven
+        // instead of hardcoded — it must match types::THINKING_LEVELS exactly.
+        let levels = resp["thinkingLevels"].as_array().expect("thinkingLevels is an array");
+        assert_eq!(
+            levels,
+            &types::THINKING_LEVELS.iter().map(|s| json!(*s)).collect::<Vec<_>>(),
+            "thinkingLevels must match the backend constant"
+        );
+        assert!(levels.contains(&json!("high")), "thinkingLevels must include 'high'");
+        assert!(!levels.is_empty(), "thinkingLevels must not be empty");
+
         match prev_dir {
             Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
             None => std::env::remove_var("DOTZ_CONFIG_DIR"),
@@ -504,6 +516,11 @@ mod tests {
         assert!(
             body["current"]["modelId"].as_str().map(|m| !m.is_empty()).unwrap_or(false),
             "/api/models body must have a current.modelId"
+        );
+        // The thinking-level list must be surfaced so the UI's reasoning picker is backend-driven.
+        assert!(
+            body["thinkingLevels"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "/api/models body must have a non-empty thinkingLevels array"
         );
 
         let _ = tx.send(());
