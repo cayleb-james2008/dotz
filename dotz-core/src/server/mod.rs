@@ -39,6 +39,7 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
         .route("/api/health", get(health))
         .route("/api/providers", get(providers))
         .route("/api/profiles", get(profiles_list))
+        .route("/api/models", get(models))
         .route("/api/config", get(get_config).post(post_config))
         .route(
             "/api/verify/suite/{profile}",
@@ -82,6 +83,32 @@ async fn providers() -> Json<Value> {
 
 async fn profiles_list() -> Json<Value> {
     Json(json!({ "profiles": profiles::summaries(), "default": "workflow" }))
+}
+
+/// GET /api/models — the backend-driven model catalog for the UI's model picker. Returns the
+/// full provider list, per-provider metadata, the available model catalog, provider-aware
+/// default executive/subagent model ids, and the currently configured provider + executive
+/// model. This is session-independent (unlike `/api/sessions/:id/models`), so the command
+/// center can render a populated picker before any session is opened. The UI filters
+/// `available` by `current.provider` to fill the dropdown / datalist.
+async fn models(State(s): State<Shared>) -> Json<Value> {
+    let c = state_config(&s).clone();
+    let default = types::default_model();
+    Json(json!({
+        "current": {
+            "provider": c.provider,
+            "modelId": c.executive_model,
+            "name": c.executive_model,
+            "reasoning": true,
+        },
+        "default": default,
+        "providers": types::provider_ids(),
+        "providerMeta": types::providers(),
+        "available": types::available_models(),
+        "providerDefaults": types::provider_defaults_json(),
+        "subagentModel": c.subagent_model,
+        "thinkingLevel": c.thinking_level,
+    }))
 }
 
 async fn get_config(State(s): State<Shared>) -> Json<Value> {
@@ -351,6 +378,137 @@ mod tests {
             "server exited with error: {:?}",
             result.err()
         );
+    }
+
+    /// `GET /api/models` must return the backend-driven model catalog: at least one provider, a
+    /// non-empty `available` catalog with model ids, provider metadata, provider-aware defaults,
+    /// and the currently configured `current` provider/model derived from the loaded config. This
+    /// is what the UI's model picker binds to instead of a hardcoded list.
+    #[tokio::test]
+    async fn get_models_returns_backend_driven_catalog() {
+        let dir =
+            std::env::temp_dir().join(format!("dotz-server-models-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev_dir = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+
+        let state = Arc::new(AppState {
+            config: Mutex::new(config::load()),
+        });
+        let Json(resp) = models(State(state)).await;
+
+        // At least one provider id is present.
+        let providers = resp["providers"].as_array().expect("providers is an array");
+        assert!(!providers.is_empty(), "providers list must not be empty");
+        assert!(
+            providers.iter().any(|p| p.as_str() == Some("ollama")),
+            "providers must include ollama"
+        );
+
+        // Provider metadata is present and non-empty.
+        let meta = resp["providerMeta"].as_array().expect("providerMeta is an array");
+        assert!(!meta.is_empty(), "providerMeta must not be empty");
+        assert!(
+            meta.iter().any(|p| p["id"] == "ollama"),
+            "providerMeta must include ollama entry"
+        );
+
+        // The available catalog must have at least one model id per entry, and at least one entry
+        // for a fixed (non-free-form) provider so the dropdown is usable.
+        let available = resp["available"].as_array().expect("available is an array");
+        assert!(!available.is_empty(), "available catalog must not be empty");
+        for m in available {
+            let mid = m["modelId"].as_str().expect("modelId present");
+            assert!(!mid.is_empty(), "catalog entry must have a non-empty modelId");
+            let prov = m["provider"].as_str().expect("provider present");
+            assert!(!prov.is_empty(), "catalog entry must have a non-empty provider");
+            assert!(
+                types::is_known_provider(prov),
+                "catalog entry provider {prov} must be a known provider"
+            );
+        }
+        assert!(
+            available.iter().any(|m| m["provider"] == "anthropic"),
+            "catalog must include at least one anthropic model for the fixed-provider dropdown"
+        );
+
+        // Provider-aware defaults are present for the free-form providers.
+        let defaults = &resp["providerDefaults"];
+        assert_eq!(defaults["ollama"]["executive"], "glm-5.2");
+        assert_eq!(defaults["ollama"]["subagent"], "minimax-m3");
+
+        // The current provider/model is derived from the loaded config (default = ollama/glm-5.2).
+        assert_eq!(resp["current"]["provider"], "ollama");
+        assert_eq!(resp["current"]["modelId"], "glm-5.2");
+        assert_eq!(resp["current"]["reasoning"], true);
+
+        // The default model ref is present.
+        assert_eq!(resp["default"]["provider"], "ollama");
+        assert_eq!(resp["default"]["modelId"], "glm-5.2");
+
+        // Subagent model + thinking level are surfaced so the UI can render them without a
+        // second round-trip to /api/config.
+        assert_eq!(resp["subagentModel"], "minimax-m3");
+        assert_eq!(resp["thinkingLevel"], "high");
+
+        match prev_dir {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `GET /api/models` must be reachable over HTTP through the full axum router and return the
+    /// catalog JSON with the expected shape — proving the route is wired into `app()`.
+    #[tokio::test]
+    async fn get_models_endpoint_reachable_over_http() {
+        let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dummy.local_addr().unwrap();
+        drop(dummy);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(serve_with_shutdown_addr(
+            addr,
+            PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/api/models", addr.port()))
+            .send()
+            .await
+            .expect("GET /api/models");
+        assert!(
+            resp.status().is_success(),
+            "/api/models should be 200, got {}",
+            resp.status()
+        );
+        let body: Value = resp.json().await.expect("/api/models body is JSON");
+        assert!(
+            body["providers"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "/api/models body must have a non-empty providers array"
+        );
+        assert!(
+            body["available"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "/api/models body must have a non-empty available catalog"
+        );
+        assert!(
+            body["current"]["provider"].as_str().map(|p| !p.is_empty()).unwrap_or(false),
+            "/api/models body must have a current.provider"
+        );
+        assert!(
+            body["current"]["modelId"].as_str().map(|m| !m.is_empty()).unwrap_or(false),
+            "/api/models body must have a current.modelId"
+        );
+
+        let _ = tx.send(());
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "server should exit cleanly: {:?}", result.err());
     }
 
     #[tokio::test]

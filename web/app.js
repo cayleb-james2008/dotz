@@ -121,6 +121,7 @@ async function init() {
   await loadProfiles();
   await loadProviders();
   await loadDotzConfig();
+  await loadGlobalModels();
   primeTopbarFromConfig();
   await refreshProviderHealth();
   await loadProjects();
@@ -774,6 +775,29 @@ function renderProfilePicker() {
 async function loadProviders() {
   try { const { providers } = await api("/api/providers"); state.providers = providers || []; }
   catch (e) { state.providers = []; pushError("providers: " + e.message); }
+}
+
+// Backend-driven model catalog: GET /api/models returns the full provider list, per-provider
+// metadata, the available model catalog, provider-aware defaults, and the current config's
+// selected provider + executive model. This populates the model picker before any session
+// exists (the command center), so the dropdown/datalist is never empty or hardcoded.
+async function loadGlobalModels() {
+  try {
+    const m = await api("/api/models");
+    state.modelCatalog = m.available || [];
+    if (m.providerMeta) state.providers = m.providerMeta;
+    if (m.providerDefaults) state.providerDefaults = m.providerDefaults;
+    if (m.current) {
+      state.activeProvider = m.current.provider || state.activeProvider || "ollama";
+      // Surface the backend's current provider/model so primeTopbarFromConfig renders them.
+      if (state.config) {
+        state.config.provider = m.current.provider || state.config.provider;
+        state.config.executiveModel = m.current.modelId || state.config.executiveModel;
+        if (m.subagentModel) state.config.subagentModel = m.subagentModel;
+        if (m.thinkingLevel) state.config.thinkingLevel = m.thinkingLevel;
+      }
+    }
+  } catch (e) { pushError("models: " + e.message); }
 }
 
 async function loadDotzConfig() {
