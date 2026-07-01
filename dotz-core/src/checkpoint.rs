@@ -343,7 +343,7 @@ pub fn save_checkpoint(run_id: &str, cwd: &str) -> Result<String, CheckpointErro
     let cp = Checkpoint {
         run_id: run_id.to_string(),
         snapshot_sha: snapshot_sha.clone(),
-        created_at: now_ms(),
+        created_at: crate::util::now_ms(),
         cwd: cwd.to_string(),
     };
 
@@ -457,13 +457,6 @@ pub fn restore_checkpoint(run_id: &str, cwd: &str) -> Result<(), CheckpointError
 pub fn discard_checkpoint(run_id: &str) -> Result<(), CheckpointError> {
     remove_checkpoint(run_id).ok_or(CheckpointError::UnknownCheckpoint)?;
     Ok(())
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 // ---- REST handlers ----
@@ -674,6 +667,27 @@ mod tests {
 
         // Metadata is gone.
         assert!(get_checkpoint(run_id).is_none());
+    }
+
+    /// `save_checkpoint` must stamp `created_at` with a plausible recent wall-clock timestamp.
+    /// This guards the consolidation from the module's local `now_ms()` to the shared
+    /// `crate::util::now_ms()`: a broken or stale copy would produce a zero or pre-2020
+    /// timestamp, which would corrupt the LIFO ordering the restore path depends on.
+    #[test]
+    fn save_checkpoint_stamps_plausible_created_at() {
+        let _guard = test_lock();
+        reset_checkpoints_for_testing();
+        let dir = init_git_repo();
+        let cwd = dir.to_str().unwrap();
+        let run_id = "created-at-run";
+        save_checkpoint(run_id, cwd).unwrap();
+
+        let cp = get_checkpoint(run_id).expect("checkpoint should exist after save");
+        assert!(
+            cp.created_at > 1_577_836_800_000,
+            "created_at should be a plausible recent timestamp (after 2020-01-01), got {}",
+            cp.created_at
+        );
     }
 
     /// Restore without a prior save returns UnknownCheckpoint.
