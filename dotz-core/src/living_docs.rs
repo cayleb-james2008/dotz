@@ -325,7 +325,16 @@ pub fn render_prompt_block(cwd: Option<&str>) -> String {
     }
     let mut rendered = sections.join("\n\n");
     if rendered.len() > 5000 {
-        rendered.truncate(5000);
+        // Back up to the nearest UTF-8 char boundary at or before byte 5000 so the slice
+        // doesn't panic when a multi-byte character straddles the cut point — the common
+        // case for real living-docs content (emoji, non-ASCII prose, i18n code comments).
+        // `String::truncate` panics on a non-boundary index, and this fn runs inside agent
+        // system-prompt construction, so a panic here would crash the whole turn.
+        let mut end = 5000;
+        while !rendered.is_char_boundary(end) {
+            end -= 1;
+        }
+        rendered.truncate(end);
         rendered.push_str("\n[truncated]");
     }
     format!(
@@ -501,6 +510,40 @@ mod tests {
         let block = render_prompt_block(Some(dir.to_str().unwrap()));
         assert!(block.contains("dotz living docs"));
         assert!(block.contains("Do not infer credentials"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `render_prompt_block` truncates the joined doc summaries to 5 KB. The old code used
+    /// `String::truncate(5000)`, which panics when byte 5000 falls inside a multi-byte UTF-8
+    /// character — the common case for real living-docs content (emoji, non-ASCII prose, i18n
+    /// code comments). Because this fn runs inside agent system-prompt construction, a panic
+    /// here would crash the whole turn. This test feeds a doc whose compacted summary is a
+    /// single long run of `é` (2 bytes/char); the project section prefix
+    /// `"Project Anti-Patterns:\n"` is 23 bytes (odd), so byte 5000 lands at offset 4977
+    /// into the `é` run — an odd offset, i.e. 1 byte into a 2-byte char — which is exactly
+    /// the cut that panicked before the char-boundary fix. It must truncate without panicking
+    /// and still emit the `[truncated]` marker.
+    #[test]
+    fn render_prompt_block_truncates_multibyte_content_without_panicking() {
+        let dir = tmp_dir();
+        // 2500 × `é` = 5000 bytes on one non-`#` line; after `compact_doc(.., 12)` the
+        // rendered section is `"Project Anti-Patterns:\n"` (23 bytes) + this line, so total
+        // is 5023 bytes > 5000 and byte 5000 sits at offset 4977 inside the `é` run — an odd
+        // offset, which is mid-char for a 2-byte codepoint.
+        let big = "é".repeat(2500);
+        write_doc(
+            "project",
+            Some(&dir),
+            &LivingDocKind::AntiPatterns,
+            &format!("# Anti-Patterns\n\n{big}\n"),
+        )
+        .unwrap();
+        let block = render_prompt_block(Some(dir.to_str().unwrap()));
+        assert!(
+            block.contains("[truncated]"),
+            "truncated multibyte block must carry the [truncated] marker"
+        );
+        assert!(block.contains("dotz living docs"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
