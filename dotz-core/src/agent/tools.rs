@@ -1429,11 +1429,13 @@ mod tests {
     /// directories uselessly) terminates the scan cleanly.
     #[tokio::test]
     async fn grep_respects_file_budget_and_terminates_cleanly() {
-        static GREP_BUDGET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = GREP_BUDGET_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // tokio Mutex (not std): the guard is intentionally held across the `.await` calls below
+        // to serialize the process-global DOTZ_GREP_FILE_BUDGET env var for this test; an
+        // async-aware mutex is the correct type to hold across an await point.
+        static GREP_BUDGET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = GREP_BUDGET_LOCK.lock().await;
 
-        let base =
-            std::env::temp_dir().join(format!("dotz-grep-budget-{}", uuid::Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("dotz-grep-budget-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
 
         // Create a single directory with files. The first file is a decoy (consumes the

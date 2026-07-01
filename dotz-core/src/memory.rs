@@ -1068,7 +1068,11 @@ mod tests {
     #[test]
     fn clamp_top_k_prevents_overflow_and_preserves_default() {
         assert_eq!(clamp_top_k(None), 8, "None must keep the default of 8");
-        assert_eq!(clamp_top_k(Some(0)), 0, "explicit 0 is a valid 'return nothing' request");
+        assert_eq!(
+            clamp_top_k(Some(0)),
+            0,
+            "explicit 0 is a valid 'return nothing' request"
+        );
         assert_eq!(clamp_top_k(Some(1)), 1);
         assert_eq!(clamp_top_k(Some(50)), 50);
         assert_eq!(
@@ -1088,7 +1092,9 @@ mod tests {
         );
         // The critical invariant: the clamped value must never overflow when doubled.
         let clamped = clamp_top_k(Some(usize::MAX));
-        let _ = clamped.checked_mul(2).expect("clamped top_k * 2 must not overflow");
+        let _ = clamped
+            .checked_mul(2)
+            .expect("clamped top_k * 2 must not overflow");
     }
 
     #[test]

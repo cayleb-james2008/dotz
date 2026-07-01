@@ -560,17 +560,17 @@ impl Tool for RsiCompareTool {
 }
 
 // ---- human_gate: emit a {kind:"gate"} frame over the session WS, block until approve/reject ----
-static GATES: OnceLock<Mutex<HashMap<String, oneshot::Sender<(bool, Option<String>)>>>> =
-    OnceLock::new();
-fn gates() -> &'static Mutex<HashMap<String, oneshot::Sender<(bool, Option<String>)>>> {
+/// Pending human-gate resolutions keyed by gate id.
+type GateMap = HashMap<String, oneshot::Sender<(bool, Option<String>)>>;
+static GATES: OnceLock<Mutex<GateMap>> = OnceLock::new();
+fn gates() -> &'static Mutex<GateMap> {
     GATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Lock the human-gate mutex, recovering from a poisoned lock. A panic while holding the gates
 /// lock (e.g. inside a gate resolution callback) must not permanently brick the `human_gate`
 /// tool or the /ws `gate.approve` / `gate.reject` handler.
-fn gates_guard(
-) -> std::sync::MutexGuard<'static, HashMap<String, oneshot::Sender<(bool, Option<String>)>>> {
+fn gates_guard() -> std::sync::MutexGuard<'static, GateMap> {
     gates()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1278,10 +1278,7 @@ mod tests {
             // ~3s of wall-clock time; the 1s timeout fires first.
             "ping -n 4 127.0.0.1".to_string()
         } else {
-            format!(
-                "sleep 30 & echo $! > {} ; wait",
-                pidfile.to_string_lossy()
-            )
+            format!("sleep 30 & echo $! > {} ; wait", pidfile.to_string_lossy())
         };
 
         let result = run_gate(&dir, Some(&command)).await;
@@ -1316,7 +1313,10 @@ mod tests {
             }
             let _ = fs::remove_dir_all(&dir);
             let pid: i32 = pid_text.trim().parse().unwrap_or(-1);
-            assert!(pid > 0, "test should have captured the descendant pid: '{pid_text}'");
+            assert!(
+                pid > 0,
+                "test should have captured the descendant pid: '{pid_text}'"
+            );
             // `kill -0` is a non-destructive probe: success means the process still exists. The
             // process-group kill must have reaped the `sleep 30` grandchild, so this must fail.
             // Give the kernel a moment to reap the killed process.

@@ -450,7 +450,7 @@ async fn create_handler(
     });
     create(b.name, b.body, b.description, b.tags)
         .map(|t| Json(json!({ "template": t })))
-        .map_err(|e| bad(e))
+        .map_err(bad)
 }
 
 #[derive(Deserialize, Default)]

@@ -56,9 +56,9 @@ pub struct Usage {
 ///
 /// The `kind` field discriminates the renderer:
 ///   - `git_diff`      → `content` is a unified diff string (already colored by the
-///                        UI's diff renderer).
+///     UI's diff renderer).
 ///   - `patch_review`  → `content` is a reviewer's structured findings markdown;
-///                        rendered as a markdown block with approve/reject buttons.
+///     rendered as a markdown block with approve/reject buttons.
 ///
 /// `title` is a short label (e.g. "3 files changed" or "review round 1").
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -294,11 +294,17 @@ pub(crate) fn emit_event(run_id: &str, event: Value) {
 }
 
 fn emit_workflow_start(run: &WorkflowRun) {
-    emit_event(&run.id, json!({ "type": "workflow_start", "run": run_with_summary(run) }));
+    emit_event(
+        &run.id,
+        json!({ "type": "workflow_start", "run": run_with_summary(run) }),
+    );
 }
 
 fn emit_workflow_end(run: &WorkflowRun) {
-    emit_event(&run.id, json!({ "type": "workflow_end", "run": run_with_summary(run) }));
+    emit_event(
+        &run.id,
+        json!({ "type": "workflow_end", "run": run_with_summary(run) }),
+    );
 }
 
 fn emit_step_state(run_id: &str, step: &WorkflowStep, summary: Option<&WorkflowSummary>) {
@@ -433,13 +439,11 @@ fn write_all(runs: &[WorkflowRun]) {
     // history intact; the rename is atomic on both Unix and Windows (the std impl uses
     // MoveFileExW with MOVEFILE_REPLACE_EXISTING). Mirrors `run_record::write_unlocked`.
     let tmp = file.with_extension("json.tmp");
-    if std::fs::write(&tmp, &s).is_ok() {
-        if std::fs::rename(&tmp, &file).is_err() {
-            // Exotic cross-device / permission edge: fall back to a direct write so the history
-            // is still persisted, accepting the non-atomic window only on that path.
-            let _ = std::fs::write(&file, &s);
-            let _ = std::fs::remove_file(&tmp);
-        }
+    if std::fs::write(&tmp, &s).is_ok() && std::fs::rename(&tmp, &file).is_err() {
+        // Exotic cross-device / permission edge: fall back to a direct write so the history
+        // is still persisted, accepting the non-atomic window only on that path.
+        let _ = std::fs::write(&file, &s);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -1120,10 +1124,10 @@ pub fn startup_resume() -> usize {
         // Resume only if there's something to re-dispatch. A run whose every step
         //terminal (shouldn't happen given the filter above, but guard anyway) is
         // left in `interrupted` state for operator inspection.
-        if interrupted.unwrap_or(0) > 0 || restored.status == "running" {
-            if resume(&restored.id).is_some() {
-                resumed += 1;
-            }
+        if (interrupted.unwrap_or(0) > 0 || restored.status == "running")
+            && resume(&restored.id).is_some()
+        {
+            resumed += 1;
         }
     }
     resumed
@@ -1175,9 +1179,7 @@ async fn list_active_handler() -> Json<Value> {
 /// GET /api/workflows/:id → run (active, else history fallback) or 404.
 /// The run carries a pre-computed `summary` so the UI can render progress counts
 /// (`3/7 done · 1 running · 1 failed`) without walking the step DAG.
-async fn get_handler(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn get_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(run) = get_active(&id) {
         return Ok(Json(run_with_summary(&run)));
     }
@@ -1361,9 +1363,7 @@ async fn abort_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCod
 
 /// POST /api/workflows/:id/resume → resume an interrupted/running run via the executor.
 /// 200 with the run (running), 404 unknown run, 409 already terminal.
-async fn resume_handler(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn resume_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Reject the resume if the run is already terminal. `resume()` returns the
     // run as-is in that case, but the UI should see a 409 so it doesn't render a
     // "running" badge on a run that hasn't actually restarted.
@@ -1414,7 +1414,9 @@ async fn execute_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
     };
 
     match crate::workflow_executor::run_workflow(&id).await {
-        Some(run) => Ok(Json(json!({ "run": run_with_summary(&run), "checkpoint": checkpoint }))),
+        Some(run) => Ok(Json(
+            json!({ "run": run_with_summary(&run), "checkpoint": checkpoint }),
+        )),
         None => Err(not_found("no such workflow run")),
     }
 }
@@ -1442,7 +1444,9 @@ fn not_found(msg: &str) -> (StatusCode, Json<Value>) {
 /// re-running the workflow.
 async fn record_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match crate::run_record::load(&id) {
-        Some(record) => Ok(Json(serde_json::to_value(&record).unwrap_or_else(|_| json!({})))),
+        Some(record) => Ok(Json(
+            serde_json::to_value(&record).unwrap_or_else(|_| json!({})),
+        )),
         None => Err(not_found("no run record for this workflow")),
     }
 }
@@ -1620,7 +1624,7 @@ async fn patch_step_handler(
                                 Ok(n) if n < len => run.steps[n].id.clone(),
                                 _ => continue,
                             }
-                        } else if run.steps.iter().any(|st| &st.id == trimmed) {
+                        } else if run.steps.iter().any(|st| st.id == trimmed) {
                             trimmed.to_string()
                         } else {
                             continue;
@@ -1713,9 +1717,9 @@ async fn patch_step_handler(
                     .map(|p| p.status == "done" || p.status == "skipped" || p.status == "error")
                     .unwrap_or(false)
             });
-            if step.status == "pending" && (all_parents_terminal || step.parents.is_empty()) {
-                Some("ready")
-            } else if step.status == "error" && body.parents.is_some() {
+            if (step.status == "pending" && (all_parents_terminal || step.parents.is_empty()))
+                || (step.status == "error" && body.parents.is_some())
+            {
                 Some("ready")
             } else {
                 None
@@ -1832,10 +1836,10 @@ async fn insert_steps_handler(
                                 // to new-step ids are resolved after all ids are known.
                                 run.steps
                                     .iter()
-                                    .find(|st| &st.id == trimmed)
+                                    .find(|st| st.id == trimmed)
                                     .map(|st| st.id.clone())
                                     .unwrap_or_else(|| new_step_ids[idx].clone())
-                            } else if run.steps.iter().any(|st| &st.id == trimmed) {
+                            } else if run.steps.iter().any(|st| st.id == trimmed) {
                                 trimmed.to_string()
                             } else {
                                 continue;
@@ -1959,8 +1963,8 @@ async fn insert_steps_handler(
     Ok(Json(updated))
 }
 
-/// Public helpers (used by handlers AND tests) — these encapsulate the store
-/// operations so the logic is testable without a full axum test server.
+// Public helpers (used by handlers AND tests) — these encapsulate the store
+// operations so the logic is testable without a full axum test server.
 
 /// Patch a step's parents. Returns Err(CycleError) if the proposed parents form a cycle.
 pub fn patch_parents(
@@ -1991,7 +1995,7 @@ pub fn patch_parents(
                         Ok(n) if n < len => Some(run.steps[n].id.clone()),
                         _ => None,
                     }
-                } else if run.steps.iter().any(|st| &st.id == trimmed) {
+                } else if run.steps.iter().any(|st| st.id == trimmed) {
                     Some(trimmed.to_string())
                 } else {
                     None
@@ -2131,7 +2135,7 @@ pub fn insert_steps(run_id: &str, inputs: &[CreateStepInput]) -> Result<Workflow
                                         Ok(n) if n < existing_count => run.steps[n].id.clone(),
                                         _ => continue,
                                     }
-                                } else if run.steps.iter().any(|st| &st.id == trimmed) {
+                                } else if run.steps.iter().any(|st| st.id == trimmed) {
                                     trimmed.to_string()
                                 } else {
                                     continue;
@@ -3973,8 +3977,16 @@ mod tests {
                 agent: "worker".into(),
                 task: format!("task {i}"),
                 status: st.to_string(),
-                parents: if i > 0 { vec![format!("s{}", i - 1)] } else { Vec::new() },
-                children: if i + 1 < statuses.len() { vec![format!("s{}", i + 1)] } else { Vec::new() },
+                parents: if i > 0 {
+                    vec![format!("s{}", i - 1)]
+                } else {
+                    Vec::new()
+                },
+                children: if i + 1 < statuses.len() {
+                    vec![format!("s{}", i + 1)]
+                } else {
+                    Vec::new()
+                },
                 output: None,
                 error: None,
                 usage: None,

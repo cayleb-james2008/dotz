@@ -101,8 +101,8 @@ impl Embedder {
         // mask-weighted mean-pool over the seq dimension; last_hidden_state is [1, seq, EMBED_DIM].
         let mut pooled = vec![0f32; EMBED_DIM];
         let mut msum = 0f32;
-        for sp in 0..seq {
-            let m = mask[sp] as f32;
+        for (sp, &mask_val) in mask.iter().enumerate().take(seq) {
+            let m = mask_val as f32;
             msum += m;
             let off = sp * EMBED_DIM;
             for h in 0..EMBED_DIM {

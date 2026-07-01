@@ -99,7 +99,7 @@ fn updated_at(path: &FsPath) -> u64 {
 fn read_doc(dir: &FsPath, kind: &LivingDocKind) -> LivingDoc {
     let path = doc_path(dir, kind);
     LivingDoc {
-        kind: kind.clone(),
+        kind: *kind,
         path: path.to_string_lossy().to_string(),
         content: std::fs::read_to_string(&path).unwrap_or_default(),
         updated_at: updated_at(&path),

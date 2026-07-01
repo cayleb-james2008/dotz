@@ -338,10 +338,9 @@ fn parse_prompt_description(raw: &str) -> Option<String> {
     } else {
         // Find a `\n---` that is followed by a newline, CR, or EOF (a complete fence line).
         let mut search_from = 0usize;
-        let idx = loop {
-            let Some(rel) = after_open[search_from..].find("\n---") else {
-                return None;
-            };
+
+        loop {
+            let rel = after_open[search_from..].find("\n---")?;
             let pos = search_from + rel; // position of the `\n` before the `---`
             let after_dashes = pos + 4; // just past `\n---`
             let tail = &after_open[after_dashes..];
@@ -349,8 +348,7 @@ fn parse_prompt_description(raw: &str) -> Option<String> {
                 break pos;
             }
             search_from = pos + 1;
-        };
-        idx
+        }
     };
 
     // Normalize CRLF in the frontmatter content so key:value parsing sees clean LF lines.
@@ -1723,7 +1721,6 @@ mod tests {
         );
     }
 
-
     /// A killed sandbox run must deliver exactly one `sandbox_end` event, not two. Before the
     /// `try_mark_end_emitted` dedup, both the sandbox-start poller and the sandbox-kill handler
     /// emitted `sandbox_end` for the same run, so the UI received a redundant terminal event on
@@ -1841,10 +1838,7 @@ mod tests {
                     if frame.get("kind").and_then(|k| k.as_str()) == Some("sandbox") {
                         let event = frame.get("event").cloned().unwrap_or_default();
                         if event.get("type").and_then(|t| t.as_str()) == Some("sandbox_end") {
-                            let eid = event
-                                .get("runId")
-                                .and_then(|r| r.as_str())
-                                .unwrap_or("");
+                            let eid = event.get("runId").and_then(|r| r.as_str()).unwrap_or("");
                             if eid == rid {
                                 end_count += 1;
                             }

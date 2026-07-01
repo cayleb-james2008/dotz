@@ -419,11 +419,19 @@ mod tests {
             json!({ "role": "tool", "tool_call_id": "call_2", "content": "out2" }),
         ];
         let (_, contents) = convert_messages(&messages);
-        assert_eq!(contents.len(), 2, "two tool results must collapse into one user turn");
+        assert_eq!(
+            contents.len(),
+            2,
+            "two tool results must collapse into one user turn"
+        );
         assert_eq!(contents[0]["role"], "model");
         assert_eq!(contents[1]["role"], "user");
         let parts = contents[1]["parts"].as_array().unwrap();
-        assert_eq!(parts.len(), 2, "the single user turn must carry both functionResponse parts");
+        assert_eq!(
+            parts.len(),
+            2,
+            "the single user turn must carry both functionResponse parts"
+        );
         assert_eq!(parts[0]["functionResponse"]["name"], "bash");
         assert_eq!(parts[0]["functionResponse"]["response"]["result"], "out1");
         assert_eq!(parts[1]["functionResponse"]["name"], "read");

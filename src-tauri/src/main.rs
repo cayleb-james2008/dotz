@@ -200,7 +200,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .title("dotz · ultra code")
                 .inner_size(1480.0, 920.0)
                 .min_inner_size(1000.0, 700.0)
-                .initialization_script(&shim(&app.package_info().version.to_string()))
+                .initialization_script(shim(&app.package_info().version.to_string()))
                 .build()?;
             Ok(())
         });

@@ -94,10 +94,7 @@ fn read_all_from_disk() -> Vec<Project> {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
-    match serde_json::from_str::<Vec<Project>>(&raw) {
-        Ok(v) => v,
-        Err(_) => Vec::new(),
-    }
+    serde_json::from_str::<Vec<Project>>(&raw).unwrap_or_default()
 }
 
 /// Persist the full array (pretty-printed, matching `JSON.stringify(projects, null, 2)`).
@@ -1009,10 +1006,7 @@ mod tests {
     /// node_modules) must be skipped.
     #[test]
     fn build_file_tree_sorts_dirs_before_files_alphabetically() {
-        let dir = std::env::temp_dir().join(format!(
-            "dotz-filetree-sort-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("dotz-filetree-sort-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         // Mix of dirs + files with names that are NOT already in sorted order, so a pass
         // through an unsorted iterator would produce a different sequence.
@@ -1056,7 +1050,9 @@ mod tests {
 
         // Skipped dirs must not appear anywhere in the tree.
         assert!(
-            !order.iter().any(|(n, _)| n == ".git" || n == "node_modules"),
+            !order
+                .iter()
+                .any(|(n, _)| n == ".git" || n == "node_modules"),
             ".git and node_modules must be excluded from the file tree"
         );
 

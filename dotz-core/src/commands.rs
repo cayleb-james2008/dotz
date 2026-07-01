@@ -14,11 +14,7 @@
 //! function returning a `Vec<Command>`, which makes the palette's contract unit-testable without
 //! spinning up axum. The handler below just wraps it in JSON.
 
-use axum::{
-    http::StatusCode,
-    routing::get,
-    Json, Router,
-};
+use axum::{http::StatusCode, routing::get, Json, Router};
 use serde_json::{json, Value};
 
 /// A single palette entry. The UI dispatches on `action` (optionally with `arg`); `key` is an
@@ -79,7 +75,9 @@ pub fn catalog() -> Vec<Command> {
             id: format!("model.provider.{pid}"),
             category: "model",
             label: format!("Switch provider → {}", title(pid)),
-            description: format!("Set the active model provider to {pid} and apply its default models."),
+            description: format!(
+                "Set the active model provider to {pid} and apply its default models."
+            ),
             key: None,
             action: "model:provider".to_string(),
             arg: Some(pid.to_string()),
@@ -90,7 +88,8 @@ pub fn catalog() -> Vec<Command> {
         id: "model.set-id".to_string(),
         category: "model",
         label: "Set executive model id…".to_string(),
-        description: "Prompt for a model id and apply it as the executive (lead) model.".to_string(),
+        description: "Prompt for a model id and apply it as the executive (lead) model."
+            .to_string(),
         key: None,
         action: "model:set-id".to_string(),
         arg: None,
@@ -139,7 +138,8 @@ pub fn catalog() -> Vec<Command> {
         id: "graph.focus-step".to_string(),
         category: "graph",
         label: "Graph: focus a step…".to_string(),
-        description: "Open a step from the active workflow run and show its node detail.".to_string(),
+        description: "Open a step from the active workflow run and show its node detail."
+            .to_string(),
         key: Some("G S".to_string()),
         action: "graph:focus-step".to_string(),
         arg: None,
@@ -152,7 +152,8 @@ pub fn catalog() -> Vec<Command> {
         id: "step.rerun".to_string(),
         category: "step",
         label: "Re-run selected step".to_string(),
-        description: "Re-run the step currently open in the node-detail drawer (no feedback).".to_string(),
+        description: "Re-run the step currently open in the node-detail drawer (no feedback)."
+            .to_string(),
         key: Some("R".to_string()),
         action: "step:rerun".to_string(),
         arg: None,
@@ -162,7 +163,9 @@ pub fn catalog() -> Vec<Command> {
         id: "step.rerun-feedback".to_string(),
         category: "step",
         label: "Re-run selected step with feedback…".to_string(),
-        description: "Prompt for feedback and re-run the step currently open in the node-detail drawer.".to_string(),
+        description:
+            "Prompt for feedback and re-run the step currently open in the node-detail drawer."
+                .to_string(),
         key: Some("Shift+R".to_string()),
         action: "step:rerun-feedback".to_string(),
         arg: None,
@@ -256,7 +259,9 @@ async fn list_commands() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
             Json(json!({ "error": format!("invalid command catalog: {e}") })),
         ));
     }
-    Ok(Json(json!({ "commands": cmds.iter().map(cmd_to_json).collect::<Vec<_>>() })))
+    Ok(Json(
+        json!({ "commands": cmds.iter().map(cmd_to_json).collect::<Vec<_>>() }),
+    ))
 }
 
 /// Stateless `Router<()>` merged into `server::app()`.
@@ -293,7 +298,9 @@ mod tests {
         for &lvl in types::THINKING_LEVELS.iter() {
             let id = format!("reasoning.{lvl}");
             assert!(
-                cmds.iter().any(|c| c.id == id && c.category == "reasoning" && c.arg.as_deref() == Some(lvl)),
+                cmds.iter().any(|c| c.id == id
+                    && c.category == "reasoning"
+                    && c.arg.as_deref() == Some(lvl)),
                 "missing reasoning command for level {lvl}"
             );
         }
@@ -305,7 +312,8 @@ mod tests {
         for pid in types::provider_ids() {
             let id = format!("model.provider.{pid}");
             assert!(
-                cmds.iter().any(|c| c.id == id && c.category == "model" && c.arg.as_deref() == Some(pid)),
+                cmds.iter()
+                    .any(|c| c.id == id && c.category == "model" && c.arg.as_deref() == Some(pid)),
                 "missing model switch command for provider {pid}"
             );
         }
@@ -314,7 +322,10 @@ mod tests {
     #[test]
     fn graph_and_step_commands_require_session() {
         let cmds = catalog();
-        for c in cmds.iter().filter(|c| c.category == "graph" || c.category == "step") {
+        for c in cmds
+            .iter()
+            .filter(|c| c.category == "graph" || c.category == "step")
+        {
             assert!(c.requires_session, "{} should require a session", c.id);
         }
     }
@@ -324,7 +335,10 @@ mod tests {
         // Provider/reasoning switches persist to config and apply on session open, so the palette
         // must let a power user set them from the command center before any session exists.
         let cmds = catalog();
-        for c in cmds.iter().filter(|c| c.category == "model" || c.category == "reasoning") {
+        for c in cmds
+            .iter()
+            .filter(|c| c.category == "model" || c.category == "reasoning")
+        {
             assert!(!c.requires_session, "{} should not require a session", c.id);
         }
     }
@@ -335,7 +349,10 @@ mod tests {
         // heading — validate() rejects this, so assert directly.
         let cmds = catalog();
         for cat in CATEGORIES {
-            assert!(cmds.iter().any(|c| c.category == cat), "category {cat} has no commands");
+            assert!(
+                cmds.iter().any(|c| c.category == cat),
+                "category {cat} has no commands"
+            );
         }
     }
 
@@ -350,7 +367,10 @@ mod tests {
     fn validate_catches_unknown_category() {
         let mut cmds = catalog();
         cmds[0].category = "nope";
-        assert!(validate(&cmds).is_err(), "unknown category should be rejected");
+        assert!(
+            validate(&cmds).is_err(),
+            "unknown category should be rejected"
+        );
     }
 
     #[test]
@@ -385,7 +405,10 @@ mod tests {
         cmds[0].key = Some(dup.clone());
         cmds[1].key = Some(dup.clone());
         let err = validate(&cmds).expect_err("duplicate keybinding should be rejected");
-        assert!(err.contains("duplicate keybinding"), "unexpected error: {err}");
+        assert!(
+            err.contains("duplicate keybinding"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

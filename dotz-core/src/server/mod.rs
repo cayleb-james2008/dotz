@@ -407,7 +407,9 @@ mod tests {
         );
 
         // Provider metadata is present and non-empty.
-        let meta = resp["providerMeta"].as_array().expect("providerMeta is an array");
+        let meta = resp["providerMeta"]
+            .as_array()
+            .expect("providerMeta is an array");
         assert!(!meta.is_empty(), "providerMeta must not be empty");
         assert!(
             meta.iter().any(|p| p["id"] == "ollama"),
@@ -420,9 +422,15 @@ mod tests {
         assert!(!available.is_empty(), "available catalog must not be empty");
         for m in available {
             let mid = m["modelId"].as_str().expect("modelId present");
-            assert!(!mid.is_empty(), "catalog entry must have a non-empty modelId");
+            assert!(
+                !mid.is_empty(),
+                "catalog entry must have a non-empty modelId"
+            );
             let prov = m["provider"].as_str().expect("provider present");
-            assert!(!prov.is_empty(), "catalog entry must have a non-empty provider");
+            assert!(
+                !prov.is_empty(),
+                "catalog entry must have a non-empty provider"
+            );
             assert!(
                 types::is_known_provider(prov),
                 "catalog entry provider {prov} must be a known provider"
@@ -454,13 +462,21 @@ mod tests {
 
         // The full thinking-level list is surfaced so the UI's reasoning picker is backend-driven
         // instead of hardcoded — it must match types::THINKING_LEVELS exactly.
-        let levels = resp["thinkingLevels"].as_array().expect("thinkingLevels is an array");
+        let levels = resp["thinkingLevels"]
+            .as_array()
+            .expect("thinkingLevels is an array");
         assert_eq!(
             levels,
-            &types::THINKING_LEVELS.iter().map(|s| json!(*s)).collect::<Vec<_>>(),
+            &types::THINKING_LEVELS
+                .iter()
+                .map(|s| json!(*s))
+                .collect::<Vec<_>>(),
             "thinkingLevels must match the backend constant"
         );
-        assert!(levels.contains(&json!("high")), "thinkingLevels must include 'high'");
+        assert!(
+            levels.contains(&json!("high")),
+            "thinkingLevels must include 'high'"
+        );
         assert!(!levels.is_empty(), "thinkingLevels must not be empty");
 
         match prev_dir {
@@ -502,30 +518,49 @@ mod tests {
         );
         let body: Value = resp.json().await.expect("/api/models body is JSON");
         assert!(
-            body["providers"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            body["providers"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
             "/api/models body must have a non-empty providers array"
         );
         assert!(
-            body["available"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            body["available"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
             "/api/models body must have a non-empty available catalog"
         );
         assert!(
-            body["current"]["provider"].as_str().map(|p| !p.is_empty()).unwrap_or(false),
+            body["current"]["provider"]
+                .as_str()
+                .map(|p| !p.is_empty())
+                .unwrap_or(false),
             "/api/models body must have a current.provider"
         );
         assert!(
-            body["current"]["modelId"].as_str().map(|m| !m.is_empty()).unwrap_or(false),
+            body["current"]["modelId"]
+                .as_str()
+                .map(|m| !m.is_empty())
+                .unwrap_or(false),
             "/api/models body must have a current.modelId"
         );
         // The thinking-level list must be surfaced so the UI's reasoning picker is backend-driven.
         assert!(
-            body["thinkingLevels"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            body["thinkingLevels"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
             "/api/models body must have a non-empty thinkingLevels array"
         );
 
         let _ = tx.send(());
         let result = handle.await.unwrap();
-        assert!(result.is_ok(), "server should exit cleanly: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "server should exit cleanly: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
@@ -658,7 +693,9 @@ mod tests {
     /// Resolve the `web/` dir the way the server does in the existing tests: the cargo
     /// workspace root (CARGO_MANIFEST_DIR is dotz-core, so the web dir is one level up).
     fn web_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("web")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("web")
     }
 
     /// `index.html` must not reach out to Google Fonts at runtime and must load the local
@@ -728,17 +765,13 @@ mod tests {
         let mut count = 0usize;
         for ent in entries.flatten() {
             let path = ent.path();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-            ;
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !name.ends_with(".woff2") {
                 continue;
             }
             count += 1;
-            let bytes = std::fs::read(&path)
-                .unwrap_or_else(|e| panic!("failed to read font {name}: {e}"));
+            let bytes =
+                std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read font {name}: {e}"));
             // woff2 magic: b"wOF2".
             assert_eq!(
                 &bytes[..4.min(bytes.len())],
@@ -817,11 +850,7 @@ mod tests {
         let shutdown = async {
             let _: () = rx.await.unwrap_or(());
         };
-        let handle = tokio::spawn(serve_with_shutdown_addr(
-            addr,
-            web_dir(),
-            shutdown,
-        ));
+        let handle = tokio::spawn(serve_with_shutdown_addr(addr, web_dir(), shutdown));
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
         let client = reqwest::Client::new();
@@ -882,6 +911,10 @@ mod tests {
 
         let _ = tx.send(());
         let result = handle.await.unwrap();
-        assert!(result.is_ok(), "server should exit cleanly: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "server should exit cleanly: {:?}",
+            result.err()
+        );
     }
 }

@@ -34,11 +34,9 @@ impl Budget {
     /// True when the given cumulative usage exceeds ANY of the set budget limits.
     pub fn is_exceeded(&self, cost: f64, input_tokens: u64, output_tokens: u64) -> bool {
         let total = input_tokens.saturating_add(output_tokens);
-        self.max_cost.map_or(false, |max| cost > max)
-            || self.max_tokens.map_or(false, |max| total > max)
-            || self
-                .max_input_tokens
-                .map_or(false, |max| input_tokens > max)
+        self.max_cost.is_some_and(|max| cost > max)
+            || self.max_tokens.is_some_and(|max| total > max)
+            || self.max_input_tokens.is_some_and(|max| input_tokens > max)
     }
 
     /// The highest consumption ratio (0.0..) across whichever of `max_cost`,
@@ -62,14 +60,12 @@ impl Budget {
         if let Some(max_tokens) = self.max_tokens {
             // Guard against the degenerate max_tokens == 0 config.
             if max_tokens > 0 {
-                max_ratio =
-                    max_ratio.max(total as f64 / max_tokens as f64);
+                max_ratio = max_ratio.max(total as f64 / max_tokens as f64);
             }
         }
         if let Some(max_input_tokens) = self.max_input_tokens {
             if max_input_tokens > 0 {
-                max_ratio =
-                    max_ratio.max(input_tokens as f64 / max_input_tokens as f64);
+                max_ratio = max_ratio.max(input_tokens as f64 / max_input_tokens as f64);
             }
         }
         max_ratio
@@ -381,8 +377,7 @@ pub fn provider_default(id: &str) -> Option<(&'static str, &'static str)> {
 pub fn available_models() -> Vec<ModelRef> {
     let mut out: Vec<ModelRef> = Vec::new();
     // Deduplicate by (provider, model_id) while preserving first-seen order.
-    let mut seen: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut push = |out: &mut Vec<ModelRef>, provider: &str, model_id: &str| {
         let key = (provider.to_string(), model_id.to_string());
         if seen.insert(key) {

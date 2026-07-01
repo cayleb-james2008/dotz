@@ -315,10 +315,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                 // Keep the SingleResult (if any) so the run record can capture
                 // the full provider response stream, skill set, and effective
                 // model. The executor-level timeout arm yields None.
-                let single: Option<SingleResult> = match result {
-                    Ok(r) => Some(r),
-                    Err(_) => None,
-                };
+                let single: Option<SingleResult> = result.ok();
                 let (status, output, error) = match &single {
                     Some(result) => {
                         if result.is_failed() {
@@ -398,14 +395,12 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
         // derives a truthful `agent_source`/`stop_reason` from the step's actual
         // status (`skipped` vs `error`/timeout).
         if let Some(run) = workflows::get_active(run_id) {
-            let recorded: std::collections::HashSet<String> =
-                run_record::load(run_id)
-                    .map(|r| r.steps.into_iter().map(|s| s.step_id).collect())
-                    .unwrap_or_default();
+            let recorded: std::collections::HashSet<String> = run_record::load(run_id)
+                .map(|r| r.steps.into_iter().map(|s| s.step_id).collect())
+                .unwrap_or_default();
             for step in &run.steps {
-                let terminal = step.status == "done"
-                    || step.status == "error"
-                    || step.status == "skipped";
+                let terminal =
+                    step.status == "done" || step.status == "error" || step.status == "skipped";
                 if terminal && !recorded.contains(&step.id) {
                     run_record::capture_step(run_id, &step.id, None);
                 }
@@ -427,9 +422,9 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
     }
 }
 
-/// The execute handler is wired into `workflows::router()` directly (see the
-/// `execute_handler` function in workflows.rs). This module exposes `run_workflow`
-/// for the REST layer and tests.
+// The execute handler is wired into `workflows::router()` directly (see the
+// `execute_handler` function in workflows.rs). This module exposes `run_workflow`
+// for the REST layer and tests.
 
 #[cfg(test)]
 mod tests {
@@ -437,10 +432,13 @@ mod tests {
     use crate::types::Budget;
     use crate::workflows::{self, CreateStepInput};
     use serde_json::{json, Value};
-    use std::sync::Mutex;
     use uuid::Uuid;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // tokio Mutex (not std): several tests below intentionally hold this guard across `.await`
+    // (run_workflow reads the process-global env vars mid-execution), so the lock MUST serialize
+    // the whole async test body. An async-aware mutex is the correct type to hold across await;
+    // the sync `#[test]` cases use `blocking_lock()` since they run outside a runtime.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn step(agent: &str, task: &str, parents: Option<Vec<Value>>) -> CreateStepInput {
         CreateStepInput {
@@ -471,7 +469,7 @@ mod tests {
         std::env::remove_var("DOTZ_WF_CONCURRENCY");
         let c = concurrency();
         assert!(
-            c >= 1 && c <= MAX_CONCURRENCY,
+            (1..=MAX_CONCURRENCY).contains(&c),
             "default concurrency out of bounds: {c}"
         );
 
@@ -490,7 +488,7 @@ mod tests {
         // Invalid string falls back to default.
         std::env::set_var("DOTZ_WF_CONCURRENCY", "not-a-number");
         let c = concurrency();
-        assert!(c >= 1 && c <= MAX_CONCURRENCY);
+        assert!((1..=MAX_CONCURRENCY).contains(&c));
 
         std::env::remove_var("DOTZ_WF_CONCURRENCY");
     }
@@ -505,9 +503,7 @@ mod tests {
     /// the unset default) when this test ran unlocked.
     #[test]
     fn step_timeout_clamps_to_sane_bounds() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK.blocking_lock();
         std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
         let t = step_timeout();
         assert_eq!(t.as_secs(), 300, "default step timeout is 5 minutes");
@@ -531,9 +527,7 @@ mod tests {
     /// run_workflow must return None for an unknown run id.
     #[tokio::test]
     async fn run_workflow_returns_none_for_unknown_run() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
         let result = run_workflow("no-such-run-id").await;
         assert!(result.is_none());
@@ -542,9 +536,7 @@ mod tests {
     /// run_workflow must return the run immediately if it is already terminal.
     #[tokio::test]
     async fn run_workflow_returns_immediately_for_terminal_run() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
         let run = workflows::create(
             None,
@@ -567,9 +559,7 @@ mod tests {
     /// subagent returns an error for unknown agents, and step_state records it).
     #[tokio::test]
     async fn run_workflow_marks_unknown_agent_step_as_error() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
         // Keep the timeout short so the test doesn't wait 5 minutes.
         std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
@@ -612,9 +602,7 @@ mod tests {
     /// A two-step DAG where the first step fails must skip the second step (failure-rerouting).
     #[tokio::test]
     async fn run_workflow_skips_children_of_failed_step() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
         std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
         std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
@@ -650,9 +638,7 @@ mod tests {
     /// context_read without parsing raw text.
     #[tokio::test]
     async fn context_bus_auto_populates_from_completed_steps() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
         std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
         std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
@@ -716,9 +702,7 @@ mod tests {
     /// caller is responsible for destroying it explicitly (bounded: one bus per run).
     #[tokio::test]
     async fn context_bus_persists_after_run_completion() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
         std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
         std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
@@ -763,9 +747,7 @@ mod tests {
     /// worker step reads an empty bus and starts from scratch.
     #[tokio::test]
     async fn run_workflow_preloads_context_bus_on_resume() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
         std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
         std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
@@ -935,9 +917,7 @@ mod tests {
     /// ready step is skipped.
     #[tokio::test]
     async fn run_budget_exceeded_skips_remaining_steps() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
         std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
         std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
@@ -998,7 +978,7 @@ mod tests {
             step1
         );
         assert!(
-            step1.error.as_ref().map_or(false, |e| e.contains("budget")),
+            step1.error.as_ref().is_some_and(|e| e.contains("budget")),
             "step 1 error should mention budget: {:?}",
             step1.error
         );
@@ -1011,9 +991,7 @@ mod tests {
     /// This is the regression guard: the budget feature must be opt-in.
     #[tokio::test]
     async fn run_without_budget_never_skips_on_cost() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
 
         // No budget on the run. Agent name must NOT contain "budget" so we can
@@ -1040,7 +1018,7 @@ mod tests {
             run.steps[0]
                 .error
                 .as_ref()
-                .map_or(false, |e| !e.contains("budget")),
+                .is_some_and(|e| !e.contains("budget")),
             "step should not mention budget when no budget is set: {:?}",
             run.steps[0].error
         );
@@ -1071,9 +1049,7 @@ mod tests {
     /// the store and back).
     #[test]
     fn run_budget_round_trips_through_store() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK.blocking_lock();
         let _file = set_tmp_workflows_file();
         let budget = Budget {
             max_cost: Some(10.0),
