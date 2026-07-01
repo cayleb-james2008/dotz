@@ -38,6 +38,11 @@ const SANDBOX_LANGUAGES: [&str; 6] = [
 const DEFAULT_TIMEOUT_MS: i64 = 30_000;
 /// Output cap, matching the spirit of the Node streaming buffer — keep memory bounded.
 const OUTPUT_CAP: usize = 50 * 1024;
+/// Soft cap on retained run entries. Terminal runs (done/error/killed) are evicted oldest-first
+/// once the store exceeds this size, so a long-lived dotz-core server doesn't leak every run's
+/// captured output (up to `OUTPUT_CAP` each) and its `end_emitted` dedup flag forever. Running
+/// runs are never evicted — only finished ones.
+const MAX_RETAINED_RUNS: usize = 64;
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -128,6 +133,42 @@ pub fn try_mark_end_emitted(id: &str) -> bool {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(id.to_string())
+}
+
+/// Evict terminal runs oldest-first (by `startedAt`) until the store is at or below
+/// `MAX_RETAINED_RUNS`, and drop the matching `end_emitted` flags — once a run is gone from the
+/// store its dedup flag is dead weight. Running runs are always retained. Called from
+/// `start_run` (insertion) and `finish` (terminal transition) so the store stays bounded as
+/// runs accumulate over a long-lived server process. Lock order is `runs` then `end_emitted`,
+/// matching `remove_test_run`; no path takes them in reverse, so this cannot deadlock.
+fn prune_finished_runs() {
+    let evicted: Vec<String> = {
+        let mut store = runs_guard();
+        if store.len() <= MAX_RETAINED_RUNS {
+            return;
+        }
+        // Oldest terminal runs first; running runs are never candidates.
+        let mut terminal: Vec<(String, i64)> = store
+            .iter()
+            .filter(|(_, e)| e.run.status != "running")
+            .map(|(id, e)| (id.clone(), e.run.started_at))
+            .collect();
+        terminal.sort_by_key(|(_, t)| *t);
+        let to_evict = store.len().saturating_sub(MAX_RETAINED_RUNS);
+        let mut evicted = Vec::with_capacity(to_evict);
+        for (id, _) in terminal.into_iter().take(to_evict) {
+            store.remove(&id);
+            evicted.push(id);
+        }
+        evicted
+    };
+    if evicted.is_empty() {
+        return;
+    }
+    let mut emitted = end_emitted_set().lock().unwrap_or_else(|p| p.into_inner());
+    for id in &evicted {
+        emitted.remove(id);
+    }
 }
 
 pub fn router() -> Router<()> {
@@ -249,6 +290,9 @@ pub async fn start_run(
             },
         );
     }
+    // Bounded-retention sweep: evict oldest terminal runs so the store doesn't leak every
+    // run's captured output over a long-lived server process.
+    prune_finished_runs();
 
     tokio::spawn(execute_run(
         id.clone(),
@@ -556,6 +600,8 @@ fn finish(id: &str, status: &str, exit_code: Option<i64>, output: &str) {
         e.run.ended_at = Some(now_ms());
         e.pid = None;
     }
+    // A run just became terminal — sweep oldest finished runs so the store stays bounded.
+    prune_finished_runs();
 }
 
 fn mark_killed_by_us(id: &str) {
@@ -791,6 +837,157 @@ mod tests {
             after_remove, before,
             "run_count should return to baseline after removal"
         );
+    }
+
+    /// `prune_finished_runs` must keep the runs store bounded by evicting the oldest *terminal*
+    /// runs (never running ones) once the store exceeds `MAX_RETAINED_RUNS`, and must drop the
+    /// matching `end_emitted` dedup flags so neither the store nor the dedup set leaks every
+    /// run's captured output / flag over a long-lived server.
+    ///
+    /// This test drives the prune path directly with runs whose `started_at` values are far
+    /// below any real `now_ms()`, so they are always the oldest entries in the shared store and
+    /// are evicted before any other test's runs — making the assertions deterministic without a
+    /// global test serialization lock. Running runs use `started_at` 1..3 and terminal runs use
+    /// 100..(100+N); only terminal runs are eviction candidates, so the running runs' lower
+    /// `started_at` does not affect eviction order.
+    #[test]
+    fn prune_finished_runs_evicts_oldest_terminal_and_cleans_end_emitted() {
+        let my_running: Vec<String> =
+            (0..3).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        let my_terminal: Vec<String> = (0..(MAX_RETAINED_RUNS + 20))
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+
+        // Insert with started_at far below now_ms() so these are always the oldest entries in
+        // the shared store and are evicted first, never touching other tests' runs.
+        {
+            let mut store = runs_guard();
+            for (i, id) in my_running.iter().enumerate() {
+                store.insert(
+                    id.clone(),
+                    RunEntry {
+                        run: SandboxRun {
+                            id: id.clone(),
+                            project_id: None,
+                            language: "shell".to_string(),
+                            code: String::new(),
+                            status: "running".to_string(),
+                            output: String::new(),
+                            exit_code: None,
+                            started_at: 1 + i as i64,
+                            ended_at: None,
+                        },
+                        pid: None,
+                        killed_by_us: false,
+                        mode: "terminal".to_string(),
+                        port: None,
+                    },
+                );
+            }
+            for (i, id) in my_terminal.iter().enumerate() {
+                store.insert(
+                    id.clone(),
+                    RunEntry {
+                        run: SandboxRun {
+                            id: id.clone(),
+                            project_id: None,
+                            language: "shell".to_string(),
+                            code: String::new(),
+                            status: "done".to_string(),
+                            output: String::new(),
+                            exit_code: Some(0),
+                            started_at: 100 + i as i64,
+                            ended_at: Some(100 + i as i64),
+                        },
+                        pid: None,
+                        killed_by_us: false,
+                        mode: "terminal".to_string(),
+                        port: None,
+                    },
+                );
+            }
+        }
+
+        // Mark every terminal run as end-emitted so we can verify the dedup flags are cleaned.
+        {
+            let mut emitted = end_emitted_set().lock().unwrap_or_else(|p| p.into_inner());
+            for id in &my_terminal {
+                emitted.insert(id.clone());
+            }
+        }
+
+        prune_finished_runs();
+
+        // Running runs are never evicted.
+        {
+            let store = runs_guard();
+            for id in &my_running {
+                assert!(
+                    store.contains_key(id),
+                    "running run {id} must never be evicted by prune_finished_runs"
+                );
+            }
+        }
+
+        // The store must be at or below the cap plus a small slack for other tests' running
+        // runs (running runs are never evicted, so a concurrent test could hold a few extra).
+        {
+            let store = runs_guard();
+            assert!(
+                store.len() <= MAX_RETAINED_RUNS + 8,
+                "store must be bounded after prune, got {} entries",
+                store.len()
+            );
+        }
+
+        // At least one terminal run must have been evicted (we inserted cap+20, well over cap).
+        let evicted: Vec<String> = {
+            let store = runs_guard();
+            my_terminal
+                .iter()
+                .filter(|id| !store.contains_key(*id))
+                .cloned()
+                .collect()
+        };
+        assert!(
+            !evicted.is_empty(),
+            "at least one terminal run must be evicted when the store exceeds the cap"
+        );
+
+        // Evicted runs must have their end_emitted flag cleaned; retained terminal runs must
+        // keep theirs — proving the dedup set does not leak evicted runs' flags.
+        {
+            let emitted = end_emitted_set().lock().unwrap_or_else(|p| p.into_inner());
+            for id in &evicted {
+                assert!(
+                    !emitted.contains(id),
+                    "evicted run {id} must have its end_emitted flag cleaned by prune"
+                );
+            }
+            let store = runs_guard();
+            for id in &my_terminal {
+                if store.contains_key(id) {
+                    assert!(
+                        emitted.contains(id),
+                        "retained terminal run {id} must keep its end_emitted flag"
+                    );
+                }
+            }
+        }
+
+        // Clean up: remove my surviving entries so the global store is left pristine.
+        {
+            let mut store = runs_guard();
+            for id in my_running.iter().chain(my_terminal.iter()) {
+                store.remove(id);
+            }
+        }
+        {
+            let mut emitted = end_emitted_set().lock().unwrap_or_else(|p| p.into_inner());
+            for id in &my_terminal {
+                emitted.remove(id);
+            }
+        }
     }
 
     /// Dev servers (Vite, Next.js, etc.) often print the listener keyword on one line and the
