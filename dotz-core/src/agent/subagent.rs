@@ -25,7 +25,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 
 const MAX_PARALLEL_TASKS: usize = 8;
@@ -69,13 +69,6 @@ fn timeout_result(agent_name: &str, task: &str, step: Option<usize>) -> SingleRe
         step,
         skill_set: Vec::new(),
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
 }
 
 // ---- agent discovery (port of agents.ts) ----
@@ -577,7 +570,7 @@ async fn run_single_agent_inner(
         .map(|b| crate::context_bus::inject_context_into_task(task, b))
         .unwrap_or_else(|| task.to_string());
     let mut history: Vec<Message> =
-        vec![Message::user(&format!("Task: {effective_task}"), now_ms())];
+        vec![Message::user(&format!("Task: {effective_task}"), crate::util::now_ms())];
 
     for _round in 0..MAX_ROUNDS {
         let messages = to_openai_messages(&system_prompt, &history);
@@ -594,7 +587,7 @@ async fn run_single_agent_inner(
         let stream_task = tokio::spawn(async move { adapter.stream(req, delta_tx).await });
         let deadline = tokio::time::Instant::now() + subagent_timeout();
 
-        let mut acc = Acc::new(&provider_id, &model_id, now_ms());
+        let mut acc = Acc::new(&provider_id, &model_id, crate::util::now_ms());
         let mut stop_reason = "stop".to_string();
         // Clone the progress sender once per round so each delta can be forwarded without
         // holding a borrow across the apply_delta call.
@@ -706,7 +699,7 @@ async fn run_single_agent_inner(
                 usage: None,
                 stop_reason: None,
                 error_message: None,
-                timestamp: now_ms(),
+                timestamp: crate::util::now_ms(),
                 response_id: Some(call_id),
             });
         }

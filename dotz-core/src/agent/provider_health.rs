@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 
 /// Classify a provider error string into a `FailKind`. Only the kinds we know how to recover from
@@ -217,13 +217,6 @@ fn recovery_cooldown() -> Duration {
         .unwrap_or(RECOVERY_COOLDOWN)
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
-
 /// The process-global health map, keyed by provider id.
 static HEALTH: OnceLock<RwLock<HashMap<String, ProviderHealth>>> = OnceLock::new();
 fn health_map() -> &'static RwLock<HashMap<String, ProviderHealth>> {
@@ -303,7 +296,7 @@ pub async fn record_failure(provider: &str, error: &str) -> HealthStatus {
             && h.status == HealthStatus::Healthy
         {
             h.status = HealthStatus::Degraded;
-            h.degraded_at = Some(now_ms());
+            h.degraded_at = Some(crate::util::now_ms());
             transitioned = true;
         } else if h.status == HealthStatus::Degraded {
             // A failover-worthy failure while already degraded (most importantly: a recovery
@@ -313,7 +306,7 @@ pub async fn record_failure(provider: &str, error: &str) -> HealthStatus {
             // subsequent call to the primary as a probe — permanently abandoning the backup
             // even though the primary is still broken. Refreshing the timestamp sends the next
             // call back to the backup until another cooldown window passes.
-            h.degraded_at = Some(now_ms());
+            h.degraded_at = Some(crate::util::now_ms());
         }
     }
     // A non-failover-worthy error (401/404/4xx) does NOT reset the consecutive counter — the
@@ -358,7 +351,7 @@ pub async fn resolve_effective_model(
             m.get(primary_provider)
                 .and_then(|h| h.degraded_at)
                 .map(|at| {
-                    let elapsed = Duration::from_millis((now_ms() - at).max(0) as u64);
+                    let elapsed = Duration::from_millis((crate::util::now_ms() - at).max(0) as u64);
                     elapsed >= recovery_cooldown()
                 })
                 .unwrap_or(false)
