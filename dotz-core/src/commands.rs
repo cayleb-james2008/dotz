@@ -370,7 +370,7 @@ mod tests {
         validate(&cmds).expect("catalog must be valid (incl. unique keybindings)");
         // Belt-and-suspenders: scan explicitly so a future refactor of validate() can't quietly
         // drop the assertion without this test going red.
-        let mut keys: Vec<&str> = cmds.iter().filter_map(|c| c.key.as_deref()).collect();
+        let keys: Vec<&str> = cmds.iter().filter_map(|c| c.key.as_deref()).collect();
         let mut sorted = keys.clone();
         sorted.sort();
         sorted.dedup();
