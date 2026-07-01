@@ -362,9 +362,17 @@ fn platforms_ok(s: &Skill) -> bool {
 /// them across the available cores with `std::thread::scope` (stdlib — no rayon dep), then insert in
 /// the original order so the dedupe priority is byte-identical to the sequential version.
 fn build_index() -> BTreeMap<String, Skill> {
+    build_index_from(scan_roots())
+}
+
+/// Build the skill index from a pre-collected set of roots. Splitting this out of `build_index`
+/// lets the parallel-vs-sequential test compare both scans over the *same* root snapshot, so a
+/// concurrent `DOTZ_PI`/`DOTZ_SKILLS_PATHS` mutation by another test can't make the two diverge
+/// and poison the shared `TEST_LOCK`. Production `build_index()` still resolves roots itself.
+fn build_index_from(roots: Vec<(PathBuf, &'static str)>) -> BTreeMap<String, Skill> {
     // 1. Collect candidate files in priority order (low→high). The walk is fast; parsing isn't.
     let mut files: Vec<(PathBuf, &'static str)> = Vec::new();
-    for (dir, source) in scan_roots() {
+    for (dir, source) in roots {
         for file in find_skill_files(&dir) {
             files.push((file, source));
         }
@@ -554,14 +562,25 @@ mod tests {
     use std::time::Instant;
 
     /// Serialize tests that mutate the process-global `DOTZ_PI` / `DOTZ_SKILLS_PATHS` env vars
-    /// so concurrent index builds don't see each other's isolated directories.
+    /// so concurrent index builds don't see each other's isolated directories. Recover from
+    /// poison (matching `index_guard`) so a single panicking sibling can't brick the group —
+    /// this is what kept the cascade going once `parallel_index_matches_sequential` panicked.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire `TEST_LOCK`, surviving a poison left by a sibling test that panicked while holding
+    /// it. Poison is sticky on the mutex itself, so without recovery every later skills test
+    /// would fail with `PoisonError` even though they did nothing wrong.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// DOTZ_SKILLS_PATHS must be parsed with the OS path-list separator so a multi-dir override
     /// works on both Windows (`;`) and Unix (`:`) without hand-rolling the delimiter.
     #[test]
     fn extra_skills_paths_uses_os_path_delimiter() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         let dir1 = std::env::temp_dir().join(format!("dotz-skills-a-{}", uuid::Uuid::new_v4()));
         let dir2 = std::env::temp_dir().join(format!("dotz-skills-b-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir1).unwrap();
@@ -591,11 +610,16 @@ mod tests {
     /// also see the sequential-vs-parallel timing over the real on-disk skill pool.
     #[test]
     fn parallel_index_matches_sequential() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
+        // Snapshot the env-controlled roots ONCE so the sequential reference and the parallel
+        // build see the exact same root set. Without this, a concurrently-running test that
+        // mutates DOTZ_PI/DOTZ_SKILLS_PATHS can flip the roots between the two scans, making them
+        // diverge and poisoning TEST_LOCK — flaking the whole skills test group in the full suite.
+        let roots = scan_roots();
         let t0 = Instant::now();
         let mut seq: BTreeMap<String, PathBuf> = BTreeMap::new();
-        for (dir, source) in scan_roots() {
-            for file in find_skill_files(&dir) {
+        for (dir, source) in &roots {
+            for file in find_skill_files(dir) {
                 if let Some(s) = parse_skill_file(&file, source) {
                     if platforms_ok(&s) {
                         seq.insert(s.name.clone(), s.path.clone());
@@ -606,7 +630,7 @@ mod tests {
         let seq_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
-        let par = build_index();
+        let par = build_index_from(roots.clone());
         let par_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let par_paths: BTreeMap<String, PathBuf> = par
@@ -628,7 +652,7 @@ mod tests {
     /// scan root. Without it, `load_body` stays stale until the process restarts.
     #[test]
     fn reload_index_picks_up_newly_created_skill() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         let dir = std::env::temp_dir().join(format!("dotz-skills-reload-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
