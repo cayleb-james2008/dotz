@@ -53,12 +53,22 @@ struct Parsed {
 /// dependency. A spawn failure (missing CLI) => code 127, never an error.
 fn run_command(program: &str, args: &[&str], timeout: Duration) -> CmdResult {
     use std::io::Read;
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .spawn();
+        .stdin(std::process::Stdio::null());
+    // Suppress the console-window flash on Windows: the Tauri/WebView2 desktop shell has no
+    // visible console, so spawning `gh`/`vercel` without this flag would pop a transient cmd
+    // window on every connection-status check. sandbox.rs and browser.rs already do this.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let child = command.spawn();
 
     let mut child = match child {
         Ok(c) => c,
@@ -418,6 +428,22 @@ mod tests {
         assert!(p.installed);
         assert!(!p.logged_in);
         assert_eq!(p.account, None);
+    }
+
+    #[test]
+    fn run_command_succeeds_for_simple_builtin() {
+        // After adding CREATE_NO_WINDOW on Windows, the spawn path must still work: a
+        // fixed first-party command must complete with code 0 and capture stdout. This
+        // guards against a regression where the flag (or its trait import) breaks the
+        // spawn on either platform.
+        let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
+            ("cmd", vec!["/C", "echo", "dotz-ok"])
+        } else {
+            ("echo", vec!["dotz-ok"])
+        };
+        let r = run_command(program, &args, Duration::from_secs(5));
+        assert_eq!(r.code, Some(0), "expected exit 0, got stderr: {}", r.stderr);
+        assert!(r.stdout.contains("dotz-ok"), "stdout should contain output, got: {}", r.stdout);
     }
 
     #[tokio::test]
