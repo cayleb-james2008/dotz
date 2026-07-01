@@ -46,7 +46,10 @@ async fn main() -> ExitCode {
         suite.retain(|t| want.contains(t.id.as_str()));
     }
 
-    eprintln!("dotz self-eval: release={release} min_pass_rate={min} tasks={}", suite.len());
+    eprintln!(
+        "dotz self-eval: release={release} min_pass_rate={min} tasks={}",
+        suite.len()
+    );
     for t in &suite {
         eprintln!("  - {} ({})", t.id, t.agent);
     }
@@ -84,16 +87,28 @@ async fn main() -> ExitCode {
             id = c.task_id,
             cost = c.cost,
             wall = c.wall_ms,
-            reason = if c.pass { String::new() } else { c.grade_reason.clone() }
+            reason = if c.pass {
+                String::new()
+            } else {
+                c.grade_reason.clone()
+            }
         );
     }
     eprintln!(
         "\npass-rate: {}/{} ({:.0}%)  total cost: ${:.4}  total wall: {}ms",
-        report.passed, report.total, report.pass_rate * 100.0, report.total_cost, report.total_wall_ms
+        report.passed,
+        report.total,
+        report.pass_rate * 100.0,
+        report.total_cost,
+        report.total_wall_ms
     );
 
     if report.gate_ok(min) {
-        eprintln!("GATE: green (pass-rate {:.0}% >= floor {:.0}%)", report.pass_rate * 100.0, min * 100.0);
+        eprintln!(
+            "GATE: green (pass-rate {:.0}% >= floor {:.0}%)",
+            report.pass_rate * 100.0,
+            min * 100.0
+        );
         ExitCode::SUCCESS
     } else {
         eprintln!(

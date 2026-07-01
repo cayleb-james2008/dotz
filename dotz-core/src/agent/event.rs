@@ -152,7 +152,7 @@ pub enum AgentEvent {
     #[serde(rename = "message_update")]
     MessageUpdate {
         #[serde(rename = "assistantMessageEvent")]
-        assistant_message_event: AssistantMessageEvent,
+        assistant_message_event: Box<AssistantMessageEvent>,
         message: Message,
     },
     #[serde(rename = "message_end")]

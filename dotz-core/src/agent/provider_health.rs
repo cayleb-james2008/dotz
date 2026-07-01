@@ -136,19 +136,15 @@ pub struct ProviderHealth {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HealthStatus {
     /// Provider is responding normally.
+    #[default]
     Healthy,
     /// Consecutive failures exceeded the threshold; failover is active.
     Degraded,
     /// Operator manually disabled this provider (not yet used; reserved).
     Disabled,
-}
-
-impl Default for HealthStatus {
-    fn default() -> Self {
-        HealthStatus::Healthy
-    }
 }
 
 /// The failover pair: a primary provider and the backup to use when the primary is degraded.
@@ -182,9 +178,7 @@ pub fn default_failover_for(primary_provider: &str, primary_model: &str) -> Opti
         return None;
     }
     // Validate the backup resolves before committing to it.
-    if provider::resolve(backup_provider, backup_model).is_none() {
-        return None;
-    }
+    provider::resolve(backup_provider, backup_model)?;
     Some(FailoverPair {
         primary_provider: primary_provider.to_string(),
         primary_model: primary_model.to_string(),
@@ -197,15 +191,9 @@ pub fn default_failover_for(primary_provider: &str, primary_model: &str) -> Opti
 /// Returns the primary model when healthy, the backup when degraded.
 pub fn effective_model(pair: &FailoverPair, primary_healthy: bool) -> (String, String) {
     if primary_healthy {
-        (
-            pair.primary_provider.clone(),
-            pair.primary_model.clone(),
-        )
+        (pair.primary_provider.clone(), pair.primary_model.clone())
     } else {
-        (
-            pair.backup_provider.clone(),
-            pair.backup_model.clone(),
-        )
+        (pair.backup_provider.clone(), pair.backup_model.clone())
     }
 }
 
@@ -305,9 +293,7 @@ pub async fn record_failure(provider: &str, error: &str) -> HealthStatus {
     if kind.is_failover_worthy() {
         h.failures += 1;
         h.consecutive_failures += 1;
-        if h.consecutive_failures >= DEGRADE_THRESHOLD
-            && h.status == HealthStatus::Healthy
-        {
+        if h.consecutive_failures >= DEGRADE_THRESHOLD && h.status == HealthStatus::Healthy {
             h.status = HealthStatus::Degraded;
             h.degraded_at = Some(crate::util::now_ms());
             transitioned = true;
@@ -427,7 +413,10 @@ mod tests {
             classify_error("openrouter returned 429: rate limit exceeded"),
             FailKind::RateLimit
         );
-        assert_eq!(classify_error("HTTP 429 Too Many Requests"), FailKind::RateLimit);
+        assert_eq!(
+            classify_error("HTTP 429 Too Many Requests"),
+            FailKind::RateLimit
+        );
         assert_eq!(classify_error("rate limit hit"), FailKind::RateLimit);
     }
 
@@ -446,7 +435,9 @@ mod tests {
     #[test]
     fn classify_error_detects_timeout() {
         assert_eq!(
-            classify_error("request to https://openrouter.ai/api/v1/chat/completions failed: timed out"),
+            classify_error(
+                "request to https://openrouter.ai/api/v1/chat/completions failed: timed out"
+            ),
             FailKind::Timeout
         );
         assert_eq!(classify_error("operation timed out"), FailKind::Timeout);
@@ -454,7 +445,10 @@ mod tests {
 
     #[test]
     fn classify_error_detects_stream_interrupted() {
-        assert_eq!(classify_error("stream error: connection reset"), FailKind::StreamInterrupted);
+        assert_eq!(
+            classify_error("stream error: connection reset"),
+            FailKind::StreamInterrupted
+        );
         assert_eq!(classify_error("broken pipe"), FailKind::StreamInterrupted);
     }
 
@@ -464,14 +458,29 @@ mod tests {
     #[test]
     fn classify_error_detects_5xx_as_failover_worthy() {
         // Numeric status codes via the standalone-token helper.
-        assert_eq!(classify_error("openrouter returned 500: internal server error"), FailKind::StreamInterrupted);
-        assert_eq!(classify_error("openrouter returned 502: bad gateway"), FailKind::StreamInterrupted);
-        assert_eq!(classify_error("openrouter returned 503: service unavailable"), FailKind::StreamInterrupted);
+        assert_eq!(
+            classify_error("openrouter returned 500: internal server error"),
+            FailKind::StreamInterrupted
+        );
+        assert_eq!(
+            classify_error("openrouter returned 502: bad gateway"),
+            FailKind::StreamInterrupted
+        );
+        assert_eq!(
+            classify_error("openrouter returned 503: service unavailable"),
+            FailKind::StreamInterrupted
+        );
         // 504 "gateway timeout" contains "timeout" which is checked first → Timeout (still
         // failover-worthy, so failover trips correctly).
-        assert_eq!(classify_error("openrouter returned 504: gateway timeout"), FailKind::Timeout);
+        assert_eq!(
+            classify_error("openrouter returned 504: gateway timeout"),
+            FailKind::Timeout
+        );
         // Textual server-side messages without an explicit code.
-        assert_eq!(classify_error("service unavailable"), FailKind::StreamInterrupted);
+        assert_eq!(
+            classify_error("service unavailable"),
+            FailKind::StreamInterrupted
+        );
         assert_eq!(classify_error("bad gateway"), FailKind::StreamInterrupted);
         // The failover-worthy invariant the task requires.
         assert!(
@@ -484,7 +493,10 @@ mod tests {
 
     #[test]
     fn classify_error_falls_back_to_other() {
-        assert_eq!(classify_error("returned 401: invalid api key"), FailKind::Other);
+        assert_eq!(
+            classify_error("returned 401: invalid api key"),
+            FailKind::Other
+        );
         assert_eq!(classify_error("model not found"), FailKind::Other);
         // A bare numeric body (e.g. a request id) with no recognizable status code or
         // transport-error substring must still classify as Other.
@@ -660,16 +672,18 @@ mod tests {
 
         // Degraded → backup, NOT a probe (cooldown not elapsed). The backup for an
         // arbitrary provider is ollama/minimax-m3 (see default_failover_for).
-        let (prov, model, probe) =
-            resolve_effective_model(primary_provider, primary_model).await.unwrap();
+        let (prov, model, probe) = resolve_effective_model(primary_provider, primary_model)
+            .await
+            .unwrap();
         assert_eq!(prov, "ollama");
         assert_eq!(model, "minimax-m3");
         assert!(!probe);
 
         // A success recovers the provider.
         record_success(primary_provider).await;
-        let (prov, model, _) =
-            resolve_effective_model(primary_provider, primary_model).await.unwrap();
+        let (prov, model, _) = resolve_effective_model(primary_provider, primary_model)
+            .await
+            .unwrap();
         assert_eq!(prov, primary_provider);
         assert_eq!(model, "nex-agi/nex-n2-pro:free");
         reset().await;
@@ -700,16 +714,24 @@ mod tests {
         assert!(is_degraded(primary_provider).await);
 
         // Immediately (cooldown NOT elapsed) → backup, not a probe.
-        let (prov, _, probe) =
-            resolve_effective_model(primary_provider, primary_model).await.unwrap();
-        assert_eq!(prov, "ollama", "before cooldown the call must go to the backup");
+        let (prov, _, probe) = resolve_effective_model(primary_provider, primary_model)
+            .await
+            .unwrap();
+        assert_eq!(
+            prov, "ollama",
+            "before cooldown the call must go to the backup"
+        );
         assert!(!probe);
 
         // Wait for the cooldown to elapse → the next call is a probe to the primary.
         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
-        let (prov, _, probe) =
-            resolve_effective_model(primary_provider, primary_model).await.unwrap();
-        assert_eq!(prov, primary_provider, "after cooldown the call must probe the primary");
+        let (prov, _, probe) = resolve_effective_model(primary_provider, primary_model)
+            .await
+            .unwrap();
+        assert_eq!(
+            prov, primary_provider,
+            "after cooldown the call must probe the primary"
+        );
         assert!(probe);
 
         // The probe FAILS — the primary is still down. This must restart the cooldown.
@@ -718,13 +740,17 @@ mod tests {
         // Immediately after the failed probe (cooldown just restarted) → backup, NOT primary.
         // Without the fix this would return the primary (probe) again, permanently abandoning
         // the backup.
-        let (prov, _, probe) =
-            resolve_effective_model(primary_provider, primary_model).await.unwrap();
+        let (prov, _, probe) = resolve_effective_model(primary_provider, primary_model)
+            .await
+            .unwrap();
         assert_eq!(
             prov, "ollama",
             "a failed probe must route the next call back to the backup, got {prov}"
         );
-        assert!(!probe, "the next call after a failed probe must not be another probe");
+        assert!(
+            !probe,
+            "the next call after a failed probe must not be another probe"
+        );
 
         // Restore env + state.
         match prev {
@@ -747,11 +773,7 @@ mod tests {
                 .await
                 .is_some()
         );
-        assert!(
-            resolve_effective_model("ollama", "glm-5.2")
-                .await
-                .is_some()
-        );
+        assert!(resolve_effective_model("ollama", "glm-5.2").await.is_some());
         reset().await;
     }
 
@@ -798,17 +820,22 @@ mod tests {
         assert!(is_degraded(primary).await);
 
         // Round 1 (both old and new code): failover to the backup.
-        let (r1_prov, _, _) =
-            resolve_effective_model(primary, primary_model).await.unwrap();
-        assert_eq!(r1_prov, "ollama", "degraded primary must fail over to backup");
+        let (r1_prov, _, _) = resolve_effective_model(primary, primary_model)
+            .await
+            .unwrap();
+        assert_eq!(
+            r1_prov, "ollama",
+            "degraded primary must fail over to backup"
+        );
 
         // Simulate recovery: the rate-limit window passes and the primary is healthy again.
         record_success(primary).await;
         assert!(!is_degraded(primary).await, "primary should be recovered");
 
         // Fixed behavior (what run_turn does now): re-probe the ORIGINAL primary.
-        let (fixed_prov, _, _) =
-            resolve_effective_model(primary, primary_model).await.unwrap();
+        let (fixed_prov, _, _) = resolve_effective_model(primary, primary_model)
+            .await
+            .unwrap();
         assert_eq!(
             fixed_prov, primary,
             "fixed: re-probing the original primary must route back to it after recovery"
@@ -818,24 +845,32 @@ mod tests {
         // probing the BACKUP (what the old shadowing did) never detects the primary's state.
         record_failure(primary, "returned 429: rate limit").await;
         record_failure(primary, "returned 429: rate limit").await;
-        assert!(is_degraded(primary).await, "primary should be degraded again");
+        assert!(
+            is_degraded(primary).await,
+            "primary should be degraded again"
+        );
 
         // Old code called resolve_effective_model with the BACKUP provider, not the original.
         // The backup is not degraded, so this always returns the backup — the primary's
         // degradation (or recovery) is invisible.
-        let (old_prov, _, _) =
-            resolve_effective_model("ollama", "minimax-m3").await.unwrap();
+        let (old_prov, _, _) = resolve_effective_model("ollama", "minimax-m3")
+            .await
+            .unwrap();
         assert_eq!(
             old_prov, "ollama",
             "old buggy behavior: probing the backup stays on the backup, never seeing the primary"
         );
         // The primary is still degraded — the old code would never notice it recovered.
-        assert!(is_degraded(primary).await, "primary is still degraded but old code can't see it");
+        assert!(
+            is_degraded(primary).await,
+            "primary is still degraded but old code can't see it"
+        );
 
         // Fixed code probes the original primary — and after recovery, routes back.
         record_success(primary).await; // simulate recovery
-        let (fixed_prov2, _, _) =
-            resolve_effective_model(primary, primary_model).await.unwrap();
+        let (fixed_prov2, _, _) = resolve_effective_model(primary, primary_model)
+            .await
+            .unwrap();
         assert_eq!(
             fixed_prov2, primary,
             "fixed: probing the original primary after recovery routes back to it"

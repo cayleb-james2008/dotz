@@ -24,7 +24,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -68,7 +68,7 @@ fn now_iso() -> String {
         .unwrap_or_default();
     let total_ms = dur.as_millis() as i64;
     let secs = total_ms / 1000;
-    let ms = (total_ms % 1000) as i64;
+    let ms = total_ms % 1000;
     // Civil-from-days (Howard Hinnant's algorithm).
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
@@ -519,7 +519,7 @@ fn split_role_name(descriptor: &str) -> (String, String) {
 /// trailing `--json <command...>` portion.
 async fn run(
     session_id: &str,
-    profile_dir: &PathBuf,
+    profile_dir: &Path,
     allowed_origins: &[String],
     command: &[&str],
 ) -> Result<Value, String> {

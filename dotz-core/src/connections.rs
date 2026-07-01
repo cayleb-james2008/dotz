@@ -7,7 +7,7 @@
 //!   - github: `gh auth status` (parse "logged in to" + account)
 //!   - vercel: `vercel whoami` (read-only; exit 0 + non-empty output => logged in, account = last line)
 //!   - neon:   READ ~/.config/neonctl/credentials.json (present & non-empty => logged in). Never calls
-//!             neonctl — it has no on-PATH CLI / no logout command here, so status keys off the file.
+//!     neonctl — it has no on-PATH CLI / no logout command here, so status keys off the file.
 use axum::{http::StatusCode, routing::get, Json, Router};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -292,10 +292,13 @@ fn status_vercel() -> Parsed {
     parse_vercel(&run_command("vercel", &["whoami"], STATUS_TIMEOUT))
 }
 
+/// One provider's static descriptor: (id, label, cli name, status probe fn).
+type ProviderSpec = (&'static str, &'static str, &'static str, fn() -> Parsed);
+
 /// Build all three providers' status. Each provider is independent; a panic/failure in one is
 /// degraded to a blank entry (mirrors the per-provider try/catch in connections.ts `status()`).
 fn all_status() -> Vec<ConnectionStatus> {
-    let specs: [(&'static str, &'static str, &'static str, fn() -> Parsed); 3] = [
+    let specs: [ProviderSpec; 3] = [
         ("github", "GitHub", "gh", status_github),
         ("vercel", "Vercel", "vercel", status_vercel),
         ("neon", "Neon", "neonctl", status_neon),
@@ -335,7 +338,7 @@ fn all_status() -> Vec<ConnectionStatus> {
 /// off the async runtime thread. A slow or hanging `gh auth status` call must not delay other
 /// REST handlers or the WebSocket event fan-out.
 async fn get_connections() -> Json<Value> {
-    let connections = tokio::task::spawn_blocking(|| all_status())
+    let connections = tokio::task::spawn_blocking(all_status)
         .await
         .unwrap_or_else(|_| Vec::new());
     Json(json!({ "connections": connections }))
@@ -443,7 +446,11 @@ mod tests {
         };
         let r = run_command(program, &args, Duration::from_secs(5));
         assert_eq!(r.code, Some(0), "expected exit 0, got stderr: {}", r.stderr);
-        assert!(r.stdout.contains("dotz-ok"), "stdout should contain output, got: {}", r.stdout);
+        assert!(
+            r.stdout.contains("dotz-ok"),
+            "stdout should contain output, got: {}",
+            r.stdout
+        );
     }
 
     #[tokio::test]

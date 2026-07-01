@@ -427,7 +427,7 @@ async fn execute_run(
     };
 
     if let Some(w) = watchdog {
-        let _ = w.abort();
+        w.abort();
     }
 
     // Reap the child so its current directory is released before we remove the temp dir
@@ -911,8 +911,7 @@ mod tests {
     /// `started_at` does not affect eviction order.
     #[test]
     fn prune_finished_runs_evicts_oldest_terminal_and_cleans_end_emitted() {
-        let my_running: Vec<String> =
-            (0..3).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        let my_running: Vec<String> = (0..3).map(|_| uuid::Uuid::new_v4().to_string()).collect();
         let my_terminal: Vec<String> = (0..(MAX_RETAINED_RUNS + 20))
             .map(|_| uuid::Uuid::new_v4().to_string())
             .collect();
@@ -1151,13 +1150,7 @@ mod tests {
         // the call noticeably slow. The short-circuit must return in well under that.
         let window: Vec<String> = vec!["ready in 300 ms".into()];
         let start = tokio::time::Instant::now();
-        detect_port_in_window(
-            &id,
-            "  ->  Local:   http://localhost:5173/",
-            &window,
-            &tx,
-        )
-        .await;
+        detect_port_in_window(&id, "  ->  Local:   http://localhost:5173/", &window, &tx).await;
         let elapsed = start.elapsed();
 
         // The cached port must be unchanged (the function must not overwrite it).
@@ -1184,13 +1177,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<Value>(4);
         let window: Vec<String> = vec!["ready in 300 ms".into()];
         let start = tokio::time::Instant::now();
-        detect_port_in_window(
-            &id,
-            "  ->  Local:   http://localhost:5173/",
-            &window,
-            &tx,
-        )
-        .await;
+        detect_port_in_window(&id, "  ->  Local:   http://localhost:5173/", &window, &tx).await;
         let elapsed = start.elapsed();
         assert!(
             elapsed < std::time::Duration::from_millis(300),
@@ -1454,11 +1441,11 @@ mod tests {
                 frame.get("runId").and_then(|r| r.as_str()),
                 Some(id.as_str())
             );
-            if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_output") {
-                if frame.get("line").and_then(|l| l.as_str()) == Some("dotz-stream-test") {
-                    assert_eq!(frame.get("stream").and_then(|s| s.as_str()), Some("stdout"));
-                    found = true;
-                }
+            if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_output")
+                && frame.get("line").and_then(|l| l.as_str()) == Some("dotz-stream-test")
+            {
+                assert_eq!(frame.get("stream").and_then(|s| s.as_str()), Some("stdout"));
+                found = true;
             }
         }
         assert!(
@@ -1876,10 +1863,7 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert!(
-            alive,
-            "grandchild should be alive before the sandbox kill"
-        );
+        assert!(alive, "grandchild should be alive before the sandbox kill");
 
         // Kill the sandbox run — this must tree-kill the process group, including the grandchild.
         assert!(
@@ -1914,9 +1898,7 @@ mod tests {
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                panic!(
-                    "grandchild was not killed by the process-group signal within 10s"
-                );
+                panic!("grandchild was not killed by the process-group signal within 10s");
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

@@ -206,42 +206,35 @@ pub fn capture_step(run_id: &str, step_id: &str, result: Option<&SingleResult>) 
 }
 
 fn build_step_record(step: &WorkflowStep, result: Option<&SingleResult>) -> StepRecord {
-    let (
-        messages,
-        skill_set,
-        agent_source,
-        exit_code,
-        stop_reason,
-        error_message,
-        effective_model,
-    ) = match result {
-        Some(r) => (
-            r.messages.clone(),
-            r.skill_set.clone(),
-            r.agent_source.clone(),
-            r.exit_code,
-            r.stop_reason.clone(),
-            r.error_message.clone(),
-            r.model.clone(),
-        ),
-        // No `SingleResult` was produced — the step never made a provider call.
-        // Distinguish the two real causes so the record is truthful rather than
-        // blanket-labeling every gap "timeout":
-        //   - `skipped` → cascaded-skip from a failed parent / exhausted budget;
-        //     the executor never dispatched it. `agent_source = "skipped"`, no
-        //     stop reason (the step didn't run, so it didn't "stop").
-        //   - `error`    → the executor's wall-clock timeout fired mid-stream.
-        //     `agent_source = "timeout"`, `stop_reason = "timeout"`, exit 1.
-        //   - anything else → defensive: no provider call, no synthetic label.
-        None => {
-            let (src, stop, code) = match step.status.as_str() {
-                "skipped" => ("skipped".to_string(), None, 0),
-                "error" => ("timeout".to_string(), Some("timeout".to_string()), 1),
-                _ => (String::new(), None, 0),
-            };
-            (Vec::new(), Vec::new(), src, code, stop, None, None)
-        }
-    };
+    let (messages, skill_set, agent_source, exit_code, stop_reason, error_message, effective_model) =
+        match result {
+            Some(r) => (
+                r.messages.clone(),
+                r.skill_set.clone(),
+                r.agent_source.clone(),
+                r.exit_code,
+                r.stop_reason.clone(),
+                r.error_message.clone(),
+                r.model.clone(),
+            ),
+            // No `SingleResult` was produced — the step never made a provider call.
+            // Distinguish the two real causes so the record is truthful rather than
+            // blanket-labeling every gap "timeout":
+            //   - `skipped` → cascaded-skip from a failed parent / exhausted budget;
+            //     the executor never dispatched it. `agent_source = "skipped"`, no
+            //     stop reason (the step didn't run, so it didn't "stop").
+            //   - `error`    → the executor's wall-clock timeout fired mid-stream.
+            //     `agent_source = "timeout"`, `stop_reason = "timeout"`, exit 1.
+            //   - anything else → defensive: no provider call, no synthetic label.
+            None => {
+                let (src, stop, code) = match step.status.as_str() {
+                    "skipped" => ("skipped".to_string(), None, 0),
+                    "error" => ("timeout".to_string(), Some("timeout".to_string()), 1),
+                    _ => (String::new(), None, 0),
+                };
+                (Vec::new(), Vec::new(), src, code, stop, None, None)
+            }
+        };
     StepRecord {
         step_id: step.id.clone(),
         agent: step.agent.clone(),
@@ -263,9 +256,7 @@ fn build_step_record(step: &WorkflowStep, result: Option<&SingleResult>) -> Step
         usage: step.usage.clone(),
         // Prefer the provider's stop reason; fall back to a synthesized "error"
         // marker when the step errored but the provider didn't report one.
-        stop_reason: stop_reason.or_else(|| {
-            (step.status == "error").then(|| "error".to_string())
-        }),
+        stop_reason: stop_reason.or_else(|| (step.status == "error").then(|| "error".to_string())),
         // Prefer the provider's error message; fall back to the step's recorded
         // error (e.g. the executor's timeout message).
         error_message: error_message.or(step.error.clone()),
@@ -310,13 +301,11 @@ fn write_unlocked(record: &RunRecord) {
     // the previous complete record intact; the rename is atomic on both Unix and Windows (the
     // std impl uses MoveFileExW with MOVEFILE_REPLACE_EXISTING, confirmed on the target host).
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &s).is_ok() {
-        if std::fs::rename(&tmp, &path).is_err() {
-            // Exotic cross-device / permission edge: fall back to a direct write so the record is
-            // still persisted, accepting the non-atomic window only on that path.
-            let _ = std::fs::write(&path, &s);
-            let _ = std::fs::remove_file(&tmp);
-        }
+    if std::fs::write(&tmp, &s).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        // Exotic cross-device / permission edge: fall back to a direct write so the record is
+        // still persisted, accepting the non-atomic window only on that path.
+        let _ = std::fs::write(&path, &s);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -698,7 +687,10 @@ mod tests {
         let s = &record.steps[0];
         assert_eq!(s.status, "skipped");
         assert_eq!(s.agent_source, "skipped", "skipped ≠ timeout");
-        assert!(s.stop_reason.is_none(), "a skipped step did not run — it has no stop reason");
+        assert!(
+            s.stop_reason.is_none(),
+            "a skipped step did not run — it has no stop reason"
+        );
         assert_eq!(s.exit_code, 0);
         assert!(s.messages.is_empty());
         assert!(s.skill_set.is_empty());
@@ -783,20 +775,30 @@ mod tests {
         let _ = crate::workflow_executor::run_workflow(&run_id).await;
 
         let record = load(&run_id).expect("executor captured the record");
-        assert_eq!(record.steps.len(), 2, "both steps recorded (incl. the skipped child)");
+        assert_eq!(
+            record.steps.len(),
+            2,
+            "both steps recorded (incl. the skipped child)"
+        );
         // The skipped child must be in the record with status "skipped".
         let skipped = record
             .steps
             .iter()
             .find(|s| s.status == "skipped")
             .expect("the skipped step is recorded");
-        assert!(skipped.messages.is_empty(), "skipped step had no provider call");
+        assert!(
+            skipped.messages.is_empty(),
+            "skipped step had no provider call"
+        );
         assert_eq!(record.budget.as_ref().unwrap().max_cost, Some(10.0));
         assert_eq!(record.max_repair_rounds, 3);
 
         // Replay: build a fresh run from the record and let it drive to completion.
         let replayed = replay(&run_id).expect("replay returns a new run");
-        assert!(replayed.label.ends_with("(replay)"), "label gets a replay tag");
+        assert!(
+            replayed.label.ends_with("(replay)"),
+            "label gets a replay tag"
+        );
         assert_eq!(replayed.origin.as_deref(), Some("replay"));
         assert_eq!(replayed.steps.len(), 2, "replay clones both steps");
         // The parent edge must be preserved (numeric ref resolved to the new
@@ -916,7 +918,10 @@ mod tests {
         assert_eq!(loaded.status, "completed");
         // The on-disk content is well-formed (no truncation).
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert!(on_disk.trim_end().ends_with('}'), "record file is complete JSON");
+        assert!(
+            on_disk.trim_end().ends_with('}'),
+            "record file is complete JSON"
+        );
 
         // (c) The temp sibling is gone — the rename consumed it, so a future write never races a
         // stale temp and the record dir is not polluted.

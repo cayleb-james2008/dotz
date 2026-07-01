@@ -211,10 +211,7 @@ impl Grader for CommandSucceeds {
                 let code = out.status.code().unwrap_or(-1);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let stderr_trim = stderr.trim();
-                Grade::fail(format!(
-                    "command {:?} exited {code}: {stderr_trim}",
-                    self.0
-                ))
+                Grade::fail(format!("command {:?} exited {code}: {stderr_trim}", self.0))
             }
             Err(e) => Grade::fail(format!("could not run command {:?}: {e}", self.0)),
         }
@@ -565,8 +562,8 @@ impl Harness {
             return Err(format!("could not create {}: {e}", dir.display()));
         }
         let path = dir.join(format!("{}-{}.json", report.release, report.created_at));
-        let body = serde_json::to_string_pretty(report)
-            .map_err(|e| format!("serialize report: {e}"))?;
+        let body =
+            serde_json::to_string_pretty(report).map_err(|e| format!("serialize report: {e}"))?;
         std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
 
         // Append the rolling summary so two releases can be diffed without reading every
@@ -849,18 +846,13 @@ mod tests {
             cost: 0.0,
         };
         let harness = Harness::new(
-            vec![task(
-                "missing",
-                Box::new(FileExists("nope.txt".into())),
-            )],
+            vec![task("missing", Box::new(FileExists("nope.txt".into())))],
             Box::new(runner),
             "test",
         );
         let report = harness.run().await;
         assert_eq!(report.passed, 0);
-        assert!(report.cases[0]
-            .grade_reason
-            .contains("not found"));
+        assert!(report.cases[0].grade_reason.contains("not found"));
     }
 
     #[tokio::test]
@@ -1236,9 +1228,7 @@ mod tests {
 
     #[test]
     fn self_eval_dir_honors_env_and_falls_back_to_dotz_dir() {
-        let _g = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("DOTZ_SELF_EVAL_DIR", "/tmp/dotz-eval-xyz");
         assert_eq!(self_eval_dir(), PathBuf::from("/tmp/dotz-eval-xyz"));
         std::env::set_var("DOTZ_SELF_EVAL_DIR", "");

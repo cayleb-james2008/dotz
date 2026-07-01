@@ -320,7 +320,7 @@ pub fn get(id: &str) -> Option<std::sync::Arc<Mutex<AgentSession>>> {
 pub fn list_summaries() -> Vec<Value> {
     store_guard()
         .values()
-        .map(|s| session_guard(&s).summary())
+        .map(|s| session_guard(s).summary())
         .collect()
 }
 
@@ -607,15 +607,11 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         // Provider health + automatic failover: if the session's provider is degraded (e.g.
         // OpenRouter :free tier returning 429s), transparently swap to the backup provider so
         // the lead turn degrades gracefully instead of surfacing a hard error.
-        let (prov_for_turn, model_for_turn) = match super::provider_health::resolve_effective_model(
-            &provider_id,
-            &model_id,
-        )
-        .await
-        {
-            Some((prov, model, _)) => (prov, model),
-            None => (provider_id.clone(), model_id.clone()),
-        };
+        let (prov_for_turn, model_for_turn) =
+            match super::provider_health::resolve_effective_model(&provider_id, &model_id).await {
+                Some((prov, model, _)) => (prov, model),
+                None => (provider_id.clone(), model_id.clone()),
+            };
         // Use the failover-resolved (provider, model) for THIS round's request only. The
         // original `provider_id`/`model_id` (the session's configured provider) are NOT shadowed
         // so the next round re-probes the original provider's health — if it recovered, the turn
@@ -850,7 +846,7 @@ async fn execute_tool(
 ) -> (Value, bool, String) {
     if name == "subagent" {
         let active = {
-            let s = session_guard(&session);
+            let s = session_guard(session);
             s.tools.active_names()
         };
         if !active.iter().any(|n| n == "subagent") {
@@ -870,7 +866,7 @@ async fn execute_tool(
         let (progress_tx, mut progress_rx) = mpsc::channel::<StreamDelta>(256);
         let session_for_progress = session.clone();
         let sess_id_for_progress = {
-            let s = session_guard(&session);
+            let s = session_guard(session);
             s.id.clone()
         };
         let tcid = tool_call_id.to_string();
@@ -958,7 +954,7 @@ async fn run_tool(
 ) -> Result<String, String> {
     // Snapshot the session's active tool set so execution respects set_tools restrictions.
     let active = {
-        let s = session_guard(&session);
+        let s = session_guard(session);
         s.tools.active_names()
     };
     let registry = {
@@ -1069,7 +1065,7 @@ fn apply_delta(
     }
 
     if let Some(kind) = ame_kind {
-        let s = session_guard(&session);
+        let s = session_guard(session);
         let ame = AssistantMessageEvent {
             kind: kind.to_string(),
             content_index,
@@ -1080,7 +1076,7 @@ fn apply_delta(
         let _ = s.tx.send(ws_frame(
             sess_id,
             &AgentEvent::MessageUpdate {
-                assistant_message_event: ame,
+                assistant_message_event: Box::new(ame),
                 message: acc.msg.clone(),
             },
         ));
@@ -1225,7 +1221,7 @@ fn finish_turn(
             .join("")
     };
     let (cwd, user_text, assistant_text) = {
-        let s = session_guard(&session);
+        let s = session_guard(session);
         let user_text = s
             .history
             .iter()
@@ -1280,7 +1276,7 @@ fn finish_error(
     detail: &str,
     tool_results: Vec<ToolResult>,
 ) {
-    let mut s = session_guard(&session);
+    let mut s = session_guard(session);
     let mut msg = Message::assistant_shell(&s.provider, &s.model_id, crate::util::now_ms());
     msg.stop_reason = Some("error".into());
     msg.error_message = Some(detail.to_string());
@@ -1449,7 +1445,11 @@ mod tests {
             .collect();
         let dropped = prune_history(&mut history);
         assert_eq!(dropped, 50, "should report exactly 50 dropped entries");
-        assert_eq!(history.len(), MAX_HISTORY_LEN, "should be capped at MAX_HISTORY_LEN");
+        assert_eq!(
+            history.len(),
+            MAX_HISTORY_LEN,
+            "should be capped at MAX_HISTORY_LEN"
+        );
         // The oldest 50 entries (msg-0 .. msg-49) must be gone; msg-50 must be first.
         assert_eq!(
             first_text(&history[0]),
@@ -1548,7 +1548,8 @@ mod tests {
             "prune_history must not leave an orphaned tool message at the front"
         );
         // Every remaining `tool` message must have a preceding assistant carrying its tool_call_id.
-        let mut seen_tool_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_tool_calls: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for m in &history {
             match m.role.as_str() {
                 "assistant" => {
@@ -1891,7 +1892,7 @@ mod tests {
         assert_eq!(updated["model"]["modelId"], "glm-5.2");
         // The stored provider must be canonical so resolution succeeds.
         assert!(
-            provider::resolve(&updated["model"]["provider"].as_str().unwrap(), "glm-5.2").is_some(),
+            provider::resolve(updated["model"]["provider"].as_str().unwrap(), "glm-5.2").is_some(),
             "normalized provider must resolve"
         );
         dispose(&sid);
@@ -2718,8 +2719,11 @@ mod tests {
         let sess = get(&sid).unwrap();
         {
             let mut g = sess.lock().unwrap();
-            g.history
-                .push(Message::assistant_shell("ollama", "glm-5.2", crate::util::now_ms()));
+            g.history.push(Message::assistant_shell(
+                "ollama",
+                "glm-5.2",
+                crate::util::now_ms(),
+            ));
         }
         let mut rx = sess.lock().unwrap().tx.subscribe();
 
@@ -2912,25 +2916,24 @@ mod tests {
         let mut saw_toolcall = false;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline && !saw_toolcall {
-            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
-                Ok(Ok(frame)) => {
-                    if frame
+            if let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                if frame
+                    .get("event")
+                    .and_then(|e| e.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("message_update")
+                {
+                    if let Some(ame) = frame
                         .get("event")
-                        .and_then(|e| e.get("type"))
-                        .and_then(|t| t.as_str())
-                        == Some("message_update")
+                        .and_then(|e| e.get("assistantMessageEvent"))
                     {
-                        if let Some(ame) = frame
-                            .get("event")
-                            .and_then(|e| e.get("assistantMessageEvent"))
-                        {
-                            if ame.get("type").and_then(|t| t.as_str()) == Some("toolcall_start") {
-                                saw_toolcall = true;
-                            }
+                        if ame.get("type").and_then(|t| t.as_str()) == Some("toolcall_start") {
+                            saw_toolcall = true;
                         }
                     }
                 }
-                _ => {}
             }
         }
         assert!(
@@ -3183,7 +3186,8 @@ mod tests {
             })
             .expect("tool call block should exist");
         assert_ne!(
-            tc, json!({}),
+            tc,
+            json!({}),
             "arguments must not stay {{}} after a partial fragment — the old bug"
         );
 

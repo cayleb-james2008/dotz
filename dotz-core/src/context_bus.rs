@@ -604,10 +604,7 @@ mod tests {
             .await
             .unwrap();
         write
-            .execute(
-                &json!({"key": "scout:notes", "value": "all clear"}),
-                &ctx_b,
-            )
+            .execute(&json!({"key": "scout:notes", "value": "all clear"}), &ctx_b)
             .await
             .unwrap();
 
@@ -615,13 +612,19 @@ mod tests {
             .execute(&json!({"key": "scout:notes"}), &ctx_a)
             .await
             .unwrap();
-        assert!(got_a.contains("found a bug"), "read A must see A's value: {got_a}");
+        assert!(
+            got_a.contains("found a bug"),
+            "read A must see A's value: {got_a}"
+        );
 
         let got_b = read
             .execute(&json!({"key": "scout:notes"}), &ctx_b)
             .await
             .unwrap();
-        assert!(got_b.contains("all clear"), "read B must see B's value: {got_b}");
+        assert!(
+            got_b.contains("all clear"),
+            "read B must see B's value: {got_b}"
+        );
     }
 
     #[tokio::test]
@@ -650,11 +653,7 @@ mod tests {
             Some(json!("mine")),
             "write must target the ctx run, ignoring the runId arg"
         );
-        assert_eq!(
-            foreign.read("k"),
-            None,
-            "foreign run bus must be untouched"
-        );
+        assert_eq!(foreign.read("k"), None, "foreign run bus must be untouched");
 
         // Reading with a foreign runId arg must NOT see the foreign run's secret.
         let err_or_val = read
@@ -678,7 +677,10 @@ mod tests {
         let read = ContextReadTool;
 
         let werr = write
-            .execute(&json!({"key": "k", "value": 1, "runId": "anything"}), &ctx_none)
+            .execute(
+                &json!({"key": "k", "value": 1, "runId": "anything"}),
+                &ctx_none,
+            )
             .await
             .unwrap_err();
         assert!(

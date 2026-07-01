@@ -23,6 +23,7 @@
 //! - web-mode checks (e.g. frontend build) emit `sandbox_port` the same way, so the
 //!   preview iframe auto-opens for behavioral inspection.
 //! - the ~50 KB output cap + timeout watchdog apply for free.
+//!
 //! No new streaming / state / process-management code.
 //!
 //! ### Endpoints
@@ -106,7 +107,7 @@ pub enum VerificationKind {
 impl VerificationKind {
     /// Parse a kind from a JSON string (POST body or query param). Returns None for an
     /// unknown value so the REST handler can 400 instead of panic.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_kind(s: &str) -> Option<Self> {
         match s {
             "typeCheck" | "type_check" | "typecheck" => Some(Self::TypeCheck),
             "lint" => Some(Self::Lint),
@@ -259,7 +260,7 @@ pub async fn run_handler(
         .map(|Json(v)| v)
         .ok_or_else(|| bad("missing JSON body with { profile, kind }"))?;
 
-    let kind = VerificationKind::from_str(&body.kind)
+    let kind = VerificationKind::parse_kind(&body.kind)
         .ok_or_else(|| bad(format!("unknown verify kind: {}", body.kind)))?;
 
     let (label, applicable) = kind_meta(kind);
@@ -271,7 +272,7 @@ pub async fn run_handler(
     }
 
     let code = command_for(kind);
-    let project_id = body.project_id.map(String::from);
+    let project_id = body.project_id;
 
     // Backend checks default to the dotz-core package's own workspace dir so the
     // operator clicking "adversarial verify" on the backend profile checks the server
@@ -387,28 +388,28 @@ mod tests {
     #[allow(non_snake_case)]
     fn kind_from_str_accepts_camelCase_and_alias() {
         assert_eq!(
-            VerificationKind::from_str("typeCheck"),
+            VerificationKind::parse_kind("typeCheck"),
             Some(VerificationKind::TypeCheck)
         );
         assert_eq!(
-            VerificationKind::from_str("type_check"),
+            VerificationKind::parse_kind("type_check"),
             Some(VerificationKind::TypeCheck)
         );
         assert_eq!(
-            VerificationKind::from_str("typecheck"),
+            VerificationKind::parse_kind("typecheck"),
             Some(VerificationKind::TypeCheck)
         );
         assert_eq!(
-            VerificationKind::from_str("build"),
+            VerificationKind::parse_kind("build"),
             Some(VerificationKind::Build)
         );
     }
 
     #[test]
     fn kind_from_str_rejects_unknown_values() {
-        assert_eq!(VerificationKind::from_str(""), None);
-        assert_eq!(VerificationKind::from_str("not-a-check"), None);
-        assert_eq!(VerificationKind::from_str("deploy"), None);
+        assert_eq!(VerificationKind::parse_kind(""), None);
+        assert_eq!(VerificationKind::parse_kind("not-a-check"), None);
+        assert_eq!(VerificationKind::parse_kind("deploy"), None);
     }
 
     // ---- command construction ----

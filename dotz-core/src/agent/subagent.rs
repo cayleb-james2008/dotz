@@ -428,6 +428,9 @@ fn parse_subagent_model(effective_model: &str) -> (String, String) {
 /// model, NO memory autonomy (the agent's own prompt only), and the agent's tool set (or the default
 /// active set). Captures the message list + usage as a SingleResult. A wall-clock timeout prevents a
 /// hung provider or long tool chain from stalling the executive turn indefinitely.
+// 8 params are all irreducibly distinct inputs to a single subagent run; grouping them into a
+// struct would only move the argument list to the 7+ call sites without simplifying anything.
+#[allow(clippy::too_many_arguments)]
 async fn run_single_agent_with_progress(
     agents: &[AgentConfig],
     agent_name: &str,
@@ -456,6 +459,8 @@ async fn run_single_agent_with_progress(
 /// `progress_tx`, when present, receives a copy of every `StreamDelta` the subagent's provider
 /// streams — the lead session forwards these as `subagent_progress` events so the orchestrator
 /// (and the operator) can see a drifting scout/planner's reasoning mid-run.
+// See run_single_agent_with_progress: same irreducible 8-input signature (it delegates here).
+#[allow(clippy::too_many_arguments)]
 async fn run_single_agent_inner(
     agents: &[AgentConfig],
     agent_name: &str,
@@ -512,18 +517,15 @@ async fn run_single_agent_inner(
     // OpenRouter :free tier returning 429s), transparently swap to the backup provider so the
     // fan-out degrades gracefully instead of failing the task. The effective (provider, model)
     // is recorded so the result's `model` field reflects what actually ran.
-    let (provider_id, model_id) = match crate::agent::provider_health::resolve_effective_model(
-        &provider_id,
-        &model_id,
-    )
-    .await
-    {
-        Some((prov, model, _)) => {
-            result.model = Some(format!("{prov}/{model}"));
-            (prov, model)
-        }
-        None => (provider_id, model_id),
-    };
+    let (provider_id, model_id) =
+        match crate::agent::provider_health::resolve_effective_model(&provider_id, &model_id).await
+        {
+            Some((prov, model, _)) => {
+                result.model = Some(format!("{prov}/{model}"));
+                (prov, model)
+            }
+            None => (provider_id, model_id),
+        };
 
     let resolved = match provider::resolve(&provider_id, &model_id) {
         Some(r) => r,
@@ -569,8 +571,10 @@ async fn run_single_agent_inner(
     let effective_task = bus
         .map(|b| crate::context_bus::inject_context_into_task(task, b))
         .unwrap_or_else(|| task.to_string());
-    let mut history: Vec<Message> =
-        vec![Message::user(&format!("Task: {effective_task}"), crate::util::now_ms())];
+    let mut history: Vec<Message> = vec![Message::user(
+        &format!("Task: {effective_task}"),
+        crate::util::now_ms(),
+    )];
 
     for _round in 0..MAX_ROUNDS {
         let messages = to_openai_messages(&system_prompt, &history);

@@ -634,7 +634,7 @@ mod tests {
 
         // Point DOTZ_PI at an empty tree so the only scanned skills come from our override dir.
         let pi = std::env::temp_dir().join(format!("dotz-pi-reload-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&pi.join("design-systems")).unwrap();
+        std::fs::create_dir_all(pi.join("design-systems")).unwrap();
 
         let prev_pi = std::env::var("DOTZ_PI").ok();
         let prev_paths = std::env::var("DOTZ_SKILLS_PATHS").ok();
