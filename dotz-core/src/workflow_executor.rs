@@ -121,6 +121,11 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
     let mut cumulative_cost: f64;
     let mut cumulative_input_tokens: u64;
     let mut cumulative_output_tokens: u64;
+    // Whether the near-limit (headroom) warning has already been emitted for this
+    // run. The executor polls in a tight loop, so without this guard the warning
+    // would fire on every iteration once cumulative spend crosses 80% — flooding
+    // the event stream. Emit once, then let the hard-abort path take over at 100%.
+    let mut budget_near_limit_warned = false;
 
     loop {
         // Snapshot the run's current state.
@@ -175,28 +180,56 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
         // Budget check: if cumulative spend exceeds the run budget, skip all ready
         // steps and abort the run.
         if let Some(ref budget) = run.budget {
-            if !budget.is_unbounded()
-                && budget.is_exceeded(
+            if !budget.is_unbounded() {
+                // Headroom signal: emit a near-limit warning once when cumulative
+                // spend crosses 80% of the most-consumed budget dimension. This is
+                // the prerequisite for the intended downgrade-before-abort behavior
+                // — the runtime can only hard-abort at 100%, so the operator (and a
+                // future auto-downgrade path) needs an earlier signal to act while
+                // there is still headroom. `fraction_used` returns 0.0 when
+                // unbounded, but we already gated on `!is_unbounded()` above.
+                let fraction = budget.fraction_used(
                     cumulative_cost,
                     cumulative_input_tokens,
                     cumulative_output_tokens,
-                )
-            {
-                // Skip every ready step and abort the run.
-                for sid in &ready_ids {
-                    let _ = workflows::step_state(
+                );
+                if !budget_near_limit_warned && fraction >= 0.8 {
+                    budget_near_limit_warned = true;
+                    workflows::emit_event(
                         run_id,
-                        &sid.0,
-                        workflows::StepPatch {
-                            status: Some("skipped".into()),
-                            error: Some("run budget exceeded".into()),
-                            ..Default::default()
-                        },
+                        serde_json::json!({
+                            "type": "budget_near_limit",
+                            "fractionUsed": fraction,
+                            "cost": cumulative_cost,
+                            "inputTokens": cumulative_input_tokens,
+                            "outputTokens": cumulative_output_tokens,
+                            "budget": serde_json::to_value(budget)
+                                .unwrap_or(serde_json::Value::Null),
+                        }),
                     );
                 }
-                // Mark the run aborted.
-                workflows::abort(run_id);
-                return workflows::get_active(run_id);
+
+                if budget.is_exceeded(
+                    cumulative_cost,
+                    cumulative_input_tokens,
+                    cumulative_output_tokens,
+                ) {
+                    // Skip every ready step and abort the run.
+                    for sid in &ready_ids {
+                        let _ = workflows::step_state(
+                            run_id,
+                            &sid.0,
+                            workflows::StepPatch {
+                                status: Some("skipped".into()),
+                                error: Some("run budget exceeded".into()),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    // Mark the run aborted.
+                    workflows::abort(run_id);
+                    return workflows::get_active(run_id);
+                }
             }
         }
 
