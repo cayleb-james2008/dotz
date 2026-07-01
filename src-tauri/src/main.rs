@@ -244,7 +244,14 @@ fn bind_listener(
             format!("failed to set non-blocking mode for server socket: {e}"),
         )) as Box<dyn std::error::Error + Send + Sync>
     })?;
-    Ok(tokio::net::TcpListener::from_std(std_listener)?)
+    // ponytail: TcpListener::from_std must run inside a Tokio reactor, but run()/main() is sync.
+    // Convert on the same global tauri async runtime the server task later runs on, so the listener
+    // is registered to the reactor that will poll it. (Fixes "there is no reactor running" panic.)
+    let listener =
+        tauri::async_runtime::block_on(
+            async move { tokio::net::TcpListener::from_std(std_listener) },
+        )?;
+    Ok(listener)
 }
 
 #[cfg(test)]
