@@ -1172,7 +1172,15 @@ fn apply_subagent_delta(msg: &mut super::event::Message, delta: StreamDelta) {
 /// Aborted turns are intentionally skipped: the assistant message is incomplete
 /// (partial stream or tool chain) and would pollute durable memory with fragments.
 fn should_capture_memory(stop_reason: Option<&str>) -> bool {
-    stop_reason != Some("aborted")
+    // Skip capture for turns that did not produce a usable assistant exchange.
+    //   - "aborted": the user cancelled; the assistant text is partial/empty.
+    //   - "error":  the provider reported a failure (a provider can close the stream cleanly
+    //               while emitting finish_reason "error" / an unmapped reason the adapters pass
+    //               through as "error"). The stream task returns Ok(()), so finish_error is NOT
+    //               called and the turn falls through to finish_turn. Without this guard the
+    //               failed exchange would be LLM-extracted into durable memory, poisoning the
+    //               recall store with facts from a broken/partial response.
+    !matches!(stop_reason, Some("aborted") | Some("error"))
 }
 
 /// Emit turn_end + agent_end, then (main session only) fire-and-forget autonomous memory capture.
@@ -2449,6 +2457,25 @@ mod tests {
         assert!(
             !should_capture_memory(Some("aborted")),
             "aborted stop reason must skip capture"
+        );
+    }
+
+    /// A turn whose provider stream closed cleanly but carried a passthrough/"error" finish
+    /// reason reaches `finish_turn` with `stop_reason == "error"` (the stream task returns
+    /// `Ok(())`, so `finish_error` is never called). Capturing that failed exchange would
+    /// LLM-extract a broken/partial response into durable memory, poisoning recall for every
+    /// future turn. `should_capture_memory` must skip it just like an abort.
+    #[test]
+    fn should_capture_memory_skips_error_stop_reason() {
+        assert!(
+            !should_capture_memory(Some("error")),
+            "error stop reason must skip capture — a failed provider turn must not poison memory"
+        );
+        // A truncated-but-completed turn (max_tokens) still carries usable partial text, so it
+        // stays capturable; only true failures are excluded.
+        assert!(
+            should_capture_memory(Some("max_tokens")),
+            "max_tokens stop reason should still allow capture (partial but usable text)"
         );
     }
 
