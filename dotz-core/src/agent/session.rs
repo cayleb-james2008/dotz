@@ -614,18 +614,20 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             Some((prov, model, _)) => (prov, model),
             None => (provider_id.clone(), model_id.clone()),
         };
-        // Use the failover-resolved (provider, model) for this round's request. The original
-        // `provider_id`/`model_id` are retained so each round re-checks health (recovery probe).
-        let provider_id = prov_for_turn;
-        let model_id = model_for_turn;
+        // Use the failover-resolved (provider, model) for THIS round's request only. The
+        // original `provider_id`/`model_id` (the session's configured provider) are NOT shadowed
+        // so the next round re-probes the original provider's health — if it recovered, the turn
+        // switches back instead of staying stuck on the backup for the whole turn.
+        let round_provider = prov_for_turn;
+        let round_model = model_for_turn;
 
-        let resolved = match provider::resolve(&provider_id, &model_id) {
+        let resolved = match provider::resolve(&round_provider, &round_model) {
             Some(r) => r,
             None => {
                 finish_error(
                     &session,
                     &format!(
-                        "provider '{provider_id}' not resolvable (anthropic/google are Phase 3b)"
+                        "provider '{round_provider}' not resolvable (anthropic/google are Phase 3b)"
                     ),
                     tool_results,
                 );
@@ -640,7 +642,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         };
 
         let (delta_tx, mut delta_rx) = mpsc::channel::<StreamDelta>(256);
-        let adapter = provider::adapter_for(&provider_id);
+        let adapter = provider::adapter_for(&round_provider);
         let stream_task = tokio::spawn(async move { adapter.stream(req, delta_tx).await });
 
         // message_start (assistant shell).
@@ -650,12 +652,12 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             emit(
                 &s,
                 &AgentEvent::MessageStart {
-                    message: Message::assistant_shell(&provider_id, &model_id, start_ts),
+                    message: Message::assistant_shell(&round_provider, &round_model, start_ts),
                 },
             );
         }
 
-        let mut acc = Accumulator::new(&provider_id, &model_id, start_ts);
+        let mut acc = Accumulator::new(&round_provider, &round_model, start_ts);
         let mut stop_reason = "stop".to_string();
 
         loop {
@@ -689,19 +691,19 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         match stream_task.await {
             Ok(Ok(())) if !aborted => {
                 // Record success so a recovered provider's health is cleared.
-                super::provider_health::record_success(&provider_id).await;
+                super::provider_health::record_success(&round_provider).await;
             }
             Ok(Err(e)) if !aborted => {
                 // Record the failure (classified). If this degrades the provider, the next
                 // turn will automatically fail over to the backup.
-                super::provider_health::record_failure(&provider_id, &e).await;
+                super::provider_health::record_failure(&round_provider, &e).await;
                 finish_error(&session, &e, tool_results);
                 return;
             }
             Err(e) if !aborted => {
                 // A panicked stream task counts as a transient failure (worth failing over).
                 super::provider_health::record_failure(
-                    &provider_id,
+                    &round_provider,
                     &format!("stream task panicked: {e}"),
                 )
                 .await;

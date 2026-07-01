@@ -736,4 +736,77 @@ mod tests {
         assert!(pairs.contains_key("ollama"));
         reset().await;
     }
+
+    /// Regression for the `run_turn` provider-health re-probe shadowing bug.
+    ///
+    /// Before the fix, `run_turn` shadowed the session's original `provider_id`/`model_id`
+    /// with the failover-resolved values (`let provider_id = prov_for_turn`). This meant
+    /// that after round 1 failed over to the backup, round 2's health check probed the
+    /// BACKUP's health — not the original session provider's. The original provider's
+    /// recovery was never re-detected, so the turn stayed on the backup for all remaining
+    /// rounds even after the primary came back.
+    ///
+    /// This test proves the invariant the fix relies on: `resolve_effective_model` must be
+    /// called with the ORIGINAL session provider each round. Probing the original detects
+    /// recovery and routes back; probing the backup (the old behavior) never sees the
+    /// original's state and stays on the backup forever.
+    #[tokio::test]
+    async fn reprobe_original_provider_detects_recovery_but_probing_backup_does_not() {
+        let _guard = HEALTH_TEST_LOCK.lock().await;
+        reset().await;
+
+        let primary = "openrouter";
+        let primary_model = "nex-agi/nex-n2-pro:free";
+
+        // Degrade the primary with two consecutive failover-worthy failures.
+        record_failure(primary, "returned 429: rate limit").await;
+        record_failure(primary, "returned 429: rate limit").await;
+        assert!(is_degraded(primary).await);
+
+        // Round 1 (both old and new code): failover to the backup.
+        let (r1_prov, _, _) =
+            resolve_effective_model(primary, primary_model).await.unwrap();
+        assert_eq!(r1_prov, "ollama", "degraded primary must fail over to backup");
+
+        // Simulate recovery: the rate-limit window passes and the primary is healthy again.
+        record_success(primary).await;
+        assert!(!is_degraded(primary).await, "primary should be recovered");
+
+        // Fixed behavior (what run_turn does now): re-probe the ORIGINAL primary.
+        let (fixed_prov, _, _) =
+            resolve_effective_model(primary, primary_model).await.unwrap();
+        assert_eq!(
+            fixed_prov, primary,
+            "fixed: re-probing the original primary must route back to it after recovery"
+        );
+
+        // Now demonstrate the old buggy behavior: re-degrade the primary, then show that
+        // probing the BACKUP (what the old shadowing did) never detects the primary's state.
+        record_failure(primary, "returned 429: rate limit").await;
+        record_failure(primary, "returned 429: rate limit").await;
+        assert!(is_degraded(primary).await, "primary should be degraded again");
+
+        // Old code called resolve_effective_model with the BACKUP provider, not the original.
+        // The backup is not degraded, so this always returns the backup — the primary's
+        // degradation (or recovery) is invisible.
+        let (old_prov, _, _) =
+            resolve_effective_model("ollama", "minimax-m3").await.unwrap();
+        assert_eq!(
+            old_prov, "ollama",
+            "old buggy behavior: probing the backup stays on the backup, never seeing the primary"
+        );
+        // The primary is still degraded — the old code would never notice it recovered.
+        assert!(is_degraded(primary).await, "primary is still degraded but old code can't see it");
+
+        // Fixed code probes the original primary — and after recovery, routes back.
+        record_success(primary).await; // simulate recovery
+        let (fixed_prov2, _, _) =
+            resolve_effective_model(primary, primary_model).await.unwrap();
+        assert_eq!(
+            fixed_prov2, primary,
+            "fixed: probing the original primary after recovery routes back to it"
+        );
+
+        reset().await;
+    }
 }
