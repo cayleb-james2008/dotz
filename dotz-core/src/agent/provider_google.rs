@@ -214,7 +214,8 @@ fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
             }
             "user" => {
                 let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                out.push(json!({ "role": "user", "parts": [{ "text": text }] }));
+                let parts = vec![json!({ "text": text })];
+                merge_or_push(&mut out, "user", parts);
             }
             "assistant" => {
                 let mut parts: Vec<Value> = Vec::new();
@@ -246,7 +247,7 @@ fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
                 if parts.is_empty() {
                     parts.push(json!({ "text": "" }));
                 }
-                out.push(json!({ "role": "model", "parts": parts }));
+                merge_or_push(&mut out, "model", parts);
             }
             "tool" => {
                 let id = m.get("tool_call_id").and_then(|i| i.as_str()).unwrap_or("");
@@ -256,21 +257,37 @@ fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
                     .get(id)
                     .cloned()
                     .unwrap_or_else(|| id.to_string());
-                out.push(json!({
-                    "role": "user",
-                    "parts": [{
-                        "functionResponse": {
-                            "name": name,
-                            "response": { "result": content },
-                        }
-                    }],
-                }));
+                let parts = vec![json!({
+                    "functionResponse": {
+                        "name": name,
+                        "response": { "result": content },
+                    }
+                })];
+                // tool results map to the "user" role, so they merge with a preceding user turn.
+                merge_or_push(&mut out, "user", parts);
             }
             _ => {}
         }
     }
 
     (system, out)
+}
+
+/// Push a `{role, parts}` turn onto `out`, OR merge `parts` into the last turn when it has the
+/// same role. Gemini's `streamGenerateContent` API requires strictly alternating user/model
+/// roles in `contents`; an assistant `tool_calls` turn followed by N `tool` results would
+/// otherwise produce N consecutive "user" turns, which Gemini rejects. This mirrors the
+/// consecutive-role merge the Anthropic adapter already does.
+fn merge_or_push(out: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
+    if let Some(last) = out.last_mut() {
+        if last.get("role").and_then(|r| r.as_str()) == Some(role) {
+            if let Some(existing) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                existing.extend(parts);
+                return;
+            }
+        }
+    }
+    out.push(json!({ "role": role, "parts": parts }));
 }
 
 /// OpenAI `{type:"function", function:{name,description,parameters}}` → Gemini
@@ -380,5 +397,69 @@ mod tests {
 
         // A bare literal key is passed through (matches the shared resolve_api_key rule).
         assert_eq!(resolve_google_key("literal-key"), "literal-key");
+    }
+
+    /// Gemini's `streamGenerateContent` API requires strictly alternating user/model roles in
+    /// `contents`. An OpenAI history with one assistant `tool_calls` turn followed by N `tool`
+    /// result messages would otherwise produce N consecutive "user" turns, which Gemini rejects.
+    /// `convert_messages` must collapse them into a single user turn carrying N
+    /// `functionResponse` parts — mirroring the consecutive-role merge the Anthropic adapter does.
+    #[test]
+    fn convert_messages_groups_consecutive_tool_results_into_one_user_turn() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    { "id": "call_1", "type": "function", "function": { "name": "bash", "arguments": "{}" } },
+                    { "id": "call_2", "type": "function", "function": { "name": "read", "arguments": "{}" } }
+                ]
+            }),
+            json!({ "role": "tool", "tool_call_id": "call_1", "content": "out1" }),
+            json!({ "role": "tool", "tool_call_id": "call_2", "content": "out2" }),
+        ];
+        let (_, contents) = convert_messages(&messages);
+        assert_eq!(contents.len(), 2, "two tool results must collapse into one user turn");
+        assert_eq!(contents[0]["role"], "model");
+        assert_eq!(contents[1]["role"], "user");
+        let parts = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "the single user turn must carry both functionResponse parts");
+        assert_eq!(parts[0]["functionResponse"]["name"], "bash");
+        assert_eq!(parts[0]["functionResponse"]["response"]["result"], "out1");
+        assert_eq!(parts[1]["functionResponse"]["name"], "read");
+        assert_eq!(parts[1]["functionResponse"]["response"]["result"], "out2");
+    }
+
+    /// Consecutive plain user messages must also merge into a single user turn so Gemini sees a
+    /// legal alternating history (no two user turns in a row).
+    #[test]
+    fn convert_messages_merges_consecutive_user_turns() {
+        let messages = vec![
+            json!({ "role": "user", "content": "part one" }),
+            json!({ "role": "user", "content": "part two" }),
+        ];
+        let (_, contents) = convert_messages(&messages);
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "part one");
+        assert_eq!(parts[1]["text"], "part two");
+    }
+
+    /// Alternating user/assistant turns with no tool results must stay as separate turns — the
+    /// merge must only fire on consecutive same-role turns.
+    #[test]
+    fn convert_messages_keeps_alternating_roles_when_no_tool_results() {
+        let messages = vec![
+            json!({ "role": "user", "content": "hi" }),
+            json!({ "role": "assistant", "content": "hello" }),
+            json!({ "role": "user", "content": "bye" }),
+        ];
+        let (_, contents) = convert_messages(&messages);
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[2]["role"], "user");
     }
 }
