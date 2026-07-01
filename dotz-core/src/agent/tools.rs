@@ -258,6 +258,24 @@ fn bash_timeout() -> Duration {
 }
 
 // ---- bash ----
+
+/// Locate Git for Windows bash. The tool is *named* "bash" and models write POSIX
+/// syntax for it; spawning `cmd /C` silently broke every `cat | head`-style command.
+/// Deliberately NOT System32\bash.exe — that is WSL, whose filesystem view (/mnt/c)
+/// and environment differ from what the model's commands assume.
+/// # ponytail: two standard install paths, cmd /C fallback; add a DOTZ_BASH override if
+/// # a nonstandard Git install ever matters.
+#[cfg(windows)]
+fn windows_bash() -> Option<std::path::PathBuf> {
+    [
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+    ]
+    .iter()
+    .map(std::path::PathBuf::from)
+    .find(|p| p.exists())
+}
+
 struct BashTool;
 #[async_trait]
 impl Tool for BashTool {
@@ -280,9 +298,18 @@ impl Tool for BashTool {
         let mut c = {
             #[cfg(windows)]
             {
-                let mut c = tokio::process::Command::new("cmd");
-                c.arg("/C").arg(&cmd);
-                c
+                match windows_bash() {
+                    Some(bash) => {
+                        let mut c = tokio::process::Command::new(bash);
+                        c.arg("-c").arg(&cmd);
+                        c
+                    }
+                    None => {
+                        let mut c = tokio::process::Command::new("cmd");
+                        c.arg("/C").arg(&cmd);
+                        c
+                    }
+                }
             }
             #[cfg(not(windows))]
             {
@@ -914,6 +941,37 @@ mod tests {
         assert!(
             err.contains("not active"),
             "inactive tool should be rejected, got: {err}"
+        );
+    }
+
+    /// On Windows the bash tool must execute POSIX syntax via Git bash when installed —
+    /// spawning `cmd /C` silently broke every piped command models write for a tool
+    /// named "bash" (`cat | head`, `2>/dev/null`, …), which stalled agent turns.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_bash_tool_runs_posix_pipelines() {
+        if windows_bash().is_none() {
+            eprintln!("skipped: Git bash not installed, cmd /C fallback in effect");
+            return;
+        }
+        let mut registry = ToolRegistry::new();
+        registry.set_active(&["bash".to_string()]);
+        let ctx = ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: None,
+            run_id: None,
+        };
+        let out = registry
+            .run(
+                "bash",
+                &json!({"command": "printf 'first\\nsecond\\n' | head -1"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.contains("first") && !out.contains("second"),
+            "POSIX pipeline must run under Git bash, got: {out}"
         );
     }
 
