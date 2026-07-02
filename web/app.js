@@ -2633,10 +2633,14 @@ function applyModel(step, value) {
 }
 
 // Approve / request-changes on a worker step from the artifact controls.
-// "approve" marks the step accepted (UI-only signal; auto-repair reviewer
-// already produced the artifact). "reject" sends a rejection note that
-// the run executor can feed into a repair cycle.
+// "approve" is a UI-only acknowledgement (the artifact already exists; nothing
+// to tell the server). "reject" asks the server to rerun the step with a
+// rejection note fed into the repair cycle (workflow.actOnStep arm).
 function actOnStep(step, action) {
+  if (action === "approve") {
+    logBrain(`step ${step.agent}: artifact approved`);
+    return;
+  }
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) { pushError("not connected"); return; }
   state.ws.send(JSON.stringify({
     kind: "workflow.actOnStep",
@@ -2644,7 +2648,7 @@ function actOnStep(step, action) {
     stepId: step.id,
     action,
   }));
-  logBrain(`step ${step.agent}: ${action} submitted`);
+  logBrain(`step ${step.agent}: changes requested — repair rerun dispatched`);
 }
 
 function applyParents(step, value, run) {
