@@ -3071,14 +3071,6 @@ async function refreshConnections() {
       if (list) { list.innerHTML = ""; list.appendChild(el("div", "dim mono", "⚠ couldn't reach the server — retrying…")); }
     }
   }
-  if (state.connectionsLoginProvider) {
-    try {
-      const st = await api(`/api/connections/${state.connectionsLoginProvider}/login`);
-      const out = panel.querySelector("#conn-login-output");
-      if (out) { out.classList.remove("hidden"); out.textContent = st.output || "starting browser login…"; }
-      if (!st.running) { state.connectionsLoginProvider = null; }
-    } catch (e) { state.connectionsLoginProvider = null; }
-  }
 }
 
 function renderConnections(panel, connections) {
@@ -3096,39 +3088,16 @@ function renderConnections(panel, connections) {
       : (c.hint || (c.installed ? "not logged in" : "CLI not installed"));
     meta.appendChild(el("span", "conn-sub dim mono", sub));
     row.appendChild(meta);
-    const actions = el("div", "conn-actions");
-    const loginBtn = el("button", "btn-mini btn-go conn-login", c.loggedIn ? "RE-LOGIN" : "LOG IN");
-    loginBtn.onclick = () => startConnectionLogin(c.id);
-    actions.appendChild(loginBtn);
-    if (c.loggedIn) {
-      const outBtn = el("button", "btn-mini conn-logout", "LOG OUT");
-      outBtn.onclick = () => connectionLogout(c.id);
-      actions.appendChild(outBtn);
+    if (!c.loggedIn) {
+      // In-app login/logout is disabled server-side (the routes 501 by design — a spawned
+      // provider login has logged the operator out before). Point at the terminal instead
+      // of rendering buttons that can only fail.
+      const actions = el("div", "conn-actions");
+      actions.appendChild(el("span", "conn-sub dim mono", "connect from a terminal — dotz reads the CLI's auth"));
+      row.appendChild(actions);
     }
-    row.appendChild(actions);
     list.appendChild(row);
   }
-}
-
-async function startConnectionLogin(provider) {
-  try {
-    await post(`/api/connections/${provider}/login`);
-    state.connectionsLoginProvider = provider;
-    const panel = document.querySelector('.panel[data-panel="connections"]');
-    const out = panel && panel.querySelector("#conn-login-output");
-    if (out) { out.classList.remove("hidden"); out.textContent = "starting browser login — follow the device code / browser tab that opens…"; }
-  } catch (e) { pushError("connection login: " + e.message); }
-}
-
-async function connectionLogout(provider) {
-  // The server replies HTTP 200 with {ok:false, output} when the CLI logout fails (e.g. gh errors,
-  // or neon's credentials file can't be removed), so post() won't throw — surface ok:false ourselves
-  // instead of silently leaving the row "connected" with no feedback.
-  try {
-    const r = await post(`/api/connections/${provider}/logout`);
-    if (r && r.ok === false) pushError("logout failed: " + (r.output || provider));
-    refreshConnections();
-  } catch (e) { pushError("connection logout: " + e.message); }
 }
 
 /* ---------- spec / living docs / vcs ---------- */
