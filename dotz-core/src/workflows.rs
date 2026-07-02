@@ -2366,12 +2366,10 @@ pub fn router() -> Router<()> {
             post(patch_step_handler),
         )
         .route("/api/workflows/{id}/insert", post(insert_steps_handler))
-        // Reproducible run record: GET the captured record, POST to replay it
-        // into a fresh run (debugging + orchestration-regression bisect).
-        .route(
-            "/api/workflows/{id}/record",
-            get(record_handler).post(replay_handler),
-        )
+        // Reproducible run record: GET the captured record, POST /replay to rebuild
+        // it into a fresh run (debugging + orchestration-regression bisect).
+        .route("/api/workflows/{id}/record", get(record_handler))
+        .route("/api/workflows/{id}/replay", post(replay_handler))
 }
 
 #[cfg(test)]
