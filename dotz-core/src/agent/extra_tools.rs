@@ -115,11 +115,18 @@ impl Tool for CreateAgentTool {
         {
             return Err(format!("agent \"{name}\" already exists"));
         }
-        let body = if desc.is_empty() {
-            format!("# {name}\n\n{prompt}\n")
+        // Discovery (subagent.rs load_agents_from_dir) requires `---` frontmatter with BOTH
+        // name and description keys and silently skips files without them — plain markdown
+        // here means the created agent could never be invoked. Mirror the bundled
+        // .pi/agents/*.md shape; single-line values so a crafted name/desc can't break out
+        // of the frontmatter block.
+        let fm_name = name.replace(['\r', '\n'], " ");
+        let fm_desc = if desc.is_empty() {
+            fm_name.clone()
         } else {
-            format!("# {name}\n\n> {desc}\n\n{prompt}\n")
+            desc.replace(['\r', '\n'], " ")
         };
+        let body = format!("---\nname: {fm_name}\ndescription: {fm_desc}\n---\n\n{prompt}\n");
         tokio::fs::write(&file, body)
             .await
             .map_err(|e| e.to_string())?;
