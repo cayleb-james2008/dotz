@@ -59,11 +59,13 @@ impl Provider for GoogleGemini {
     async fn stream(&self, req: ChatRequest, tx: mpsc::Sender<StreamDelta>) -> Result<(), String> {
         let key = resolve_google_key(&req.model.api_key_ref);
         // base_url points at the Gemini API root (https://generativelanguage.googleapis.com/v1beta).
+        // The key goes in the x-goog-api-key header, NEVER the URL: reqwest's error Display
+        // prints the full URL (query included), and that string reaches the UI, session
+        // history, and /api/provider-health — a query-param key leaks on any network error.
         let url = format!(
-            "{}/models/{}:streamGenerateContent?alt=sse&key={}",
+            "{}/models/{}:streamGenerateContent?alt=sse",
             req.model.base_url.trim_end_matches('/'),
             req.model.model_id,
-            key,
         );
 
         let (system_instruction, contents) = convert_messages(&req.messages);
@@ -87,6 +89,7 @@ impl Provider for GoogleGemini {
             .post(&url)
             .timeout(request_timeout())
             .header("content-type", "application/json")
+            .header("x-goog-api-key", &key)
             .json(&body)
             .send()
             .await
