@@ -288,8 +288,11 @@ mod tests {
     }
 
     /// Binding to an ephemeral/free port must succeed and return a usable tokio listener.
-    #[tokio::test]
-    async fn bind_listener_succeeds_on_free_port() {
+    /// Plain #[test]: bind_listener block_on's the global tauri runtime internally, which
+    /// panics ("cannot start a runtime from within a runtime") under #[tokio::test] — exactly
+    /// like production, where run() calls it from the sync main thread.
+    #[test]
+    fn bind_listener_succeeds_on_free_port() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let listener = bind_listener(addr).expect("should bind to a free ephemeral port");
         let bound_addr = listener
