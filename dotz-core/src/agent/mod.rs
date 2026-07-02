@@ -1942,9 +1942,8 @@ mod tests {
                                 if dup_deadline.is_none() {
                                     // First terminal event seen: give a would-be duplicate a
                                     // dedicated window (the buggy double-emit fired back-to-back).
-                                    dup_deadline = Some(
-                                        tokio::time::Instant::now() + Duration::from_secs(3),
-                                    );
+                                    dup_deadline =
+                                        Some(tokio::time::Instant::now() + Duration::from_secs(3));
                                 }
                             }
                         }
