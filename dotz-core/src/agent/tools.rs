@@ -954,6 +954,11 @@ mod tests {
             eprintln!("skipped: Git bash not installed, cmd /C fallback in effect");
             return;
         }
+        // Serialize against the timeout tests: they set the process-global
+        // DOTZ_BASH_TIMEOUT_MS to 1000ms, and a concurrent run leaks that short
+        // timeout into this test's bash spawn, which under load takes >1s and is
+        // killed ("[timeout] killed after 1000ms") instead of running the pipeline.
+        let _guard = BASH_TIMEOUT_TEST_LOCK.lock().await;
         let mut registry = ToolRegistry::new();
         registry.set_active(&["bash".to_string()]);
         let ctx = ToolCtx {
@@ -977,6 +982,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_allows_active_tool() {
+        // Same DOTZ_BASH_TIMEOUT_MS leak hazard as the pipeline test above.
+        let _guard = BASH_TIMEOUT_TEST_LOCK.lock().await;
         let mut registry = ToolRegistry::new();
         registry.set_active(&["bash".to_string()]);
         let ctx = ToolCtx {
