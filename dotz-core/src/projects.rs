@@ -184,7 +184,13 @@ fn build_file_tree(cwd: &FsPath, depth: usize) -> Vec<Value> {
     for ent in entries.flatten() {
         let name = ent.file_name();
         let name = name.to_string_lossy().to_string();
-        if name == "node_modules" || name == ".git" {
+        // Skip heavy/non-source directories so the file panel stays fast and noise-free.
+        // `node_modules` and `.git` are skipped to match server.ts; `target` is the Rust
+        // build-output dir (dotz's own repo is Rust, and any Rust project the agent works
+        // on fills it with tens of thousands of generated files). The agent's own `grep`
+        // and `find` tools already skip `target`, so excluding it here keeps the operator's
+        // file panel consistent with what the agent searches.
+        if name == "node_modules" || name == ".git" || name == "target" {
             continue;
         }
         let full = cwd.join(&name);
@@ -1018,6 +1024,11 @@ mod tests {
         // Hidden / skipped entries must not appear.
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        // `target` is the Rust build-output dir; it must be skipped just like node_modules
+        // and .git so the file panel does not descend into tens of thousands of generated
+        // files (dotz's own repo is Rust).
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("target").join("built.rs"), b"").unwrap();
 
         let tree = build_file_tree(&dir, 0);
 
@@ -1052,8 +1063,8 @@ mod tests {
         assert!(
             !order
                 .iter()
-                .any(|(n, _)| n == ".git" || n == "node_modules"),
-            ".git and node_modules must be excluded from the file tree"
+                .any(|(n, _)| n == ".git" || n == "node_modules" || n == "target"),
+            ".git, node_modules, and target must be excluded from the file tree"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
