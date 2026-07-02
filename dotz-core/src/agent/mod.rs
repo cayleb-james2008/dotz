@@ -715,13 +715,33 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                         if let Some(tx) = session::tx(&session_id) {
                             let sid = session_id.clone();
                             tokio::spawn(async move {
+                                // start_run's streamed frames (sandbox_output / sandbox_port) are
+                                // raw {type,...} values, but the api-contract requires every
+                                // sandbox event on the session socket to be wrapped in
+                                // {kind:"sandbox", sessionId, event} — app.js drops bare frames.
+                                // Relay through a private channel and wrap each frame.
+                                let (raw_tx, mut raw_rx) = broadcast::channel::<Value>(256);
+                                {
+                                    let tx = tx.clone();
+                                    let sid = sid.clone();
+                                    tokio::spawn(async move {
+                                        loop {
+                                            match raw_rx.recv().await {
+                                                Ok(ev) => emit_sandbox_event(&tx, &sid, ev),
+                                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                                Err(broadcast::error::RecvError::Closed) => break,
+                                            }
+                                        }
+                                    });
+                                }
                                 match crate::sandbox::start_run(
                                     &language,
                                     &code,
                                     &mode,
                                     project_id.as_deref(),
                                     timeout_ms,
-                                    Some(tx.clone()),
+                                    Some(raw_tx),
+                                    None,
                                 )
                                 .await
                                 {
@@ -846,6 +866,26 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                         if let (Some(rid), Some(sid)) = (run_id, step_id) {
                             let parents = parents.unwrap_or_default();
                             let _ = crate::workflows::patch_parents(&rid, &sid, parents);
+                        }
+                    }
+                    // Artifact review: "reject" feeds a repair rerun with a rejection note.
+                    // ("approve" is UI-only — the artifact already exists — and never sent.)
+                    "workflow.actOnStep" => {
+                        let run_id = v.get("runId").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        let step_id = v.get("stepId").and_then(|x| x.as_str()).map(|s| s.to_string());
+                        let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
+                        if action == "reject" {
+                            if let (Some(rid), Some(sid)) = (run_id, step_id) {
+                                let feedback = v
+                                    .get("feedback")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("The operator reviewed this step's artifact and requested changes.")
+                                    .to_string();
+                                tokio::spawn(async move {
+                                    crate::workflows::rerun_step_and_dispatch(&rid, &sid, Some(feedback))
+                                        .await;
+                                });
+                            }
                         }
                     }
                     // Live-editable workflow steering: patch a step's model.
