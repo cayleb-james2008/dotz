@@ -1723,6 +1723,8 @@ mod tests {
         } else {
             ("bash", "echo dotz-sandbox-start-test")
         };
+        // Generous timeoutMs: it only bounds a hang, and a powershell cold start can exceed 5 s
+        // under heavy load — a timeout kill would race the lifecycle this test observes.
         ws.send(Message::Text(
             json!({
                 "kind": "sandbox.start",
@@ -1730,7 +1732,7 @@ mod tests {
                 "code": code,
                 "mode": "terminal",
                 "projectId": null,
-                "timeoutMs": 5000,
+                "timeoutMs": 60000,
             })
             .to_string()
             .into(),
@@ -1739,7 +1741,7 @@ mod tests {
         .unwrap();
 
         let mut run_id: Option<String> = None;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
                 Ok(Some(Ok(Message::Text(t)))) => {
@@ -1864,9 +1866,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Collect the sandbox_start to get the run id.
+        // Collect the sandbox_start to get the run id. Generous deadline: under heavy load the
+        // server task and WS round-trip can be scheduled several seconds late.
         let mut run_id: Option<String> = None;
-        let start_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let start_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         while tokio::time::Instant::now() < start_deadline {
             match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
                 Ok(Some(Ok(Message::Text(t)))) => {
@@ -1892,8 +1895,19 @@ mod tests {
         // Wait for execute_run to spawn the child and record its pid. The sandbox_start event
         // fires as soon as the run is created, before execute_run has necessarily spawned the
         // child — if we kill before the pid is set, kill_run_by_id returns false (no-op) and
-        // the poller never sees a terminal status, so the dedup path isn't exercised.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // the poller never sees a terminal status, so the dedup path isn't exercised. A fixed
+        // sleep is not enough: a powershell cold start can take well over 5 s under heavy
+        // load, so poll for the pid with a generous deadline instead.
+        let pid_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while crate::sandbox::test_run_pid(&rid).is_none()
+            && tokio::time::Instant::now() < pid_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            crate::sandbox::test_run_pid(&rid).is_some(),
+            "sandbox child should register a pid before we kill it"
+        );
 
         // Kill the run via the WebSocket.
         ws.send(Message::Text(
@@ -1904,10 +1918,18 @@ mod tests {
         .await
         .unwrap();
 
-        // Count sandbox_end events for this run id over a generous window.
+        // Count sandbox_end events for this run id. Wait generously for the FIRST one (taskkill
+        // plus the status poller can take many seconds under heavy load), then keep listening a
+        // further fixed window so a duplicate — the regression this test guards against — would
+        // still be caught. The assertion is unchanged: exactly one sandbox_end.
         let mut end_count = 0usize;
-        let end_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while tokio::time::Instant::now() < end_deadline {
+        let first_end_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut dup_deadline: Option<tokio::time::Instant> = None;
+        loop {
+            let deadline = dup_deadline.unwrap_or(first_end_deadline);
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
             match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
                 Ok(Some(Ok(Message::Text(t)))) => {
                     let frame: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
@@ -1917,6 +1939,13 @@ mod tests {
                             let eid = event.get("runId").and_then(|r| r.as_str()).unwrap_or("");
                             if eid == rid {
                                 end_count += 1;
+                                if dup_deadline.is_none() {
+                                    // First terminal event seen: give a would-be duplicate a
+                                    // dedicated window (the buggy double-emit fired back-to-back).
+                                    dup_deadline = Some(
+                                        tokio::time::Instant::now() + Duration::from_secs(3),
+                                    );
+                                }
                             }
                         }
                     }

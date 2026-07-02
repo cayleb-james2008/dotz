@@ -305,6 +305,14 @@ pub fn lookup(id: &str) -> Option<SandboxRun> {
 }
 
 #[cfg(test)]
+/// Read the recorded child pid for a run. Test-only helper so WebSocket sandbox tests can wait
+/// for `execute_run` to actually spawn the child (a powershell cold start can take several
+/// seconds under load) instead of sleeping a fixed interval before killing it.
+pub fn test_run_pid(id: &str) -> Option<u32> {
+    runs_guard().get(id).and_then(|e| e.pid)
+}
+
+#[cfg(test)]
 /// Remove a run entry from the in-memory store. Test-only helper so WebSocket sandbox tests can
 /// clean up the process-global runs map.
 pub fn remove_test_run(id: &str) {
@@ -1242,8 +1250,10 @@ mod tests {
 
         // Give Windows a moment to finish taskkill and release handles, then assert the temp
         // dir was cleaned up. (Linux allows removing an in-use dir, so this primarily guards
-        // Windows, but it still validates the cleanup path everywhere.)
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        // Windows, but it still validates the cleanup path everywhere.) The deadline is
+        // generous because taskkill + handle release can take many seconds under heavy load;
+        // the tight poll keeps the happy path fast.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut gone = false;
         while tokio::time::Instant::now() < deadline {
             if !temp_dir.exists() {
@@ -1301,7 +1311,10 @@ mod tests {
         assert!(poisoned.is_err(), "mutex should be poisoned");
 
         // Run a quick command that exits cleanly, forcing `execute_run` to read `killed_by_us`
-        // via `runs_guard()` in the normal (non-timeout) exit path.
+        // via `runs_guard()` in the normal (non-timeout) exit path. The timeout is generous:
+        // it only bounds a hang, and a powershell cold start can take well over 5 s when the
+        // machine is under heavy load — a short timeout turns this into a "killed" run and a
+        // spurious failure.
         let (language, code) = if cfg!(windows) {
             ("powershell", "Write-Output ok")
         } else {
@@ -1311,7 +1324,7 @@ mod tests {
             id.clone(),
             language.to_string(),
             code.to_string(),
-            5000,
+            60_000,
             "terminal".to_string(),
             None,
         )
@@ -1425,11 +1438,13 @@ mod tests {
         } else {
             ("bash", "echo dotz-stream-test")
         };
+        // Generous timeout: it only bounds a hang. A powershell cold start can exceed 5 s under
+        // heavy load, and a timeout kill here would drop the output line the test asserts on.
         execute_run(
             id.clone(),
             language.to_string(),
             code.to_string(),
-            5000,
+            60_000,
             "terminal".to_string(),
             Some(tx),
         )
@@ -1513,28 +1528,43 @@ mod tests {
                 &format!("echo 'ready'; echo 'http://localhost:{port}/'; sleep 1"),
             )
         };
+        // Generous timeout: it only bounds a hang, and a powershell cold start under heavy load
+        // can exceed 5 s — a timeout kill would swallow the banner line before port detection.
         execute_run(
             id.clone(),
             language.to_string(),
             code.to_string(),
-            5000,
+            60_000,
             "web".to_string(),
             Some(tx),
         )
         .await;
 
+        // Port detection runs on a detached task (see drain_stream), so the `sandbox_port` event
+        // can legitimately arrive after `execute_run` returns. Wait for it with a bounded
+        // deadline instead of draining only what is already buffered — under load the detached
+        // probe can lose that race by seconds. `Closed` means every sender (including the probe
+        // task's clone) is gone, so no further event can arrive and we can stop early.
         let mut found = false;
-        while let Ok(frame) = rx.try_recv() {
-            if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_port") {
-                assert_eq!(
-                    frame.get("runId").and_then(|r| r.as_str()),
-                    Some(id.as_str())
-                );
-                assert_eq!(
-                    frame.get("port").and_then(|p| p.as_u64()),
-                    Some(port as u64)
-                );
-                found = true;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !found && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_port") {
+                        assert_eq!(
+                            frame.get("runId").and_then(|r| r.as_str()),
+                            Some(id.as_str())
+                        );
+                        assert_eq!(
+                            frame.get("port").and_then(|p| p.as_u64()),
+                            Some(port as u64)
+                        );
+                        found = true;
+                    }
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Err(_) => continue,
             }
         }
         assert!(
