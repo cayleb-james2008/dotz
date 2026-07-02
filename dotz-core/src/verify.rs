@@ -274,20 +274,22 @@ pub async fn run_handler(
     let code = command_for(kind);
     let project_id = body.project_id;
 
-    // Backend checks default to the dotz-core package's own workspace dir so the
-    // operator clicking "adversarial verify" on the backend profile checks the server
-    // itself out of the box. Frontend / design checks want the project cwd, which the
-    // frontend will POST with `projectId`. We default to `std::env::current_dir()`
-    // when the project doesn't supply one.
-    let cwd_hint_project = project_id.as_deref();
+    // Checks must run in a REAL working tree or they are vacuous: the sandbox default is a
+    // fresh empty temp dir where `[ -f Cargo.toml ]`-style gates all fall through to the echo
+    // fallback. Resolve the POSTed projectId to its cwd; otherwise fall back to the server's
+    // own current_dir so the backend profile checks the server itself out of the box.
+    let check_cwd = crate::projects::cwd_for_project(project_id.as_deref())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
 
     let run = crate::sandbox::start_run(
         "bash",
         code,
         "terminal",
-        cwd_hint_project,
+        project_id.as_deref(),
         5 * 60 * 1000, // 5 min; mirrors workflow_executor's default step timeout ceiling
         None,          // no WS broadcast — UI polls the sandbox run record directly
+        check_cwd,
     )
     .await
     .map_err(|e| bad(format!("failed to start verification run: {e}")))?;

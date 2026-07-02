@@ -226,6 +226,7 @@ async fn create_run(
         project_id.as_deref(),
         timeout_ms,
         None,
+        None,
     )
     .await
     {
@@ -246,6 +247,7 @@ pub async fn start_run(
     project_id: Option<&str>,
     timeout_ms: i64,
     tx: Option<broadcast::Sender<Value>>,
+    cwd: Option<std::path::PathBuf>,
 ) -> Result<SandboxRun, String> {
     if !SANDBOX_LANGUAGES.contains(&language) {
         return Err(format!(
@@ -294,6 +296,7 @@ pub async fn start_run(
         timeout_ms,
         mode.to_string(),
         tx,
+        cwd,
     ));
 
     Ok(run)
@@ -333,6 +336,7 @@ async fn execute_run(
     timeout_ms: i64,
     mode: String,
     tx: Option<broadcast::Sender<Value>>,
+    cwd: Option<std::path::PathBuf>,
 ) {
     let (file, cmd) = match lang_spec(&language) {
         Some(v) => v,
@@ -354,10 +358,30 @@ async fn execute_run(
         return;
     }
 
+    // A caller-supplied cwd (verify checks run in the project dir, not the throwaway temp
+    // dir — a check like `[ -f Cargo.toml ] && cargo check` is vacuous in an empty dir)
+    // requires the script to be invoked by ABSOLUTE path, since the relative filename in
+    // lang_spec only resolves from temp_dir. Default callers keep today's exact argv.
+    let work_dir = cwd.filter(|p| p.is_dir());
+    let args: Vec<String> = if work_dir.is_some() {
+        let script = temp_dir.join(file).to_string_lossy().replace('\\', "/");
+        cmd[1..]
+            .iter()
+            .map(|a| {
+                if *a == file {
+                    script.clone()
+                } else {
+                    a.to_string()
+                }
+            })
+            .collect()
+    } else {
+        cmd[1..].iter().map(|a| a.to_string()).collect()
+    };
     let mut command = tokio::process::Command::new(cmd[0]);
     command
-        .args(&cmd[1..])
-        .current_dir(&temp_dir)
+        .args(&args)
+        .current_dir(work_dir.as_deref().unwrap_or(&temp_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1238,6 +1262,7 @@ mod tests {
             500,
             "terminal".to_string(),
             None,
+            None,
         )
         .await;
 
@@ -1326,6 +1351,7 @@ mod tests {
             code.to_string(),
             60_000,
             "terminal".to_string(),
+            None,
             None,
         )
         .await;
@@ -1447,6 +1473,7 @@ mod tests {
             60_000,
             "terminal".to_string(),
             Some(tx),
+            None,
         )
         .await;
 
@@ -1537,6 +1564,7 @@ mod tests {
             60_000,
             "web".to_string(),
             Some(tx),
+            None,
         )
         .await;
 
@@ -1793,6 +1821,7 @@ mod tests {
                 60_000, // long timeout so the watchdog doesn't fire first
                 "terminal".to_string(),
                 Some(tx),
+                None,
             )
             .await;
         });
@@ -1879,6 +1908,7 @@ mod tests {
             None,
             60_000,
             Some(tx.clone()),
+            None,
         )
         .await
         .expect("start_run should succeed");
