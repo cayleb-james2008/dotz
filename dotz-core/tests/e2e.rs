@@ -39,7 +39,11 @@ impl ServeGuard {
             let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
             l.local_addr().unwrap().port()
         };
-        let unique = format!("dotz-e2e-{label}-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        let unique = format!(
+            "dotz-e2e-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
         let base = std::env::temp_dir().join(unique);
         let config_dir = base.join("config");
         let work_dir = base.join("work");
@@ -124,9 +128,18 @@ async fn get_raw(client: &reqwest::Client, base: &str, path: &str) -> (u16, Vec<
 /// GET a path, assert 200, parse JSON.
 async fn get_json(client: &reqwest::Client, base: &str, path: &str) -> Value {
     let (status, body) = get_raw(client, base, path).await;
-    assert_eq!(status, 200, "GET {path} expected 200, got {status}: {}", String::from_utf8_lossy(&body));
-    serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("GET {path} body is not JSON: {e}: {}", String::from_utf8_lossy(&body)))
+    assert_eq!(
+        status,
+        200,
+        "GET {path} expected 200, got {status}: {}",
+        String::from_utf8_lossy(&body)
+    );
+    serde_json::from_slice(&body).unwrap_or_else(|e| {
+        panic!(
+            "GET {path} body is not JSON: {e}: {}",
+            String::from_utf8_lossy(&body)
+        )
+    })
 }
 
 /// POST json to a path, return (status, json-or-null body).
@@ -226,19 +239,36 @@ async fn e2e_offline() {
 
     // ---- 1. health ------------------------------------------------------------------
     let health = get_json(&client, &base, "/api/health").await;
-    assert_eq!(health["ok"], json!(true), "1: /api/health ok must be true: {health}");
+    assert_eq!(
+        health["ok"],
+        json!(true),
+        "1: /api/health ok must be true: {health}"
+    );
     eprintln!("1: health embedderReady = {}", health["embedderReady"]);
 
     // ---- 2. static UI smoke ---------------------------------------------------------
     let (status, body) = get_raw(&client, &base, "/").await;
     assert_eq!(status, 200, "2: GET / must be 200");
     let html = String::from_utf8_lossy(&body).to_string();
-    assert!(html.contains("app.js"), "2: index.html must reference app.js");
-    assert!(html.contains("data-panel=\"chat\""), "2: index.html must have the chat panel");
-    assert!(html.contains("data-panel=\"doctrine\""), "2: index.html must have the doctrine panel");
+    assert!(
+        html.contains("app.js"),
+        "2: index.html must reference app.js"
+    );
+    assert!(
+        html.contains("data-panel=\"chat\""),
+        "2: index.html must have the chat panel"
+    );
+    assert!(
+        html.contains("data-panel=\"doctrine\""),
+        "2: index.html must have the doctrine panel"
+    );
 
     for path in html_asset_paths(&html) {
-        let p = if path.starts_with('/') { path.clone() } else { format!("/{path}") };
+        let p = if path.starts_with('/') {
+            path.clone()
+        } else {
+            format!("/{path}")
+        };
         let (st, b) = get_raw(&client, &base, &p).await;
         assert_eq!(st, 200, "2: index.html asset {p} must be 200");
         assert!(!b.is_empty(), "2: index.html asset {p} must be non-empty");
@@ -247,9 +277,16 @@ async fn e2e_offline() {
     assert_eq!(st, 200, "2: /fonts.css must be 200");
     let css = String::from_utf8_lossy(&css).to_string();
     let font_urls = css_url_paths(&css);
-    assert!(!font_urls.is_empty(), "2: fonts.css must reference local font files");
+    assert!(
+        !font_urls.is_empty(),
+        "2: fonts.css must reference local font files"
+    );
     for path in font_urls {
-        let p = if path.starts_with('/') { path } else { format!("/{path}") };
+        let p = if path.starts_with('/') {
+            path
+        } else {
+            format!("/{path}")
+        };
         let (st, b) = get_raw(&client, &base, &p).await;
         assert_eq!(st, 200, "2: fonts.css asset {p} must be 200");
         assert!(!b.is_empty(), "2: fonts.css asset {p} must be non-empty");
@@ -257,7 +294,10 @@ async fn e2e_offline() {
 
     // ---- 3. boot APIs all 200 JSON --------------------------------------------------
     let providers = get_json(&client, &base, "/api/providers").await;
-    assert!(providers["providers"].is_array(), "3: /api/providers shape: {providers}");
+    assert!(
+        providers["providers"].is_array(),
+        "3: /api/providers shape: {providers}"
+    );
     let profiles = get_json(&client, &base, "/api/profiles").await;
     let profile_ids: Vec<&str> = profiles["profiles"]
         .as_array()
@@ -282,15 +322,28 @@ async fn e2e_offline() {
         "/api/design/systems",
     ] {
         let v = get_json(&client, &base, path).await;
-        assert!(v.is_object() || v.is_array(), "3: {path} must return JSON: {v}");
+        assert!(
+            v.is_object() || v.is_array(),
+            "3: {path} must return JSON: {v}"
+        );
     }
 
     // ---- 4. config isolation --------------------------------------------------------
-    let (st, cfg) = post_json(&client, &base, "/api/config", json!({ "thinkingLevel": "low" })).await;
-    assert_eq!(st, 200, "4: POST /api/config thinkingLevel=low must be 200: {cfg}");
+    let (st, cfg) = post_json(
+        &client,
+        &base,
+        "/api/config",
+        json!({ "thinkingLevel": "low" }),
+    )
+    .await;
+    assert_eq!(
+        st, 200,
+        "4: POST /api/config thinkingLevel=low must be 200: {cfg}"
+    );
     let cfg = get_json(&client, &base, "/api/config").await;
     assert_eq!(
-        cfg["config"]["thinkingLevel"], json!("low"),
+        cfg["config"]["thinkingLevel"],
+        json!("low"),
         "4: GET /api/config must reflect the POSTed thinkingLevel: {cfg}"
     );
     assert!(
@@ -314,7 +367,8 @@ async fn e2e_offline() {
         .unwrap_or_else(|| panic!("5: create response must carry sessionId: {created}"))
         .to_string();
     assert_eq!(
-        created["profileId"], json!("new-model-new-project"),
+        created["profileId"],
+        json!("new-model-new-project"),
         "5: create response must echo profileId: {created}"
     );
 
@@ -327,7 +381,11 @@ async fn e2e_offline() {
         "5: new session must appear in GET /api/sessions: {list}"
     );
     let one = get_json(&client, &base, &format!("/api/sessions/{sid}")).await;
-    assert_eq!(one["sessionId"], json!(sid.clone()), "5: GET /api/sessions/id: {one}");
+    assert_eq!(
+        one["sessionId"],
+        json!(sid.clone()),
+        "5: GET /api/sessions/id: {one}"
+    );
 
     let (st, m) = post_json(
         &client,
@@ -337,8 +395,16 @@ async fn e2e_offline() {
     )
     .await;
     assert_eq!(st, 200, "5: POST model must be 200: {m}");
-    assert_eq!(m["model"]["provider"], json!("ollama"), "5: model summary: {m}");
-    assert_eq!(m["model"]["modelId"], json!("glm-5.2"), "5: model summary: {m}");
+    assert_eq!(
+        m["model"]["provider"],
+        json!("ollama"),
+        "5: model summary: {m}"
+    );
+    assert_eq!(
+        m["model"]["modelId"],
+        json!("glm-5.2"),
+        "5: model summary: {m}"
+    );
 
     let (st, t) = post_json(
         &client,
@@ -348,10 +414,17 @@ async fn e2e_offline() {
     )
     .await;
     assert_eq!(st, 200, "5: POST thinking must be 200: {t}");
-    assert_eq!(t["thinkingLevel"], json!("low"), "5: thinking response: {t}");
+    assert_eq!(
+        t["thinkingLevel"],
+        json!("low"),
+        "5: thinking response: {t}"
+    );
 
     let tools = get_json(&client, &base, &format!("/api/sessions/{sid}/tools")).await;
-    assert!(tools["active"].is_array() && tools["all"].is_array(), "5: tools shape: {tools}");
+    assert!(
+        tools["active"].is_array() && tools["all"].is_array(),
+        "5: tools shape: {tools}"
+    );
     let active = tools["active"].clone();
     let (st, t2) = post_json(
         &client,
@@ -361,10 +434,16 @@ async fn e2e_offline() {
     )
     .await;
     assert_eq!(st, 200, "5: POST tools must be 200: {t2}");
-    assert_eq!(t2["active"], tools["active"], "5: POST tools must echo the active set: {t2}");
+    assert_eq!(
+        t2["active"], tools["active"],
+        "5: POST tools must echo the active set: {t2}"
+    );
 
     let commands = get_json(&client, &base, &format!("/api/sessions/{sid}/commands")).await;
-    assert!(commands["commands"].is_array(), "5: commands shape: {commands}");
+    assert!(
+        commands["commands"].is_array(),
+        "5: commands shape: {commands}"
+    );
 
     let del = client
         .delete(format!("{base}/api/sessions/{sid}"))
@@ -378,10 +457,19 @@ async fn e2e_offline() {
     assert_eq!(st, 404, "5: GET after DELETE must be 404");
 
     // ---- 6. error paths -------------------------------------------------------------
-    let (st, e) = post_json(&client, &base, "/api/sessions", json!({ "profileId": "nope" })).await;
+    let (st, e) = post_json(
+        &client,
+        &base,
+        "/api/sessions",
+        json!({ "profileId": "nope" }),
+    )
+    .await;
     assert_eq!(st, 400, "6: bad profileId must be 400: {e}");
     assert!(
-        e["error"].as_str().unwrap_or("").contains("profileId must be one of"),
+        e["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("profileId must be one of"),
         "6: bad profileId error body: {e}"
     );
     let (st, e) = post_json(
@@ -392,7 +480,13 @@ async fn e2e_offline() {
     )
     .await;
     assert_eq!(st, 400, "6: model missing modelId must be 400: {e}");
-    let (st, e) = post_json(&client, &base, "/api/sessions", json!({ "thinkingLevel": "warp" })).await;
+    let (st, e) = post_json(
+        &client,
+        &base,
+        "/api/sessions",
+        json!({ "thinkingLevel": "warp" }),
+    )
+    .await;
     assert_eq!(st, 400, "6: bad thinkingLevel must be 400: {e}");
     let (st, e) = post_json(
         &client,
@@ -411,8 +505,17 @@ async fn e2e_offline() {
         json!({ "level": "low" }),
     )
     .await;
-    assert_eq!(st, 404, "6: POST thinking on ghost session must be 404: {e}");
-    let (st, e) = post_json(&client, &base, "/api/config", json!({ "provider": "not-a-provider" })).await;
+    assert_eq!(
+        st, 404,
+        "6: POST thinking on ghost session must be 404: {e}"
+    );
+    let (st, e) = post_json(
+        &client,
+        &base,
+        "/api/config",
+        json!({ "provider": "not-a-provider" }),
+    )
+    .await;
     assert_eq!(st, 400, "6: bad provider on /api/config must be 400: {e}");
 
     // ---- 7. WS handshake, NO prompts ------------------------------------------------
@@ -430,20 +533,34 @@ async fn e2e_offline() {
         .await
         .expect("7: WS handshake with valid sessionId must succeed");
     let ready = next_ws_json(&mut ws, Duration::from_secs(10), "ready frame").await;
-    assert_eq!(ready["kind"], json!("ready"), "7: first frame must be ready: {ready}");
-    assert_eq!(ready["sessionId"], json!(sid.clone()), "7: ready sessionId: {ready}");
+    assert_eq!(
+        ready["kind"],
+        json!("ready"),
+        "7: first frame must be ready: {ready}"
+    );
+    assert_eq!(
+        ready["sessionId"],
+        json!(sid.clone()),
+        "7: ready sessionId: {ready}"
+    );
 
     // Garbage text must not kill the server.
     ws.send(WsMessage::Text("not json".into()))
         .await
         .expect("7: send garbage frame");
     // A no-op abort (no turn running) must also be harmless.
-    ws.send(WsMessage::Text(json!({ "kind": "abort" }).to_string().into()))
-        .await
-        .expect("7: send abort frame");
+    ws.send(WsMessage::Text(
+        json!({ "kind": "abort" }).to_string().into(),
+    ))
+    .await
+    .expect("7: send abort frame");
     tokio::time::sleep(Duration::from_millis(200)).await;
     let health = get_json(&client, &base, "/api/health").await;
-    assert_eq!(health["ok"], json!(true), "7: server must survive garbage WS input");
+    assert_eq!(
+        health["ok"],
+        json!(true),
+        "7: server must survive garbage WS input"
+    );
     ws.close(None).await.ok();
 
     // A bogus session id must be rejected BEFORE the upgrade → handshake error.
@@ -590,7 +707,9 @@ async fn live_attempt() -> Result<(), String> {
         return Err("unexpected gate frame during a no-tools prompt".into());
     }
     if !assistant_text.to_lowercase().contains("pong") {
-        return Err(format!("assistant reply did not contain PONG: {assistant_text:?}"));
+        return Err(format!(
+            "assistant reply did not contain PONG: {assistant_text:?}"
+        ));
     }
     eprintln!("live prompt OK: {assistant_text:?}");
     Ok(())
