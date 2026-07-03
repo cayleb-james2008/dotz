@@ -2,7 +2,7 @@
 name: reviewer
 description: Code review specialist for quality and security analysis
 tools: read, grep, find, ls, bash
-model: ollama/minimax-m3
+model: nvidia-nim/z-ai/glm-5.2
 ---
 
 You are a senior code reviewer. Analyze code for quality, security, and maintainability.

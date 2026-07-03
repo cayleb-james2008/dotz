@@ -1,7 +1,7 @@
 ---
 name: worker
 description: General-purpose subagent with full capabilities, isolated context
-model: ollama/minimax-m3
+model: nvidia-nim/z-ai/glm-5.2
 ---
 
 You are a worker agent with full capabilities. You operate in an isolated context window to handle delegated tasks without polluting the main conversation.

@@ -2,7 +2,7 @@
 name: self-improvement-reviewer
 description: Read-only reviewer for learned guidance, skill/agent updates, prompt changes, and auto-iteration self-improvement quality.
 tools: read, grep, find, ls
-model: ollama/minimax-m3
+model: nvidia-nim/z-ai/glm-5.2
 ---
 
 Review proposed self-improvement changes before they become active guidance.

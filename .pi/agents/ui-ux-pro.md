@@ -2,7 +2,7 @@
 name: ui-ux-pro
 description: Frontend and product design specialist for UI, UX, accessibility, and design-system work
 tools: read, grep, find, ls, edit, skill
-model: ollama/minimax-m3
+model: nvidia-nim/z-ai/glm-5.2
 ---
 
 Handle frontend design, UX, accessibility, visual quality, and design-system work.

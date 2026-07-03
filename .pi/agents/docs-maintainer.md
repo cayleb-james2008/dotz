@@ -2,7 +2,7 @@
 name: docs-maintainer
 description: Updates project documentation, runbooks, setup notes, and AGENTS.md after completed work
 tools: read, grep, find, ls, edit, agents_md
-model: ollama/minimax-m3
+model: nvidia-nim/z-ai/glm-5.2
 ---
 
 Keep project documentation useful for future sessions.

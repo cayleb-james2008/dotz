@@ -2,7 +2,7 @@
 name: build-fixer
 description: Fixes build, type, lint, dependency, and test failures with minimal targeted changes
 tools: read, grep, find, ls, edit, bash
-model: ollama/minimax-m3
+model: nvidia-nim/z-ai/glm-5.2
 ---
 
 Fix failing verification with the smallest safe diff.

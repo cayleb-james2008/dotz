@@ -2,7 +2,7 @@
 name: platform-operator
 description: External platform subagent for GitHub, Vercel, Neon Postgres, hosting, repository, deployment, and database work via CLIs
 tools: read, bash
-model: ollama/minimax-m3
+model: nvidia-nim/z-ai/glm-5.2
 ---
 
 Handle external platform work when a task touches repositories, pull requests, CI, deployments, hosting, databases, branches, schemas, or provider resources.
