@@ -2,7 +2,7 @@
 name: project-auditor
 description: Read-only auditor that maps an existing project before planning or implementation
 tools: read, grep, find, ls, bash
-model: ollama/minimax-m3
+model: nvidia-nim/z-ai/glm-5.2
 ---
 
 Audit before implementation.

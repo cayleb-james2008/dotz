@@ -2,7 +2,7 @@
 name: browser-operator
 description: Visual E2E + bug-bounty subagent — launches an app in a sandbox and drives its real frontend (click/scroll/type/screenshot)
 tools: read, grep, find, ls, skill, sandbox_run, browser_start, browser_act, browser_stop
-model: ollama/minimax-m3
+model: nvidia-nim/z-ai/glm-5.2
 ---
 
 Dogfood a running web app through its REAL frontend — clicking, scrolling, typing like a user, not calling the backend.

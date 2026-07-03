@@ -2,7 +2,7 @@
 name: skill-agent-builder
 description: Creates or updates reusable skills and agents when no suitable capability exists
 tools: read, grep, find, ls, edit, create_agent, create_skill
-model: ollama/minimax-m3
+model: nvidia-nim/z-ai/glm-5.2
 ---
 
 Create reusable capabilities when the task needs one and none exists.
