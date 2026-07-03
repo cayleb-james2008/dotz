@@ -982,6 +982,37 @@ pub fn parameters_schema() -> Value {
     })
 }
 
+/// Resolve a subagent's requested working directory into a real, existing absolute path.
+///
+/// The model passes `cwd` per-task (e.g. `"mnemosyne"` to build inside the episode subfolder).
+/// Used raw, a relative path resolves against the dotz *process* cwd — not the session cwd — so
+/// it points nowhere and the subagent's shell fails to spawn ("can't run commands"). This:
+///   - returns the session cwd unchanged when no override was given (the common path),
+///   - resolves a relative request against the session cwd (so `"mnemosyne"` → `<session>/mnemosyne`),
+///   - creates the target if missing so the shell always has a valid cwd,
+///   - falls back to the session cwd (always valid) if creation fails.
+/// # ponytail: create-if-missing is the safety net so a build subagent dispatched into the
+/// # episode dir works even before the scaffold lands; falls back rather than erroring.
+fn resolve_subagent_cwd(requested: &str, session_cwd: &str) -> String {
+    if requested == session_cwd || requested.is_empty() {
+        return session_cwd.to_string();
+    }
+    let p = std::path::Path::new(requested);
+    let target = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::path::Path::new(session_cwd).join(requested)
+    };
+    if !target.exists() {
+        let _ = std::fs::create_dir_all(&target);
+    }
+    if target.exists() {
+        target.to_string_lossy().to_string()
+    } else {
+        session_cwd.to_string()
+    }
+}
+
 /// Entry the `subagent` tool calls (no progress streaming). Kept for the workflow executor
 /// and any caller that does not need live intermediate streaming.
 pub async fn dispatch(args: &Value, cwd: &str) -> Dispatch {
@@ -1078,7 +1109,8 @@ async fn dispatch_inner(
         for (i, step) in chain.iter().enumerate() {
             let agent_name = step.get("agent").and_then(|v| v.as_str()).unwrap_or("");
             let task_tmpl = step.get("task").and_then(|v| v.as_str()).unwrap_or("");
-            let step_cwd = step.get("cwd").and_then(|v| v.as_str()).unwrap_or(cwd);
+            let step_cwd =
+                resolve_subagent_cwd(step.get("cwd").and_then(|v| v.as_str()).unwrap_or(cwd), cwd);
             let model = step.get("model").and_then(|v| v.as_str());
             // Substitute {previous} (literal replacement — no regex specials).
             let task = task_tmpl.replace("{previous}", &previous);
@@ -1087,7 +1119,7 @@ async fn dispatch_inner(
                 agent_name,
                 &task,
                 model,
-                step_cwd,
+                &step_cwd,
                 Some(i + 1),
                 bus.as_ref(),
                 progress_tx.clone(),
@@ -1145,11 +1177,8 @@ async fn dispatch_inner(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let task_cwd = t
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .unwrap_or(cwd)
-                .to_string();
+            let task_cwd =
+                resolve_subagent_cwd(t.get("cwd").and_then(|v| v.as_str()).unwrap_or(cwd), cwd);
             let model = t
                 .get("model")
                 .and_then(|v| v.as_str())
@@ -1217,13 +1246,14 @@ async fn dispatch_inner(
     let agent_name = single_agent.unwrap();
     let task = single_task.unwrap();
     let model = args.get("model").and_then(|v| v.as_str());
-    let single_cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(cwd);
+    let single_cwd =
+        resolve_subagent_cwd(args.get("cwd").and_then(|v| v.as_str()).unwrap_or(cwd), cwd);
     let r = run_single_agent_with_progress(
         &agents,
         agent_name,
         task,
         model,
-        single_cwd,
+        &single_cwd,
         None,
         bus.as_ref(),
         progress_tx,
@@ -1254,6 +1284,29 @@ async fn dispatch_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_subagent_cwd_resolves_relative_and_falls_back() {
+        let base = std::env::temp_dir();
+        let session = base.join("dotz_sacwd_test");
+        let _ = std::fs::create_dir_all(&session);
+        let session = session.to_string_lossy().to_string();
+
+        // No override → session cwd unchanged.
+        assert_eq!(resolve_subagent_cwd(&session, &session), session);
+        assert_eq!(resolve_subagent_cwd("", &session), session);
+
+        // Relative request resolves against the session cwd and is created if missing.
+        let got = resolve_subagent_cwd("mnemosyne", &session);
+        let expected = std::path::Path::new(&session).join("mnemosyne");
+        assert_eq!(got, expected.to_string_lossy());
+        assert!(expected.exists(), "relative cwd should be created");
+
+        // Absolute existing request is honored as-is.
+        assert_eq!(resolve_subagent_cwd(&session, &session), session);
+
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&session));
+    }
 
     #[test]
     fn subagent_accumulator_dedupes_repeated_tool_call_start() {
