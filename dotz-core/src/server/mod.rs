@@ -50,6 +50,7 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
         // Phase 2 cold modules — self-contained, stateless Router<()> merged after with_state.
         .merge(crate::sandbox::router())
         .merge(crate::design::router())
+        .merge(crate::leaderboard::router())
         .merge(crate::projects::router())
         .merge(crate::connections::router())
         .merge(crate::workflows::router())
