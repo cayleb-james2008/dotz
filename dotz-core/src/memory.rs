@@ -466,6 +466,20 @@ fn remove(id: &str, cwd: Option<&str>) -> bool {
     ok
 }
 
+/// Delete EVERY memory scoped to a project (mem0 userId `proj:<norm cwd>`). Used when a project
+/// is removed from dotz. Returns the number of rows deleted. Deliberately does NOT rewrite the
+/// project's `<cwd>/.ai-agents/MEMORY.md` mirror — that file lives inside the project folder,
+/// which a project delete must never touch.
+pub fn purge_project(cwd: &str) -> usize {
+    let user = scope_user("project", Some(cwd));
+    let conn = db_guard();
+    conn.execute(
+        "DELETE FROM memories WHERE user_id=?1",
+        rusqlite::params![user],
+    )
+    .unwrap_or(0)
+}
+
 // ---- MEMORY.md mirror (git-committable source of truth) ----
 fn mirror_items(user_id: &str) -> Vec<MemoryView> {
     let conn = db_guard();
@@ -1007,6 +1021,42 @@ mod tests {
     fn scope_user_global_ignores_cwd() {
         assert_eq!(scope_user("global", Some("/any/path")), "__global__");
         assert_eq!(scope_user("global", None), "__global__");
+    }
+
+    #[test]
+    fn purge_project_deletes_only_that_scope() {
+        // Unique cwds so this is isolated from every other test sharing the process-static DB.
+        let cwd_a = format!("C:/tmp/purge-a-{}", uuid::Uuid::new_v4());
+        let cwd_b = format!("C:/tmp/purge-b-{}", uuid::Uuid::new_v4());
+        let ua = scope_user("project", Some(&cwd_a));
+        let ub = scope_user("project", Some(&cwd_b));
+        let count_for = |u: &str| -> i64 {
+            db_guard()
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE user_id=?1",
+                    rusqlite::params![u],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        // Insert rows directly (bypasses the embedder) — 2 under A, 1 under B.
+        {
+            let conn = db_guard();
+            for (u, mem) in [(&ua, "a1"), (&ua, "a2"), (&ub, "b1")] {
+                conn.execute(
+                    "INSERT INTO memories (id,user_id,scope,memory,embedding,created_at) \
+                     VALUES (?1,?2,'project',?3,?4,0)",
+                    rusqlite::params![uuid::Uuid::new_v4().to_string(), u, mem, Vec::<u8>::new()],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(count_for(&ua), 2);
+        assert_eq!(count_for(&ub), 1);
+        assert_eq!(purge_project(&cwd_a), 2, "both A rows purged");
+        assert_eq!(count_for(&ua), 0, "A scope gone");
+        assert_eq!(count_for(&ub), 1, "B scope untouched");
+        let _ = purge_project(&cwd_b); // cleanup
     }
 
     #[test]

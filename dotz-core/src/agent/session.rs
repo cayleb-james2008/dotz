@@ -339,6 +339,26 @@ pub fn dispose(id: &str) -> bool {
     }
 }
 
+/// Dispose every live session bound to a project. Used when a project is removed from dotz so no
+/// orphaned session keeps running against a deleted project. Returns the count disposed. Clones
+/// the Arc handles out from under the store lock first, then reads each session's project_id, to
+/// avoid holding the store lock while locking individual session mutexes.
+pub fn dispose_for_project(project_id: &str) -> usize {
+    let handles: Vec<(String, std::sync::Arc<Mutex<AgentSession>>)> = {
+        store_guard()
+            .iter()
+            .map(|(id, s)| (id.clone(), s.clone()))
+            .collect()
+    };
+    let mut n = 0;
+    for (id, s) in handles {
+        if session_guard(&s).project_id.as_deref() == Some(project_id) && dispose(&id) {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Subscribe to a session's event stream (broadcast). The WS handler relays each Value frame.
 pub fn subscribe(id: &str) -> Option<broadcast::Receiver<Value>> {
     get(id).map(|s| session_guard(&s).tx.subscribe())

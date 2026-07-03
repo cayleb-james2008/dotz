@@ -48,12 +48,16 @@ Session summary `= { sessionId, profileId:string|null, projectId:string|null, mo
 | POST | `/api/projects` | `{ name, cwd, profileId?, model?:ModelRef, thinkingLevel? }` | `Project` |
 | GET | `/api/projects/:id` | — | `Project` |
 | PATCH | `/api/projects/:id` | partial `Project` | `Project` |
-| DELETE | `/api/projects/:id` | — | `{ ok }` |
+| DELETE | `/api/projects/:id` | — | `{ ok, purged:{ memories, workflows, sessions } }` |
 | GET | `/api/projects/:id/files` | — | `{ tree: FileTreeNode[] }` |
 
 `Project = { id, name, cwd, profileId, model:ModelRef, thinkingLevel, createdAt, updatedAt }`.
 `FileTreeNode = { path, type:"file"|"dir", children?:FileTreeNode[] }`. The tree is recursive to a
 maximum depth of 3 and skips `node_modules` and `.git`. Paths are absolute on the server.
+**DELETE cascades a purge of the project's dotz-side state** (all under `~/.dotz`): project-scoped
+mem0 memories, its workflow runs + run-records, and any live sessions. It **never touches the
+project folder on disk** — `<cwd>/.ai-agents/MEMORY.md` and every file under `cwd` are left intact.
+
 A project is a **persistent named workspace** (cwd + profile + model + thinking defaults) that
 survives server restarts. Sessions created with `projectId` inherit the project's `cwd`,
 `profileId`, `model`, and `thinkingLevel` unless overridden on `POST /api/sessions`.

@@ -494,16 +494,36 @@ async fn patch_project(
     Ok(Json(serde_json::to_value(&updated).unwrap()))
 }
 
-/// DELETE /api/projects/:id -> { ok: bool }. ok=false when no project matched.
+/// DELETE /api/projects/:id -> { ok, purged: { memories, workflows, sessions } }.
+/// Removes the project from dotz AND purges its dotz-side cache/memories (all under ~/.dotz):
+/// project-scoped mem0 rows, its workflow runs + run-records, and any live sessions. NEVER touches
+/// the project folder on disk — `<cwd>/.ai-agents/MEMORY.md` and all files there are left intact.
 async fn delete_project(Path(id): Path<String>) -> Json<Value> {
-    let mut guard = store_guard();
-    let before = guard.len();
-    guard.retain(|p| p.id != id);
-    let removed = guard.len() != before;
-    if removed {
-        write_all(&guard);
+    // Capture the cwd BEFORE removal — it's needed to scope the memory purge.
+    let cwd = find(&id).map(|p| p.cwd);
+    let removed = {
+        let mut guard = store_guard();
+        let before = guard.len();
+        guard.retain(|p| p.id != id);
+        let removed = guard.len() != before;
+        if removed {
+            write_all(&guard);
+        }
+        removed
+    };
+    if !removed {
+        return Json(json!({ "ok": false }));
     }
-    Json(json!({ "ok": removed }))
+    let memories = cwd
+        .as_deref()
+        .map(crate::memory::purge_project)
+        .unwrap_or(0);
+    let workflows = crate::workflows::purge_project(&id);
+    let sessions = crate::agent::session::dispose_for_project(&id);
+    Json(json!({
+        "ok": true,
+        "purged": { "memories": memories, "workflows": workflows, "sessions": sessions }
+    }))
 }
 
 /// GET /api/projects/:id/files -> { tree: [FileTreeNode…] } or 404.
