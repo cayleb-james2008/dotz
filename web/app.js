@@ -277,14 +277,25 @@ function renderProjectDropdown() {
     list.appendChild(empty);
   } else {
     state.projects.forEach((p) => {
-      const item = el("button", "project-item");
+      // A <div> row (not <button>) so the delete <button> can nest without invalid markup.
+      const item = el("div", "project-item");
+      item.setAttribute("role", "button");
+      item.tabIndex = 0;
       item.appendChild(el("span", "pi-glyph", "◆"));
       const info = el("div", "pi-info");
       info.appendChild(el("div", "pi-name", p.name));
       info.appendChild(el("div", "pi-cwd", p.cwd));
       info.appendChild(el("div", "pi-profile", (p.profileId || "workflow").toUpperCase()));
       item.appendChild(info);
-      item.onclick = () => { $("project-dropdown").classList.add("hidden"); openProject(p.id); };
+      const open = () => { $("project-dropdown").classList.add("hidden"); openProject(p.id); };
+      item.onclick = open;
+      item.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
+      const delBtn = el("button", "project-delete-btn", "🗑");
+      delBtn.type = "button";
+      delBtn.title = "Remove from dotz (does not touch the folder)";
+      delBtn.setAttribute("aria-label", "Remove project " + p.name + " from dotz");
+      delBtn.onclick = (e) => { e.stopPropagation(); confirmDeleteProject(p); };
+      item.appendChild(delBtn);
       list.appendChild(item);
     });
   }
@@ -410,6 +421,14 @@ function openPanel(name) {
 
 function bindTopbar() {
   $("panels-btn").onclick = togglePalette;
+  $("leaderboard-btn").onclick = async () => {
+    // Opens the self-contained pantheon LLM-leaderboard page in the OS default browser.
+    try {
+      const r = await post("/api/leaderboard/open");
+      if (!r || r.ok === false) pushError("leaderboard: " + ((r && r.error) || "could not open"));
+      else showToast("Opened leaderboard");
+    } catch (e) { pushError("leaderboard: " + e.message); }
+  };
   $("brain-float-toggle").onclick = () => {
     state.brainFloat = !state.brainFloat;
     saveBrainFloat();
@@ -820,6 +839,30 @@ async function persistConfig(patch) {
 async function loadProjects() {
   try { const { projects } = await api("/api/projects"); state.projects = projects || []; state.projectsError = false; }
   catch (e) { state.projectsError = true; pushError("projects: " + e.message); }
+}
+
+function confirmDeleteProject(p) {
+  // Destructive: purges this project's dotz-side memories/cache. The folder and its files are
+  // never touched — only dotz's own state under ~/.dotz is removed.
+  const ok = window.confirm(
+    `Remove "${p.name}" from dotz?\n\nThis deletes its dotz memories, workflow history and cache. ` +
+    `Your project folder and files (${p.cwd}) are NOT touched.`
+  );
+  if (ok) deleteProject(p.id);
+}
+
+async function deleteProject(id) {
+  try {
+    const res = await del("/api/projects/" + encodeURIComponent(id));
+    if (!res || res.ok === false) { pushError("project not found"); return; }
+    if (state.activeProjectId === id) { state.activeProjectId = null; }
+    await loadProjects();
+    renderProjectDropdown();
+    const pu = res.purged || {};
+    showToast(`Project removed · ${pu.memories || 0} memories, ${pu.workflows || 0} runs purged`);
+  } catch (e) {
+    pushError("delete project: " + e.message);
+  }
 }
 
 /* ---------- session lifecycle ---------- */

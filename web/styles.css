@@ -168,6 +168,15 @@ code { font-family: var(--mono); color: var(--peach); }
 .project-item .pi-name { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project-item .pi-cwd { font-family: var(--mono); font-size: 9px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project-item .pi-profile { font-family: var(--mono); font-size: 8px; color: var(--lav); letter-spacing: 1px; }
+.project-delete-btn {
+  flex-shrink: 0; background: transparent; border: none; color: var(--dim);
+  cursor: pointer; font-size: 13px; line-height: 1; padding: 4px;
+  min-width: 24px; min-height: 24px; border-radius: var(--radius-sm);
+  display: inline-flex; align-items: center; justify-content: center;
+  opacity: 0.55; transition: opacity 0.12s, color 0.12s, background 0.12s;
+}
+.project-item:hover .project-delete-btn { opacity: 1; }
+.project-delete-btn:hover { color: var(--red); background: rgba(243,139,168,0.12); }
 .project-dropdown-foot { padding: 8px; border-top: 1px solid var(--border); text-align: center; }
 .project-form { padding: 10px; display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); }
 .dropdown-empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 24px 12px; text-align: center; }
