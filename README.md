@@ -48,7 +48,40 @@ flowchart LR
 
 Every non-trivial task fans out to `scout` / `planner` / `worker` / `reviewer` subagents that run in
 parallel, then their output is adversarially verified before it lands. Pick a **profile** to change the
-strategy (WORKFLOW · SOLO · PLAN · FRONTEND · BACKEND · DESIGN).
+strategy (WORKFLOW · SOLO · PLAN · FRONTEND · BACKEND · DESIGN · NEW MODEL, NEW PROJECT).
+
+### The live workflow graph — watch every agent and every tool
+
+Dispatching work no longer happens off-screen. Every `subagent` call **materializes a live node** on
+the workflow graph, and **every tool that agent reaches for** — memory, browser, sandbox, spec, vcs,
+design — streams onto its node in real time as a **panel-colored sub-node chip** (running → done/error).
+The graph is the single live visual of what the agents are doing; **click a node or a chip to open the
+exact panel** that tool drives. Nothing pops open on its own — you watch it happen and drill in on
+demand.
+
+### NEW MODEL, NEW PROJECT — one prompt ships a repo
+
+The **NEW MODEL, NEW PROJECT** profile turns one line into a genuinely-useful app shipped to a fresh
+public GitHub repo, driven by a **required capability spine** — each phase is its own agent, so each is
+a node on the graph:
+
+```mermaid
+flowchart LR
+    I([one-line idea]) --> D[design<br/>+ app icon]
+    D --> S[spec]
+    S --> B[build<br/>parallel workers]
+    B --> SV[sandbox<br/>build/test]
+    SV --> E[visual E2E<br/>+ bug-bounty]
+    E --> DOC[docs<br/>+ beautify repo]
+    DOC --> SH[ship<br/>+ honest CI]
+    SH --> SC([score])
+```
+
+The **design** phase picks a bundled Open Design system and produces an app icon; **sandbox** and a
+**visual E2E / bug-bounty** phase (the agent launches the built app in its own web-sandbox and clicks
+through the real frontend) are the authoritative ship gate; the repo is beautified (README, badges,
+screenshot, topics) before it ships. A phase runs unless it's genuinely impossible, in which case it's
+logged as `skipped <phase>: <reason>` — never faked.
 
 ## Architecture
 
@@ -96,6 +129,9 @@ for the full UI↔backend contract, and [docs/design-prompt.md](docs/design-prom
     - **FRONTEND** — workflow mode tuned for UI/design work (WCAG, real focus states, no AI-slop).
     - **BACKEND** — workflow mode tuned for APIs/data/infra (TDD, boring tech, honest errors).
     - **DESIGN** — graphic/visual design backed by native Open Design (gallery, preview, export — see below).
+    - **NEW MODEL, NEW PROJECT** — autonomous "own the full arc": one idea → a shipped public GitHub
+      repo, orchestrated as the required capability spine above (design → spec → build → sandbox → E2E
+      → docs → ship → score), each phase a node on the live graph.
 - **Model** — dotz is **multi-provider**, not just OpenRouter. Each provider declares its own UI
   mode via `ProviderMeta.freeForm`: OpenRouter is a **free-form model-id input** (not a giant
   dropdown), defaulting to `nex-agi/nex-n2-pro:free`; other providers may expose a fixed model list.
@@ -104,10 +140,14 @@ for the full UI↔backend contract, and [docs/design-prompt.md](docs/design-prom
   what the active model supports.
 - **Tools** — live toggle of pi's built-ins (`read, bash, edit, write, grep, find, ls`) plus the
   bundled `subagent` tool.
-- **Skills / Subagents** — discovered via pi's command registry; the bundled `.pi/` extension
-  provides the `subagent` tool and workflow presets `/implement`, `/scout-and-plan`,
-  `/implement-and-review`, with agents `scout / planner / reviewer / worker`. Invoke a command by
-  sending it in the composer (e.g. `/implement add a dark-mode toggle`).
+- **Skills / Subagents** — the bundled `.pi/` resources provide the `subagent` tool plus panel-backed
+  tools (`design_*`, `sandbox_run`, `openspec_*`, `vcs_*`, `living_docs_*`, `memory_*`, `browser_*`,
+  `rsi_*`), a roster of specialist agents (`scout`, `planner`, `worker`, `reviewer`, `ui-ux-pro`,
+  `spec-owner`, `sandbox-runner`, `browser-operator`, `build-fixer`, `docs-maintainer`,
+  `platform-operator`, `security-reviewer`, `self-improvement-reviewer`, `skill-agent-builder`,
+  `project-auditor`), and workflow presets: `/implement`, `/scout-and-plan`, `/implement-and-review`,
+  `/design`, `/goal`, `/improve`, `/e2e-test`, `/bug-bounty`, `/self-improve`, `/ultra-code-review`,
+  `/pantheon`. Invoke one by sending it in the composer (e.g. `/implement add a dark-mode toggle`).
 
 ## Projects, Memory, and Sandbox
 
@@ -115,13 +155,12 @@ for the full UI↔backend contract, and [docs/design-prompt.md](docs/design-prom
   `profile` / `model` / `thinking` settings; sessions created with a `projectId` inherit those
   defaults. Projects survive server restarts, so you can keep one config per codebase and jump back
   into it without re-configuring every session.
-- **Memory** — an **autonomous, on-device memory** backed by [mem0](https://github.com/mem0ai/mem0).
-  Durable facts (`project` or `global` scope) are **captured automatically** from each task, **recalled
-  automatically** before the next one (semantic search of the folder + global memory, injected into the
-  turn), and **consolidated automatically** — you never manage it. Embeddings run from a bundled local
-  model; the extraction LLM is the same Ollama Cloud chat dotz already uses, so no new key or cloud. A
-  git-committable `MEMORY.md` mirror is the source of truth; the vector index is a derived cache.
-  Memory persists across restarts alongside projects.
+- **Memory** — an **autonomous, on-device memory store** (`rusqlite` + local ONNX embeddings,
+  all-MiniLM-L6-v2, injected in-process — no embeddings API). Durable facts (`project` or `global`
+  scope) are **captured automatically** from each task, **recalled automatically** before the next one
+  (semantic search of the folder + global memory, injected into the turn), and **consolidated
+  automatically** — you never manage it. A git-committable `MEMORY.md` mirror is the source of truth;
+  the vector index is a derived cache. Memory persists across restarts alongside projects.
 - **Sandbox** — run code in two modes. **`terminal`** mode streams stdout/stderr back into the
   chat. **`web`** mode starts a long-lived process bound to a local HTTP port and the UI renders an
   inline web preview iframe at that port; the agent drives an **agent cursor** over the live
