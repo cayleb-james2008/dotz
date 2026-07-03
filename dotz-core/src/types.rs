@@ -259,6 +259,7 @@ const fn pm(id: &'static str, label: &'static str, free_form: bool) -> ProviderM
 pub fn providers() -> Vec<ProviderMeta> {
     vec![
         pm("openrouter", "OpenRouter", true),
+        pm("nvidia-nim", "NVIDIA NIM", true),
         pm("ollama", "Ollama Cloud", true),
         pm("anthropic", "Anthropic", false),
         pm("openai", "OpenAI", false),
@@ -285,6 +286,7 @@ pub fn provider_defaults_json() -> Value {
     json!({
         "ollama": { "executive": "glm-5.2", "subagent": "minimax-m3" },
         "openrouter": { "executive": "nex-agi/nex-n2-pro:free", "subagent": "nex-agi/nex-n2-pro:free" },
+        "nvidia-nim": { "executive": "z-ai/glm-5.2", "subagent": "z-ai/glm-5.2" },
         "local": { "executive": "qwen2.5-coder", "subagent": "qwen2.5-coder" },
     })
 }
@@ -356,6 +358,7 @@ pub fn provider_default(id: &str) -> Option<(&'static str, &'static str)> {
     match id {
         "ollama" => Some(("glm-5.2", "minimax-m3")),
         "openrouter" => Some(("nex-agi/nex-n2-pro:free", "nex-agi/nex-n2-pro:free")),
+        "nvidia-nim" => Some(("z-ai/glm-5.2", "z-ai/glm-5.2")),
         "local" => Some(("qwen2.5-coder", "qwen2.5-coder")),
         _ => None,
     }
@@ -451,8 +454,9 @@ mod tests {
     #[test]
     fn providers_list_is_stable() {
         let p = providers();
-        assert_eq!(p.len(), 11);
+        assert_eq!(p.len(), 12);
         assert!(p.iter().any(|pm| pm.id == "ollama" && pm.free_form));
+        assert!(p.iter().any(|pm| pm.id == "nvidia-nim" && pm.free_form));
         assert!(p.iter().any(|pm| pm.id == "anthropic" && !pm.free_form));
     }
 

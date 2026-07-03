@@ -133,6 +133,8 @@ fn provider_endpoint(provider: &str) -> Option<(String, String)> {
         "xai" => pair("https://api.x.ai/v1", "$XAI_API_KEY"),
         "deepseek" => pair("https://api.deepseek.com/v1", "$DEEPSEEK_API_KEY"),
         "cohere" => pair("https://api.cohere.ai/compatibility/v1", "$COHERE_API_KEY"),
+        // NVIDIA NIM (build.nvidia.com) — OpenAI-compatible; free preview models via an nvapi key.
+        "nvidia-nim" => pair("https://integrate.api.nvidia.com/v1", "$NVIDIA_API_KEY"),
         "local" => {
             let base = std::env::var("DOTZ_LOCAL_BASE_URL")
                 .ok()
@@ -166,6 +168,7 @@ fn context_window_for(provider: &str, model_id: &str) -> u64 {
         ("ollama", "minimax-m3") => 524_288,
         ("ollama", "deepseek-v4-pro") => 524_288,
         ("ollama", "kimi-k2.7-code") => 262_144,
+        ("nvidia-nim", "z-ai/glm-5.2") => 1_000_000,
         ("local", _) => 32_768,
         ("anthropic", _) => 200_000,
         ("google", _) => 1_000_000,
@@ -780,6 +783,18 @@ mod tests {
         assert_eq!(google.api_key_ref, "$GEMINI_API_KEY");
         assert_eq!(google.context_window, 1_000_000);
         assert!(google.reasoning);
+    }
+
+    /// NVIDIA NIM (build.nvidia.com) is a free-form OpenAI-compatible provider: resolve must map it
+    /// to the integrate.api.nvidia.com base + the nvapi key env ref, and pass any model id through.
+    #[test]
+    fn resolve_returns_nvidia_nim_openai_compatible_endpoint() {
+        let m = resolve("nvidia-nim", "z-ai/glm-5.2").expect("nvidia-nim should resolve");
+        assert_eq!(m.provider, "nvidia-nim");
+        assert_eq!(m.base_url, "https://integrate.api.nvidia.com/v1");
+        assert_eq!(m.api_key_ref, "$NVIDIA_API_KEY");
+        assert_eq!(m.model_id, "z-ai/glm-5.2");
+        assert_eq!(m.context_window, 1_000_000);
     }
 
     /// The native adapter providers accept arbitrary model ids (the upstream API validates them),
