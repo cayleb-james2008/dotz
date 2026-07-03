@@ -36,11 +36,11 @@ powershell -ExecutionPolicy Bypass -File pantheon\scripts\new-episode.ps1 `
   -Slug "<slug>" -Idea "<idea>" -DevPort <port> -UpdateHub
 ```
 This copies `template\`, fills tokens, `git init`s with a repo-local identity, tags `episode/N`,
-`gh repo create --public --push`, and appends the episode's row to the hub index. It creates a
-sibling folder `day<N>-<model>-<codename>\`.
+`gh repo create --public --push`, and appends the episode's row to the hub index. It creates the
+folder `pantheon\projects\<codename>\` (the scaffolder prints its full path).
 
 ## 4. Build the app to the ship checklist
-`cd` into `day<N>-<model>-<codename>\`, read its `AGENTS.md`, and build to that file's definition of
+`cd` into `pantheon\projects\<codename>\`, read its `AGENTS.md`, and build to that file's definition of
 done: **GitHub-only** (clone-and-run; static site or desktop release — no hosted server, no managed
 DB), keep CI green, follow **ponytail** (laziest solution that works; stdlib before deps; shortest
 diff), commit with `rsi:` / `fix(scope):`.
