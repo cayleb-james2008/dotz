@@ -69,6 +69,21 @@ pub struct Artifact {
     pub content: String,
 }
 
+/// One tool call a step made — the graph renders each as a panel-colored sub-node (chip) on its
+/// step node. `panel` is `panel_for_tool(tool_name)` (None for plain file/shell tools). This is the
+/// durable, reload-surviving record; live chips also stream in via `step_tool` events mid-run.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallRef {
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: String,
+    #[serde(rename = "toolName")]
+    pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panel: Option<String>,
+    #[serde(rename = "isError", default)]
+    pub is_error: bool,
+}
+
 /// A node in a workflow run's DAG — one agent executing one task.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkflowStep {
@@ -132,6 +147,15 @@ pub struct WorkflowStep {
     /// review the actual change without cross-referencing a terminal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact: Option<Artifact>,
+    /// Absolute working dir for this step. When set, the executor runs the subagent here
+    /// (the subagent→workflow bridge resolves each dispatched subagent's `cwd` — e.g. a pantheon
+    /// episode dir — to an absolute path). When None, the executor's process cwd is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The tool calls this step made, panel-tagged — rendered as sub-node chips on the graph.
+    /// Populated from the subagent's messages at completion; streamed live via `step_tool` events.
+    #[serde(rename = "toolCalls", skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallRef>>,
 }
 
 /// A workflow run — a DAG of steps, observable by the UI.
@@ -262,6 +286,9 @@ pub struct CreateStepInput {
     /// model instead of the run/agent default.
     #[serde(default)]
     pub model: Option<String>,
+    /// Absolute working dir for this step (the bridge resolves each subagent's cwd before create).
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 // ---- module-level store (OnceLock<Mutex<..>>; mirrors the Node module-singleton) ----
@@ -330,6 +357,9 @@ fn emit_step_state(run_id: &str, step: &WorkflowStep, summary: Option<&WorkflowS
     }
     if let Some(t) = &step.tool_call_ids {
         event["toolCallIds"] = json!(t);
+    }
+    if let Some(tc) = &step.tool_calls {
+        event["toolCalls"] = json!(tc);
     }
     if let Some(t) = &step.thinking {
         event["thinking"] = json!(t);
@@ -560,6 +590,8 @@ pub fn create(
             actual_tokens: None,
             model: s.model.clone(),
             artifact: None,
+            cwd: s.cwd.clone(),
+            tool_calls: None,
         })
         .collect();
 
@@ -711,6 +743,7 @@ pub struct StepPatch {
     pub error: Option<String>,
     pub usage: Option<Usage>,
     pub artifact: Option<Artifact>,
+    pub tool_calls: Option<Vec<ToolCallRef>>,
 }
 
 /// Update a step's state and propagate readiness to children. Returns the updated run (clone).
@@ -744,6 +777,10 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
             }
             if patch.artifact.is_some() && step.artifact != patch.artifact {
                 step.artifact = patch.artifact.clone();
+                changed.insert(step.id.clone());
+            }
+            if patch.tool_calls.is_some() && step.tool_calls != patch.tool_calls {
+                step.tool_calls = patch.tool_calls.clone();
                 changed.insert(step.id.clone());
             }
             if step.status == "running" && step.started_at.is_none() {
@@ -833,6 +870,8 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
                     actual_tokens: None,
                     model: None,
                     artifact: None,
+                    cwd: None,
+                    tool_calls: None,
                 };
                 let re_review_step = WorkflowStep {
                     id: new_id(),
@@ -857,6 +896,8 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
                     actual_tokens: None,
                     model: None,
                     artifact: None,
+                    cwd: None,
+                    tool_calls: None,
                 };
 
                 // Wire the review step → repair → re-review chain.
@@ -1380,6 +1421,7 @@ async fn step_handler(
         error: body.error,
         usage: body.usage,
         artifact: body.artifact,
+        tool_calls: None,
     };
     match step_state(&id, &step_id, patch) {
         Some(updated) => Ok(Json(run_with_summary(&updated))),
@@ -1569,6 +1611,7 @@ async fn rerun_step_handler(
         error: None,
         usage: None,
         artifact: None,
+        tool_calls: None,
     };
     // Apply the state change first.
     let updated = match step_state(&id, &step_id, patch) {
@@ -1918,6 +1961,8 @@ async fn insert_steps_handler(
             actual_tokens: None,
             model: input.model.clone(),
             artifact: None,
+            cwd: input.cwd.clone(),
+            tool_calls: None,
         });
     }
 
@@ -2214,6 +2259,8 @@ pub fn insert_steps(run_id: &str, inputs: &[CreateStepInput]) -> Result<Workflow
                 actual_tokens: None,
                 model: input.model.clone(),
                 artifact: None,
+                cwd: input.cwd.clone(),
+                tool_calls: None,
             }
         })
         .collect();
@@ -2426,6 +2473,7 @@ mod tests {
             auto_repair: false,
             budget: None,
             model: None,
+            cwd: None,
         }
     }
 
@@ -2445,6 +2493,7 @@ mod tests {
             auto_repair: true,
             budget: None,
             model: None,
+            cwd: None,
         }
     }
 
@@ -3758,6 +3807,7 @@ mod tests {
                     error: None,
                     usage: None,
                     artifact: None,
+                    tool_calls: None,
                 },
             );
 
@@ -4036,6 +4086,8 @@ mod tests {
                 actual_tokens: None,
                 model: None,
                 artifact: None,
+                cwd: None,
+                tool_calls: None,
             })
             .collect();
         WorkflowRun {
