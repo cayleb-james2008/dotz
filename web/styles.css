@@ -609,6 +609,13 @@ code { font-family: var(--mono); color: var(--peach); }
 .wf-node.skipped .wf-node-ring { stroke: var(--dim); }
 @keyframes ringPulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
 
+/* Tool sub-node chips: one panel-colored square per tool call, streamed live under each node. */
+.wf-chip rect { opacity: 0.8; stroke: rgba(0,0,0,0.35); stroke-width: 0.5; transition: opacity 0.2s; }
+.wf-chip:hover rect { opacity: 1; }
+.wf-chip.running rect { animation: wfPulse 1.2s ease-in-out infinite; }
+.wf-chip.err rect { stroke: var(--red); stroke-width: 1; }
+.wf-chip-glyph { font-family: var(--mono); font-size: 8px; font-weight: 700; fill: var(--crust); pointer-events: none; user-select: none; }
+
 .wf-edge { fill: none; stroke: var(--surface-2); stroke-width: 1.5; transition: stroke 0.25s; }
 .wf-edge.ready { stroke: var(--cyan); }
 .wf-edge.active { stroke: var(--yellow); stroke-dasharray: 6 4; animation: dashFlow 0.8s linear infinite; }

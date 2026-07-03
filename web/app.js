@@ -2200,6 +2200,7 @@ function handleWorkflowEvent(runId, event) {
         if (event.sandboxRunId !== undefined) step.sandboxRunId = event.sandboxRunId;
         if (event.browserSessionId !== undefined) step.browserSessionId = event.browserSessionId;
         if (event.toolCallIds !== undefined) step.toolCallIds = event.toolCallIds;
+        if (event.toolCalls !== undefined) step.toolCalls = event.toolCalls; // authoritative on completion
         if (event.thinking !== undefined) step.thinking = event.thinking;
       }
       // Update the run-level progress summary from the server-sent counts so the
@@ -2212,6 +2213,24 @@ function handleWorkflowEvent(runId, event) {
           state.openNodeDetail.stepId === event.stepId && !$("node-detail").classList.contains("hidden")) {
         showNodeDetail(run, step);
       }
+      break;
+    }
+    case "step_tool": {
+      // Live per-tool chip: upsert into the step's transient live-tool map as each tool fires
+      // (phase start → running chip, end → done/error). Reconciled by `toolCalls` on completion.
+      const run = state.workflows.get(runId);
+      if (!run) break;
+      const step = run.steps.find((s) => s.id === event.stepId);
+      if (!step) break;
+      if (!step._liveTools) step._liveTools = {};
+      const prev = step._liveTools[event.toolCallId] || {};
+      step._liveTools[event.toolCallId] = {
+        toolName: event.toolName || prev.toolName,
+        panel: event.panel !== undefined ? event.panel : prev.panel,
+        phase: event.phase || prev.phase,
+        isError: event.isError !== undefined ? event.isError : prev.isError,
+      };
+      refreshWorkflowGraph();
       break;
     }
   }
@@ -2317,6 +2336,56 @@ function refreshWorkflowGraph() {
   renderWorkflowDag(run, panel);
 }
 
+// Panel accent colors for tool sub-node chips (reuse the theme tokens).
+const PANEL_COLOR = {
+  memory: "var(--mauve)", browser: "var(--cyan)", spec: "var(--peach)", vcs: "var(--green)",
+  "living-docs": "var(--pink)", skills: "var(--yellow)", doctrine: "var(--lav)",
+  brain: "var(--mauve)", graph: "var(--cyan)", files: "var(--muted)",
+  design: "var(--pink)", sandbox: "var(--peach)",
+};
+
+// JS mirror of the backend `panel_for_tool` — maps a tool name to its bento panel (for chip color
+// + click-to-open). Kept in sync with dotz-core/src/agent/session.rs::panel_for_tool.
+function panelForToolJS(name) {
+  if (!name) return null;
+  if (name.startsWith("memory_")) return "memory";
+  if (name.startsWith("browser_")) return "browser";
+  if (name.startsWith("openspec_")) return "spec";
+  if (name.startsWith("vcs_")) return "vcs";
+  if (name.startsWith("living_docs_")) return "living-docs";
+  if (name.startsWith("design_")) return "design";
+  if (name.startsWith("sandbox_")) return "sandbox";
+  if (["skill", "create_skill", "list_skills", "create_agent", "list_agents"].includes(name)) return "skills";
+  if (name === "agents_md") return "doctrine";
+  if (name === "rsi_baseline" || name === "rsi_compare") return "brain";
+  if (name === "subagent") return "graph";
+  if (name === "edit" || name === "write") return "files";
+  return null;
+}
+
+// The tools a step touched, as chips. Prefer the durable `toolCalls` (set on completion); while the
+// step runs, fall back to the live `_liveTools` map that `step_tool` events populate in real time.
+function stepTools(step) {
+  if (step.toolCalls && step.toolCalls.length) {
+    return step.toolCalls.map((tc) => ({ toolName: tc.toolName, panel: tc.panel, isError: tc.isError, running: false }));
+  }
+  return Object.values(step._liveTools || {}).map((t) => ({
+    toolName: t.toolName, panel: t.panel, isError: t.isError, running: t.phase !== "end",
+  }));
+}
+
+// The panel a node opens on click: the most-used panel among its tool chips.
+function dominantPanel(step) {
+  const counts = {};
+  for (const t of stepTools(step)) {
+    const p = t.panel || panelForToolJS(t.toolName);
+    if (p) counts[p] = (counts[p] || 0) + 1;
+  }
+  let best = null, n = 0;
+  for (const [p, c] of Object.entries(counts)) if (c > n) { best = p; n = c; }
+  return best;
+}
+
 function renderWorkflowDag(run, panel) {
   const nodesG = panel.querySelector("#wf-nodes");
   const edgesG = panel.querySelector("#wf-edges");
@@ -2410,7 +2479,44 @@ function renderWorkflowDag(run, panel) {
     status.textContent = step.status;
     g.appendChild(status);
 
-    g.onclick = () => showNodeDetail(run, step);
+    // Tool sub-nodes: one panel-colored chip per tool call, in a row beneath the node. They stream
+    // in live (running → done/error) as the step's tools fire, and clicking one opens its panel.
+    const NS = "http://www.w3.org/2000/svg";
+    const tools = stepTools(step);
+    if (tools.length) {
+      const CHIP = 16, GAP = 4, PER_ROW = Math.max(1, Math.floor((NODE_W + GAP) / (CHIP + GAP))), MAX = PER_ROW * 2;
+      tools.slice(0, MAX).forEach((t, k) => {
+        const row = Math.floor(k / PER_ROW), col = k % PER_ROW;
+        const panel = t.panel || panelForToolJS(t.toolName);
+        const chip = document.createElementNS(NS, "g");
+        chip.setAttribute("class", "wf-chip" + (t.isError ? " err" : "") + (t.running ? " running" : ""));
+        chip.setAttribute("transform", `translate(${col * (CHIP + GAP)}, ${NODE_H + 8 + row * (CHIP + GAP)})`);
+        const c = document.createElementNS(NS, "rect");
+        c.setAttribute("width", CHIP); c.setAttribute("height", CHIP); c.setAttribute("rx", 4);
+        c.setAttribute("fill", t.isError ? "var(--red)" : (PANEL_COLOR[panel] || "var(--surface-2)"));
+        chip.appendChild(c);
+        const gl = document.createElementNS(NS, "text");
+        gl.setAttribute("x", CHIP / 2); gl.setAttribute("y", 11); gl.setAttribute("text-anchor", "middle");
+        gl.setAttribute("class", "wf-chip-glyph");
+        gl.textContent = ((t.toolName || "?")[0] || "?").toUpperCase();
+        chip.appendChild(gl);
+        const title = document.createElementNS(NS, "title");
+        title.textContent = (t.toolName || "?") + (t.isError ? " (error)" : t.running ? " (running)" : "") + (panel ? " → " + panel : "");
+        chip.appendChild(title);
+        chip.style.cursor = "pointer";
+        chip.addEventListener("click", (ev) => { ev.stopPropagation(); if (panel) openPanel(panel); showNodeDetail(run, step); });
+        g.appendChild(chip);
+      });
+      if (tools.length > MAX) {
+        const more = document.createElementNS(NS, "text");
+        more.setAttribute("x", 1); more.setAttribute("y", NODE_H + 8 + 2 * (CHIP + GAP) + 9);
+        more.setAttribute("class", "wf-chip-glyph"); more.setAttribute("fill", "var(--muted)");
+        more.textContent = `+${tools.length - MAX}`;
+        g.appendChild(more);
+      }
+    }
+
+    g.onclick = () => { const p = dominantPanel(step); if (p) openPanel(p); showNodeDetail(run, step); };
     nodesG.appendChild(g);
   });
 

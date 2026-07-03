@@ -1063,6 +1063,199 @@ pub async fn dispatch_with_progress(
     dispatch_inner(args, cwd, Some(progress_tx)).await
 }
 
+/// Route a `subagent` tool call THROUGH the workflow executor: materialize a `WorkflowRun` (one
+/// step per dispatched subagent, tied to the lead `session_id` so the UI graph filters it in),
+/// drive it to completion via `run_workflow`, and assemble the same `Dispatch` the agent expects.
+/// This is what makes the live workflow graph populate for EVERY dispatch (pantheon + /implement)
+/// and stream per-tool `step_tool` chips — the executor is the single path that emits the graph.
+/// Chain data-flow is carried by the run's context bus (prior step outputs injected into the next
+/// task) rather than `{previous}` substitution.
+pub async fn dispatch_via_executor(
+    args: &Value,
+    cwd: &str,
+    session_id: Option<String>,
+    project_id: Option<String>,
+) -> Dispatch {
+    let scope = args
+        .get("agentScope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("user")
+        .to_string();
+    let discovery = discover_agents(cwd, &scope);
+    let project_agents_dir = discovery.project_agents_dir.clone();
+    let details = |mode: &str, results: Vec<SingleResult>| SubagentDetails {
+        mode: mode.to_string(),
+        agent_scope: scope.clone(),
+        project_agents_dir: project_agents_dir.clone(),
+        results,
+    };
+
+    let chain = args.get("chain").and_then(|v| v.as_array());
+    let tasks = args.get("tasks").and_then(|v| v.as_array());
+    let single_agent = args.get("agent").and_then(|v| v.as_str());
+    let single_task = args.get("task").and_then(|v| v.as_str());
+    let has_chain = chain.map(|c| !c.is_empty()).unwrap_or(false);
+    let has_tasks = tasks.map(|t| !t.is_empty()).unwrap_or(false);
+    let has_single = single_agent.is_some() && single_task.is_some();
+    if (has_chain as u8 + has_tasks as u8 + has_single as u8) != 1 {
+        let available = discovery
+            .agents
+            .iter()
+            .map(|a| format!("{} ({})", a.name, a.source))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let available = if available.is_empty() {
+            "none".into()
+        } else {
+            available
+        };
+        return Dispatch {
+            text: format!(
+                "Invalid parameters. Provide exactly one mode.\nAvailable agents: {available}"
+            ),
+            is_error: true,
+            details: details("single", Vec::new()),
+        };
+    }
+
+    // Build one CreateStepInput per subagent, resolving its cwd (e.g. a pantheon episode dir) to an
+    // absolute path so the executor runs the step there.
+    let build_input =
+        |s: &Value, parents: Option<Vec<Value>>| -> crate::workflows::CreateStepInput {
+            let requested = s.get("cwd").and_then(|v| v.as_str()).unwrap_or(cwd);
+            crate::workflows::CreateStepInput {
+                agent: s.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                task: s.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                parents,
+                sandbox_run_id: None,
+                browser_session_id: None,
+                tool_call_ids: None,
+                thinking: None,
+                auto_repair: false,
+                budget: None,
+                model: s.get("model").and_then(|v| v.as_str()).map(String::from),
+                cwd: Some(resolve_subagent_cwd(requested, cwd)),
+            }
+        };
+
+    let (mode, inputs): (&str, Vec<crate::workflows::CreateStepInput>) = if has_chain {
+        let steps = chain.unwrap();
+        if steps.len() > MAX_CHAIN_STEPS {
+            return Dispatch {
+                text: format!("Chain too long ({}). Max is {MAX_CHAIN_STEPS}.", steps.len()),
+                is_error: true,
+                details: details("chain", Vec::new()),
+            };
+        }
+        let inputs = steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| build_input(s, if i > 0 { Some(vec![json!(i - 1)]) } else { None }))
+            .collect();
+        ("chain", inputs)
+    } else if has_tasks {
+        let steps = tasks.unwrap();
+        if steps.len() > MAX_PARALLEL_TASKS {
+            return Dispatch {
+                text: format!(
+                    "Too many parallel tasks ({}). Max is {MAX_PARALLEL_TASKS}.",
+                    steps.len()
+                ),
+                is_error: true,
+                details: details("parallel", Vec::new()),
+            };
+        }
+        ("parallel", steps.iter().map(|s| build_input(s, None)).collect())
+    } else {
+        ("single", vec![build_input(args, None)])
+    };
+
+    let label = format!("subagent · {mode} · {} step(s)", inputs.len());
+    let run = match crate::workflows::create(
+        project_id,
+        session_id,
+        label,
+        Some("subagent".into()),
+        0,
+        &inputs,
+        None,
+    ) {
+        Ok(r) => r,
+        Err(_) => {
+            return Dispatch {
+                text: "subagent dispatch formed a dependency cycle".into(),
+                is_error: true,
+                details: details(mode, Vec::new()),
+            }
+        }
+    };
+    let run = crate::workflow_executor::run_workflow(&run.id)
+        .await
+        .unwrap_or(run);
+
+    // Assemble the agent-facing result from the completed steps (run.steps preserves input order).
+    let out_of = |s: &crate::workflows::WorkflowStep| {
+        s.output
+            .clone()
+            .or_else(|| s.error.clone())
+            .unwrap_or_default()
+    };
+    let results: Vec<SingleResult> = run
+        .steps
+        .iter()
+        .map(|s| SingleResult {
+            agent: s.agent.clone(),
+            agent_source: "user".to_string(),
+            task: s.task.clone(),
+            exit_code: if s.status == "done" { 0 } else { 1 },
+            messages: Vec::new(),
+            usage: SubUsage::default(),
+            model: s.model.clone(),
+            stop_reason: Some(s.status.clone()),
+            error_message: s.error.clone(),
+            step: None,
+            skill_set: Vec::new(),
+        })
+        .collect();
+    let any_error = run
+        .steps
+        .iter()
+        .any(|s| s.status != "done" && s.status != "skipped");
+    let text = match mode {
+        "chain" => run
+            .steps
+            .last()
+            .map(|s| {
+                let o = out_of(s);
+                if o.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    o
+                }
+            })
+            .unwrap_or_default(),
+        "parallel" => {
+            let success = run.steps.iter().filter(|s| s.status == "done").count();
+            let summaries: Vec<String> = run
+                .steps
+                .iter()
+                .map(|s| format!("### [{}] {}\n\n{}", s.agent, s.status, out_of(s)))
+                .collect();
+            format!(
+                "Parallel: {success}/{} succeeded\n\n{}",
+                run.steps.len(),
+                summaries.join("\n\n---\n\n")
+            )
+        }
+        _ => run.steps.first().map(out_of).unwrap_or_default(),
+    };
+    Dispatch {
+        text,
+        is_error: any_error,
+        details: details(mode, results),
+    }
+}
+
 /// Shared implementation: parses the tool args (single / parallel / chain), discovers agents for
 /// `cwd`, runs the selected mode, and assembles the result the workflow bridge reads.
 /// `run_id` is the workflow run this dispatch belongs to; when present, the shared context
