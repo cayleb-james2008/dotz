@@ -1036,6 +1036,100 @@ impl Tool for VcsRollbackTool {
     }
 }
 
+// ---- Design tools (thin wrappers over crate::design; light up the DESIGN panel node) ----
+struct DesignListTool;
+#[async_trait]
+impl Tool for DesignListTool {
+    fn name(&self) -> &'static str {
+        "design_list"
+    }
+    fn description(&self) -> &'static str {
+        "List the bundled Open Design systems (id, name, category, description) to pick one to build on-brand. Args: {}."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    async fn execute(&self, _args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
+        Ok(serde_json::to_string(&crate::design::list_systems_value().await).unwrap_or_default())
+    }
+}
+
+struct DesignUseTool;
+#[async_trait]
+impl Tool for DesignUseTool {
+    fn name(&self) -> &'static str {
+        "design_use"
+    }
+    fn description(&self) -> &'static str {
+        "Load one Open Design system's reference components.html so you can paste its :root tokens and build on-brand. Args: {id}."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] })
+    }
+    async fn execute(&self, args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
+        let id = args
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or("id is required")?;
+        crate::design::system_components_html(id).await
+    }
+}
+
+// ---- Sandbox tool (thin wrapper over crate::sandbox::start_run; lights up the SANDBOX panel node) ----
+struct SandboxRunTool;
+#[async_trait]
+impl Tool for SandboxRunTool {
+    fn name(&self) -> &'static str {
+        "sandbox_run"
+    }
+    fn description(&self) -> &'static str {
+        "Run code in a disposable sandbox and return the created run (poll status via the panel). \
+         terminal mode streams stdout/stderr; web mode serves the app on a local port (its url/port \
+         is on the returned run) for E2E. Args: {language, code, mode?:\"terminal\"|\"web\", timeoutMs?}."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "language": { "type": "string" },
+                "code": { "type": "string" },
+                "mode": { "type": "string", "enum": ["terminal", "web"] },
+                "timeoutMs": { "type": "number" }
+            },
+            "required": ["language", "code"]
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        let language = args
+            .get("language")
+            .and_then(|v| v.as_str())
+            .ok_or("language is required")?;
+        let code = args
+            .get("code")
+            .and_then(|v| v.as_str())
+            .ok_or("code is required")?;
+        let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("terminal");
+        // Run in the session cwd so a real `cargo test` / `npm run build` isn't vacuous in an empty
+        // temp dir. Default 30s; callers can extend for slow builds.
+        let timeout_ms = args
+            .get("timeoutMs")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n > 0)
+            .unwrap_or(30_000);
+        let run = crate::sandbox::start_run(
+            language,
+            code,
+            mode,
+            None,
+            timeout_ms,
+            ctx.tx.clone(),
+            Some(ctx.cwd.clone()),
+        )
+        .await?;
+        Ok(serde_json::to_string(&run).unwrap_or_default())
+    }
+}
+
 /// Register all the extra tools into a registry's add-closure.
 pub fn register(add: &mut dyn FnMut(Box<dyn Tool>)) {
     add(Box::new(AgentsMdTool));
@@ -1059,6 +1153,9 @@ pub fn register(add: &mut dyn FnMut(Box<dyn Tool>)) {
     add(Box::new(VcsAtomicCommitTool));
     add(Box::new(VcsPrTool));
     add(Box::new(VcsRollbackTool));
+    add(Box::new(DesignListTool));
+    add(Box::new(DesignUseTool));
+    add(Box::new(SandboxRunTool));
 }
 
 #[cfg(test)]

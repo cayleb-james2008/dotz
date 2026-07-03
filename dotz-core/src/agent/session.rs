@@ -857,17 +857,20 @@ fn finish_round_cap(session: &std::sync::Arc<Mutex<AgentSession>>, tool_results:
     }
 }
 
-/// The bento panel a tool "belongs to", so the UI can auto-open it when the agent uses that tool —
-/// the operator sees the agent reach for memory / the browser / skills / specs / vcs live. Returns
-/// None for plain file/shell tools (too noisy to pop a panel for every read/bash). sandbox + the
-/// workflow graph already open on their own dedicated events, so they're not mapped here.
-fn panel_for_tool(name: &str) -> Option<&'static str> {
+/// The bento panel a tool "belongs to". This drives the workflow graph: each tool call becomes a
+/// panel-colored sub-node (chip) on its step, and clicking a node opens its dominant panel — the
+/// graph is the single live visual of what the agent is doing. (Tools no longer auto-open panels;
+/// see the removed emission in `execute_tool`.) Returns None for plain file/shell tools that don't
+/// map to a dedicated panel.
+pub(crate) fn panel_for_tool(name: &str) -> Option<&'static str> {
     Some(match name {
         n if n.starts_with("memory_") => "memory",
         n if n.starts_with("browser_") => "browser",
         n if n.starts_with("openspec_") => "spec",
         n if n.starts_with("vcs_") => "vcs",
         n if n.starts_with("living_docs_") => "living-docs",
+        n if n.starts_with("design_") => "design",
+        n if n.starts_with("sandbox_") => "sandbox",
         "skill" | "create_skill" | "list_skills" | "create_agent" | "list_agents" => "skills",
         "agents_md" => "doctrine",
         "rsi_baseline" | "rsi_compare" => "brain",
@@ -886,12 +889,9 @@ async fn execute_tool(
     ctx: &ToolCtx,
     tool_call_id: &str,
 ) -> (Value, bool, String) {
-    // Auto-open the panel this tool belongs to (idempotent on the client). The frontend handles
-    // `{kind:"panel_open", panelName}` at app.js's WS dispatcher.
-    if let Some(panel) = panel_for_tool(name) {
-        let tx = session_guard(session).tx.clone();
-        let _ = tx.send(json!({ "kind": "panel_open", "panelName": panel }));
-    }
+    // Tools no longer auto-open panels: the workflow graph is the single live visual. Each tool
+    // call surfaces as a panel-colored sub-node on its step (see `panel_for_tool` +
+    // `emit_step_tool`), and the operator opens a panel on demand by clicking a node/chip.
     if name == "subagent" {
         let active = {
             let s = session_guard(session);
@@ -1483,6 +1483,20 @@ mod tests {
     /// Serializes the hung-SSE tests below so they don't race on the
     /// process-global `DOTZ_LOCAL_BASE_URL` env var.
     use super::SSE_TEST_LOCK;
+
+    /// `panel_for_tool` binds each capability tool to its graph-node panel. The design + sandbox
+    /// tools (new first-class panels) must map, and plain file/shell tools must not.
+    #[test]
+    fn panel_for_tool_maps_capability_tools() {
+        assert_eq!(panel_for_tool("design_use"), Some("design"));
+        assert_eq!(panel_for_tool("design_list"), Some("design"));
+        assert_eq!(panel_for_tool("sandbox_run"), Some("sandbox"));
+        assert_eq!(panel_for_tool("memory_search"), Some("memory"));
+        assert_eq!(panel_for_tool("browser_act"), Some("browser"));
+        assert_eq!(panel_for_tool("subagent"), Some("graph"));
+        assert_eq!(panel_for_tool("read"), None);
+        assert_eq!(panel_for_tool("bash"), None);
+    }
 
     #[test]
     fn prune_history_caps_at_max_and_keeps_newest() {

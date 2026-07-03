@@ -859,6 +859,9 @@ impl ToolRegistry {
             "vcs_atomic_commit",
             "vcs_pr",
             "vcs_rollback",
+            "design_list",
+            "design_use",
+            "sandbox_run",
             "context_read",
             "context_write",
         ]
@@ -923,6 +926,19 @@ mod tests {
     /// Serialize tests that mutate the process-global `DOTZ_BASH_TIMEOUT_MS` env var so
     /// concurrent bash tests do not race on timeout configuration.
     static BASH_TIMEOUT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The design + sandbox tools must be registered AND active by default so the pantheon
+    /// design/sandbox/E2E phases can call them (and light up their panel nodes).
+    #[test]
+    fn new_registry_registers_and_activates_design_and_sandbox_tools() {
+        let r = ToolRegistry::new();
+        let all = r.all_names();
+        let active = r.active_names();
+        for t in ["design_list", "design_use", "sandbox_run"] {
+            assert!(all.contains(&t.to_string()), "{t} must be registered");
+            assert!(active.contains(&t.to_string()), "{t} must be active");
+        }
+    }
 
     #[tokio::test]
     async fn run_rejects_inactive_tool() {
