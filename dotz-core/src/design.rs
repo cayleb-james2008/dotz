@@ -67,10 +67,16 @@ fn is_valid_slug(id: &str) -> bool {
 /// `manifest.json` and use `name||id`, `category||""`, `description||""`; on read/parse failure
 /// fall back to `{ id, name: id, category: "", description: "" }`.
 async fn list_systems() -> Json<serde_json::Value> {
+    Json(list_systems_value().await)
+}
+
+/// The catalog value (`{ "systems": [...] }`) the REST handler wraps in `Json`. Exposed so the
+/// `design_list` agent tool reuses the exact scan/sort/manifest logic instead of duplicating it.
+pub async fn list_systems_value() -> serde_json::Value {
     let dir = design_systems_dir();
     let read = match std::fs::read_dir(&dir) {
         Ok(rd) => rd,
-        Err(_) => return Json(json!({ "systems": [] })),
+        Err(_) => return json!({ "systems": [] }),
     };
 
     // Collect (slug, is_dir) for valid directory slugs, then sort by name to match the Node sort.
@@ -139,25 +145,33 @@ async fn list_systems() -> Json<serde_json::Value> {
     }))
     .await;
 
-    Json(json!({ "systems": systems }))
+    json!({ "systems": systems })
 }
 
 /// GET /api/design/systems/:id/components — serve the slug's reference `components.html` as
 /// text/html (the same-origin srcdoc preview). 400 `{error:"bad id"}` on a non-slug id; 404
 /// `{error:"no components for this system"}` when the file is missing. Mirrors server.ts.
 async fn system_components(Path(id): Path<String>) -> Response {
-    if !is_valid_slug(&id) {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "bad id" }))).into_response();
-    }
-    let html_path = design_systems_dir().join(&id).join("components.html");
-    match tokio::fs::read_to_string(&html_path).await {
+    match system_components_html(&id).await {
         Ok(html) => (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], html).into_response(),
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "no components for this system" })),
-        )
-            .into_response(),
+        Err(e) if e == "bad id" => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response()
+        }
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e }))).into_response(),
     }
+}
+
+/// Read a system's reference `components.html`. `Err("bad id")` for a non-slug id (→ 400),
+/// `Err("no components for this system")` when the file is missing (→ 404). Exposed so the
+/// `design_use` agent tool reuses the same guard + read as the REST handler.
+pub async fn system_components_html(id: &str) -> Result<String, String> {
+    if !is_valid_slug(id) {
+        return Err("bad id".to_string());
+    }
+    let html_path = design_systems_dir().join(id).join("components.html");
+    tokio::fs::read_to_string(&html_path)
+        .await
+        .map_err(|_| "no components for this system".to_string())
 }
 
 /// Stateless router for the Open Design catalog endpoints.
@@ -267,6 +281,22 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "bad id");
+    }
+
+    /// `system_components_html` (used by the `design_use` agent tool) returns the raw HTML for a
+    /// valid slug, `Err("bad id")` for a non-slug, and `Err("no components...")` when missing.
+    #[tokio::test]
+    async fn system_components_html_returns_html_or_typed_errors() {
+        let (_guard, pi) = with_tmp_design_systems();
+        let slug_dir = make_slug_dir(&pi, "stripe");
+        std::fs::write(slug_dir.join("components.html"), "<h1>ok</h1>").unwrap();
+
+        assert_eq!(system_components_html("stripe").await.unwrap(), "<h1>ok</h1>");
+        assert_eq!(system_components_html("_schema").await.unwrap_err(), "bad id");
+        assert_eq!(
+            system_components_html("missing").await.unwrap_err(),
+            "no components for this system"
+        );
     }
 
     /// GET /api/design/systems must scan slugs in lexicographic order, read manifest.json fields,

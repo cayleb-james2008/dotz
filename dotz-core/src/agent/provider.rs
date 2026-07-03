@@ -84,6 +84,25 @@ pub fn resolve_api_key(reference: &str) -> String {
     r.to_string()
 }
 
+/// If `api_key_ref` names an env var (`$VAR` / `${VAR}`) but `resolved` came back empty, return a
+/// clear, actionable error naming the variable. A bare-literal reference (including an empty one,
+/// e.g. a local / no-auth provider) returns `None` so those setups keep working. Keeps
+/// `resolve_api_key`'s `String` signature stable for its other callers.
+fn missing_env_key_error(api_key_ref: &str, resolved: &str, provider: &str) -> Option<String> {
+    if !resolved.trim().is_empty() {
+        return None;
+    }
+    let r = api_key_ref.trim();
+    let var = r
+        .strip_prefix("${")
+        .and_then(|s| s.strip_suffix('}'))
+        .or_else(|| r.strip_prefix('$'))?;
+    Some(format!(
+        "missing api key for provider '{provider}': environment variable {var} is not set. \
+         Set {var} and retry (an empty key 401s silently on Ollama Cloud)."
+    ))
+}
+
 /// Configurable HTTP request timeout for every upstream LLM call. A hung provider connection
 /// otherwise blocks the executive turn (or a subagent) indefinitely. Defaults to 5 minutes;
 /// override with `DOTZ_PROVIDER_TIMEOUT_MS` (clamped to [1s, 1h]).
@@ -207,6 +226,14 @@ impl Default for OpenAiChat {
 impl Provider for OpenAiChat {
     async fn stream(&self, req: ChatRequest, tx: mpsc::Sender<StreamDelta>) -> Result<(), String> {
         let key = resolve_api_key(&req.model.api_key_ref);
+        // Fail fast when a `$VAR`/`${VAR}` reference resolved to nothing: an unset key sends an
+        // empty Bearer, and Ollama Cloud (and other hosted providers) answer 401 with an empty
+        // reply that masquerades as a silent stop — or the turn just hangs to the timeout. A clear
+        // error beats a 5-minute hang. Bare-literal keys (incl. empty, e.g. local/no-auth) pass
+        // through untouched.
+        if let Some(err) = missing_env_key_error(&req.model.api_key_ref, &key, &req.model.provider) {
+            return Err(err);
+        }
         let url = format!(
             "{}/chat/completions",
             req.model.base_url.trim_end_matches('/')
@@ -761,6 +788,24 @@ mod tests {
     fn resolve_accepts_any_model_id_for_native_adapter_providers() {
         assert!(resolve("anthropic", "any-model-id").is_some());
         assert!(resolve("google", "any-model-id").is_some());
+    }
+
+    /// A `$VAR` key that resolved empty must fail fast with an actionable, variable-named error —
+    /// an unset `$OLLAMA_API_KEY` otherwise sends an empty Bearer and 401s silently. A bare literal
+    /// (incl. an empty one, e.g. local/no-auth) must NOT error, so those setups keep working.
+    #[test]
+    fn missing_env_key_error_only_fires_for_unset_env_refs() {
+        let err = missing_env_key_error("$OLLAMA_API_KEY", "", "ollama")
+            .expect("unset $VAR must produce an error");
+        assert!(err.contains("OLLAMA_API_KEY"), "names the var: {err}");
+        assert!(err.contains("ollama"), "names the provider: {err}");
+        // ${VAR} form too.
+        assert!(missing_env_key_error("${GROQ_KEY}", "", "groq").is_some());
+        // A resolved key is fine.
+        assert!(missing_env_key_error("$OLLAMA_API_KEY", "sk-real", "ollama").is_none());
+        // Bare literals (incl. empty) never error — local / no-auth providers.
+        assert!(missing_env_key_error("", "", "local").is_none());
+        assert!(missing_env_key_error("literal-key", "literal-key", "local").is_none());
     }
 
     /// `truncate` is called on upstream provider error bodies in every adapter's stream error
