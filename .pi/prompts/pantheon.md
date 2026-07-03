@@ -45,5 +45,15 @@ done: **GitHub-only** (clone-and-run; static site or desktop release — no host
 DB), keep CI green, follow **ponytail** (laziest solution that works; stdlib before deps; shortest
 diff), commit with `rsi:` / `fix(scope):`.
 
-## 5. Report
-When the ship checklist passes, report the episode repo URL.
+## 5. Score — refresh the leaderboard
+Once shipped, spawn a subagent with a FIXED judge model (not your own — same judge every episode)
+to read `pantheon\projects\<codename>` and rate `difficulty` (1-5) and `quality` (0-100) with a
+one-line note. Then run:
+```
+powershell -ExecutionPolicy Bypass -File C:\Users\Cayleb\Desktop\workspace\projects\pantheon\scripts\score-episode.ps1 `
+  -Codename <codename> -Difficulty <d> -Quality <q> -JudgeNote "<note>"
+```
+It auto-harvests build time / CI / commits and refreshes `pantheon\leaderboard.html`.
+
+## 6. Report
+When the ship checklist passes, report the episode repo URL (and the new leaderboard standing).

@@ -10,6 +10,7 @@ pub mod connections;
 pub mod context_bus;
 pub mod design;
 pub mod embed;
+pub mod leaderboard;
 pub mod living_docs;
 pub mod memory;
 pub mod profiles;
