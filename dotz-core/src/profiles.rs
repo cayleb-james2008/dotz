@@ -83,7 +83,7 @@ PIPELINE — decompose and disperse via the `subagent` tool; run an adversarial 
 1. PLAN — from the one-liner, pick an UNUSED mythological codename (check the pool + used list in C:/Users/Cayleb/Desktop/workspace/projects/pantheon/README.md and the existing C:/Users/Cayleb/Desktop/workspace/projects/pantheon/projects/ folders) and a kebab slug; choose the stack honoring the GitHub-only rule; determine the next episode number N (the highest Ep in that README episode table + 1, or 1 if the table has no episode rows). For the model tag, read the dotz config via `bash`: `cat ~/.dotz/config.json` — use its `executiveModel` value verbatim (that is YOU, the lead model). Do NOT guess it from env vars: DOTZ_SUBAGENT_MODEL is the subagent workers' model, not yours.
 2. SCAFFOLD — run the pantheon generator through `bash` (it creates the folder in the series conventions, git-inits with a repo-local identity, tags episode/N, and creates + pushes the public GitHub repo):
    powershell -ExecutionPolicy Bypass -File C:/Users/Cayleb/Desktop/workspace/projects/pantheon/scripts/new-episode.ps1 -Codename <codename> -Episode <N> -Model "<exec-model>" -Serve "Ollama Cloud" -Slug "<slug>" -Idea "<idea>" -DevPort 8090 -UpdateHub
-3. BUILD — cd into the created folder pantheon/projects/<codename> (the scaffolder prints its full path), read its AGENTS.md, and implement the app to that file's definition of done. Disperse independent parts to worker subagents in parallel; you stay the orchestrator.
+3. BUILD — cd into the created folder pantheon/projects/<codename> (the scaffolder prints its full path), read its AGENTS.md, and implement the app to that file's definition of done. ORCHESTRATE, don't type: dispatch each independent build unit (each crate/module, the frontend, the CI, the tests) to its OWN `subagent` running in parallel — you are the conductor and stay in the orchestrator seat, you do NOT write large source files inline. This is not optional: every dispatch becomes a node in the live workflow graph the operator is watching, so a build done inline (no subagents) is a failed build even if the code works. Give each subagent one crisp task + the file paths it owns; integrate and gate their results.
 4. TEST — run the project's real build/tests, replace the generic CI with real build/test steps for the stack and keep it green, then spawn a reviewer subagent to hunt bugs and missed requirements and treat its findings as required work.
 5. PUBLISH — commit with `rsi:` / `fix(scope):` prefixes and push to the origin the scaffolder created; confirm the live GitHub URL and that a fresh clone follows the README quickstart.
 6. SCORE — once the ship checklist passes, refresh the series leaderboard. Spawn a `subagent` with a FIXED judge model (NOT your own episode model — use the same judge every episode so scores are comparable) to read `pantheon/projects/<codename>` and rate `difficulty` (1-5, the project's inherent challenge) and `quality` (0-100: correctness, completeness, code cleanliness, docs) with a one-line note against a consistent rubric. Then run, via `bash`: `powershell -ExecutionPolicy Bypass -File C:/Users/Cayleb/Desktop/workspace/projects/pantheon/scripts/score-episode.ps1 -Codename <codename> -Difficulty <d> -Quality <q> -JudgeNote "<note>"` — it auto-harvests build time/CI/commits and refreshes `pantheon/leaderboard.html`.
@@ -185,6 +185,18 @@ pub fn doctrine(id: &str, design_systems_dir: &str) -> String {
         ),
         "new-model-new-project" => format!("{WORKFLOW_DOCTRINE}{NEW_MODEL_NEW_PROJECT_DOMAIN}"),
         _ => WORKFLOW_DOCTRINE.to_string(),
+    }
+}
+
+/// Max tool-rounds per turn before the loop pauses (the user resumes with a "continue"). The
+/// autonomous "own the full arc" profiles must run start-to-finish without pausing, so they get a
+/// high ceiling (still bounded, so a runaway can't loop forever); interactive profiles keep a low
+/// cap for frequent check-ins.
+pub fn max_rounds(id: &str) -> usize {
+    match id {
+        "new-model-new-project" => 400,
+        "workflow" => 60,
+        _ => 12,
     }
 }
 

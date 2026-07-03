@@ -34,8 +34,10 @@ const MAX_CONCURRENCY: usize = 4;
 /// Cap the {previous} feed-forward so a large prior output can't explode the next task prompt
 /// (mirrors CHAIN_PREVIOUS_CAP in the oracle — 24 KiB).
 const CHAIN_PREVIOUS_CAP: usize = 24 * 1024;
-/// Bound a subagent's own tool-rounds (matches the executive loop's MAX_ROUNDS in session.rs).
-const MAX_ROUNDS: usize = 12;
+/// Bound a subagent's own tool-rounds. A dispersed build task (e.g. "build the engine crate") is
+/// a real chunk of work, so this is generous — the executive loop is what the operator watches;
+/// subagents should have room to actually finish their piece before reporting back.
+const MAX_ROUNDS: usize = 60;
 /// Default wall-clock timeout for one subagent run. Long enough for real work, short enough that
 /// a hung provider/tool cannot stall the executive turn forever. Override with
 /// `DOTZ_SUBAGENT_TIMEOUT_MS` (e.g. for fast tests).

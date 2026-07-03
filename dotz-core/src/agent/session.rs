@@ -553,7 +553,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     }
 
     // Snapshot the immutable bits + append the user message under the lock; release before awaiting.
-    let (sess_id, system_prompt, provider_id, model_id, thinking, cwd, tools_specs) = {
+    let (sess_id, system_prompt, provider_id, model_id, thinking, cwd, tools_specs, profile_id) = {
         let mut s = session_guard(&session);
         // Cancellation token was already reset in the first critical section; do not replace it
         // here or an abort that arrived in the gap would be silently lost.
@@ -583,6 +583,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
             s.thinking_level.clone(),
             s.cwd.clone(),
             s.tools.active_specs(),
+            s.profile_id.clone(),
         )
     };
 
@@ -616,9 +617,10 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     // to the UI (workflow step links, error markers, etc.).
     let mut tool_results: Vec<ToolResult> = Vec::new();
 
-    // The agent loop: up to a bounded number of tool-rounds.
-    const MAX_ROUNDS: usize = 12;
-    for _round in 0..MAX_ROUNDS {
+    // The agent loop: up to a per-profile round budget. Autonomous "own the full arc" profiles
+    // (new-model-new-project) run to completion; interactive profiles pause sooner for check-ins.
+    let max_rounds = crate::profiles::max_rounds(&profile_id);
+    for _round in 0..max_rounds {
         // Build the request from current history.
         let messages = {
             let s = session_guard(&session);
@@ -841,7 +843,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     finish_round_cap(&session, tool_results);
 }
 
-/// Finish a turn that has hit the MAX_ROUNDS cap by reusing the last assistant message.
+/// Finish a turn that has hit the per-profile round cap by reusing the last assistant message.
 /// Uses `session_guard` so a poisoned mutex does not panic the cleanup path.
 fn finish_round_cap(session: &std::sync::Arc<Mutex<AgentSession>>, tool_results: Vec<ToolResult>) {
     let last = session_guard(session)
@@ -855,6 +857,26 @@ fn finish_round_cap(session: &std::sync::Arc<Mutex<AgentSession>>, tool_results:
     }
 }
 
+/// The bento panel a tool "belongs to", so the UI can auto-open it when the agent uses that tool —
+/// the operator sees the agent reach for memory / the browser / skills / specs / vcs live. Returns
+/// None for plain file/shell tools (too noisy to pop a panel for every read/bash). sandbox + the
+/// workflow graph already open on their own dedicated events, so they're not mapped here.
+fn panel_for_tool(name: &str) -> Option<&'static str> {
+    Some(match name {
+        n if n.starts_with("memory_") => "memory",
+        n if n.starts_with("browser_") => "browser",
+        n if n.starts_with("openspec_") => "spec",
+        n if n.starts_with("vcs_") => "vcs",
+        n if n.starts_with("living_docs_") => "living-docs",
+        "skill" | "create_skill" | "list_skills" | "create_agent" | "list_agents" => "skills",
+        "agents_md" => "doctrine",
+        "rsi_baseline" | "rsi_compare" => "brain",
+        "subagent" => "graph",
+        "edit" | "write" => "files",
+        _ => return None,
+    })
+}
+
 /// Execute a single tool call, respecting the session's active tool set. subagent is special-cased
 /// so its SubagentDetails reach result.details, but it still honors set_tools restrictions.
 async fn execute_tool(
@@ -864,6 +886,12 @@ async fn execute_tool(
     ctx: &ToolCtx,
     tool_call_id: &str,
 ) -> (Value, bool, String) {
+    // Auto-open the panel this tool belongs to (idempotent on the client). The frontend handles
+    // `{kind:"panel_open", panelName}` at app.js's WS dispatcher.
+    if let Some(panel) = panel_for_tool(name) {
+        let tx = session_guard(session).tx.clone();
+        let _ = tx.send(json!({ "kind": "panel_open", "panelName": panel }));
+    }
     if name == "subagent" {
         let active = {
             let s = session_guard(session);

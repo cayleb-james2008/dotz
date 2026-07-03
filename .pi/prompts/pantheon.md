@@ -43,7 +43,9 @@ folder `pantheon\projects\<codename>\` (the scaffolder prints its full path).
 `cd` into `pantheon\projects\<codename>\`, read its `AGENTS.md`, and build to that file's definition of
 done: **GitHub-only** (clone-and-run; static site or desktop release — no hosted server, no managed
 DB), keep CI green, follow **ponytail** (laziest solution that works; stdlib before deps; shortest
-diff), commit with `rsi:` / `fix(scope):`.
+diff), commit with `rsi:` / `fix(scope):`. **Orchestrate, don't type** — dispatch each independent
+build unit (each crate/module, frontend, CI, tests) to its own `subagent` in parallel so the live
+workflow graph shows the full DAG; you stay the conductor and don't write large files inline.
 
 ## 5. Score — refresh the leaderboard
 Once shipped, spawn a subagent with a FIXED judge model (not your own — same judge every episode)
