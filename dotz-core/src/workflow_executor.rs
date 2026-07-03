@@ -58,6 +58,48 @@ fn concurrency() -> usize {
         .unwrap_or(DEFAULT_CONCURRENCY)
 }
 
+/// Extract the tool calls a subagent made from its recorded `messages`, panel-tagged, for the
+/// step's durable `toolCalls` (graph sub-node chips). Assistant tool-call blocks are
+/// `{"type":"toolCall","id","name"}` (event.rs), tool results are top-level
+/// `{"role":"tool","toolCallId",...,"isError":true}` (subagent.rs) — a call is errored if its
+/// result message carries `isError:true`. De-dupes by tool-call id, preserving first-seen order.
+fn tool_calls_from_messages(messages: &[serde_json::Value]) -> Vec<workflows::ToolCallRef> {
+    use std::collections::HashSet;
+    let mut errored: HashSet<String> = HashSet::new();
+    for m in messages {
+        if m.get("role").and_then(|r| r.as_str()) == Some("tool")
+            && m.get("isError").and_then(|e| e.as_bool()) == Some(true)
+        {
+            if let Some(id) = m.get("toolCallId").and_then(|v| v.as_str()) {
+                errored.insert(id.to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for m in messages {
+        let Some(content) = m.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for b in content {
+            if b.get("type").and_then(|t| t.as_str()) == Some("toolCall") {
+                let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if id.is_empty() || !seen.insert(id.clone()) {
+                    continue;
+                }
+                out.push(workflows::ToolCallRef {
+                    is_error: errored.contains(&id),
+                    panel: crate::agent::session::panel_for_tool(&name).map(str::to_string),
+                    tool_call_id: id,
+                    tool_name: name,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Drive a workflow run to completion.
 ///
 /// The run must already be created (via `workflows::create`) and in `pending` or `running`
@@ -163,7 +205,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
         // the executor passes it to run_single_agent_with_bus which forwards it
         // to the provider. The stored step carries the model so a rerun with a
         // different model (picked from the UI node drawer) uses the chosen model.
-        let ready_ids: Vec<(String, String, String, Option<String>)> = run
+        let ready_ids: Vec<(String, String, String, Option<String>, Option<String>)> = run
             .steps
             .iter()
             .filter(|s| s.status == "ready" || s.status == "interrupted")
@@ -173,6 +215,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                     s.agent.clone(),
                     s.task.clone(),
                     s.model.clone(),
+                    s.cwd.clone(),
                 )
             })
             .collect();
@@ -272,7 +315,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
 
         // Spawn each ready step as a subagent task. The Semaphore bounds concurrency.
         let mut handles = Vec::new();
-        for (step_id, agent, task, model) in ready_ids {
+        for (step_id, agent, task, model, step_cwd) in ready_ids {
             // Mark the step as "running" so it won't be picked up again.
             let _ = workflows::step_state(
                 run_id,
@@ -284,7 +327,8 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
             );
 
             let sem = sem.clone();
-            let cwd = cwd.clone();
+            // Per-step cwd (the bridge sets it to e.g. a pantheon episode dir); else the run's cwd.
+            let cwd = step_cwd.unwrap_or_else(|| cwd.clone());
             let rid = run_id.to_string();
             let sid = step_id.clone();
             let bus = bus.clone();
@@ -308,6 +352,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                         model_override.as_deref(),
                         &cwd,
                         Some(&bus),
+                        Some(&sid),
                     ),
                 )
                 .await;
@@ -350,6 +395,13 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                     None
                 };
 
+                // Durable per-step tool list (panel-tagged) → the graph renders each as a chip on
+                // this node, surviving reload. Live chips also stream in via `step_tool` mid-run.
+                let tool_calls = single
+                    .as_ref()
+                    .map(|r| tool_calls_from_messages(&r.messages))
+                    .filter(|v| !v.is_empty());
+
                 // Record the result via step_state (propagates readiness, handles auto-repair,
                 // cascades errors, finishes the run).
                 let _ = workflows::step_state(
@@ -360,6 +412,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                         output,
                         error,
                         artifact,
+                        tool_calls,
                         ..Default::default()
                     },
                 );
@@ -452,6 +505,7 @@ mod tests {
             auto_repair: false,
             budget: None,
             model: None,
+            cwd: None,
         }
     }
 

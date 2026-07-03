@@ -452,6 +452,7 @@ async fn run_single_agent_with_progress(
         step,
         bus,
         progress_tx,
+        None,
     )
     .await
 }
@@ -461,7 +462,9 @@ async fn run_single_agent_with_progress(
 /// `progress_tx`, when present, receives a copy of every `StreamDelta` the subagent's provider
 /// streams — the lead session forwards these as `subagent_progress` events so the orchestrator
 /// (and the operator) can see a drifting scout/planner's reasoning mid-run.
-// See run_single_agent_with_progress: same irreducible 8-input signature (it delegates here).
+/// `step_id`, when present (executor path), tags each tool call with its workflow step so the UI
+/// graph lights up a live sub-node chip as each tool fires (`step_tool` events).
+// See run_single_agent_with_progress: same irreducible signature (it delegates here).
 #[allow(clippy::too_many_arguments)]
 async fn run_single_agent_inner(
     agents: &[AgentConfig],
@@ -472,6 +475,7 @@ async fn run_single_agent_inner(
     step: Option<usize>,
     bus: Option<&ContextBus>,
     progress_tx: Option<mpsc::Sender<StreamDelta>>,
+    step_id: Option<&str>,
 ) -> SingleResult {
     let Some(agent) = agents.iter().find(|a| a.name == agent_name) else {
         return unknown_agent_result(agent_name, task, agents, step);
@@ -684,8 +688,33 @@ async fn run_single_agent_inner(
         }
 
         // Run each tool; append a `tool` message + a JSON tool-result message to history/messages.
+        // Live per-tool streaming: on the executor path (run_id + step_id present) emit a
+        // `step_tool` event on each tool start/end so the graph lights up a panel-colored sub-node
+        // chip the instant a tool fires — the graph is the operator's live view of the agent.
+        let live_run_id = bus.map(|b| b.run_id().to_string());
         for (call_id, name, args) in calls {
-            let (result_json, text) = match registry.run(&name, &args, &ctx).await {
+            let panel = crate::agent::session::panel_for_tool(&name).map(|s| s.to_string());
+            if let (Some(rid), Some(sid)) = (&live_run_id, step_id) {
+                crate::workflows::emit_event(
+                    rid,
+                    json!({
+                        "type": "step_tool", "stepId": sid, "toolCallId": call_id.clone(),
+                        "toolName": name.clone(), "panel": panel.clone(), "phase": "start",
+                    }),
+                );
+            }
+            let run_res = registry.run(&name, &args, &ctx).await;
+            let is_error = run_res.is_err();
+            if let (Some(rid), Some(sid)) = (&live_run_id, step_id) {
+                crate::workflows::emit_event(
+                    rid,
+                    json!({
+                        "type": "step_tool", "stepId": sid, "toolCallId": call_id.clone(),
+                        "toolName": name.clone(), "panel": panel, "phase": "end", "isError": is_error,
+                    }),
+                );
+            }
+            let (result_json, text) = match run_res {
                 Ok(t) => (
                     json!({ "role": "tool", "content": [{ "type": "text", "text": t }], "toolCallId": call_id }),
                     t,
@@ -763,9 +792,12 @@ pub async fn run_single_agent_with_bus(
     model_override: Option<&str>,
     cwd: &str,
     bus: Option<&ContextBus>,
+    step_id: Option<&str>,
 ) -> SingleResult {
     let discovery = discover_agents(cwd, "user");
-    run_single_agent_with_progress(
+    // Call the inner loop directly (no progress channel needed) so we can thread `step_id` for
+    // live per-tool `step_tool` streaming onto the workflow node.
+    run_single_agent_inner(
         &discovery.agents,
         agent_name,
         task,
@@ -774,6 +806,7 @@ pub async fn run_single_agent_with_bus(
         None,
         bus,
         None,
+        step_id,
     )
     .await
 }

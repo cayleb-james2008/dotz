@@ -352,6 +352,7 @@ pub fn replay(run_id: &str) -> Option<WorkflowRun> {
                 auto_repair: s.auto_repair,
                 budget: s.budget.clone(),
                 model: s.model_override.clone(),
+                cwd: None,
             }
         })
         .collect();
@@ -442,6 +443,7 @@ mod tests {
             auto_repair: false,
             budget: None,
             model: None,
+            cwd: None,
         }
     }
 
