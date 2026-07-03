@@ -45,6 +45,12 @@ fn record_path(run_id: &str) -> PathBuf {
     record_dir().join(format!("{run_id}.json"))
 }
 
+/// Delete a run's record file (best-effort). Used when a project is removed from dotz and its
+/// workflow runs are purged.
+pub fn delete(run_id: &str) {
+    let _ = std::fs::remove_file(record_path(run_id));
+}
+
 /// Serializes all record file IO so parallel step captures (a wide fan-out) do
 /// not lose updates to the shared `<run_id>.json`. Record writes are rare
 /// (one per step completion) so a single global guard is plenty.

@@ -457,6 +457,41 @@ fn persist(run: &WorkflowRun) {
     write_all(&all);
 }
 
+/// Remove every workflow run belonging to a project — from the in-memory active store AND the
+/// on-disk `workflows.json` history — and delete each removed run's run-record file. Returns the
+/// number of distinct runs purged. Called when a project is deleted from dotz.
+pub fn purge_project(project_id: &str) -> usize {
+    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    {
+        let mut active = store().lock().unwrap_or_else(|e| e.into_inner());
+        let doomed: Vec<String> = active
+            .values()
+            .filter(|r| r.project_id.as_deref() == Some(project_id))
+            .map(|r| r.id.clone())
+            .collect();
+        for id in doomed {
+            active.remove(&id);
+            ids.insert(id);
+        }
+    }
+    let kept: Vec<WorkflowRun> = read_all()
+        .into_iter()
+        .filter(|r| {
+            if r.project_id.as_deref() == Some(project_id) {
+                ids.insert(r.id.clone());
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    write_all(&kept);
+    for id in &ids {
+        crate::run_record::delete(id);
+    }
+    ids.len()
+}
+
 /// Evict the oldest TERMINAL runs once the active map exceeds ACTIVE_CAP. They remain on disk
 /// (history) + reachable via the /:id route's history fallback; in-flight runs are never evicted.
 fn prune_active(active: &mut HashMap<String, WorkflowRun>) {
