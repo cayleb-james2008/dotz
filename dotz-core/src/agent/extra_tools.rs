@@ -1108,7 +1108,10 @@ impl Tool for SandboxRunTool {
             .get("code")
             .and_then(|v| v.as_str())
             .ok_or("code is required")?;
-        let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("terminal");
+        let mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("terminal");
         // Run in the session cwd so a real `cargo test` / `npm run build` isn't vacuous in an empty
         // temp dir. Default 30s; callers can extend for slow builds.
         let timeout_ms = args

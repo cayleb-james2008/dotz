@@ -58,6 +58,17 @@ fn concurrency() -> usize {
         .unwrap_or(DEFAULT_CONCURRENCY)
 }
 
+/// Ready step data collected from the workflow run for dispatch.
+/// Replaces a 5-tuple (id, agent, task, model, cwd) to avoid clippy::type_complexity.
+#[derive(Debug, Clone)]
+struct ReadyStep {
+    id: String,
+    agent: String,
+    task: String,
+    model: Option<String>,
+    cwd: Option<String>,
+}
+
 /// Extract the tool calls a subagent made from its recorded `messages`, panel-tagged, for the
 /// step's durable `toolCalls` (graph sub-node chips). Assistant tool-call blocks are
 /// `{"type":"toolCall","id","name"}` (event.rs), tool results are top-level
@@ -83,8 +94,16 @@ fn tool_calls_from_messages(messages: &[serde_json::Value]) -> Vec<workflows::To
         };
         for b in content {
             if b.get("type").and_then(|t| t.as_str()) == Some("toolCall") {
-                let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id = b
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = b
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if id.is_empty() || !seen.insert(id.clone()) {
                     continue;
                 }
@@ -205,18 +224,16 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
         // the executor passes it to run_single_agent_with_bus which forwards it
         // to the provider. The stored step carries the model so a rerun with a
         // different model (picked from the UI node drawer) uses the chosen model.
-        let ready_ids: Vec<(String, String, String, Option<String>, Option<String>)> = run
+        let ready_steps: Vec<ReadyStep> = run
             .steps
             .iter()
             .filter(|s| s.status == "ready" || s.status == "interrupted")
-            .map(|s| {
-                (
-                    s.id.clone(),
-                    s.agent.clone(),
-                    s.task.clone(),
-                    s.model.clone(),
-                    s.cwd.clone(),
-                )
+            .map(|s| ReadyStep {
+                id: s.id.clone(),
+                agent: s.agent.clone(),
+                task: s.task.clone(),
+                model: s.model.clone(),
+                cwd: s.cwd.clone(),
             })
             .collect();
 
@@ -258,10 +275,10 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                     cumulative_output_tokens,
                 ) {
                     // Skip every ready step and abort the run.
-                    for sid in &ready_ids {
+                    for step in &ready_steps {
                         let _ = workflows::step_state(
                             run_id,
-                            &sid.0,
+                            &step.id,
                             workflows::StepPatch {
                                 status: Some("skipped".into()),
                                 error: Some("run budget exceeded".into()),
@@ -280,7 +297,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
         // pending on a step that will never complete — e.g. a cycle that slipped past
         // validation, or a crashed in-flight task). Mark errored so the operator sees
         // the failure instead of a silently-hung run.
-        if ready_ids.is_empty() {
+        if ready_steps.is_empty() {
             let any_running = run.steps.iter().any(|s| s.status == "running");
             if !any_running {
                 // All steps are either terminal or pending-on-nothing. Mark the run errored
@@ -315,7 +332,12 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
 
         // Spawn each ready step as a subagent task. The Semaphore bounds concurrency.
         let mut handles = Vec::new();
-        for (step_id, agent, task, model, step_cwd) in ready_ids {
+        for step in ready_steps {
+            let step_id = step.id;
+            let agent = step.agent;
+            let task = step.task;
+            let model = step.model;
+            let step_cwd = step.cwd;
             // Mark the step as "running" so it won't be picked up again.
             let _ = workflows::step_state(
                 run_id,

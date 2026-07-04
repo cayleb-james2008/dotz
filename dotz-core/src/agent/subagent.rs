@@ -1124,8 +1124,16 @@ pub async fn dispatch_via_executor(
         |s: &Value, parents: Option<Vec<Value>>| -> crate::workflows::CreateStepInput {
             let requested = s.get("cwd").and_then(|v| v.as_str()).unwrap_or(cwd);
             crate::workflows::CreateStepInput {
-                agent: s.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                task: s.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                agent: s
+                    .get("agent")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                task: s
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 parents,
                 sandbox_run_id: None,
                 browser_session_id: None,
@@ -1142,7 +1150,10 @@ pub async fn dispatch_via_executor(
         let steps = chain.unwrap();
         if steps.len() > MAX_CHAIN_STEPS {
             return Dispatch {
-                text: format!("Chain too long ({}). Max is {MAX_CHAIN_STEPS}.", steps.len()),
+                text: format!(
+                    "Chain too long ({}). Max is {MAX_CHAIN_STEPS}.",
+                    steps.len()
+                ),
                 is_error: true,
                 details: details("chain", Vec::new()),
             };
@@ -1150,7 +1161,16 @@ pub async fn dispatch_via_executor(
         let inputs = steps
             .iter()
             .enumerate()
-            .map(|(i, s)| build_input(s, if i > 0 { Some(vec![json!(i - 1)]) } else { None }))
+            .map(|(i, s)| {
+                build_input(
+                    s,
+                    if i > 0 {
+                        Some(vec![json!(i - 1)])
+                    } else {
+                        None
+                    },
+                )
+            })
             .collect();
         ("chain", inputs)
     } else if has_tasks {
@@ -1165,7 +1185,10 @@ pub async fn dispatch_via_executor(
                 details: details("parallel", Vec::new()),
             };
         }
-        ("parallel", steps.iter().map(|s| build_input(s, None)).collect())
+        (
+            "parallel",
+            steps.iter().map(|s| build_input(s, None)).collect(),
+        )
     } else {
         ("single", vec![build_input(args, None)])
     };
