@@ -234,7 +234,8 @@ impl Provider for OpenAiChat {
         // reply that masquerades as a silent stop — or the turn just hangs to the timeout. A clear
         // error beats a 5-minute hang. Bare-literal keys (incl. empty, e.g. local/no-auth) pass
         // through untouched.
-        if let Some(err) = missing_env_key_error(&req.model.api_key_ref, &key, &req.model.provider) {
+        if let Some(err) = missing_env_key_error(&req.model.api_key_ref, &key, &req.model.provider)
+        {
             return Err(err);
         }
         let url = format!(
