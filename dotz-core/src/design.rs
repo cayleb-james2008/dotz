@@ -291,8 +291,14 @@ mod tests {
         let slug_dir = make_slug_dir(&pi, "stripe");
         std::fs::write(slug_dir.join("components.html"), "<h1>ok</h1>").unwrap();
 
-        assert_eq!(system_components_html("stripe").await.unwrap(), "<h1>ok</h1>");
-        assert_eq!(system_components_html("_schema").await.unwrap_err(), "bad id");
+        assert_eq!(
+            system_components_html("stripe").await.unwrap(),
+            "<h1>ok</h1>"
+        );
+        assert_eq!(
+            system_components_html("_schema").await.unwrap_err(),
+            "bad id"
+        );
         assert_eq!(
             system_components_html("missing").await.unwrap_err(),
             "no components for this system"

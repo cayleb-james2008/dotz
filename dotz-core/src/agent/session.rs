@@ -2554,14 +2554,14 @@ mod tests {
                                     .map(String::from);
                             }
                         }
-                        Some("step_state") => {
+                        Some("step_state")
                             if run_id.is_some()
-                                && frame.get("runId").and_then(|v| v.as_str()) == run_id.as_deref()
-                            {
-                                let st = ev.and_then(|e| e.get("status")).and_then(|v| v.as_str());
-                                if matches!(st, Some("done") | Some("error")) {
-                                    saw_terminal_step = true;
-                                }
+                                && frame.get("runId").and_then(|v| v.as_str())
+                                    == run_id.as_deref() =>
+                        {
+                            let st = ev.and_then(|e| e.get("status")).and_then(|v| v.as_str());
+                            if matches!(st, Some("done") | Some("error")) {
+                                saw_terminal_step = true;
                             }
                         }
                         _ => {}

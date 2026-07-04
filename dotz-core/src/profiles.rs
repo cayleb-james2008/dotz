@@ -315,7 +315,10 @@ mod tests {
     #[test]
     fn pantheon_doctrine_mandates_the_capability_spine() {
         let d = doctrine("new-model-new-project", "");
-        assert!(d.starts_with(WORKFLOW_DOCTRINE), "spine builds on workflow doctrine");
+        assert!(
+            d.starts_with(WORKFLOW_DOCTRINE),
+            "spine builds on workflow doctrine"
+        );
         for needle in [
             "REQUIRED CAPABILITY SPINE",
             "design_use",
@@ -326,7 +329,10 @@ mod tests {
             "skipped CI: Actions disabled at account level",
             "OLLAMA_API_KEY",
         ] {
-            assert!(d.contains(needle), "pantheon doctrine must mention: {needle}");
+            assert!(
+                d.contains(needle),
+                "pantheon doctrine must mention: {needle}"
+            );
         }
     }
 }
