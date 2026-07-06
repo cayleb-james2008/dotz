@@ -396,13 +396,32 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
                 String::from_utf8_lossy(&stderr_buf)
             );
             let (passed, failed) = parse_counts(&text);
-            json!({
-                "exitCode": status.code(),
-                "ok": status.success(),
-                "passed": passed,
-                "failed": failed,
-                "tail": text.chars().rev().take(800).collect::<String>().chars().rev().collect::<String>(),
-            })
+            // Failure-catalog countermeasure #1 (value-blind objective): a gate that exits 0
+            // while producing ZERO parseable test evidence (passed:0, failed:0) is
+            // UNOBSERVABLE — it must read RED, never green. An empty/missing suite counting
+            // green is exactly how the RSI loop promoted on zero information.
+            let observable = passed > 0 || failed > 0;
+            let ok = status.success() && observable;
+            let tail: String = text.chars().rev().take(800).collect::<String>().chars().rev().collect();
+            if status.success() && !observable {
+                json!({
+                    "exitCode": status.code(),
+                    "ok": false,
+                    "unobservable": true,
+                    "error": "gate unobservable: command exited 0 but produced no test counts (0 passed / 0 failed) — an empty suite does not count green",
+                    "passed": passed,
+                    "failed": failed,
+                    "tail": tail,
+                })
+            } else {
+                json!({
+                    "exitCode": status.code(),
+                    "ok": ok,
+                    "passed": passed,
+                    "failed": failed,
+                    "tail": tail,
+                })
+            }
         }
         Ok(Err(e)) => json!({
             "error": format!("gate run failed: {e}"),
@@ -555,7 +574,15 @@ impl Tool for RsiCompareTool {
         let bf = base.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
         let np = now.get("passed").and_then(|v| v.as_i64()).unwrap_or(0);
         let nf = now.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
-        let verdict = if nf > bf || np < bp {
+        // Failure-catalog #1: an unobservable current gate (exit 0, zero parsed counts) can
+        // never be read as NO CHANGE / IMPROVEMENT — surface it as its own hard verdict.
+        let now_unobservable = now
+            .get("unobservable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let verdict = if now_unobservable {
+            "UNOBSERVABLE"
+        } else if nf > bf || np < bp {
             "REGRESSION"
         } else if np > bp || nf < bf {
             "IMPROVEMENT"
@@ -1355,6 +1382,56 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(15),
             "gate timeout should fire on the configured 1s timeout, not the default, elapsed: {elapsed:?}"
+        );
+    }
+
+    /// Failure-catalog #1 (the autopsy's top pattern): an empty test suite must NOT count
+    /// green. A gate command that exits 0 while emitting zero parseable test counts
+    /// (passed:0 / failed:0) is unobservable evidence — `run_gate` must report ok:false
+    /// with an explicit `unobservable` marker, never `{ok:true, passed:0}`.
+    #[tokio::test]
+    async fn run_gate_empty_suite_exit_zero_reads_red() {
+        let dir = tmp_dir();
+        // Exits 0, prints no test counts — the exact "empty suite counted green" shape.
+        let result = run_gate(&dir, Some("echo build finished cleanly")).await;
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            result.get("ok").and_then(|v| v.as_bool()),
+            Some(false),
+            "exit-0 with zero parsed test evidence must be RED: {result}"
+        );
+        assert_eq!(
+            result.get("unobservable").and_then(|v| v.as_bool()),
+            Some(true),
+            "zero-evidence gate must carry the unobservable marker: {result}"
+        );
+        let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            error.contains("unobservable"),
+            "error should explain the unobservable verdict, got: {error}"
+        );
+        assert_eq!(result.get("exitCode").and_then(|v| v.as_i64()), Some(0));
+    }
+
+    /// The inverse guard: real test evidence with exit 0 still reads green, so the
+    /// unobservable tripwire does not break legitimate gate runs.
+    #[tokio::test]
+    async fn run_gate_with_parsed_counts_exit_zero_reads_green() {
+        let dir = tmp_dir();
+        let result = run_gate(&dir, Some("echo 5 passed, 0 failed")).await;
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            result.get("ok").and_then(|v| v.as_bool()),
+            Some(true),
+            "exit-0 with parsed counts must stay green: {result}"
+        );
+        assert_eq!(result.get("passed").and_then(|v| v.as_i64()), Some(5));
+        assert_eq!(result.get("failed").and_then(|v| v.as_i64()), Some(0));
+        assert!(
+            result.get("unobservable").is_none(),
+            "observable gate must not carry the unobservable marker: {result}"
         );
     }
 

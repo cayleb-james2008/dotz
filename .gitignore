@@ -18,3 +18,4 @@ data/
 /src-tauri/gen/
 /src-tauri/permissions/
 /src-tauri/target/
+.dotz-revive-logs/

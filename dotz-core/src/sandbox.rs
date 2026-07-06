@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
 
 /// Language list, in the exact order of LANGUAGES in sandbox.ts (Object.keys order).
@@ -431,31 +431,19 @@ async fn execute_run(
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let (output, status) = match tx {
-        Some(tx) => {
-            let st = tokio::spawn(stream_output(id.clone(), mode.clone(), stdout, stderr, tx));
-            let (status, output) = tokio::join!(child.wait(), st);
-            (output.unwrap_or_default(), status)
-        }
-        None => {
-            let read_out = async {
-                let mut buf = Vec::new();
-                if let Some(mut s) = stdout {
-                    let _ = s.read_to_end(&mut buf).await;
-                }
-                buf
-            };
-            let read_err = async {
-                let mut buf = Vec::new();
-                if let Some(mut s) = stderr {
-                    let _ = s.read_to_end(&mut buf).await;
-                }
-                buf
-            };
-            let (out, err, status) = tokio::join!(read_out, read_err, child.wait());
-            let output = String::from_utf8_lossy(&out).to_string() + &String::from_utf8_lossy(&err);
-            (output, status)
-        }
+    // Always take the streaming path. A run started without a WS sender (REST
+    // `POST /api/sandbox/runs`, verify checks) previously fell into a read-to-end branch that
+    // buffered ALL output until process exit and never ran `detect_port_in_window` — so a
+    // `mode:"web"` run started over REST could NEVER publish its port while alive, and
+    // `GET /api/sandbox/runs/:id/port` (the documented polling mirror of `sandbox_port`)
+    // 404'd for its entire lifetime. A receiver-less broadcast channel keeps the streaming
+    // machinery intact: line events are dropped harmlessly (`send` errors are ignored) while
+    // web-port detection still caches the port on the run record.
+    let tx = tx.unwrap_or_else(|| broadcast::channel(16).0);
+    let (output, status) = {
+        let st = tokio::spawn(stream_output(id.clone(), mode.clone(), stdout, stderr, tx));
+        let (status, output) = tokio::join!(child.wait(), st);
+        (output.unwrap_or_default(), status)
     };
 
     if let Some(w) = watchdog {
@@ -865,6 +853,47 @@ fn not_found(msg: &str) -> (StatusCode, Json<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a `mode:"web"` run started WITHOUT a WS broadcast sender (the REST
+    /// `POST /api/sandbox/runs` path, tx = None) must still detect its web port while the run
+    /// is alive. Before the always-stream fix, the tx=None branch buffered all output until
+    /// process exit, `detect_port_in_window` never ran, and `GET .../port` 404'd forever.
+    ///
+    /// The test binds its own listener (so the probed port is genuinely open), has the
+    /// sandboxed script print a listener banner and stay alive, and asserts the port lands in
+    /// the run-record cache mid-run.
+    #[tokio::test]
+    async fn web_run_without_ws_sender_still_detects_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let code = format!("echo \"listening on 127.0.0.1:{port}\"\nsleep 20\n");
+        let run = start_run("bash", &code, "web", None, 30_000, None, None)
+            .await
+            .expect("start_run should succeed");
+
+        // Poll the run-record port cache (what GET /api/sandbox/runs/:id/port serves first).
+        let mut detected = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            detected = runs_guard().get(&run.id).and_then(|e| e.port);
+            if detected.is_some() {
+                break;
+            }
+        }
+
+        // Clean up the child before asserting so a failure doesn't leak a 20s sleeper.
+        let pid = runs_guard().get(&run.id).and_then(|e| e.pid);
+        mark_killed_by_us(&run.id);
+        kill_pid(pid);
+        drop(listener);
+
+        assert_eq!(
+            detected,
+            Some(port),
+            "web run started with tx=None must cache its detected port mid-run"
+        );
+    }
 
     /// `try_mark_end_emitted` must return true only for the first caller so the sandbox-start
     /// poller and the sandbox-kill handler don't both emit `sandbox_end` for the same run.
