@@ -1932,8 +1932,14 @@ mod tests {
 
     /// `session_count` must reflect the number of active browser sessions so the `/api/health`
     /// endpoint can surface live browser activity to the operator.
+    ///
+    /// Serialized under `BROWSER_TIMEOUT_TEST_LOCK`: the session store is process-global, and
+    /// every other test that mutates it holds this lock. Without it, a parallel test's
+    /// insert/remove lands between our baseline read and the `baseline + 2` assert (observed
+    /// flake: left 3 / right 2), and our inserted sessions break their `is_empty` asserts.
     #[test]
     fn session_count_reflects_active_sessions() {
+        let _guard = BROWSER_TIMEOUT_TEST_LOCK.blocking_lock();
         let baseline = session_count();
         let sid1 = format!("dotz-count-1-{}", uuid::Uuid::new_v4());
         let sid2 = format!("dotz-count-2-{}", uuid::Uuid::new_v4());
