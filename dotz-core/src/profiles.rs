@@ -4,7 +4,19 @@
 use crate::types::{default_model, ModelRef};
 use serde::Serialize;
 
-// ---- operating doctrines (verbatim port of profiles.ts) ----
+// ---- operating doctrines (ported from profiles.ts with the local Ultra Code override) ----
+
+pub const ULTRA_CODE_OVERRIDE_DOCTRINE: &str = r#"# dotz canonical harness: Ultra Code
+
+For every non-trivial task, call the `skill` tool for `ultra-code` before planning, editing,
+subagent dispersal, OpenSpec work, workflow execution, review, or verification. Treat Ultra Code as
+the canonical harness and first instruction layer.
+
+dotz-specific OpenSpec, subagent, workflow graph, sandbox, design, memory, and RSI behavior are host
+adapters under Ultra Code. They extend the canonical harness; they do not compete with it.
+
+Only skip loading `ultra-code` for genuinely trivial direct answers or one-line mechanical edits.
+When in doubt, load Ultra Code first."#;
 
 pub const WORKFLOW_DOCTRINE: &str = r#"# dotz operating mode: ULTRA + WORKFLOW (multi-agent dispersal — DEFAULT)
 
@@ -182,7 +194,7 @@ pub fn get(id: Option<&str>) -> Profile {
 /// The appendSystemPrompt doctrine for a profile id (verbatim port of PROFILES[].appendSystemPrompt).
 /// `design_systems_dir` is interpolated into the DESIGN doctrine (mirrors profiles.ts DESIGN_SYSTEMS_DIR).
 pub fn doctrine(id: &str, design_systems_dir: &str) -> String {
-    match id {
+    let profile_doctrine = match id {
         "solo" => SOLO_DOCTRINE.to_string(),
         "plan" => PLAN_DOCTRINE.to_string(),
         "frontend" => format!("{WORKFLOW_DOCTRINE}{FRONTEND_DOMAIN}"),
@@ -193,7 +205,8 @@ pub fn doctrine(id: &str, design_systems_dir: &str) -> String {
         ),
         "new-model-new-project" => format!("{WORKFLOW_DOCTRINE}{NEW_MODEL_NEW_PROJECT_DOMAIN}"),
         _ => WORKFLOW_DOCTRINE.to_string(),
-    }
+    };
+    format!("{ULTRA_CODE_OVERRIDE_DOCTRINE}\n\n{profile_doctrine}")
 }
 
 /// Max tool-rounds per turn before the loop pauses (the user resumes with a "continue"). The
@@ -310,14 +323,50 @@ mod tests {
         assert!(!is_valid("plan;drop table"));
     }
 
+    #[test]
+    fn every_profile_loads_ultra_code_as_the_canonical_harness() {
+        for id in [
+            "workflow",
+            "solo",
+            "plan",
+            "frontend",
+            "backend",
+            "design",
+            "new-model-new-project",
+        ] {
+            let d = doctrine(id, "C:/design-systems");
+            assert!(
+                d.starts_with(ULTRA_CODE_OVERRIDE_DOCTRINE),
+                "{id} should start with the Ultra Code override"
+            );
+            for needle in [
+                "ultra-code",
+                "canonical harness",
+                "skill` tool",
+                "OpenSpec",
+                "subagent",
+                "workflow",
+            ] {
+                assert!(
+                    d.contains(needle),
+                    "{id} doctrine must mention Ultra Code adapter rule: {needle}"
+                );
+            }
+        }
+    }
+
     /// The pantheon doctrine must build on WORKFLOW_DOCTRINE and mandate the required capability
     /// spine: the new design/sandbox tools, the app-icon + E2E requirements, and the honest CI gate.
     #[test]
     fn pantheon_doctrine_mandates_the_capability_spine() {
         let d = doctrine("new-model-new-project", "");
         assert!(
-            d.starts_with(WORKFLOW_DOCTRINE),
-            "spine builds on workflow doctrine"
+            d.starts_with(ULTRA_CODE_OVERRIDE_DOCTRINE),
+            "spine starts with the canonical Ultra Code override"
+        );
+        assert!(
+            d.contains(WORKFLOW_DOCTRINE),
+            "spine still builds on workflow doctrine"
         );
         for needle in [
             "REQUIRED CAPABILITY SPINE",

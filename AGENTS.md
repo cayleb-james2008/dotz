@@ -5,6 +5,14 @@ multi-agent coding interface with **on-the-fly workflow graphs, unified skills a
 opencode/claude/codex/ecc/superpowers pools, `.ai-agents` global memory, and recursive
 self-improvement wiring**, packaged as a single Electron `.exe`.
 
+## Canonical harness
+
+Ultra Code is the canonical agent harness for dotz. Non-trivial sessions should load
+`ultra-code` from the highest-priority dotz-local skill pool
+(`~/.dotz/ai-agents/skills/ultra-code`) before planning, editing, subagent dispersal, OpenSpec
+work, review, or verification. dotz OpenSpec, subagent, workflow graph, sandbox, design, memory,
+and RSI behavior are host adapters under Ultra Code rather than a competing harness.
+
 ## Distribution
 
 **Operator preference: ship a single self-contained Windows exe.** dotz packages as one Electron executable (portable `release/dotz <version>.exe` + NSIS installer) — Node, the pi SDK, and the UI are all bundled. The operator runs the exe directly.
@@ -15,7 +23,7 @@ self-improvement wiring**, packaged as a single Electron `.exe`.
 
 dotz embeds pi's SDK **directly** (`@earendil-works/pi-coding-agent`), so the dashboard server *is*
 the agent — no subprocess, nothing to version separately. `src/profiles.ts` loads the bundled
-`.pi/` resources (subagent extension + dotz-tools extension + 4 agents + 3 workflow prompts) and
+`.pi/` resources (subagent extension + dotz-tools extension + agents + workflow prompts) and
 injects the active profile's doctrine + the unified skill index + project memory as
 `appendSystemPrompt`. `src/skills.ts` discovers 300+ `SKILL.md` files across the opencode, claude,
 codex/ecc, superpowers, hermes, and bundled `.pi/skills` pools, dedupes by name, and exposes a
@@ -201,7 +209,8 @@ three), `POST|GET /api/connections/:provider/login` (start + stream output),
 
 ## Workflow presets
 
-`.pi/prompts/` contains 6 slash-command presets:
+`.pi/prompts/` includes these core slash-command presets:
+- `/ultra-code` - load the canonical Ultra Code harness, then use dotz adapters
 - `/scout-and-plan` — scout → planner (no edits)
 - `/implement` — scout → planner → worker
 - `/implement-and-review` — worker → reviewer → worker (applies feedback)
@@ -235,7 +244,7 @@ three), `POST|GET /api/connections/:provider/login` (start + stream output),
 - `src/main.ts` / `src/preload.ts` — Electron main + contextIsolation preload.
 - `web/` — vanilla JS bento dashboard (project launcher, progressive panel disclosure, drag-and-drop,
   on-the-fly SVG workflow graph, skills/memory/sandbox/brain panels).
-- `.pi/` — bundled agent resources (subagent extension, dotz-tools extension, agents, 6 workflow prompts).
+- `.pi/` — bundled agent resources (subagent extension, dotz-tools extension, agents, workflow prompts).
   Shipped in the exe via `electron-builder.yml` `files:`.
 - `.pi/extensions/dotz-tools/index.ts` — registers the dotz pi tools: dynamic resource tools
   `create_agent` / `list_agents` / `create_skill` / `list_skills`; `skill`; the mem0 memory tools
@@ -253,7 +262,7 @@ npm run typecheck                      # tsc --noEmit — must be clean
 npx tsx scripts/verify-profiles.mjs   # e2e: profiles + .pi bundle + subagent + dotz-tools surface
 npx tsx scripts/verify-ui.mjs          # e2e: UI markup + profiles API
 npx tsx scripts/verify-features.mjs    # e2e: projects + memory + sandbox + multi-provider (11 providers)
-npx tsx scripts/verify-ultra.mjs       # e2e: 320 skills + workflows + .ai-agents memory + RSI/browser tools + 6 presets + Ollama
+npx tsx scripts/verify-ultra.mjs       # e2e: 320 skills + workflows + .ai-agents memory + RSI/browser tools + presets + Ollama
 npx tsx scripts/verify-memory.ts       # e2e: mem0 memory OFFLINE (add/search/consolidate/MEMORY.md mirror) — no network/keys
 npx tsx scripts/verify-memory-live.ts  # e2e: live capture→recall against Ollama Cloud (needs $OLLAMA_API_KEY)
 npm run dev:server                      # http://127.0.0.1:4317 (browser dev loop)
