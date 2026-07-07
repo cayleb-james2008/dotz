@@ -127,7 +127,21 @@ pub fn load() -> DotzConfig {
     let mut explicit_subagent = false;
     let mut provider_invalid = false;
     if let Ok(raw) = std::fs::read_to_string(config_file()) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+        // A corrupt config.json silently fell back to *all* defaults — an operator whose file got
+        // truncated or hand-edited into invalid JSON would see provider/model/thinking reset with
+        // no explanation. Surface the parse failure; the default-fallback behavior is unchanged.
+        let parsed = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!(
+                    "config: {} is not valid JSON ({e}); using default configuration. \
+                     Fix or remove the file to restore your settings.",
+                    config_file().display()
+                );
+                None
+            }
+        };
+        if let Some(v) = parsed {
             if let Some(p) = v.get("provider").and_then(|x| x.as_str()) {
                 if types::is_known_provider(p) {
                     cfg.provider = p.to_string();
@@ -747,6 +761,37 @@ mod tests {
             assert_eq!(
                 loaded.executive_model, "ollama/glm-5.2",
                 "a mismatched provider prefix must not be stripped"
+            );
+        });
+    }
+
+    /// A config.json that is not valid JSON at all (truncated, hand-mangled) must degrade to the
+    /// default configuration rather than panicking. This pins the graceful-degradation contract for
+    /// the top-level parse: load() never crashes the process on a corrupt config file. The parse
+    /// failure is surfaced to stderr (see load()), but the returned config is still the default.
+    #[test]
+    fn load_degrades_to_defaults_on_invalid_json() {
+        with_tmp_dir(|_| {
+            let file = config_file();
+            std::fs::write(&file, b"{ not valid json at all ]").unwrap();
+
+            let loaded = load();
+            let default = DotzConfig::default();
+            assert_eq!(
+                loaded.provider, default.provider,
+                "invalid JSON config must fall back to the default provider"
+            );
+            assert_eq!(
+                loaded.executive_model, default.executive_model,
+                "invalid JSON config must fall back to the default executive model"
+            );
+            assert_eq!(
+                loaded.subagent_model, default.subagent_model,
+                "invalid JSON config must fall back to the default subagent model"
+            );
+            assert_eq!(
+                loaded.thinking_level, default.thinking_level,
+                "invalid JSON config must fall back to the default thinking level"
             );
         });
     }

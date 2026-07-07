@@ -89,12 +89,28 @@ fn projects_file() -> std::path::PathBuf {
 
 /// Read+parse the JSON store. Guards a hand-edited non-array store ({}, null, 42, …) by treating it
 /// as empty (matches readAll's `Array.isArray(parsed) ? … : []`). Missing/unreadable file → [].
+///
+/// A parse failure degrades to an empty store (same as before) but is now surfaced to stderr:
+/// silently returning `[]` on a corrupt or hand-edited store dropped every persisted project with
+/// no trace, so an operator who fat-fingered projects.json saw their whole registry vanish on the
+/// next read with nothing to diagnose. Degradation is unchanged — only the diagnosability improves.
 fn read_all_from_disk() -> Vec<Project> {
-    let raw = match std::fs::read_to_string(projects_file()) {
+    let path = projects_file();
+    let raw = match std::fs::read_to_string(&path) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
-    serde_json::from_str::<Vec<Project>>(&raw).unwrap_or_default()
+    match serde_json::from_str::<Vec<Project>>(&raw) {
+        Ok(projects) => projects,
+        Err(e) => {
+            eprintln!(
+                "projects: {} is not a valid project array ({e}); starting with an empty project \
+                 store. Fix or remove the file to recover persisted projects.",
+                path.display()
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Persist the full array (pretty-printed, matching `JSON.stringify(projects, null, 2)`).
@@ -1088,5 +1104,44 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt or hand-edited projects.json (invalid JSON, or valid JSON that is not a project
+    /// array) must degrade to an empty store rather than panicking. This pins the graceful-
+    /// degradation contract the store relies on: read_all_from_disk never crashes the process,
+    /// even on garbage input, so a fat-fingered file can't brick the REST endpoints or the session
+    /// binder. The parse failure is surfaced to stderr (see read_all_from_disk) but still returns [].
+    #[test]
+    fn read_all_from_disk_degrades_on_corrupt_store() {
+        let _g = with_tmp_projects_file();
+        let path = projects_file();
+
+        // Invalid JSON (truncated / garbage) → empty store, no panic.
+        std::fs::write(&path, b"{ this is not valid json ]").unwrap();
+        assert!(
+            read_all_from_disk().is_empty(),
+            "invalid JSON must degrade to an empty project store"
+        );
+
+        // Valid JSON but the wrong shape (an object, not an array) → empty store, no panic.
+        std::fs::write(&path, br#"{"not":"an array"}"#).unwrap();
+        assert!(
+            read_all_from_disk().is_empty(),
+            "a non-array JSON store must degrade to an empty project store"
+        );
+
+        // Valid JSON array of the wrong element type → empty store, no panic.
+        std::fs::write(&path, b"[1, 2, 3]").unwrap();
+        assert!(
+            read_all_from_disk().is_empty(),
+            "an array of the wrong element type must degrade to an empty project store"
+        );
+
+        // A well-formed store still round-trips (proves the degradation path didn't break parsing).
+        std::fs::write(&path, b"[]").unwrap();
+        assert!(
+            read_all_from_disk().is_empty(),
+            "an empty JSON array is a valid, empty project store"
+        );
     }
 }
