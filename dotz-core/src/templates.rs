@@ -193,7 +193,19 @@ fn user_path(id: &str) -> PathBuf {
 fn load_user(id: &str) -> Option<Template> {
     let path = user_path(id);
     let raw = std::fs::read_to_string(&path).ok()?;
-    let mut t: Template = serde_json::from_str(&raw).ok()?;
+    let mut t: Template = match serde_json::from_str(&raw) {
+        Ok(t) => t,
+        Err(e) => {
+            // A corrupt per-template file silently disappeared from the template list with no
+            // trace. Skip it as before, but tell the operator which file failed and why so the
+            // missing template is diagnosable rather than a mystery.
+            eprintln!(
+                "templates: {} is not a valid template ({e}); skipping it.",
+                path.display()
+            );
+            return None;
+        }
+    };
     t.id = id.to_string();
     t.source = "user".to_string();
     t.origin = None;
@@ -758,5 +770,36 @@ mod tests {
     fn run_rejects_missing_template() {
         let err = run("missing-id", "no-such-session", &json!(null)).unwrap_err();
         assert!(err.contains("no such template"));
+    }
+
+    /// A corrupt per-template JSON file must be skipped (load_user → None) rather than panicking.
+    /// This pins the graceful-degradation contract: a single mangled template file cannot crash the
+    /// template loader or make the whole template list unavailable. The parse failure is surfaced to
+    /// stderr (see load_user), but a well-formed template written afterward still loads.
+    #[test]
+    fn load_user_skips_corrupt_template_file() {
+        let _g = isolated_user_dir();
+        ensure_user_dir().unwrap();
+
+        // Invalid JSON in the template file → None, no panic.
+        std::fs::write(user_path("broken"), b"{ not json ]").unwrap();
+        assert!(
+            load_user("broken").is_none(),
+            "a corrupt template file must be skipped, not loaded"
+        );
+
+        // Valid JSON but the wrong shape (missing required fields) → None, no panic.
+        std::fs::write(user_path("wrongshape"), br#"{"foo":"bar"}"#).unwrap();
+        assert!(
+            load_user("wrongshape").is_none(),
+            "a template file with the wrong shape must be skipped"
+        );
+
+        // A well-formed template written through the normal path still loads (proves the
+        // degradation path didn't break ordinary loading).
+        let created = create("Good One".into(), "hello world".into(), None, None).unwrap();
+        let loaded = load_user(&created.id).expect("a well-formed template must still load");
+        assert_eq!(loaded.name, "Good One");
+        assert_eq!(loaded.source, "user");
     }
 }
