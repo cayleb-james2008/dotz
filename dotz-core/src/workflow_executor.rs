@@ -71,18 +71,36 @@ struct ReadyStep {
 
 /// Extract the tool calls a subagent made from its recorded `messages`, panel-tagged, for the
 /// step's durable `toolCalls` (graph sub-node chips). Assistant tool-call blocks are
-/// `{"type":"toolCall","id","name"}` (event.rs), tool results are top-level
-/// `{"role":"tool","toolCallId",...,"isError":true}` (subagent.rs) — a call is errored if its
-/// result message carries `isError:true`. De-dupes by tool-call id, preserving first-seen order.
+/// `{"type":"toolCall","id","name","arguments"}` (event.rs), tool results are top-level
+/// `{"role":"tool","toolCallId","content":[{"type":"text","text"}],...,"isError":true}`
+/// (subagent.rs) — a call is errored if its result message carries `isError:true`. De-dupes by
+/// tool-call id, preserving first-seen order. Captures capped `args` (from the toolCall block)
+/// and `result` (the tool message's text content) so the graph drawer is a complete, inspectable
+/// record of what each tool did — not just a colored chip.
 fn tool_calls_from_messages(messages: &[serde_json::Value]) -> Vec<workflows::ToolCallRef> {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     let mut errored: HashSet<String> = HashSet::new();
+    // tool-call id → joined result text (from `{"role":"tool",...}` messages).
+    let mut results: HashMap<String, String> = HashMap::new();
     for m in messages {
-        if m.get("role").and_then(|r| r.as_str()) == Some("tool")
-            && m.get("isError").and_then(|e| e.as_bool()) == Some(true)
-        {
+        if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
             if let Some(id) = m.get("toolCallId").and_then(|v| v.as_str()) {
-                errored.insert(id.to_string());
+                if m.get("isError").and_then(|e| e.as_bool()) == Some(true) {
+                    errored.insert(id.to_string());
+                }
+                if let Some(content) = m.get("content").and_then(|c| c.as_array()) {
+                    let entry = results.entry(id.to_string()).or_default();
+                    for b in content {
+                        if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                if !entry.is_empty() {
+                                    entry.push('\n');
+                                }
+                                entry.push_str(t);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -107,11 +125,18 @@ fn tool_calls_from_messages(messages: &[serde_json::Value]) -> Vec<workflows::To
                 if id.is_empty() || !seen.insert(id.clone()) {
                     continue;
                 }
+                let args = b
+                    .get("arguments")
+                    .and_then(|a| serde_json::to_string(a).ok())
+                    .map(|s| workflows::ToolCallRef::cap_str(&s));
+                let result = results.get(&id).map(|s| workflows::ToolCallRef::cap_str(s));
                 out.push(workflows::ToolCallRef {
                     is_error: errored.contains(&id),
                     panel: crate::agent::session::panel_for_tool(&name).map(str::to_string),
                     tool_call_id: id,
                     tool_name: name,
+                    args,
+                    result,
                 });
             }
         }
@@ -529,6 +554,70 @@ mod tests {
             model: None,
             cwd: None,
         }
+    }
+
+    /// `tool_calls_from_messages` must capture capped `args` (from the toolCall block) AND
+    /// `result` (the matching tool-message text), so the graph drawer is the inspectable record
+    /// of what each tool did — not just a colored chip. Verifies the join by tool-call id and
+    /// that a non-errored tool result is not flagged.
+    #[test]
+    fn tool_calls_from_messages_captures_args_and_result() {
+        let messages = vec![
+            json!({"role":"assistant","content":[{"type":"toolCall","id":"call_1","name":"bash","arguments":{"command":"ls -la"}}]}),
+            json!({"role":"tool","toolCallId":"call_1","content":[{"type":"text","text":"total 0\ndrwxr-xr-x 2 root root 40 Jul 9 12:00 ."}]}),
+        ];
+        let refs = tool_calls_from_messages(&messages);
+        assert_eq!(refs.len(), 1);
+        let tc = &refs[0];
+        assert_eq!(tc.tool_call_id, "call_1");
+        assert_eq!(tc.tool_name, "bash");
+        assert!(!tc.is_error, "non-error tool result must not be flagged");
+        assert_eq!(
+            tc.args.as_deref(),
+            Some(r#"{"command":"ls -la"}"#),
+            "args must be the JSON-serialized arguments"
+        );
+        assert_eq!(
+            tc.result.as_deref(),
+            Some("total 0\ndrwxr-xr-x 2 root root 40 Jul 9 12:00 ."),
+            "result must be the joined tool-message text"
+        );
+    }
+
+    /// An errored tool result (`isError:true` on the tool message) must surface as
+    /// `is_error: true` on the ToolCallRef, with the error text captured as `result`.
+    #[test]
+    fn tool_calls_from_messages_flags_errored_result() {
+        let messages = vec![
+            json!({"role":"assistant","content":[{"type":"toolCall","id":"c2","name":"read","arguments":{"path":"/nope"}}]}),
+            json!({"role":"tool","toolCallId":"c2","isError":true,"content":[{"type":"text","text":"no such file"}]}),
+        ];
+        let refs = tool_calls_from_messages(&messages);
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].is_error, "isError tool message must flag the ref");
+        assert_eq!(refs[0].result.as_deref(), Some("no such file"));
+    }
+
+    /// `ToolCallRef::cap_str` truncates on a UTF-8 char boundary (never panics on multibyte)
+    /// and appends the marker once. Verifies the bound + marker for an over-CAP input and a
+    /// no-op for an under-CAP input (so small args/results are unchanged).
+    #[test]
+    fn tool_call_ref_cap_str_truncates_on_char_boundary() {
+        let under = "small";
+        assert_eq!(workflows::ToolCallRef::cap_str(under), "small");
+
+        let big = "a".repeat(workflows::ToolCallRef::CAP + 200);
+        let capped = workflows::ToolCallRef::cap_str(&big);
+        assert!(capped.len() <= workflows::ToolCallRef::CAP + "…[truncated]".len());
+        assert!(
+            capped.ends_with("…[truncated]"),
+            "over-cap input must end with the truncation marker"
+        );
+
+        let multi = "🦀".repeat(workflows::ToolCallRef::CAP);
+        let capped_multi = workflows::ToolCallRef::cap_str(&multi);
+        assert!(capped_multi.len() <= workflows::ToolCallRef::CAP + "…[truncated]".len());
+        assert!(capped_multi.is_char_boundary(capped_multi.len()));
     }
 
     fn set_tmp_workflows_file() -> std::path::PathBuf {

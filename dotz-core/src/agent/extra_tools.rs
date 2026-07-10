@@ -402,7 +402,14 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
             // green is exactly how the RSI loop promoted on zero information.
             let observable = passed > 0 || failed > 0;
             let ok = status.success() && observable;
-            let tail: String = text.chars().rev().take(800).collect::<String>().chars().rev().collect();
+            let tail: String = text
+                .chars()
+                .rev()
+                .take(800)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
             if status.success() && !observable {
                 json!({
                     "exitCode": status.code(),

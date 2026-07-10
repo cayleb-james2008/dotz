@@ -597,11 +597,22 @@ async fn run_single_agent_inner(
         let stream_task = tokio::spawn(async move { adapter.stream(req, delta_tx).await });
         let deadline = tokio::time::Instant::now() + subagent_timeout();
 
+        // The executor path (run_id + step_id present) bridges live reasoning + tool activity
+        // onto the WORKFLOW event channel so the graph node is the single source of truth.
+        // Hoisted above the stream loop so both the reasoning bridge (below) and the tool-call
+        // bridge (after the loop) can read it.
+        let live_run_id = bus.map(|b| b.run_id().to_string());
+
         let mut acc = Acc::new(&provider_id, &model_id, crate::util::now_ms());
         let mut stop_reason = "stop".to_string();
         // Clone the progress sender once per round so each delta can be forwarded without
         // holding a borrow across the apply_delta call.
         let progress = progress_tx.clone();
+        // Bridge subagent reasoning onto the graph channel: coalesce tiny deltas into ≤256-char
+        // chunks so a token-by-token reasoning stream doesn't flood the WS (one frame per ~40
+        // tokens rather than one per token). Flushed on Stop / round end below.
+        let mut think_buf = String::new();
+        let mut text_buf = String::new();
         loop {
             match tokio::time::timeout_at(deadline, delta_rx.recv()).await {
                 Ok(Some(delta)) => {
@@ -610,6 +621,51 @@ async fn run_single_agent_inner(
                     if let Some(tx) = &progress {
                         let _ = tx.send(delta.clone()).await;
                     }
+                    // Bridge reasoning onto the graph channel (executor path only). Thinking deltas
+                    // stream as `step_thinking` so the graph node is the live reasoning surface; text
+                    // deltas stream too (the subagent's visible narration) so the operator can read
+                    // what the agent is concluding without leaving the graph.
+                    if let (Some(rid), Some(sid)) = (&live_run_id, step_id) {
+                        match &delta {
+                            crate::agent::provider::StreamDelta::Thinking(s) => {
+                                think_buf.push_str(s);
+                                if think_buf.len() >= 256 {
+                                    let payload = std::mem::take(&mut think_buf);
+                                    crate::workflows::emit_event(
+                                        rid,
+                                        json!({"type":"step_thinking","stepId":sid,"phase":"thinking","text":payload}),
+                                    );
+                                }
+                            }
+                            crate::agent::provider::StreamDelta::Text(s) => {
+                                text_buf.push_str(s);
+                                if text_buf.len() >= 256 {
+                                    let payload = std::mem::take(&mut text_buf);
+                                    crate::workflows::emit_event(
+                                        rid,
+                                        json!({"type":"step_thinking","stepId":sid,"phase":"text","text":payload}),
+                                    );
+                                }
+                            }
+                            crate::agent::provider::StreamDelta::Stop(_) => {
+                                if !think_buf.is_empty() {
+                                    let payload = std::mem::take(&mut think_buf);
+                                    crate::workflows::emit_event(
+                                        rid,
+                                        json!({"type":"step_thinking","stepId":sid,"phase":"thinking","text":payload}),
+                                    );
+                                }
+                                if !text_buf.is_empty() {
+                                    let payload = std::mem::take(&mut text_buf);
+                                    crate::workflows::emit_event(
+                                        rid,
+                                        json!({"type":"step_thinking","stepId":sid,"phase":"text","text":payload}),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     apply_delta(&mut acc, delta, &mut stop_reason);
                 }
                 Ok(None) => break,
@@ -617,6 +673,25 @@ async fn run_single_agent_inner(
                     stream_task.abort();
                     return timeout_result(agent_name, task, step);
                 }
+            }
+        }
+
+        // Flush any trailing reasoning that didn't hit the 256-char coalesce threshold or a Stop
+        // delta (a round can end on Ok(None) without a final Stop). Same executor-path guard.
+        if let (Some(rid), Some(sid)) = (&live_run_id, step_id) {
+            if !think_buf.is_empty() {
+                let payload = std::mem::take(&mut think_buf);
+                crate::workflows::emit_event(
+                    rid,
+                    json!({"type":"step_thinking","stepId":sid,"phase":"thinking","text":payload}),
+                );
+            }
+            if !text_buf.is_empty() {
+                let payload = std::mem::take(&mut text_buf);
+                crate::workflows::emit_event(
+                    rid,
+                    json!({"type":"step_thinking","stepId":sid,"phase":"text","text":payload}),
+                );
             }
         }
 
@@ -691,26 +766,38 @@ async fn run_single_agent_inner(
         // Live per-tool streaming: on the executor path (run_id + step_id present) emit a
         // `step_tool` event on each tool start/end so the graph lights up a panel-colored sub-node
         // chip the instant a tool fires — the graph is the operator's live view of the agent.
-        let live_run_id = bus.map(|b| b.run_id().to_string());
+        // (`live_run_id` was hoisted above the stream loop so the reasoning bridge can share it.)
         for (call_id, name, args) in calls {
             let panel = crate::agent::session::panel_for_tool(&name).map(|s| s.to_string());
+            // Capped arg preview so the live chip + drawer show the call shape the instant it
+            // fires, without ever ballooning the workflow WS frame (a 5MB write args is capped).
+            let args_cap = crate::workflows::ToolCallRef::cap_str(
+                &serde_json::to_string(&args).unwrap_or_default(),
+            );
             if let (Some(rid), Some(sid)) = (&live_run_id, step_id) {
                 crate::workflows::emit_event(
                     rid,
                     json!({
                         "type": "step_tool", "stepId": sid, "toolCallId": call_id.clone(),
                         "toolName": name.clone(), "panel": panel.clone(), "phase": "start",
+                        "args": args_cap,
                     }),
                 );
             }
             let run_res = registry.run(&name, &args, &ctx).await;
             let is_error = run_res.is_err();
+            let result_text = match &run_res {
+                Ok(t) => t.clone(),
+                Err(e) => e.clone(),
+            };
+            let result_cap = crate::workflows::ToolCallRef::cap_str(&result_text);
             if let (Some(rid), Some(sid)) = (&live_run_id, step_id) {
                 crate::workflows::emit_event(
                     rid,
                     json!({
                         "type": "step_tool", "stepId": sid, "toolCallId": call_id.clone(),
                         "toolName": name.clone(), "panel": panel, "phase": "end", "isError": is_error,
+                        "result": result_cap,
                     }),
                 );
             }

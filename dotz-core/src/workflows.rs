@@ -72,6 +72,11 @@ pub struct Artifact {
 /// One tool call a step made — the graph renders each as a panel-colored sub-node (chip) on its
 /// step node. `panel` is `panel_for_tool(tool_name)` (None for plain file/shell tools). This is the
 /// durable, reload-surviving record; live chips also stream in via `step_tool` events mid-run.
+///
+/// `args` + `result` carry the inspectable payload so the graph node drawer is the single source
+/// of truth for "what did this tool do?" — not just a chip that links out to the chat. Both are
+/// truncated at [`ToolCallRef::CAP`] bytes on a char boundary to keep the workflow store + WS
+/// frames bounded (a 5MB file read must never bloat the graph state).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolCallRef {
     #[serde(rename = "toolCallId")]
@@ -82,6 +87,35 @@ pub struct ToolCallRef {
     pub panel: Option<String>,
     #[serde(rename = "isError", default)]
     pub is_error: bool,
+    /// The raw arguments the agent passed (JSON-serialized, capped). Present from the `start`
+    /// phase so the drawer shows the call shape the instant it fires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<String>,
+    /// The tool's textual result (capped). Populated at the `end` phase; None while running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+}
+
+impl ToolCallRef {
+    /// Max bytes of `args`/`result` retained. Generous enough for a real command/file path
+    /// preview + a normal tool result, tight enough that a runaway tool never balloons the
+    /// in-memory workflow store or the WS frame.
+    pub const CAP: usize = 4096;
+
+    /// Truncate `s` to `CAP` bytes on a UTF-8 char boundary, appending an ellipsis marker once.
+    /// Used for `args`/`result` so the drawer shows useful content without unbounded storage.
+    pub fn cap_str(s: &str) -> String {
+        if s.len() <= Self::CAP {
+            return s.to_string();
+        }
+        let mut end = Self::CAP;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut out = s[..end].to_string();
+        out.push_str("…[truncated]");
+        out
+    }
 }
 
 /// A node in a workflow run's DAG — one agent executing one task.

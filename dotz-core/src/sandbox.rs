@@ -867,14 +867,21 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let port = listener.local_addr().unwrap().port();
 
-        let code = format!("echo \"listening on 127.0.0.1:{port}\"\nsleep 20\n");
-        let run = start_run("bash", &code, "web", None, 30_000, None, None)
+        // The child stays alive well beyond the poll window so the detached
+        // `detect_port_in_window` task has time to be scheduled + complete its
+        // TCP probe even under full-suite runtime contention (the original
+        // 10s/20s budget raced the scheduler when 500+ tests saturated tokio).
+        let code = format!("echo \"listening on 127.0.0.1:{port}\"\nsleep 45\n");
+        let run = start_run("bash", &code, "web", None, 60_000, None, None)
             .await
             .expect("start_run should succeed");
 
         // Poll the run-record port cache (what GET /api/sandbox/runs/:id/port serves first).
+        // Generous budget: the detection task is fire-and-forget so its scheduling latency
+        // scales with runtime load; 30s accommodates a saturated multi-test worker without
+        // weakening the "port is cached mid-run" assertion.
         let mut detected = None;
-        for _ in 0..100 {
+        for _ in 0..300 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             detected = runs_guard().get(&run.id).and_then(|e| e.port);
             if detected.is_some() {
