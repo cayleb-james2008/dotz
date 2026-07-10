@@ -1467,13 +1467,14 @@ function toolCard(id, patch) {
     if (!t) return;
     t.appendChild(card);
     tc = state.toolCards[id] = { card, nameEl, previewEl, badge, argsEl, outEl, data: {} };
-    // Chat→graph cross-link: clicking the toolcard head (not expanding the body) opens the
-    // workflow graph + selects the step that owns this tool call, so the operator can jump from
-    // the transcript to the graph node and back. The shared toolCallId joins the two surfaces.
+    // Chat→graph cross-link: Alt+click the toolcard head to jump to the workflow graph + select
+    // the step that owns this tool call. A plain click just expands the card (no panel yank) so
+    // the existing expand-to-read behavior is preserved. The shared toolCallId joins the surfaces.
     head.style.cursor = "pointer";
+    head.title = "Alt+click to open on the workflow graph";
     head.addEventListener("click", (ev) => {
-      // Only cross-link on a plain click without expansion interference: let the <details>
-      // toggle, but also open the graph + select the owning step if one exists.
+      if (!ev.altKey) return; // plain click: let the <details> toggle normally
+      ev.preventDefault();
       for (const run of state.workflows.values()) {
         const step = run.steps.find((s) =>
           (s.toolCallIds && s.toolCallIds.includes(id)) ||

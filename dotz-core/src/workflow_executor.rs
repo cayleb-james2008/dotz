@@ -144,6 +144,59 @@ fn tool_calls_from_messages(messages: &[serde_json::Value]) -> Vec<workflows::To
     out
 }
 
+/// Extract the accumulated reasoning (thinking + visible text) from the subagent's assistant
+/// messages so the durable workflow step carries it after reload — making the graph the single
+/// source of truth for reasoning, not only a live view. Joins all `thinking` blocks (the
+/// model's private reasoning) then all `text` blocks (the visible narration) across every
+/// assistant turn, in order. Returns None if no reasoning was produced (so the field stays
+/// absent, not an empty string).
+fn thinking_from_messages(messages: &[serde_json::Value]) -> Option<String> {
+    let mut thinking_parts: Vec<String> = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
+    for m in messages {
+        if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = m.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for b in content {
+            match b.get("type").and_then(|t| t.as_str()) {
+                Some("thinking") => {
+                    if let Some(t) = b.get("thinking").and_then(|t| t.as_str()) {
+                        if !t.trim().is_empty() {
+                            thinking_parts.push(t.to_string());
+                        }
+                    }
+                }
+                Some("text") => {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        if !t.trim().is_empty() {
+                            text_parts.push(t.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = String::new();
+    if !thinking_parts.is_empty() {
+        out.push_str(&thinking_parts.join("\n\n"));
+    }
+    if !text_parts.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n— narration —\n\n");
+        }
+        out.push_str(&text_parts.join("\n\n"));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Drive a workflow run to completion.
 ///
 /// The run must already be created (via `workflows::create`) and in `pending` or `running`
@@ -449,6 +502,14 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                     .map(|r| tool_calls_from_messages(&r.messages))
                     .filter(|v| !v.is_empty());
 
+                // Durable reasoning: extract accumulated thinking + narration from the subagent's
+                // assistant messages so the graph node carries reasoning after reload, not only
+                // live via step_thinking events. Capped to keep the store bounded.
+                let thinking = single
+                    .as_ref()
+                    .and_then(|r| thinking_from_messages(&r.messages))
+                    .map(|s| workflows::ToolCallRef::cap_str(&s));
+
                 // Record the result via step_state (propagates readiness, handles auto-repair,
                 // cascades errors, finishes the run).
                 let _ = workflows::step_state(
@@ -460,6 +521,7 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                         error,
                         artifact,
                         tool_calls,
+                        thinking,
                         ..Default::default()
                     },
                 );
@@ -618,6 +680,46 @@ mod tests {
         let capped_multi = workflows::ToolCallRef::cap_str(&multi);
         assert!(capped_multi.len() <= workflows::ToolCallRef::CAP + "…[truncated]".len());
         assert!(capped_multi.is_char_boundary(capped_multi.len()));
+    }
+
+    /// `thinking_from_messages` extracts the accumulated reasoning (thinking + narration) from
+    /// assistant messages so the durable step carries it after reload — making the graph the
+    /// single source of truth for reasoning, not only a live view. Returns None when no
+    /// reasoning was produced so the field stays absent rather than empty.
+    #[test]
+    fn thinking_from_messages_extracts_reasoning() {
+        let messages = vec![
+            json!({"role":"assistant","content":[{"type":"thinking","thinking":"planning the ls"},{"type":"text","text":"I'll list files."}]}),
+            json!({"role":"tool","toolCallId":"c1","content":[{"type":"text","text":"a\nb"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"Found 2 files."}]}),
+        ];
+        let t = thinking_from_messages(&messages).expect("reasoning present");
+        assert!(
+            t.contains("planning the ls"),
+            "thinking block extracted: {t}"
+        );
+        assert!(
+            t.contains("I'll list files."),
+            "first narration extracted: {t}"
+        );
+        assert!(
+            t.contains("Found 2 files."),
+            "second narration extracted: {t}"
+        );
+        assert!(
+            t.contains("— narration —"),
+            "thinking + narration separated: {t}"
+        );
+    }
+
+    /// No reasoning → None (so the durable field stays absent, not an empty string).
+    #[test]
+    fn thinking_from_messages_returns_none_when_empty() {
+        let messages = vec![
+            json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
+            json!({"role":"tool","toolCallId":"c1","content":[{"type":"text","text":"ok"}]}),
+        ];
+        assert_eq!(thinking_from_messages(&messages), None);
     }
 
     fn set_tmp_workflows_file() -> std::path::PathBuf {

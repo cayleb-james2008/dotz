@@ -778,6 +778,9 @@ pub struct StepPatch {
     pub usage: Option<Usage>,
     pub artifact: Option<Artifact>,
     pub tool_calls: Option<Vec<ToolCallRef>>,
+    /// Durable reasoning (thinking + narration) captured at completion so the graph node
+    /// carries it after reload. None = leave the existing field untouched.
+    pub thinking: Option<String>,
 }
 
 /// Update a step's state and propagate readiness to children. Returns the updated run (clone).
@@ -815,6 +818,10 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
             }
             if patch.tool_calls.is_some() && step.tool_calls != patch.tool_calls {
                 step.tool_calls = patch.tool_calls.clone();
+                changed.insert(step.id.clone());
+            }
+            if patch.thinking.is_some() && step.thinking != patch.thinking {
+                step.thinking = patch.thinking.clone();
                 changed.insert(step.id.clone());
             }
             if step.status == "running" && step.started_at.is_none() {
@@ -1456,6 +1463,7 @@ async fn step_handler(
         usage: body.usage,
         artifact: body.artifact,
         tool_calls: None,
+        thinking: None,
     };
     match step_state(&id, &step_id, patch) {
         Some(updated) => Ok(Json(run_with_summary(&updated))),
@@ -1646,6 +1654,7 @@ async fn rerun_step_handler(
         usage: None,
         artifact: None,
         tool_calls: None,
+        thinking: None,
     };
     // Apply the state change first.
     let updated = match step_state(&id, &step_id, patch) {
@@ -3842,6 +3851,7 @@ mod tests {
                     usage: None,
                     artifact: None,
                     tool_calls: None,
+                    thinking: None,
                 },
             );
 
