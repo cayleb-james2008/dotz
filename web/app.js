@@ -1467,6 +1467,28 @@ function toolCard(id, patch) {
     if (!t) return;
     t.appendChild(card);
     tc = state.toolCards[id] = { card, nameEl, previewEl, badge, argsEl, outEl, data: {} };
+    // Chat→graph cross-link: clicking the toolcard head (not expanding the body) opens the
+    // workflow graph + selects the step that owns this tool call, so the operator can jump from
+    // the transcript to the graph node and back. The shared toolCallId joins the two surfaces.
+    head.style.cursor = "pointer";
+    head.addEventListener("click", (ev) => {
+      // Only cross-link on a plain click without expansion interference: let the <details>
+      // toggle, but also open the graph + select the owning step if one exists.
+      for (const run of state.workflows.values()) {
+        const step = run.steps.find((s) =>
+          (s.toolCallIds && s.toolCallIds.includes(id)) ||
+          (s._liveTools && s._liveTools[id]) ||
+          (s.toolCalls && s.toolCalls.some((c) => c.toolCallId === id))
+        );
+        if (step) {
+          openPanel("graph");
+          state.activeWfId = run.id;
+          showNodeDetail(run, step);
+          refreshWorkflowGraph();
+          break;
+        }
+      }
+    });
   }
   Object.assign(tc.data, patch);
   const d = tc.data;
@@ -2218,6 +2240,8 @@ function handleWorkflowEvent(runId, event) {
     case "step_tool": {
       // Live per-tool chip: upsert into the step's transient live-tool map as each tool fires
       // (phase start → running chip, end → done/error). Reconciled by `toolCalls` on completion.
+      // Now carries capped `args` (on start) and `result` (on end) so the graph node drawer is
+      // the single source of truth for "what did this tool do?" — not just a colored chip.
       const run = state.workflows.get(runId);
       if (!run) break;
       const step = run.steps.find((s) => s.id === event.stepId);
@@ -2229,8 +2253,36 @@ function handleWorkflowEvent(runId, event) {
         panel: event.panel !== undefined ? event.panel : prev.panel,
         phase: event.phase || prev.phase,
         isError: event.isError !== undefined ? event.isError : prev.isError,
+        args: event.args !== undefined ? event.args : prev.args,
+        result: event.result !== undefined ? event.result : prev.result,
       };
       refreshWorkflowGraph();
+      // Repaint the node-detail drawer live so the operator sees args/result the instant a
+      // tool fires — the graph is the live source of truth, not a snapshot.
+      if (state.openNodeDetail && state.openNodeDetail.runId === runId &&
+          state.openNodeDetail.stepId === event.stepId && !$("node-detail").classList.contains("hidden")) {
+        showNodeDetail(run, step);
+      }
+      break;
+    }
+    case "step_thinking": {
+      // Live reasoning bridge: the executor path streams subagent thinking/text deltas onto
+      // the workflow channel so the graph node is the live reasoning surface — not only the
+      // chat. Coalesced into the step's transient `_liveThinking` buffer; rendered in the
+      // node-detail drawer as a streaming block while the step runs.
+      const run = state.workflows.get(runId);
+      if (!run) break;
+      const step = run.steps.find((s) => s.id === event.stepId);
+      if (!step) break;
+      if (!step._liveThinking) step._liveThinking = { thinking: "", text: "" };
+      if (event.phase === "thinking") step._liveThinking.thinking += event.text || "";
+      else if (event.phase === "text") step._liveThinking.text += event.text || "";
+      refreshWorkflowGraph();
+      // Repaint the drawer live so reasoning streams in real time (open <details> while running).
+      if (state.openNodeDetail && state.openNodeDetail.runId === runId &&
+          state.openNodeDetail.stepId === event.stepId && !$("node-detail").classList.contains("hidden")) {
+        showNodeDetail(run, step);
+      }
       break;
     }
   }
@@ -2365,12 +2417,18 @@ function panelForToolJS(name) {
 
 // The tools a step touched, as chips. Prefer the durable `toolCalls` (set on completion); while the
 // step runs, fall back to the live `_liveTools` map that `step_tool` events populate in real time.
+// Each entry now carries capped `args`/`result` so the drawer renders inspectable tool cards, not
+// just colored chips.
 function stepTools(step) {
   if (step.toolCalls && step.toolCalls.length) {
-    return step.toolCalls.map((tc) => ({ toolName: tc.toolName, panel: tc.panel, isError: tc.isError, running: false }));
+    return step.toolCalls.map((tc) => ({
+      toolName: tc.toolName, panel: tc.panel, isError: tc.isError, running: false,
+      toolCallId: tc.toolCallId, args: tc.args, result: tc.result,
+    }));
   }
   return Object.values(step._liveTools || {}).map((t) => ({
     toolName: t.toolName, panel: t.panel, isError: t.isError, running: t.phase !== "end",
+    toolCallId: t.toolCallId, args: t.args, result: t.result,
   }));
 }
 
@@ -2442,7 +2500,11 @@ function renderWorkflowDag(run, panel) {
     const pos = positions[step.id];
     if (!pos) return;
     const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-    g.setAttribute("class", "wf-node " + step.status);
+    // The selected class marks the node the drawer is bound to so the operator can see which
+    // graph node the detail panel reflects at a glance — a persistent ring, not just a hover.
+    const selected = state.openNodeDetail && state.openNodeDetail.runId === run.id &&
+      state.openNodeDetail.stepId === step.id;
+    g.setAttribute("class", "wf-node " + step.status + (selected ? " selected" : ""));
     g.setAttribute("transform", `translate(${pos.x}, ${pos.y})`);
     g.dataset.stepId = step.id;
 
@@ -2548,6 +2610,12 @@ function renderWorkflowDag(run, panel) {
     st.setAttribute("x", NODE_W - 8); st.setAttribute("y", 16); st.setAttribute("text-anchor", "end"); st.setAttribute("class", "wf-node-task");
     st.textContent = dotzStatus;
     g.appendChild(st);
+    // The dotz orchestrator node is clickable like every other node: it opens the run-record
+    // (the full reproducible capture of the run) so the operator can inspect the lead agent's
+    // prompt + model + the whole DAG's provider responses — consistent with "every node reveals
+    // what the agent is doing."
+    g.style.cursor = "pointer";
+    g.onclick = () => openRunRecord();
     nodesG.appendChild(g);
   }
   applyViewBox();
@@ -2667,9 +2735,32 @@ function showNodeDetail(run, step) {
     body.appendChild(el("div", "nd-block red", step.error));
   }
   if (step.usage) body.appendChild(makeNdRow("USAGE", JSON.stringify(step.usage)));
-  if (step.thinking) {
+  // ---- THINKING (live-streaming) ----
+  // While a step runs, the executor bridges subagent reasoning onto the graph channel as
+  // `step_thinking` events; `_liveThinking` accumulates them. On completion the step's static
+  // `thinking` field is set. Prefer the live buffer while running so the drawer is a live
+  // reasoning surface; fall back to the durable field after completion.
+  const liveThink = step._liveThinking || {};
+  const showThinking = (liveThink.thinking && liveThink.thinking.trim()) || (liveThink.text && liveThink.text.trim());
+  if (showThinking || (step.thinking && step.thinking.trim())) {
     body.appendChild(makeNdRow("THINKING", ""));
-    body.appendChild(el("div", "nd-block", step.thinking));
+    const wrap = el("details", "nd-thinking");
+    wrap.open = step.status === "running"; // expand while streaming, collapse when done
+    const sum = el("summary", "nd-thinking-summary", step.status === "running" ? "reasoning…" : "reasoning");
+    wrap.appendChild(sum);
+    if (liveThink.thinking && liveThink.thinking.trim()) {
+      const t = el("div", "nd-block nd-thinking-thinking", liveThink.thinking);
+      wrap.appendChild(t);
+    }
+    if (liveThink.text && liveThink.text.trim()) {
+      const t = el("div", "nd-block nd-thinking-text", liveThink.text);
+      wrap.appendChild(t);
+    }
+    // Durable field (post-completion) when the live buffer is empty.
+    if ((!liveThink.thinking && !liveThink.text) && step.thinking) {
+      wrap.appendChild(el("div", "nd-block", step.thinking));
+    }
+    body.appendChild(wrap);
   }
   if (step.sandboxRunId) {
     const row = makeNdRow("SANDBOX", "");
@@ -2685,9 +2776,51 @@ function showNodeDetail(run, step) {
     row.querySelector(".val").appendChild(link);
     body.appendChild(row);
   }
-  if (step.toolCallIds && step.toolCallIds.length) {
-    body.appendChild(makeNdRow("TOOL CALLS", ""));
-    step.toolCallIds.forEach((id) => body.appendChild(el("div", "nd-block", id)));
+  // ---- TOOL CALLS (inspectable) ----
+  // The graph is the single source of truth: each tool call renders as a collapsible card with
+  // name, capped args, capped result, and an error badge — mirroring the chat toolCard. Clicking
+  // a card cross-links to the matching chat toolCard (shared toolCallId) so the operator can drill
+  // from the graph into the transcript without losing place.
+  const tools = stepTools(step);
+  if (tools.length) {
+    body.appendChild(makeNdRow("TOOL CALLS", String(tools.length)));
+    tools.forEach((t) => {
+      const card = el("details", "nd-toolcard" + (t.isError ? " err" : "") + (t.running ? " running" : ""));
+      card.dataset.tc = t.toolCallId || "";
+      const head = el("summary", "nd-toolcard-head");
+      const glyph = el("span", "nd-toolcard-glyph", ((t.toolName || "?")[0] || "?").toUpperCase());
+      const nameEl = el("span", "nd-toolcard-name", t.toolName || "tool");
+      const badge = el("span", "nd-toolcard-badge", t.isError ? "✕" : t.running ? "●" : "✓");
+      head.appendChild(glyph); head.appendChild(nameEl); head.appendChild(badge);
+      const body2 = el("div", "nd-toolcard-body");
+      if (t.args !== undefined && t.args !== null) {
+        const lbl = el("div", "nd-toolcard-label", "ARGS");
+        const pre = el("pre", "nd-toolcard-args", t.args);
+        body2.appendChild(lbl); body2.appendChild(pre);
+      }
+      if (t.result !== undefined && t.result !== null) {
+        const lbl = el("div", "nd-toolcard-label", "RESULT");
+        const pre = el("pre", "nd-toolcard-result", t.result);
+        body2.appendChild(lbl); body2.appendChild(pre);
+      } else if (t.running) {
+        body2.appendChild(el("div", "nd-toolcard-running", "running…"));
+      }
+      card.appendChild(head); card.appendChild(body2);
+      // Click-to-chat cross-link: on card click, find the chat toolCard with the same id and
+      // scroll it into view + flash it so the operator sees the graph→transcript bridge.
+      card.addEventListener("click", (ev) => {
+        if (ev.target.tagName === "SUMMARY") return; // let the <details> toggle
+        const id = t.toolCallId;
+        if (!id) return;
+        const tc = document.querySelector(`.panel[data-panel="chat"] .toolcard[data-tc="${CSS.escape(id)}"]`);
+        if (tc) {
+          tc.scrollIntoView({ behavior: "smooth", block: "center" });
+          tc.classList.add("nd-flash");
+          setTimeout(() => tc.classList.remove("nd-flash"), 1200);
+        }
+      });
+      body.appendChild(card);
+    });
   }
   if (step.startedAt) body.appendChild(makeNdRow("STARTED", new Date(step.startedAt).toLocaleTimeString()));
   if (step.endedAt) body.appendChild(makeNdRow("ENDED", new Date(step.endedAt).toLocaleTimeString()));

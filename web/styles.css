@@ -652,6 +652,12 @@ code { font-family: var(--mono); color: var(--peach); }
 .wf-edge-disperse.active { stroke-dasharray: 6 4; animation: dashFlow 0.8s linear infinite; opacity: 1; filter: drop-shadow(0 0 5px rgba(203,166,247,0.55)); }
 .wf-edge-disperse.done { stroke: var(--green); opacity: 0.55; }
 
+/* The selected graph node — a persistent ring marking which node the detail drawer is bound to.
+   Without it the operator can't see which node the drawer reflects after clicking around. */
+.wf-node.selected rect { stroke: var(--cyan) !important; stroke-width: 3 !important; }
+.wf-node.selected .wf-node-ring { stroke: var(--cyan) !important; opacity: 1; animation: ringPulse 1.2s ease-in-out infinite; }
+.wf-node.selected rect { filter: drop-shadow(0 0 14px var(--glow-cyan)); }
+
 /* ---- NODE DETAIL SIDE DRAWER ---- */
 .node-detail {
   position: fixed; top: var(--topbar-h); right: 0; bottom: var(--statusbar-h);
@@ -756,6 +762,57 @@ code { font-family: var(--mono); color: var(--peach); }
 .nd-btn-reject:hover {
   background: var(--red); color: var(--bg);
 }
+
+/* ---- NODE DETAIL: inspectable tool cards (the single source of truth for tool calls) ---- */
+.nd-toolcard {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--mantle); margin: 6px 0; overflow: hidden;
+}
+.nd-toolcard.err { border-color: var(--red); }
+.nd-toolcard.running { border-color: var(--yellow); }
+.nd-toolcard-head {
+  display: flex; align-items: center; gap: 6px; cursor: pointer;
+  padding: 6px 8px; font-family: var(--mono); font-size: 11px;
+  background: var(--surface); list-style: none;
+}
+.nd-toolcard-head::-webkit-details-marker { display: none; }
+.nd-toolcard-glyph {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; border-radius: 4px; background: var(--lav); color: var(--crust);
+  font-weight: 700; font-size: 9px; flex-shrink: 0;
+}
+.nd-toolcard.err .nd-toolcard-glyph { background: var(--red); }
+.nd-toolcard.running .nd-toolcard-glyph { background: var(--yellow); }
+.nd-toolcard-name { flex: 1; color: var(--text); font-weight: 600; }
+.nd-toolcard-badge { font-size: 10px; color: var(--muted); }
+.nd-toolcard.err .nd-toolcard-badge { color: var(--red); }
+.nd-toolcard.running .nd-toolcard-badge { color: var(--yellow); }
+.nd-toolcard-body { padding: 6px 8px; border-top: 1px solid var(--border); }
+.nd-toolcard-label { font-size: 9px; letter-spacing: 1.5px; color: var(--dim); text-transform: uppercase; margin: 4px 0 2px; }
+.nd-toolcard-args, .nd-toolcard-result {
+  margin: 0; padding: 6px; background: var(--crust); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font-family: var(--mono); font-size: 10px; line-height: 1.45;
+  white-space: pre-wrap; max-height: 140px; overflow-y: auto; color: var(--text);
+}
+.nd-toolcard-running { font-size: 10px; color: var(--yellow); padding: 4px 0; }
+.nd-toolcard:hover { border-color: var(--cyan); }
+
+/* ---- NODE DETAIL: live-streaming reasoning ---- */
+.nd-thinking {
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--mantle);
+  margin: 6px 0;
+}
+.nd-thinking-summary {
+  cursor: pointer; padding: 6px 8px; font-family: var(--mono); font-size: 11px;
+  color: var(--lav); list-style: none;
+}
+.nd-thinking-summary::-webkit-details-marker { display: none; }
+.nd-thinking-thinking { border-left: 2px solid var(--mauve); margin: 0 8px 6px; padding-left: 8px; font-style: italic; color: var(--mauve); }
+.nd-thinking-text { border-left: 2px solid var(--cyan); margin: 0 8px 6px; padding-left: 8px; color: var(--text); }
+
+/* ---- flash highlight for graph→chat cross-link ---- */
+.nd-flash { animation: ndFlash 1.2s ease-out; }
+@keyframes ndFlash { 0% { box-shadow: 0 0 0 2px var(--cyan); } 100% { box-shadow: 0 0 0 0 transparent; } }
 
 /* ---- RUN RECORD DRAWER ---- */
 /* Reuses .node-detail / .node-detail-body chrome. Step entries are collapsible
