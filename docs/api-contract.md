@@ -55,14 +55,14 @@ Session summary `= { sessionId, profileId:string|null, projectId:string|null, mo
 `FileTreeNode = { path, type:"file"|"dir", children?:FileTreeNode[] }`. The tree is recursive to a
 maximum depth of 3 and skips `node_modules` and `.git`. Paths are absolute on the server.
 **DELETE cascades a purge of the project's dotz-side state** (all under `~/.dotz`): project-scoped
-mem0 memories, its workflow runs + run-records, and any live sessions. It **never touches the
+on-device memories, its workflow runs + run-records, and any live sessions. It **never touches the
 project folder on disk** — `<cwd>/.ai-agents/MEMORY.md` and every file under `cwd` are left intact.
 
 A project is a **persistent named workspace** (cwd + profile + model + thinking defaults) that
 survives server restarts. Sessions created with `projectId` inherit the project's `cwd`,
 `profileId`, `model`, and `thinkingLevel` unless overridden on `POST /api/sessions`.
 
-### Memory (mem0-backed, autonomous)
+### Memory (on-device rusqlite + ONNX embeddings, autonomous)
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
@@ -74,9 +74,10 @@ survives server restarts. Sessions created with `projectId` inherit the project'
 | POST | `/api/memory/consolidate` | `{ projectId? }` | `{ removed, kept }` |
 
 `MemoryView = { id, memory, scope:"project"|"global", category?, folder?, score?, createdAt?, updatedAt? }`
-(`score` only on search/recall results). Memory is backed by **mem0** (self-hosted OSS, on-device):
-the sqlite vector store + bundled local embedder live under `~/.dotz/ai-agents/mem0/`; the LLM that
-powers extraction/consolidation is dotz's Ollama Cloud chat. Storage is partitioned by scope
+(`score` only on search/recall results). Memory is backed by **on-device `rusqlite` + local `ort`
+ONNX embeddings** (all-MiniLM-L6-v2, 384-dim, injected in-process — no embeddings API): the sqlite
+vector store + bundled local embedder live under `~/.dotz/ai-agents/mem0/`; the LLM that powers
+extraction/consolidation is dotz's Ollama Cloud chat. Storage is partitioned by scope
 (`"project"` by folder, `"global"` everywhere). A human-readable, git-committable `MEMORY.md` mirror
 is written per scope (global `~/.dotz/ai-agents/MEMORY.md`, project `<cwd>/.ai-agents/MEMORY.md`) and
 is the source of truth — the vector index is a derived cache.
