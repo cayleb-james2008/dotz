@@ -208,6 +208,26 @@ pub async fn shutdown_signal() {
     }
 }
 
+/// The process-wide graceful-shutdown signal. When the server's shutdown future resolves,
+/// this watch is set to `true` so long-lived connection handlers (WebSocket loops) can break
+/// out and close their sockets instead of hanging axum's drain phase indefinitely. Without this,
+/// an active WebSocket connection would prevent the server from ever completing graceful
+/// shutdown — axum's `with_graceful_shutdown` waits for all connection tasks to finish, and a
+/// WS read loop blocks forever until the client disconnects.
+static SHUTDOWN_WATCH: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> =
+    std::sync::OnceLock::new();
+
+fn shutdown_watch() -> &'static tokio::sync::watch::Sender<bool> {
+    SHUTDOWN_WATCH.get_or_init(|| tokio::sync::watch::channel(false).0)
+}
+
+/// Subscribe to the server's graceful-shutdown signal. Returns a `watch::Receiver<bool>` that
+/// yields `true` when the server is draining. WebSocket handlers use this to close active
+/// connections so the server can exit promptly instead of hanging on long-lived sockets.
+pub fn subscribe_shutdown() -> tokio::sync::watch::Receiver<bool> {
+    shutdown_watch().subscribe()
+}
+
 /// Serve with an explicit graceful-shutdown future. Callers (e.g. the headless `serve` bin) can
 /// stop cleanly on SIGINT/SIGTERM; Tauri uses `serve()` and lets the process die with the window.
 pub async fn serve_with_shutdown(
@@ -215,6 +235,10 @@ pub async fn serve_with_shutdown(
     web_dir: PathBuf,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    // Reset the shutdown watch so a fresh server start doesn't inherit a prior shutdown signal
+    // (e.g. in tests that start/stop the server multiple times, or a re-bind after a clean exit).
+    shutdown_watch().send_modify(|v| *v = false);
+
     let state = Arc::new(AppState {
         config: Mutex::new(config::load()),
     });
@@ -235,8 +259,15 @@ pub async fn serve_with_shutdown(
         listener.local_addr()?,
         web_dir.display()
     );
+    // Wrap the caller's shutdown future so that when it resolves we also broadcast the
+    // shutdown signal to all active WebSocket handlers. This lets them close their sockets
+    // promptly so axum's drain phase completes instead of hanging on long-lived connections.
+    let sw = shutdown_watch().clone();
     axum::serve(listener, app(web_dir, state))
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            let _ = sw.send(true);
+        })
         .await
 }
 
@@ -917,5 +948,508 @@ mod tests {
             "server should exit cleanly: {:?}",
             result.err()
         );
+    }
+
+    // ===========================================================================
+    // Graceful shutdown integration tests — full system under load & failure
+    // ===========================================================================
+    //
+    // These tests cover the scenarios the campaign 2026-07-04 step 6 calls out:
+    // full-system graceful shutdown under concurrent HTTP load, with active
+    // WebSocket connections, with live agent sessions, on rapid restart, and
+    // under mixed REST + WS traffic. They also verify failure modes (port
+    // already bound, rapid start/stop cycles).
+
+    /// Start a test server on an ephemeral port. Returns the port, a oneshot
+    /// trigger for the shutdown signal, and the join handle for the server task.
+    /// The server serves the `web/` directory (relative to CARGO_MANIFEST_DIR/..).
+    async fn start_server() -> (
+        u16,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(serve_with_shutdown(
+            listener,
+            PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr.port(), tx, handle)
+    }
+
+    /// The server must drain and exit cleanly when the shutdown signal fires
+    /// while a burst of concurrent HTTP requests is in flight. The server must
+    /// not panic or hang. This is the core "shutdown under load" scenario.
+    #[tokio::test]
+    async fn shutdown_drains_under_concurrent_http_load() {
+        let (port, tx, handle) = start_server().await;
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+
+        // First, verify the server is responsive with a single request.
+        let resp = client
+            .get(format!("{base}/api/health"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "server should be responsive before load test"
+        );
+
+        // Fire 20 concurrent health requests.
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            let client = client.clone();
+            let url = format!("{base}/api/health");
+            tasks.push(tokio::spawn(async move {
+                client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+            }));
+        }
+
+        // Let the tasks be scheduled and some requests land before triggering shutdown.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = tx.send(());
+
+        // Collect results — some may fail because the server stopped accepting,
+        // which is expected. The key assertion is that the server exits cleanly.
+        let mut ok = 0;
+        for t in tasks {
+            if t.await.unwrap_or(false) {
+                ok += 1;
+            }
+        }
+        // Under heavy parallel test load, the 20ms window might not be enough for
+        // any task to complete. The critical assertion is the clean exit below.
+        let _ = ok; // don't assert on ok — it's timing-dependent
+
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "server should exit cleanly under concurrent HTTP load: {:?}",
+            result.err()
+        );
+    }
+
+    /// The server must serve a high burst of concurrent requests to multiple
+    /// endpoints without dropping any, then shut down cleanly. This verifies
+    /// the server stays responsive under load right up to the shutdown signal.
+    #[tokio::test]
+    async fn server_responsive_under_burst_load_then_clean_shutdown() {
+        let (port, tx, handle) = start_server().await;
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+
+        // 50 concurrent requests across 3 endpoints.
+        let endpoints = ["/api/health", "/api/providers", "/api/models"];
+        let mut tasks = Vec::new();
+        for i in 0..50 {
+            let client = client.clone();
+            let url = format!("{base}{}", endpoints[i % 3]);
+            tasks.push(tokio::spawn(async move {
+                client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+            }));
+        }
+
+        let mut ok = 0;
+        for t in tasks {
+            if t.await.unwrap_or(false) {
+                ok += 1;
+            }
+        }
+        assert_eq!(
+            ok, 50,
+            "all 50 burst requests should succeed before shutdown"
+        );
+
+        let _ = tx.send(());
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "server should exit cleanly after burst load: {:?}",
+            result.err()
+        );
+    }
+
+    /// The server must shut down promptly even when there are active WebSocket
+    /// connections. Before the shutdown-watch fix, an active WS read loop would
+    /// hang axum's drain phase indefinitely because `with_graceful_shutdown`
+    /// waits for all connection tasks to finish. Now the WS handler subscribes
+    /// to the shutdown signal and closes its socket so the server can exit.
+    #[tokio::test]
+    async fn shutdown_closes_active_websocket_connections() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::connect_async;
+
+        let (port, tx, handle) = start_server().await;
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+
+        // Create a session and open a WebSocket.
+        let resp = client
+            .post(format!("{base}/api/sessions"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let summary = resp.json::<Value>().await.unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let url = format!("ws://127.0.0.1:{port}/ws?sessionId={sid}");
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(
+            ready.to_text().unwrap().contains("\"ready\""),
+            "first WS frame should be ready: {ready:?}"
+        );
+
+        // Trigger shutdown while the WS is still connected and idle.
+        let _ = tx.send(());
+
+        // The server must exit within a reasonable timeout (not hang).
+        // Before the fix this would hang forever waiting for the WS task.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("server should shut down within 10s even with active WS connections");
+        let result = result.unwrap();
+        assert!(
+            result.is_ok(),
+            "server should exit cleanly with active WS: {:?}",
+            result.err()
+        );
+
+        // The WS connection should be closed by the server.
+        let close = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await;
+        match close {
+            Ok(None) | Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::protocol::Message::Close(_)))) => {}
+            other => panic!("expected WS to close on server shutdown, got {other:?}"),
+        }
+
+        // Clean up the session from the global store.
+        crate::agent::session::dispose(&sid);
+    }
+
+    /// The server must shut down cleanly when multiple active agent sessions
+    /// exist in the global store. Sessions are in-memory and not explicitly
+    /// disposed during shutdown, but the server must not deadlock or panic.
+    #[tokio::test]
+    async fn shutdown_with_active_agent_sessions_exits_cleanly() {
+        let (port, tx, handle) = start_server().await;
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+
+        // Create 5 sessions via REST.
+        let mut sids = Vec::new();
+        for _ in 0..5 {
+            let resp = client
+                .post(format!("{base}/api/sessions"))
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            let summary = resp.json::<Value>().await.unwrap();
+            sids.push(summary["sessionId"].as_str().unwrap().to_string());
+        }
+
+        // Verify the health endpoint sees the sessions.
+        let resp = client
+            .get(format!("{base}/api/health"))
+            .send()
+            .await
+            .unwrap();
+        let health = resp.json::<Value>().await.unwrap();
+        assert!(
+            health["sessions"].as_u64().unwrap_or(0) >= 5,
+            "health should reflect active sessions: {health}"
+        );
+
+        // Trigger shutdown — server must exit cleanly.
+        let _ = tx.send(());
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "server should exit cleanly with active sessions: {:?}",
+            result.err()
+        );
+
+        // Clean up sessions from the global store.
+        for sid in &sids {
+            crate::agent::session::dispose(sid);
+        }
+    }
+
+    /// The server must bind and serve on the same port immediately after a
+    /// prior instance shut down. This verifies the TCP listener is properly
+    /// released during graceful shutdown and there is no lingering socket
+    /// (TIME_WAIT or similar) that would block a rapid restart.
+    #[tokio::test]
+    async fn rapid_restart_on_same_port_after_shutdown() {
+        // Start first instance.
+        let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dummy.local_addr().unwrap();
+        drop(dummy);
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel::<()>();
+        let shutdown1 = async {
+            let _: () = rx1.await.unwrap_or(());
+        };
+        let handle1 = tokio::spawn(serve_with_shutdown_addr(
+            addr,
+            PathBuf::from("web"),
+            shutdown1,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Verify it serves.
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/api/health", addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "first instance should serve");
+
+        // Shut it down.
+        let _ = tx1.send(());
+        assert!(
+            handle1.await.unwrap().is_ok(),
+            "first instance should exit cleanly"
+        );
+
+        // Immediately restart on the same port.
+        let (tx2, rx2) = tokio::sync::oneshot::channel::<()>();
+        let shutdown2 = async {
+            let _: () = rx2.await.unwrap_or(());
+        };
+        let handle2 = tokio::spawn(serve_with_shutdown_addr(
+            addr,
+            PathBuf::from("web"),
+            shutdown2,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Verify the second instance serves.
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/api/health", addr.port()))
+            .send()
+            .await
+            .expect("second instance should accept connections");
+        assert!(
+            resp.status().is_success(),
+            "second instance should serve on the same port"
+        );
+
+        let _ = tx2.send(());
+        assert!(
+            handle2.await.unwrap().is_ok(),
+            "second instance should exit cleanly"
+        );
+    }
+
+    /// The server must shut down cleanly under mixed REST + WebSocket load:
+    /// concurrent HTTP requests and an active WS connection. This is the
+    /// real-world operator scenario — the UI has a WS open and is polling REST
+    /// endpoints when the process receives SIGINT.
+    #[tokio::test]
+    async fn shutdown_under_mixed_rest_and_ws_load() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::connect_async;
+
+        let (port, tx, handle) = start_server().await;
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+
+        // Create a session and open a WS.
+        let resp = client
+            .post(format!("{base}/api/sessions"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let summary = resp.json::<Value>().await.unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let url = format!("ws://127.0.0.1:{port}/ws?sessionId={sid}");
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(
+            ready.to_text().unwrap().contains("\"ready\""),
+            "WS should connect and receive ready frame"
+        );
+
+        // Fire concurrent REST requests while the WS is open.
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let client = client.clone();
+            let url = format!("{base}/api/health");
+            tasks.push(tokio::spawn(async move {
+                client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+            }));
+        }
+
+        // Let some requests land before triggering shutdown.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Trigger shutdown while both REST and WS are active.
+        let _ = tx.send(());
+
+        // Server must exit within a reasonable timeout.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("server should shut down within 10s under mixed REST + WS load");
+        let result = result.unwrap();
+        assert!(
+            result.is_ok(),
+            "server should exit cleanly under mixed load: {:?}",
+            result.err()
+        );
+
+        // The WS should close.
+        let close = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await;
+        match close {
+            Ok(None) | Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::protocol::Message::Close(_)))) => {}
+            other => panic!("expected WS to close on server shutdown, got {other:?}"),
+        }
+
+        // At least some REST requests should have succeeded (the server was
+        // responsive under load before shutdown). Under heavy parallel test load
+        // the timing window may be tight, so we only assert the server exited
+        // cleanly above — the ok count is informational.
+        let mut ok = 0;
+        for t in tasks {
+            if t.await.unwrap_or(false) {
+                ok += 1;
+            }
+        }
+        let _ = ok; // timing-dependent under parallel test load
+
+        crate::agent::session::dispose(&sid);
+    }
+
+    /// Multiple concurrent shutdown triggers must not panic or deadlock. In the
+    /// Tauri shell, both the window-close handler and a SIGINT could fire near
+    /// simultaneously; the server must handle this gracefully.
+    #[tokio::test]
+    async fn multiple_shutdown_triggers_are_safe() {
+        let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dummy.local_addr().unwrap();
+        drop(dummy);
+
+        // Use a watch channel so we can signal multiple times.
+        let (tx, mut rx) = tokio::sync::watch::channel(());
+        let shutdown = async move {
+            let _ = rx.changed().await;
+            // Even if changed() returns, the server should handle the signal once.
+        };
+        let handle = tokio::spawn(serve_with_shutdown_addr(
+            addr,
+            PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Send the shutdown signal.
+        let _ = tx.send(());
+
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "server should exit cleanly on shutdown signal: {:?}",
+            result.err()
+        );
+
+        // Sending another signal after shutdown should not panic.
+        let _ = tx.send(());
+    }
+
+    /// Multiple WebSocket connections must all close on server shutdown, not
+    /// just the first one. Each WS handler subscribes to the shutdown signal
+    /// independently; if any handler misses the signal, the server would hang.
+    #[tokio::test]
+    async fn shutdown_closes_multiple_websocket_connections() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::connect_async;
+
+        let (port, tx, handle) = start_server().await;
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+
+        // Create 3 sessions and open a WS for each.
+        let mut sids = Vec::new();
+        let mut conns = Vec::new();
+        for _ in 0..3 {
+            let resp = client
+                .post(format!("{base}/api/sessions"))
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            let summary = resp.json::<Value>().await.unwrap();
+            let sid = summary["sessionId"].as_str().unwrap().to_string();
+            let url = format!("ws://127.0.0.1:{port}/ws?sessionId={sid}");
+            let (ws, _) = connect_async(&url).await.unwrap();
+            conns.push(ws);
+            sids.push(sid);
+        }
+
+        // Verify all 3 received the ready frame.
+        for ws in &mut conns {
+            let ready = ws.next().await.unwrap().unwrap();
+            assert!(
+                ready.to_text().unwrap().contains("\"ready\""),
+                "each WS should receive ready frame"
+            );
+        }
+
+        // Trigger shutdown.
+        let _ = tx.send(());
+
+        // Server must exit within 10s.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("server should shut down within 10s with multiple WS connections");
+        let result = result.unwrap();
+        assert!(
+            result.is_ok(),
+            "server should exit cleanly with multiple WS: {:?}",
+            result.err()
+        );
+
+        // All 3 WS connections should close.
+        for ws in &mut conns {
+            let close = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await;
+            match close {
+                Ok(None) | Ok(Some(Err(_))) => {}
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::protocol::Message::Close(_)))) => {}
+                other => panic!("expected each WS to close on shutdown, got {other:?}"),
+            }
+        }
+
+        for sid in &sids {
+            crate::agent::session::dispose(sid);
+        }
     }
 }

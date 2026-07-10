@@ -636,6 +636,12 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
         done2.cancel();
     });
 
+    // Subscribe to the server's graceful-shutdown signal so this WebSocket closes
+    // promptly when the server is draining, instead of hanging axum's shutdown
+    // phase indefinitely. Without this, an active WS read loop blocks the server
+    // from completing graceful shutdown — axum waits for all connection tasks.
+    let mut shutdown_rx = crate::server::subscribe_shutdown();
+
     // Read client messages (prompt/steer/followUp/abort).
     loop {
         tokio::select! {
@@ -901,6 +907,12 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                 }
             }
             _ = done.cancelled() => break,
+            // Server is shutting down — cancel the done token so the fan also breaks,
+            // then exit the reader loop to let the close handshake run.
+            _ = shutdown_rx.changed() => {
+                done.cancel();
+                break;
+            }
         }
     }
 
