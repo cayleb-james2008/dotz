@@ -22,7 +22,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
 uuid = { version = "1", features = ["v4"] }
-serde_yaml = "0.9"
+# serde_yaml_ng: maintained continuation of the archived serde_yaml (0.9.34+deprecated),
+# same API surface (Value/from_str) — only the skill-frontmatter parser uses it.
+serde_yaml_ng = "0.10"
 ort = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
