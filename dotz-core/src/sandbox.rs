@@ -36,6 +36,28 @@ const SANDBOX_LANGUAGES: [&str; 6] = [
 ];
 
 const DEFAULT_TIMEOUT_MS: i64 = 30_000;
+/// Default timeout for `mode:"web"` (preview) runs. A web run hosts a dev server that is meant to
+/// stay alive while the user looks at the preview iframe — the 30 s terminal default killed every
+/// preview mid-view (the UI never sends `timeoutMs`). 30 minutes keeps an active preview alive for
+/// any realistic viewing session while still bounding a forgotten one so it can't leak a dev
+/// server forever. An explicit client `timeoutMs` still wins in either mode.
+const DEFAULT_WEB_TIMEOUT_MS: i64 = 30 * 60 * 1000;
+
+/// Resolve the effective timeout for a run: a positive client-supplied value wins; otherwise the
+/// mode-aware default (web previews get the long preview default, terminal runs the short one).
+/// Shared by the REST handler and the WebSocket `sandbox.start` path so both resolve identically.
+pub fn resolve_timeout_ms(requested: Option<i64>, mode: &str) -> i64 {
+    match requested {
+        Some(n) if n > 0 => n,
+        _ => {
+            if mode == "web" {
+                DEFAULT_WEB_TIMEOUT_MS
+            } else {
+                DEFAULT_TIMEOUT_MS
+            }
+        }
+    }
+}
 /// Output cap, matching the spirit of the Node streaming buffer — keep memory bounded.
 const OUTPUT_CAP: usize = 50 * 1024;
 /// Soft cap on retained run entries. Terminal runs (done/error/killed) are evicted oldest-first
@@ -214,10 +236,7 @@ async fn create_run(
         .get("projectId")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let timeout_ms = match b.get("timeoutMs").and_then(|v| v.as_i64()) {
-        Some(n) if n > 0 => n,
-        _ => DEFAULT_TIMEOUT_MS,
-    };
+    let timeout_ms = resolve_timeout_ms(b.get("timeoutMs").and_then(|v| v.as_i64()), &mode);
 
     match start_run(
         &language,
@@ -853,6 +872,31 @@ fn not_found(msg: &str) -> (StatusCode, Json<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: web-mode previews were killed by the 30 s terminal default because the UI
+    /// never sends `timeoutMs`. The mode-aware resolver must give `mode:"web"` runs the long
+    /// preview default while terminal runs keep the short default, and an explicit positive
+    /// client value must win in either mode.
+    #[test]
+    fn resolve_timeout_is_mode_aware() {
+        // No client value: terminal keeps 30 s, web gets the preview default.
+        assert_eq!(resolve_timeout_ms(None, "terminal"), DEFAULT_TIMEOUT_MS);
+        assert_eq!(resolve_timeout_ms(None, "web"), DEFAULT_WEB_TIMEOUT_MS);
+        assert!(
+            DEFAULT_WEB_TIMEOUT_MS > DEFAULT_TIMEOUT_MS,
+            "preview default must exceed the terminal default or the fix is vacuous"
+        );
+        // Explicit positive value wins in both modes.
+        assert_eq!(resolve_timeout_ms(Some(5_000), "terminal"), 5_000);
+        assert_eq!(resolve_timeout_ms(Some(5_000), "web"), 5_000);
+        // Zero/negative are rejected exactly like the old `.filter(|n| *n > 0)` guards, so a
+        // client cannot request an unbounded run by sending 0 or -1.
+        assert_eq!(resolve_timeout_ms(Some(0), "web"), DEFAULT_WEB_TIMEOUT_MS);
+        assert_eq!(
+            resolve_timeout_ms(Some(-1), "terminal"),
+            DEFAULT_TIMEOUT_MS
+        );
+    }
 
     /// Regression: a `mode:"web"` run started WITHOUT a WS broadcast sender (the REST
     /// `POST /api/sandbox/runs` path, tx = None) must still detect its web port while the run
