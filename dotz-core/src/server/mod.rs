@@ -1,4 +1,6 @@
 //! axum HTTP/WS server. Mirrors src/server.ts route groups; serves the static `web/` UI.
+mod guard;
+
 use crate::{
     config::{self, CleanPatch, DotzConfig},
     profiles, types,
@@ -65,6 +67,10 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
         .merge(crate::checkpoint::router())
         .merge(crate::commands::router())
         .fallback_service(ServeDir::new(web_dir).append_index_html_on_directories(true))
+        // Origin/Host allowlist guard (applied last so it wraps every route above, including the
+        // static fallback and the `/ws` upgrade). Rejects present-and-disallowed Origin/Host with
+        // 403; a missing Origin passes so the Tauri IPC shim / same-origin fetches keep working.
+        .layer(axum::middleware::from_fn(guard::origin_guard))
 }
 
 async fn health(State(_s): State<Shared>) -> Json<Value> {
@@ -593,6 +599,74 @@ mod tests {
             "server should exit cleanly: {:?}",
             result.err()
         );
+    }
+
+    /// The Origin/Host allowlist guard must reject a cross-origin request from a foreign page with
+    /// `403` on a code-exec route (`GET /api/sandbox/runs`) — before the handler runs — while an
+    /// allowed loopback Origin and a no-Origin request both pass. This is the router-level proof
+    /// that the guard layer is wired into `app()` and covers the sandbox surface. We use the GET
+    /// list route (which spawns nothing) so the test never executes sandbox code.
+    #[tokio::test]
+    async fn origin_guard_blocks_foreign_origin_on_sandbox_route() {
+        let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dummy.local_addr().unwrap();
+        drop(dummy);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        let handle = tokio::spawn(serve_with_shutdown_addr(
+            addr,
+            PathBuf::from("web"),
+            shutdown,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let client = reqwest::Client::new();
+        let sandbox_url = format!("http://127.0.0.1:{}/api/sandbox/runs", addr.port());
+        let health_url = format!("http://127.0.0.1:{}/api/health", addr.port());
+
+        // Foreign Origin -> 403 (rejected before the handler).
+        let forbidden = client
+            .get(&sandbox_url)
+            .header("Origin", "http://evil.example")
+            .send()
+            .await
+            .expect("GET /api/sandbox/runs with foreign origin");
+        assert_eq!(
+            forbidden.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "a foreign Origin must be rejected with 403 on the sandbox route"
+        );
+
+        // Allowed loopback Origin -> not rejected.
+        let allowed = client
+            .get(&health_url)
+            .header("Origin", format!("http://127.0.0.1:{}", addr.port()))
+            .send()
+            .await
+            .expect("GET /api/health with loopback origin");
+        assert!(
+            allowed.status().is_success(),
+            "an allowed loopback Origin must pass, got {}",
+            allowed.status()
+        );
+
+        // No Origin header (Tauri IPC shim / same-origin) -> passes.
+        let no_origin = client
+            .get(&health_url)
+            .send()
+            .await
+            .expect("GET /api/health with no origin");
+        assert!(
+            no_origin.status().is_success(),
+            "a request with no Origin must pass, got {}",
+            no_origin.status()
+        );
+
+        let _ = tx.send(());
+        let _ = handle.await.unwrap();
     }
 
     #[tokio::test]
