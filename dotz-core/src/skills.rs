@@ -194,22 +194,22 @@ fn parent_dir_name(file: &std::path::Path) -> String {
 
 /// Split a YAML value coerced to a string: a string OR a number → its string form; anything else
 /// (null/seq/map/bool) → `None`. Mirrors the JS `typeof === "string" || typeof === "number"` guard.
-fn scalar_str(v: &serde_yaml::Value) -> Option<String> {
+fn scalar_str(v: &serde_yaml_ng::Value) -> Option<String> {
     match v {
-        serde_yaml::Value::String(s) => Some(s.clone()),
-        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml_ng::Value::String(s) => Some(s.clone()),
+        serde_yaml_ng::Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
 }
 
 /// A YAML sequence filtered to its string elements only (non-strings dropped). A non-sequence → None.
 /// Mirrors `Array.isArray(x) ? x.filter(typeof === "string") : undefined`.
-fn string_array(v: &serde_yaml::Value) -> Option<Vec<String>> {
+fn string_array(v: &serde_yaml_ng::Value) -> Option<Vec<String>> {
     match v {
-        serde_yaml::Value::Sequence(seq) => Some(
+        serde_yaml_ng::Value::Sequence(seq) => Some(
             seq.iter()
                 .filter_map(|x| match x {
-                    serde_yaml::Value::String(s) => Some(s.clone()),
+                    serde_yaml_ng::Value::String(s) => Some(s.clone()),
                     _ => None,
                 })
                 .collect(),
@@ -293,9 +293,9 @@ fn parse_skill_file(file: &std::path::Path, source: &'static str) -> Option<Skil
     let (fm_src, body) = split_frontmatter(&raw);
 
     // Parse the frontmatter; on any error fall back to an empty mapping (dirname name fallback).
-    let fm: serde_yaml::Value = fm_src
-        .and_then(|y| serde_yaml::from_str::<serde_yaml::Value>(&y).ok())
-        .unwrap_or(serde_yaml::Value::Mapping(Default::default()));
+    let fm: serde_yaml_ng::Value = fm_src
+        .and_then(|y| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&y).ok())
+        .unwrap_or(serde_yaml_ng::Value::Mapping(Default::default()));
 
     let get = |k: &str| fm.get(k);
 
