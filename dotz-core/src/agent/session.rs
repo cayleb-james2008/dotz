@@ -588,7 +588,10 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     };
 
     // Per-turn query-relevant memory recall, appended to the system prompt (best-effort).
-    let recall = memory::recall(&prompt, Some(&cwd.to_string_lossy()));
+    // recall_async hops to the blocking pool: the first call pays the multi-second ONNX
+    // embedder load, which must not stall this reactor thread (it carries the WS stream).
+    let recall =
+        memory::recall_async(prompt.clone(), Some(cwd.to_string_lossy().into_owned())).await;
     let recall_block = memory::render_recall(&recall);
     let effective_system = if recall_block.is_empty() {
         system_prompt

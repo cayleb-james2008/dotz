@@ -636,7 +636,7 @@ impl Tool for MemorySearchTool {
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let q = str_arg(args, "query").ok_or("query is required")?;
         let cwd = ctx.cwd.to_string_lossy().to_string();
-        let hits = crate::memory::search_public(q, Some(&cwd));
+        let hits = crate::memory::search_public_async(q.to_string(), Some(cwd)).await;
         Ok(render_mem(&hits))
     }
 }
@@ -660,7 +660,8 @@ impl Tool for MemoryAddTool {
         let text = str_arg(args, "text").ok_or("text is required")?;
         let scope = str_arg(args, "scope").unwrap_or("project");
         let cwd = ctx.cwd.to_string_lossy().to_string();
-        let v = crate::memory::add_public(text, scope, Some(&cwd))?;
+        let v =
+            crate::memory::add_public_async(text.to_string(), scope.to_string(), Some(cwd)).await?;
         Ok(format!("saved memory {} ({})", v.id, v.scope))
     }
 }
@@ -679,7 +680,9 @@ impl Tool for MemoryListTool {
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let cwd = ctx.cwd.to_string_lossy().to_string();
-        Ok(render_mem(&crate::memory::list_public(Some(&cwd))))
+        Ok(render_mem(
+            &crate::memory::list_public_async(Some(cwd)).await,
+        ))
     }
 }
 
