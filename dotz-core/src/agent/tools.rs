@@ -379,11 +379,11 @@ impl Tool for BashTool {
                 #[cfg(windows)]
                 {
                     if let Some(pid) = child.id() {
-                        let _ = std::process::Command::new("taskkill")
-                            .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        let mut kc = std::process::Command::new("taskkill");
+                        kc.args(["/PID", &pid.to_string(), "/T", "/F"])
                             .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
+                            .stderr(Stdio::null());
+                        let _ = crate::util::no_window(&mut kc).status();
                     }
                 }
                 #[cfg(not(windows))]

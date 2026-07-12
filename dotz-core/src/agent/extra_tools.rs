@@ -325,22 +325,23 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
     // as an orphan that keeps consuming CPU — the exact bug already fixed in the `bash` tool.
     // tokio's Command doesn't expose process_group, so build a std Command and convert.
     #[cfg(windows)]
-    let mut child = match tokio::process::Command::new("cmd")
-        .arg("/C")
-        .arg(&command)
-        .current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return json!({
-                "error": format!("gate run failed: {e}"),
-                "ok": false,
-                "passed": 0,
-                "failed": 0,
-            });
+    let mut child = {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C")
+            .arg(&command)
+            .current_dir(&cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match crate::util::no_window_tokio(&mut c).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return json!({
+                    "error": format!("gate run failed: {e}"),
+                    "ok": false,
+                    "passed": 0,
+                    "failed": 0,
+                });
+            }
         }
     };
     #[cfg(not(windows))]
@@ -444,14 +445,16 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
             // Windows: `taskkill /PID <pid> /T /F` kills the whole process tree.  POSIX: the
             // child was placed in its own process group at spawn, so `kill -9 -<pgrp>` reaps
             // the entire group — shell + every descendant.
+            // Use .status() (not .spawn()) so the kill/taskkill subprocess is reaped instead of
+            // leaking a zombie/handle — same fix the bash tool's timeout path already carries.
             #[cfg(windows)]
             {
                 if let Some(pid) = child.id() {
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    let mut kc = std::process::Command::new("taskkill");
+                    kc.args(["/PID", &pid.to_string(), "/T", "/F"])
                         .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn();
+                        .stderr(Stdio::null());
+                    let _ = crate::util::no_window(&mut kc).status();
                 }
             }
             #[cfg(not(windows))]
@@ -461,7 +464,7 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
                         .args(["-9", &format!("-{pid}")])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
-                        .spawn();
+                        .status();
                 }
             }
             // Reap the killed child so it does not become a zombie (Unix) or leak handles

@@ -25,6 +25,27 @@ pub fn now_ms() -> i64 {
     millis_since_epoch(SystemTime::now())
 }
 
+/// House convention: every spawned console subprocess must be windowless on Windows, or the
+/// packaged (`windows_subsystem = "windows"`) app flashes a conhost window over the dashboard
+/// on every git/taskkill/gh/openspec spawn. Apply this to a `std::process::Command` before
+/// spawning; no-op off Windows. Enforced by `dotz-core/tests/windowless_guard.rs`.
+pub fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
+/// `no_window` for `tokio::process::Command`, which exposes `creation_flags` inherently on
+/// Windows (no `CommandExt` import needed). No-op off Windows.
+pub fn no_window_tokio(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,6 +75,42 @@ mod tests {
         assert_eq!(millis_since_epoch(t), 60_000);
         let t2 = UNIX_EPOCH + Duration::from_millis(1);
         assert_eq!(millis_since_epoch(t2), 1);
+    }
+
+    /// After applying `no_window`, a command must still spawn and complete normally on every
+    /// platform (mirrors the connections.rs spawn-still-works test for CREATE_NO_WINDOW).
+    #[test]
+    fn no_window_command_still_spawns_and_completes() {
+        let mut c = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit 0"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", "exit 0"]);
+            c
+        };
+        let status = no_window(&mut c).status().expect("command should spawn");
+        assert!(status.success(), "windowless command should exit 0");
+    }
+
+    /// Same for the tokio variant: `no_window_tokio` must not break spawning.
+    #[tokio::test]
+    async fn no_window_tokio_command_still_spawns_and_completes() {
+        let mut c = if cfg!(windows) {
+            let mut c = tokio::process::Command::new("cmd");
+            c.args(["/C", "exit 0"]);
+            c
+        } else {
+            let mut c = tokio::process::Command::new("sh");
+            c.args(["-c", "exit 0"]);
+            c
+        };
+        let status = no_window_tokio(&mut c)
+            .status()
+            .await
+            .expect("command should spawn");
+        assert!(status.success(), "windowless command should exit 0");
     }
 
     /// `now_ms()` must be non-negative and broadly sane (a smoke test that the helper is wired

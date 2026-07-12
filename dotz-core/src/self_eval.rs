@@ -221,7 +221,7 @@ impl Grader for CommandSucceeds {
 /// Build a shell-launched `Command` for the platform. Centralized so the grader and any
 /// setup shell steps share one cross-platform entry point.
 fn shell_cmd(line: &str) -> std::process::Command {
-    if cfg!(windows) {
+    let mut c = if cfg!(windows) {
         let mut c = std::process::Command::new("cmd");
         c.args(["/C", line]);
         c
@@ -229,7 +229,9 @@ fn shell_cmd(line: &str) -> std::process::Command {
         let mut c = std::process::Command::new("sh");
         c.args(["-c", line]);
         c
-    }
+    };
+    crate::util::no_window(&mut c);
+    c
 }
 
 /// Always-pass sentinel (smoke tasks).
