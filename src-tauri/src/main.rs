@@ -175,7 +175,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = shutdown_rx.changed().await;
             };
 
-            tauri::async_runtime::spawn(async move {
+            let server_task = tauri::async_runtime::spawn(async move {
                 if let Err(e) =
                     dotz_core::server::serve_with_shutdown(listener, web_dir, shutdown).await
                 {
@@ -183,6 +183,11 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             });
             app.manage(shutdown_tx);
+            // Keep the server task's JoinHandle so the Exit handler can actually await the
+            // drain — signalling shutdown without awaiting it lets the process die mid-drain,
+            // truncating in-flight requests and WS close frames. Mutex<Option<..>> because the
+            // RunEvent closure only gets shared state access and the handle must be taken once.
+            app.manage(std::sync::Mutex::new(Some(server_task)));
 
             // Wait until the server accepts connections, then open the window on it.
             let mut ready = false;
@@ -231,6 +236,20 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             dotz_core::browser::reap_stray_browsers();
             if let Some(tx) = app_handle.try_state::<tokio::sync::watch::Sender<()>>() {
                 let _ = tx.send(());
+            }
+            // Await the server's graceful drain with a bounded timeout. The watch signal above
+            // only STARTS the drain (axum stops accepting and waits for connection tasks); if
+            // the process exits immediately the drain is truncated and in-flight work is
+            // dropped on the floor. 3 s is generous — WS loops break promptly on the shutdown
+            // watch — while the bound guarantees a hung connection can't wedge app exit.
+            let server_task = app_handle
+                .try_state::<std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>()
+                .and_then(|s| s.lock().ok().and_then(|mut g| g.take()));
+            if let Some(task) = server_task {
+                tauri::async_runtime::block_on(async {
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+                });
             }
         }
     });
