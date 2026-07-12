@@ -713,11 +713,14 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                             .get("projectId")
                             .and_then(|x| x.as_str())
                             .map(|s| s.to_string());
-                        let timeout_ms = v
-                            .get("timeoutMs")
-                            .and_then(|x| x.as_i64())
-                            .filter(|n| *n > 0)
-                            .unwrap_or(30_000);
+                        // Mode-aware default: web-mode previews host a dev server the user is
+                        // actively looking at, so they get the long preview default instead of
+                        // the 30 s terminal default (which killed every preview mid-view). An
+                        // explicit positive timeoutMs from the client still wins in either mode.
+                        let timeout_ms = crate::sandbox::resolve_timeout_ms(
+                            v.get("timeoutMs").and_then(|x| x.as_i64()),
+                            &mode,
+                        );
                         if let Some(tx) = session::tx(&session_id) {
                             let sid = session_id.clone();
                             tokio::spawn(async move {
