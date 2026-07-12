@@ -984,7 +984,9 @@ async fn delete_memory(
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
     let cwd = cwd_of(&q);
-    Json(json!({ "ok": remove(&id, cwd.as_deref()) }))
+    // remove() holds the sqlite mutex and rewrites the MEMORY.md mirror — hop off the reactor.
+    let ok = on_blocking(|| false, move || remove(&id, cwd.as_deref())).await;
+    Json(json!({ "ok": ok }))
 }
 
 async fn search_memory(
@@ -1646,8 +1648,26 @@ mod tests {
     /// the reactor must still complete while the mutex is held — with the old inline
     /// `memory::recall` call this test deadlocks until the holder's 10s bailout, then fails the
     /// elapsed assertion.
+    ///
+    /// ENV_LOCK is deliberately held across the awaits: the recall must not race the other
+    /// memory tests' store mutations, and the awaited tasks never acquire ENV_LOCK, so the
+    /// deadlock the lint guards against cannot occur (each test runs on its own runtime).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn recall_async_keeps_reactor_free_while_embedder_mutex_is_held() {
+        // Serialize against the other memory tests and point DOTZ_CONFIG_DIR at a scratch dir
+        // so a first-to-run store init lands in temp, never in the operator's real memory.db
+        // (same idiom as async_wrappers_match_sync_results).
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-memory-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // Force DB init in the isolated dir (no-op if another test already initialized it).
+        drop(db().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+
         let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
@@ -1680,6 +1700,12 @@ mod tests {
             joined.is_ok(),
             "recall_async should resolve once the embedder mutex is released"
         );
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The async wrappers are thin blocking-pool hops: for identical inputs they must return
