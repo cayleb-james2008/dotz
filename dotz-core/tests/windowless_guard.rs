@@ -29,7 +29,10 @@ fn every_spawn_site_is_windowless() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest.parent().expect("dotz-core has a parent dir");
     // Shipped source only: dotz-core/src + the Tauri shell. tests/ dirs are exempt by omission.
-    let roots = [manifest.join("src"), workspace.join("src-tauri").join("src")];
+    let roots = [
+        manifest.join("src"),
+        workspace.join("src-tauri").join("src"),
+    ];
 
     let mut files = Vec::new();
     for root in &roots {

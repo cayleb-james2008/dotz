@@ -560,7 +560,9 @@ async fn run_single_agent_inner(
     };
     // Query with the task (the most relevant signal) so the recall surfaces the conventions /
     // decisions that actually bear on this subagent's work, not a generic project dump.
-    let recall = crate::memory::recall(task, Some(cwd));
+    // recall_async: with workflow fan-out several subagents recall concurrently behind one
+    // embedder mutex — that wait belongs on the blocking pool, not on reactor threads.
+    let recall = crate::memory::recall_async(task.to_string(), Some(cwd.to_string())).await;
     let system_prompt = system_prompt_with_recall(&base_prompt, &recall);
 
     let ctx = ToolCtx {

@@ -721,43 +721,51 @@ pub async fn capture_exchange(
         return Vec::new();
     }
 
-    // Same-scope neighbors for dedup (embeddings already in the row).
-    let user_id = scope_user(scope, cwd);
-    let neighbors: Vec<Row> = {
-        let conn = db_guard();
-        rows_for_user(&conn, &user_id, None)
-    };
-
-    let mut kept: Vec<MemoryView> = Vec::new();
-    let mut added_embs: Vec<Vec<f32>> = Vec::new();
-    for fact in facts {
-        let emb = match embed_text(&fact) {
-            Ok(e) => e,
-            Err(_) => continue,
+    // The embed/dedup/add loop runs ONNX inference behind the global embedder mutex (plus the
+    // sqlite mutex and an eventual auto-consolidate), so hop to the blocking pool — this is
+    // awaited from reactor threads after every turn and must not stall the WS event stream.
+    let cwd_owned = cwd.map(str::to_string);
+    on_blocking(Vec::new, move || {
+        let cwd = cwd_owned.as_deref();
+        // Same-scope neighbors for dedup (embeddings already in the row).
+        let user_id = scope_user(scope, cwd);
+        let neighbors: Vec<Row> = {
+            let conn = db_guard();
+            rows_for_user(&conn, &user_id, None)
         };
-        // Near-dup vs existing neighbors OR vs a fact we just added this turn → skip.
-        let dup = neighbors
-            .iter()
-            .any(|r| cosine(&emb, &r.embedding) >= CAPTURE_DEDUP_THRESHOLD)
-            || added_embs
-                .iter()
-                .any(|e| cosine(&emb, e) >= CAPTURE_DEDUP_THRESHOLD);
-        if dup {
-            continue;
-        }
-        if let Ok(v) = add(&fact, scope, None, None, cwd) {
-            kept.push(v);
-            added_embs.push(emb);
-        }
-    }
 
-    if !kept.is_empty() {
-        let count = increment_captures(&user_id, kept.len() as i64);
-        if count >= AUTO_CONSOLIDATE_EVERY {
-            maybe_auto_consolidate(cwd);
+        let mut kept: Vec<MemoryView> = Vec::new();
+        let mut added_embs: Vec<Vec<f32>> = Vec::new();
+        for fact in facts {
+            let emb = match embed_text(&fact) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            // Near-dup vs existing neighbors OR vs a fact we just added this turn → skip.
+            let dup = neighbors
+                .iter()
+                .any(|r| cosine(&emb, &r.embedding) >= CAPTURE_DEDUP_THRESHOLD)
+                || added_embs
+                    .iter()
+                    .any(|e| cosine(&emb, e) >= CAPTURE_DEDUP_THRESHOLD);
+            if dup {
+                continue;
+            }
+            if let Ok(v) = add(&fact, scope, None, None, cwd) {
+                kept.push(v);
+                added_embs.push(emb);
+            }
         }
-    }
-    kept
+
+        if !kept.is_empty() {
+            let count = increment_captures(&user_id, kept.len() as i64);
+            if count >= AUTO_CONSOLIDATE_EVERY {
+                maybe_auto_consolidate(cwd);
+            }
+        }
+        kept
+    })
+    .await
 }
 
 /// Run consolidation if enough new captures have accumulated for any relevant scope since the last
@@ -822,6 +830,55 @@ pub fn add_public(text: &str, scope: &str, cwd: Option<&str>) -> Result<MemoryVi
     add(text, scope, None, None, cwd)
 }
 
+// ---- async wrappers (blocking-pool hops) ----
+//
+// Every sync fn above runs ONNX inference behind the global embedder mutex (whose FIRST call
+// also pays the multi-second ONNX session load) and/or holds the sqlite mutex. Called inline
+// from async code that stalls a reactor thread — with workflow fan-out, several at once — and
+// freezes the WS event stream operators watch. These wrappers hop to tokio's blocking pool;
+// the sync cores stay the single source of truth.
+
+/// Run a blocking memory operation on the blocking pool. Best-effort like the rest of the
+/// module: a panicked/cancelled blocking task yields `fallback()` instead of an error.
+async fn on_blocking<T: Send + 'static>(
+    fallback: impl FnOnce() -> T,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(_) => fallback(),
+    }
+}
+
+/// `recall` off the reactor — for pre-turn recall in `run_turn` / subagent dispatch.
+pub async fn recall_async(query: String, cwd: Option<String>) -> Vec<MemoryView> {
+    on_blocking(Vec::new, move || recall(&query, cwd.as_deref())).await
+}
+
+/// `search_public` off the reactor — for the memory_search tool.
+pub async fn search_public_async(query: String, cwd: Option<String>) -> Vec<MemoryView> {
+    on_blocking(Vec::new, move || search_public(&query, cwd.as_deref())).await
+}
+
+/// `add_public` off the reactor — for the memory_add tool.
+pub async fn add_public_async(
+    text: String,
+    scope: String,
+    cwd: Option<String>,
+) -> Result<MemoryView, String> {
+    on_blocking(
+        || Err("memory add: blocking task failed".to_string()),
+        move || add_public(&text, &scope, cwd.as_deref()),
+    )
+    .await
+}
+
+/// `list_public` off the reactor — for the memory_list tool (sqlite mutex can be held for a
+/// long consolidate pass, so even the no-embedding list should not wait on a reactor thread).
+pub async fn list_public_async(cwd: Option<String>) -> Vec<MemoryView> {
+    on_blocking(Vec::new, move || list_public(cwd.as_deref())).await
+}
+
 // ---- handlers ----
 fn cwd_of(q: &HashMap<String, String>) -> Option<String> {
     crate::projects::cwd_for_project(q.get("projectId").map(|s| s.as_str()))
@@ -832,7 +889,9 @@ fn bad(msg: &str) -> (StatusCode, Json<Value>) {
 
 async fn get_memory(Query(q): Query<HashMap<String, String>>) -> Json<Value> {
     let cwd = cwd_of(&q);
-    Json(json!({ "entries": list(cwd.as_deref()) }))
+    // No embedding, but the sqlite mutex can be held for a long consolidate pass — hop anyway.
+    let entries = on_blocking(Vec::new, move || list(cwd.as_deref())).await;
+    Json(json!({ "entries": entries }))
 }
 
 async fn post_memory(
@@ -870,9 +929,26 @@ async fn post_memory(
                 "global".into()
             }
         });
-    let category = b.get("category").and_then(|v| v.as_str());
-    let folder = b.get("folder").and_then(|v| v.as_str());
-    match add(&text, &scope, category, folder, cwd.as_deref()) {
+    let category = b
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let folder = b.get("folder").and_then(|v| v.as_str()).map(str::to_string);
+    // add() embeds behind the global embedder mutex — hop off the reactor thread.
+    let res = on_blocking(
+        || Err("memory add: blocking task failed".to_string()),
+        move || {
+            add(
+                &text,
+                &scope,
+                category.as_deref(),
+                folder.as_deref(),
+                cwd.as_deref(),
+            )
+        },
+    )
+    .await;
+    match res {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -892,7 +968,9 @@ async fn patch_memory(
         _ => return Err(bad("text (or value) is required")),
     };
     let cwd = crate::projects::cwd_for_project(b.get("projectId").and_then(|v| v.as_str()));
-    match update(&id, &text, cwd.as_deref()) {
+    // update() re-embeds the new text behind the embedder mutex — hop off the reactor thread.
+    let res = on_blocking(|| None, move || update(&id, &text, cwd.as_deref())).await;
+    match res {
         Some(v) => Ok(Json(v)),
         None => Err((
             StatusCode::NOT_FOUND,
@@ -941,20 +1019,36 @@ async fn search_memory(
             return Err(bad("scope must be 'project' or 'global'"));
         }
     }
-    let query = b.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let query = b
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let cwd = crate::projects::cwd_for_project(b.get("projectId").and_then(|v| v.as_str()));
-    let scope = b.get("scope").and_then(|v| v.as_str());
-    let folder = b.get("folder").and_then(|v| v.as_str());
-    let category = b.get("category").and_then(|v| v.as_str());
-    match search(
-        query,
-        cwd.as_deref(),
-        scope,
-        threshold,
-        top_k,
-        folder,
-        category,
-    ) {
+    let scope = b.get("scope").and_then(|v| v.as_str()).map(str::to_string);
+    let folder = b.get("folder").and_then(|v| v.as_str()).map(str::to_string);
+    let category = b
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    // search() embeds the query behind the embedder mutex (first call: full ONNX session load)
+    // — hop off the reactor thread.
+    let res = on_blocking(
+        || Err("memory search: blocking task failed".to_string()),
+        move || {
+            search(
+                &query,
+                cwd.as_deref(),
+                scope.as_deref(),
+                threshold,
+                top_k,
+                folder.as_deref(),
+                category.as_deref(),
+            )
+        },
+    )
+    .await;
+    match res {
         Ok(results) => Ok(Json(json!({ "results": results }))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -966,7 +1060,9 @@ async fn search_memory(
 async fn consolidate_memory(body: Option<Json<Value>>) -> Json<Value> {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let cwd = crate::projects::cwd_for_project(b.get("projectId").and_then(|v| v.as_str()));
-    let (removed, kept) = consolidate(cwd.as_deref());
+    // consolidate() is O(n²) cosine over every row while holding the sqlite mutex — the single
+    // longest memory operation; it must not run on a reactor thread.
+    let (removed, kept) = on_blocking(|| (0, 0), move || consolidate(cwd.as_deref())).await;
     Json(json!({ "removed": removed, "kept": kept }))
 }
 
@@ -1296,7 +1392,9 @@ mod tests {
             let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
             std::env::set_var("DOTZ_CONFIG_DIR", dir);
             // Force DB init in the isolated dir.
-            drop(db().lock().unwrap());
+            // Recovering lock: db_guard_recovers_from_poisoned_mutex intentionally leaves the
+            // process-global DB mutex poisoned, and test order is arbitrary.
+            drop(db().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
 
             let err = add_public("a fact", "workspace", Some(dir.to_str().unwrap()))
                 .err()
@@ -1363,7 +1461,9 @@ mod tests {
             std::env::set_var("DOTZ_CONFIG_DIR", dir);
             // Force initialization if not already done, so this test runs in an isolated
             // location when it is the first caller.
-            drop(db().lock().unwrap());
+            // Recovering lock: db_guard_recovers_from_poisoned_mutex intentionally leaves the
+            // process-global DB mutex poisoned, and test order is arbitrary.
+            drop(db().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
 
             let db_ref = db();
             let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1491,7 +1591,9 @@ mod tests {
         with_tmp_dir(|dir| {
             let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
             std::env::set_var("DOTZ_CONFIG_DIR", dir);
-            drop(db().lock().unwrap());
+            // Recovering lock: db_guard_recovers_from_poisoned_mutex intentionally leaves the
+            // process-global DB mutex poisoned, and test order is arbitrary.
+            drop(db().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
 
             let cwd = dir.join("project");
             std::fs::create_dir_all(&cwd).unwrap();
@@ -1536,5 +1638,125 @@ mod tests {
                 None => std::env::remove_var("DOTZ_CONFIG_DIR"),
             }
         });
+    }
+
+    /// The reactor must stay responsive while a memory operation waits on the embedder mutex.
+    /// A std thread holds the global embedder mutex; `recall_async` (spawned as a task) then
+    /// blocks on it INSIDE the blocking pool. On this current_thread runtime, a 50ms sleep on
+    /// the reactor must still complete while the mutex is held — with the old inline
+    /// `memory::recall` call this test deadlocks until the holder's 10s bailout, then fails the
+    /// elapsed assertion.
+    #[tokio::test]
+    async fn recall_async_keeps_reactor_free_while_embedder_mutex_is_held() {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _g = embedder_guard();
+            let _ = locked_tx.send(());
+            // Hold until released (bounded so a broken test cannot hang the suite forever).
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+        });
+        locked_rx
+            .recv()
+            .expect("holder should signal lock acquired");
+
+        // Non-empty query so recall genuinely contends on the embedder mutex.
+        let recall_task = tokio::spawn(recall_async("reactor liveness probe".into(), None));
+
+        let start = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "reactor sleep must complete while the embedder mutex is held elsewhere \
+             (took {:?} — recall is blocking the reactor)",
+            start.elapsed()
+        );
+
+        release_tx.send(()).expect("holder should still be waiting");
+        holder.join().expect("holder thread should exit cleanly");
+        // recall_async must now resolve (best-effort result; content does not matter here).
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(60), recall_task).await;
+        assert!(
+            joined.is_ok(),
+            "recall_async should resolve once the embedder mutex is released"
+        );
+    }
+
+    /// The async wrappers are thin blocking-pool hops: for identical inputs they must return
+    /// exactly what the sync cores return (compare ids/text — rerank's recency term shifts
+    /// scores by nanoseconds between calls).
+    ///
+    /// ENV_LOCK is deliberately held across the awaits: the store must stay unmutated for the
+    /// sync/async comparisons, and the awaited blocking tasks never acquire ENV_LOCK, so the
+    /// deadlock the lint guards against cannot occur (each test runs on its own runtime).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn async_wrappers_match_sync_results() {
+        // Serialize against the other memory tests (they mutate the shared store under ENV_LOCK)
+        // and point DOTZ_CONFIG_DIR at a scratch dir so a first-to-run store init lands in temp,
+        // never in the operator's real memory.db (same idiom as add_rejects_invalid_scope).
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-memory-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // Force DB init in the isolated dir (no-op if another test already initialized it).
+        drop(db().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+
+        let unique = format!("async-wrapper equivalence fact {}", uuid::Uuid::new_v4());
+        let added = add_public_async(unique.clone(), "global".into(), None)
+            .await
+            .expect("add_public_async should store the fact");
+        assert_eq!(added.memory, unique);
+
+        let sync_hits: Vec<(String, String)> = search_public(&unique, None)
+            .into_iter()
+            .map(|v| (v.id, v.memory))
+            .collect();
+        let async_hits: Vec<(String, String)> = search_public_async(unique.clone(), None)
+            .await
+            .into_iter()
+            .map(|v| (v.id, v.memory))
+            .collect();
+        assert!(
+            sync_hits.iter().any(|(id, _)| id == &added.id),
+            "sync search should surface the fact it just stored"
+        );
+        assert_eq!(
+            sync_hits, async_hits,
+            "search_public_async must return exactly what search_public returns"
+        );
+
+        let sync_recall: Vec<String> = recall(&unique, None).into_iter().map(|v| v.id).collect();
+        let async_recall: Vec<String> = recall_async(unique.clone(), None)
+            .await
+            .into_iter()
+            .map(|v| v.id)
+            .collect();
+        assert_eq!(
+            sync_recall, async_recall,
+            "recall_async must return exactly what recall returns"
+        );
+
+        let sync_list: Vec<String> = list_public(None).into_iter().map(|v| v.id).collect();
+        let async_list: Vec<String> = list_public_async(None)
+            .await
+            .into_iter()
+            .map(|v| v.id)
+            .collect();
+        assert_eq!(
+            sync_list, async_list,
+            "list_public_async must return exactly what list_public returns"
+        );
+
+        // Clean up the stored fact so this test leaves no residue in the shared store.
+        assert!(remove(&added.id, None), "cleanup remove should succeed");
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
