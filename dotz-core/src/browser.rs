@@ -626,22 +626,23 @@ async fn run(
 
 /// Kill a pid and its descendant tree — taskkill /T /F on win32, kill -9 on posix. Best-effort.
 ///
-/// The kill is dispatched on a blocking thread (spawn_blocking) and not awaited: `CreateProcess`
-/// for taskkill.exe is a synchronous syscall that can take several hundred ms under load, and
-/// running it inline on the timeout path would stall a tokio worker thread for that whole time
-/// (and let the caller's wall-clock timeout balloon past its budget). Fire-and-forget keeps the
-/// kill semantics identical (best-effort, never waited on) while freeing the timeout path to
-/// return promptly.
+/// The kill is dispatched on a blocking thread (spawn_blocking) and not awaited by the caller:
+/// `CreateProcess` for taskkill.exe is a synchronous syscall that can take several hundred ms
+/// under load, and running it inline on the timeout path would stall a tokio worker thread for
+/// that whole time (and let the caller's wall-clock timeout balloon past its budget). Inside the
+/// blocking task the kill subprocess IS waited on (`.status()`, not `.spawn()`) so it gets
+/// reaped — dropping a spawned `std::process::Child` without waiting leaves a zombie that
+/// accumulates over a long-lived server with many browser kills (same fix as sandbox::kill_pid).
 fn kill_pid(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     tokio::task::spawn_blocking(move || {
         #[cfg(windows)]
         {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
+            let mut cmd = std::process::Command::new("taskkill");
+            cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
+                .stderr(Stdio::null());
+            let _ = crate::util::no_window(&mut cmd).status();
         }
         #[cfg(not(windows))]
         {
@@ -649,7 +650,7 @@ fn kill_pid(pid: Option<u32>) {
                 .args(["-9", &pid.to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn();
+                .status();
         }
     });
 }
@@ -1368,14 +1369,16 @@ pub async fn dispose_all() {
 /// Force-kill any lingering agent-browser process tree by image name. Best-effort backstop —
 /// `agent-browser close` does not reliably reap the headless-Chrome grandchild. Exposed publicly
 /// so the Tauri shell can call it after `dispose_all` on shutdown.
+/// Blocking (`.status()`, not `.spawn()`): only called at process exit, where waiting a few ms
+/// for taskkill/pkill is fine and reaping the subprocess avoids leaving a zombie behind.
 pub fn reap_stray_browsers() {
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "agent-browser-win32-x64.exe", "/T", "/F"])
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/IM", "agent-browser-win32-x64.exe", "/T", "/F"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        let _ = crate::util::no_window(&mut cmd).status();
     }
     #[cfg(not(windows))]
     {
@@ -1383,7 +1386,7 @@ pub fn reap_stray_browsers() {
             .args(["-f", "agent-browser"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .status();
     }
 }
 

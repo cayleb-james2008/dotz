@@ -53,9 +53,9 @@ fn resolve_cwd(project_id: Option<&str>) -> Result<PathBuf, (StatusCode, Json<Va
 }
 
 fn run(cwd: &FsPath, program: &str, args: &[&str]) -> Result<(String, String, i32), String> {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(cwd);
+    let output = crate::util::no_window(&mut cmd)
         .output()
         .map_err(|e| format!("{program} {}: {e}", args.join(" ")))?;
     Ok((
@@ -94,7 +94,9 @@ fn parse_ahead_behind(raw: &str) -> (u32, u32) {
 }
 
 fn gh_installed() -> bool {
-    Command::new("gh").arg("--version").output().is_ok()
+    let mut cmd = Command::new("gh");
+    cmd.arg("--version");
+    crate::util::no_window(&mut cmd).output().is_ok()
 }
 
 fn gh_logged_in(cwd: &FsPath) -> bool {

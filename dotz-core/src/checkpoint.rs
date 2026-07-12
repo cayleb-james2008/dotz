@@ -170,9 +170,9 @@ pub fn remove_checkpoint(run_id: &str) -> Option<Checkpoint> {
 /// Run a git command in `cwd`, return (stdout, stderr, exit_code).
 /// Mirrors the style of BashTool: build a `Command`, collect stdout+stderr, return them.
 fn git(cwd: &str, args: &[&str]) -> Result<(String, String, i32), String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args).current_dir(cwd);
+    let output = crate::util::no_window(&mut cmd)
         .output()
         .map_err(|e| format!("git {}: {}", args.join(" "), e))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

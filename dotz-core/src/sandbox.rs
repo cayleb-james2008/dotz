@@ -678,11 +678,11 @@ fn kill_pid(pid: Option<u32>) {
         // Use .status() (not .spawn()) so the taskkill subprocess is reaped. Dropping a spawned
         // std::process::Child without waiting leaves a zombie that accumulates over a long-lived
         // server with many sandbox kills.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        let _ = crate::util::no_window(&mut cmd).status();
     }
     #[cfg(not(windows))]
     {

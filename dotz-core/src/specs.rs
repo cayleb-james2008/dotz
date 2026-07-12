@@ -342,10 +342,9 @@ pub fn status_for_cwd(cwd: &FsPath) -> Value {
 }
 
 fn openspec_cli_version() -> Value {
-    match std::process::Command::new("openspec")
-        .arg("--version")
-        .output()
-    {
+    let mut cmd = std::process::Command::new("openspec");
+    cmd.arg("--version");
+    match crate::util::no_window(&mut cmd).output() {
         Ok(out) if out.status.success() => json!({
             "installed": true,
             "version": String::from_utf8_lossy(&out.stdout).trim(),
