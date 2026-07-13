@@ -6,6 +6,7 @@
 
 **The ultra-code agent dashboard — one prompt becomes a team of AI coding agents.**
 
+[![CI](https://github.com/cayleb-james2008/dotz/actions/workflows/ci.yml/badge.svg)](https://github.com/cayleb-james2008/dotz/actions/workflows/ci.yml)
 [![Download](https://img.shields.io/github/v/release/cayleb-james2008/dotz?label=download&color=b4befe)](https://github.com/cayleb-james2008/dotz/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/cayleb-james2008/dotz/total?color=a6e3a1)](https://github.com/cayleb-james2008/dotz/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-89b4fa)](https://github.com/cayleb-james2008/dotz/releases/latest)
@@ -28,6 +29,27 @@ and a native **Open Design** workspace (150+ design systems, live preview, HTML/
 <div align="center">
 <img src="docs/screenshot.png" alt="dotz — the ultra-code agent dashboard" width="820" />
 </div>
+
+## Highlights
+
+- **Live workflow graph** — every subagent materializes as a node, every tool it reaches for
+  streams onto that node as a live chip; click any node/chip to open the exact panel it drives.
+- **Multi-agent by default** — non-trivial tasks fan out to `scout` / `planner` / `worker` /
+  `reviewer` subagents in parallel, then the result is adversarially verified before it lands.
+- **Sessions over WebSocket** — the UI is a plain web app (`fetch` + WS streaming), identical in a
+  browser against the headless `serve` bin and inside the Tauri window.
+- **Sandbox with live web previews** — `terminal` runs stream output into chat; `web` runs render
+  an inline preview iframe the agent drives with an on-screen cursor you both can see.
+- **On-device memory** — automatic capture/recall/consolidation via `rusqlite` + local ONNX
+  embeddings (all-MiniLM-L6-v2, in-process — no embeddings API), mirrored to a committable `MEMORY.md`.
+- **Model-agnostic providers** — multi-provider auth with per-provider UI modes (free-form model-id
+  input or fixed list) and a reasoning-effort slider constrained to what the model supports.
+- **Origin-guarded local API** — the loopback axum server rejects disallowed `Origin`/`Host`
+  requests with `403`, closing browser-CSRF and DNS-rebinding against the code-exec endpoints.
+- **Skills + native Open Design** — a unified skill pool plus a design workspace with 150+ bundled
+  design systems, live preview, and HTML/PDF export.
+- **Signed self-updates** — `tauri-plugin-updater` verifies a minisign-signed `latest.json` from
+  GitHub Releases and updates in place.
 
 ## How it works
 
@@ -225,6 +247,24 @@ cargo tauri build   # → src-tauri/target/release/bundle/nsis/  (signed NSIS in
 
 The signed build needs the updater signing key in the environment — see
 [src-tauri/DEPLOY.md](src-tauri/DEPLOY.md) for the full build + release flow.
+
+## Development & gates
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every push and PR to `main`
+(on `windows-latest`) and is the merge gate — run the same three commands locally before pushing:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy -p dotz-core --all-targets -- -D warnings
+cargo test -p dotz-core
+```
+
+The embed tests need the bundled all-MiniLM-L6-v2 model files (`npm run fetch-model` first).
+Repo guard tests under `dotz-core/tests/` enforce standing invariants — e.g. `windowless_guard.rs`
+(child processes must never flash a console window) and `ort_pin_guard.rs` (the deliberate `ort`
+pre-release pin, see Notes & caveats). Pushing a `v*` tag triggers
+[`release.yml`](.github/workflows/release.yml), which builds the NSIS installer and cuts a draft
+GitHub Release with the signed `latest.json` updater feed.
 
 ## Cross-device auto-update
 
