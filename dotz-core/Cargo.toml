@@ -25,6 +25,13 @@ uuid = { version = "1", features = ["v4"] }
 # serde_yaml_ng: maintained continuation of the archived serde_yaml (0.9.34+deprecated),
 # same API surface (Value/from_str) — only the skill-frontmatter parser uses it.
 serde_yaml_ng = "0.10"
+# ort: exact-pinned pre-release, on purpose. No stable 2.x exists on crates.io (checked
+# 2026-07-13: max_stable_version = none; rc.12 of 2026-03-05 IS the newest release) and the
+# 2.0 rcs break API between releases, so a range would be a footgun. The `=` pin also pins
+# ort-sys =rc.12, whose download-binaries dist table hardcodes ONNX Runtime 1.24.2 with
+# per-target SHA-256 checksums — the runtime shipped in the installer is fully deterministic.
+# Guarded by tests/ort_pin_guard.rs; bump deliberately when a stable 2.0 lands (see README
+# "Notes & caveats").
 ort = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

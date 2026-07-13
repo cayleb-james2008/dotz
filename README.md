@@ -245,6 +245,12 @@ signed releases live in this one public repo. Full topology and the release comm
 - **Subagents** run in dotz's native runtime (each a separate LLM run); the bundled agents default
   to the free model so `/implement` is runnable out of the box. Edit `.pi/agents/*.md` to change models.
 - **Fonts** load from Google Fonts (online). Bundle locally for fully-offline use.
+- **`ort` is pinned to a pre-release on purpose** (`=2.0.0-rc.12` in `dotz-core/Cargo.toml`):
+  no stable 2.x exists on crates.io yet (checked 2026-07-13) and the pin transitively fixes the
+  ONNX Runtime (1.24.2, checksummed) that `download-binaries` bundles into the installer.
+  Enforced by `dotz-core/tests/ort_pin_guard.rs`. **Watch:** when a stable `ort 2.0.0` ships,
+  bump deliberately — update the pin, the guard test's `PINNED`, and re-verify the embedder
+  (`cargo test -p dotz-core`, embed tests need the bundled all-MiniLM-L6-v2 model files).
 - The UI was specced for and can be refined in [claude.ai/design](https://claude.ai/design).
 
 ## License
