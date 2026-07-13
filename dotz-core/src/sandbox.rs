@@ -279,6 +279,16 @@ pub async fn start_run(
         return Err("mode must be \"terminal\" or \"web\"".to_string());
     }
 
+    // Web previews are single-occupancy per project: the UI never kills the prior preview
+    // before starting a new one, and with the 30-minute web default an iterate-on-preview
+    // loop would otherwise stack live dev-server children (each alive for up to 30 min, and
+    // a fixed-port server keeps its port occupied so every replacement fails with
+    // EADDRINUSE until the stale run is hunted down). Supersede: kill any still-running
+    // web run for the same project before spawning the replacement.
+    if mode == "web" {
+        supersede_prior_web_runs(project_id);
+    }
+
     let run = SandboxRun {
         id: uuid::Uuid::new_v4().to_string(),
         project_id: project_id.map(String::from),
@@ -429,8 +439,21 @@ async fn execute_run(
 
     // Record the pid so kill_run and the timeout watchdog can reach the child.
     if let Some(pid) = child.id() {
-        if let Some(e) = runs_guard().get_mut(&id) {
-            e.pid = Some(pid);
+        let killed_before_spawn = {
+            let mut guard = runs_guard();
+            match guard.get_mut(&id) {
+                Some(e) => {
+                    e.pid = Some(pid);
+                    e.killed_by_us
+                }
+                None => false,
+            }
+        };
+        // A kill/supersede that ran before the pid landed (kill_run_by_id and the web
+        // supersession path are no-ops while pid is None) could not signal the child;
+        // deliver it now so a superseded preview can't live out its full timeout.
+        if killed_before_spawn {
+            kill_pid(Some(pid));
         }
     }
 
@@ -760,6 +783,45 @@ pub fn kill_run_by_id(id: &str) -> bool {
     }
 }
 
+/// Kill every still-running `mode:"web"` run for the same project (`None` matches `None`,
+/// `Some` matches the equal `Some`), so web previews stay single-occupancy per project.
+/// Called by `start_run` before a new web run is inserted; returns the superseded ids.
+///
+/// A prior run whose child has not spawned yet (pid still `None` — `kill_run_by_id` is a
+/// no-op for those) is marked `killed_by_us` + terminal here; `execute_run` delivers the
+/// actual kill the moment the pid lands, so even a start that races the previous spawn
+/// cannot leak a 30-minute dev server.
+fn supersede_prior_web_runs(project_id: Option<&str>) -> Vec<String> {
+    let stale: Vec<String> = {
+        let store = runs_guard();
+        store
+            .iter()
+            .filter(|(_, e)| {
+                e.mode == "web"
+                    && e.run.status == "running"
+                    && e.run.project_id.as_deref() == project_id
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for id in &stale {
+        if !kill_run_by_id(id) {
+            // No pid yet: mark it terminal + killed_by_us so the spawn path kills the
+            // child as soon as it exists (mirrors kill_run_by_id's terminal bookkeeping).
+            let mut store = runs_guard();
+            if let Some(e) = store.get_mut(id) {
+                if e.run.status == "running" {
+                    e.killed_by_us = true;
+                    e.run.status = "killed".to_string();
+                    e.run.ended_at = Some(crate::util::now_ms());
+                    e.run.output.push_str("\n[killed]\n");
+                }
+            }
+        }
+    }
+    stale
+}
+
 /// POST /api/sandbox/runs/:id/kill — kill the child, mark killed → { ok }.
 async fn kill_run(Path(id): Path<String>) -> Json<Value> {
     Json(json!({ "ok": kill_run_by_id(&id) }))
@@ -892,10 +954,7 @@ mod tests {
         // Zero/negative are rejected exactly like the old `.filter(|n| *n > 0)` guards, so a
         // client cannot request an unbounded run by sending 0 or -1.
         assert_eq!(resolve_timeout_ms(Some(0), "web"), DEFAULT_WEB_TIMEOUT_MS);
-        assert_eq!(
-            resolve_timeout_ms(Some(-1), "terminal"),
-            DEFAULT_TIMEOUT_MS
-        );
+        assert_eq!(resolve_timeout_ms(Some(-1), "terminal"), DEFAULT_TIMEOUT_MS);
     }
 
     /// Regression: a `mode:"web"` run started WITHOUT a WS broadcast sender (the REST
@@ -944,6 +1003,205 @@ mod tests {
             Some(port),
             "web run started with tx=None must cache its detected port mid-run"
         );
+    }
+
+    /// Regression (audit w3): iterating on a preview must not stack live dev servers. The UI
+    /// never kills the prior preview before starting a new one, so with the 30-minute web
+    /// default each iteration used to leak a live child (and its port) for up to 30 minutes.
+    /// Starting a new web run for the same project must kill the prior still-running one.
+    #[tokio::test]
+    async fn web_start_supersedes_prior_running_web_run_for_same_project() {
+        let project = format!("proj-{}", uuid::Uuid::new_v4());
+        let first = start_run(
+            "bash",
+            "sleep 45\n",
+            "web",
+            Some(&project),
+            60_000,
+            None,
+            None,
+        )
+        .await
+        .expect("first web run should start");
+        // Wait for the child to actually spawn so the supersession exercises the live-pid
+        // kill path (the pre-spawn path has its own test below).
+        let mut pid = None;
+        for _ in 0..300 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            pid = test_run_pid(&first.id);
+            if pid.is_some() {
+                break;
+            }
+        }
+        assert!(pid.is_some(), "first web run's child should spawn");
+
+        let second = start_run(
+            "bash",
+            "sleep 45\n",
+            "web",
+            Some(&project),
+            60_000,
+            None,
+            None,
+        )
+        .await
+        .expect("second web run should start");
+
+        // Supersession happens synchronously inside start_run, before the new run is
+        // inserted: by the time the second start returns, the first must be terminal.
+        let first_status = lookup(&first.id).map(|r| r.status);
+        assert_eq!(
+            first_status.as_deref(),
+            Some("killed"),
+            "prior running web run for the same project must be killed by the new start"
+        );
+        let second_status = lookup(&second.id).map(|r| r.status);
+        assert_eq!(
+            second_status.as_deref(),
+            Some("running"),
+            "the replacement web run must not kill itself"
+        );
+
+        // Clean up: kill the second child and drop both entries from the global store.
+        let mut pid2 = None;
+        for _ in 0..300 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            pid2 = test_run_pid(&second.id);
+            if pid2.is_some() {
+                break;
+            }
+        }
+        mark_killed_by_us(&second.id);
+        kill_pid(pid2);
+        remove_test_run(&first.id);
+        remove_test_run(&second.id);
+    }
+
+    /// The web supersession must be scoped: same-project web runs only. Other projects'
+    /// web runs, terminal-mode runs, and already-finished runs are untouched — and a
+    /// pid-less running web run (child not spawned yet) is still marked killed so the
+    /// spawn path can deliver the kill.
+    #[test]
+    fn web_supersession_is_scoped_to_same_project_and_web_mode() {
+        let proj_a = format!("proj-a-{}", uuid::Uuid::new_v4());
+        let proj_b = format!("proj-b-{}", uuid::Uuid::new_v4());
+        let mk = |project: &str, mode: &str, status: &str| RunEntry {
+            run: SandboxRun {
+                id: uuid::Uuid::new_v4().to_string(),
+                project_id: Some(project.to_string()),
+                language: "shell".to_string(),
+                code: String::new(),
+                status: status.to_string(),
+                output: String::new(),
+                exit_code: None,
+                started_at: crate::util::now_ms(),
+                ended_at: None,
+            },
+            pid: None,
+            killed_by_us: false,
+            mode: mode.to_string(),
+            port: None,
+        };
+        let web_a = mk(&proj_a, "web", "running");
+        let web_b = mk(&proj_b, "web", "running");
+        let term_a = mk(&proj_a, "terminal", "running");
+        let done_a = mk(&proj_a, "web", "done");
+        let ids: Vec<String> = [&web_a, &web_b, &term_a, &done_a]
+            .iter()
+            .map(|e| e.run.id.clone())
+            .collect();
+        {
+            let mut store = runs_guard();
+            for e in [web_a, web_b, term_a, done_a] {
+                store.insert(e.run.id.clone(), e);
+            }
+        }
+
+        let superseded = supersede_prior_web_runs(Some(&proj_a));
+
+        assert_eq!(
+            superseded,
+            vec![ids[0].clone()],
+            "only the running web run of the SAME project may be superseded"
+        );
+        {
+            let store = runs_guard();
+            let e = store.get(&ids[0]).expect("superseded entry still stored");
+            assert_eq!(e.run.status, "killed");
+            assert!(
+                e.killed_by_us,
+                "pid-less superseded run must be marked killed_by_us for the spawn path"
+            );
+            assert!(e.run.ended_at.is_some());
+            assert_eq!(store.get(&ids[1]).unwrap().run.status, "running");
+            assert_eq!(store.get(&ids[2]).unwrap().run.status, "running");
+            assert_eq!(store.get(&ids[3]).unwrap().run.status, "done");
+        }
+
+        // Clean up the process-global store.
+        let mut store = runs_guard();
+        for id in &ids {
+            store.remove(id);
+        }
+    }
+
+    /// A supersede/kill that lands BEFORE the child pid is recorded (kill_run_by_id is a
+    /// no-op while pid is None) must still kill the child: execute_run delivers the kill
+    /// as soon as the pid exists, so a superseded preview can't live out its full timeout.
+    #[tokio::test]
+    async fn execute_run_kills_child_immediately_when_superseded_before_spawn() {
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut store = runs_guard();
+            store.insert(
+                id.clone(),
+                RunEntry {
+                    run: SandboxRun {
+                        id: id.clone(),
+                        project_id: None,
+                        language: "bash".to_string(),
+                        code: String::new(),
+                        // Exactly the state supersede_prior_web_runs leaves a pid-less run in.
+                        status: "killed".to_string(),
+                        output: String::new(),
+                        exit_code: None,
+                        started_at: crate::util::now_ms(),
+                        ended_at: Some(crate::util::now_ms()),
+                    },
+                    pid: None,
+                    killed_by_us: true,
+                    mode: "web".to_string(),
+                    port: None,
+                },
+            );
+        }
+
+        // The child sleeps far beyond the assertion budget; only the immediate post-spawn
+        // kill can make execute_run return in time. The budget is generous (spawn + taskkill
+        // latency scales badly when the full suite saturates the machine) but stays well
+        // under the sleep, so it still discriminates kill-on-spawn from waiting out the
+        // child.
+        let done = tokio::time::timeout(
+            Duration::from_secs(120),
+            execute_run(
+                id.clone(),
+                "bash".to_string(),
+                "sleep 300\n".to_string(),
+                600_000,
+                "web".to_string(),
+                None,
+                None,
+            ),
+        )
+        .await;
+        assert!(
+            done.is_ok(),
+            "execute_run must kill a pre-superseded child right after spawn, not wait out the sleep"
+        );
+
+        let status = lookup(&id).map(|r| r.status);
+        assert_eq!(status.as_deref(), Some("killed"));
+        remove_test_run(&id);
     }
 
     /// `try_mark_end_emitted` must return true only for the first caller so the sandbox-start
