@@ -2198,7 +2198,13 @@ mod tests {
                 Ok(Some(Ok(Message::Text(t)))) => {
                     let frame: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
                     if frame.get("kind").and_then(|k| k.as_str()) == Some("workflow") {
-                        assert_eq!(frame["runId"], run_id);
+                        // The workflow event bus is GLOBAL: another test's concurrently
+                        // running workflow can interleave its events onto this socket.
+                        // Filter to this run's events instead of asserting on whatever
+                        // frame happens to arrive first.
+                        if frame["runId"].as_str() != Some(run_id.as_str()) {
+                            continue;
+                        }
                         let event = frame.get("event").cloned().unwrap_or_default();
                         if event.get("type").and_then(|t| t.as_str()) == Some("workflow_start") {
                             assert_eq!(event["run"]["status"], "running");
@@ -2235,7 +2241,10 @@ mod tests {
                 Ok(Some(Ok(Message::Text(t)))) => {
                     let frame: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
                     if frame.get("kind").and_then(|k| k.as_str()) == Some("workflow") {
-                        assert_eq!(frame["runId"], run_id);
+                        // Same global-bus caveat as above: skip foreign runs' events.
+                        if frame["runId"].as_str() != Some(run_id.as_str()) {
+                            continue;
+                        }
                         let event = frame.get("event").cloned().unwrap_or_default();
                         if event.get("type").and_then(|t| t.as_str()) == Some("step_state") {
                             assert_eq!(event["stepId"], step_id);
