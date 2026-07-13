@@ -226,9 +226,14 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Dispose all browser sessions and reap any lingering agent-browser processes so the
             // app does not leave headless Chrome instances running after exit. Bound the cleanup
             // so a hung `agent-browser close` command cannot block shutdown indefinitely.
+            // 2 s, not 10: graceful close is best-effort (reap_stray_browsers force-kills the
+            // image right after), and the WHOLE exit path must stay well under ~9 s of WM_CLOSE —
+            // measured 2026-07-13: three hung session closes at 3 s each pushed exit to 10.1 s,
+            // which reads as a hung app to `taskkill` verification. Budget now ≈ 2 s here +
+            // reap + 3 s drain ≈ 5.5 s worst case.
             tauri::async_runtime::block_on(async {
                 let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(2),
                     dotz_core::browser::dispose_all(),
                 )
                 .await;
