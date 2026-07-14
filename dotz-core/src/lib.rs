@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod commands;
 pub mod config;
 pub mod connections;
+pub mod connectors;
 pub mod context_bus;
 pub mod design;
 pub mod embed;

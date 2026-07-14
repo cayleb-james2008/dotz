@@ -865,6 +865,8 @@ impl ToolRegistry {
             "design_list",
             "design_use",
             "sandbox_run",
+            "connector_action",
+            "connector_list",
             "context_read",
             "context_write",
         ]
@@ -938,6 +940,20 @@ mod tests {
         let all = r.all_names();
         let active = r.active_names();
         for t in ["design_list", "design_use", "sandbox_run"] {
+            assert!(all.contains(&t.to_string()), "{t} must be registered");
+            assert!(active.contains(&t.to_string()), "{t} must be active");
+        }
+    }
+
+    /// The optional open-connector bridge tools must be registered AND active so the agent can
+    /// list and invoke gateway actions. They are inert (report "no connectors configured") when no
+    /// gateway is set up, so activating them unconditionally is safe and off-by-default in effect.
+    #[test]
+    fn new_registry_registers_and_activates_connector_tools() {
+        let r = ToolRegistry::new();
+        let all = r.all_names();
+        let active = r.active_names();
+        for t in ["connector_action", "connector_list"] {
             assert!(all.contains(&t.to_string()), "{t} must be registered");
             assert!(active.contains(&t.to_string()), "{t} must be active");
         }

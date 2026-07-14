@@ -1170,6 +1170,81 @@ impl Tool for SandboxRunTool {
     }
 }
 
+// ---- open-connector bridge tools (optional, config-gated; see crate::connectors) ----
+/// List the configured open-connector gateway connectors, or one connector's action catalog.
+struct ConnectorListTool;
+#[async_trait]
+impl Tool for ConnectorListTool {
+    fn name(&self) -> &'static str {
+        "connector_list"
+    }
+    fn description(&self) -> &'static str {
+        "List configured open-connector gateway connectors, or fetch one connector's action \
+         catalog. Args: {connector?}. No connector => the configured connectors (id, host, \
+         enabled); with a connector id => that gateway's OpenAPI catalog of invokable actions. \
+         Returns an empty list when no gateway is configured."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": { "connector": { "type": "string" } } })
+    }
+    async fn execute(&self, args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
+        match args.get("connector").and_then(|v| v.as_str()) {
+            None | Some("") => {
+                Ok(serde_json::to_string(&crate::connectors::list_summary()).unwrap_or_default())
+            }
+            Some(id) => {
+                let c = crate::connectors::enabled_by_id(id)
+                    .ok_or_else(|| format!("no enabled connector '{id}' configured"))?;
+                let client = reqwest::Client::new();
+                let catalog = crate::connectors::fetch_catalog(&client, &c).await?;
+                Ok(serde_json::to_string(&catalog).unwrap_or_default())
+            }
+        }
+    }
+}
+
+/// Invoke a gateway action, proxying to a running open-connector gateway.
+struct ConnectorActionTool;
+#[async_trait]
+impl Tool for ConnectorActionTool {
+    fn name(&self) -> &'static str {
+        "connector_action"
+    }
+    fn description(&self) -> &'static str {
+        "Invoke an action on a configured open-connector gateway (credentials stay behind the \
+         gateway). Args: {connector, action, input?}. `connector` is a configured connector id, \
+         `action` is the '<provider>.<action>' identifier (e.g. 'github.create_issue'), `input` \
+         is the action's argument object. Use connector_list to discover connectors and actions."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "connector": { "type": "string" },
+                "action": { "type": "string" },
+                "input": { "type": "object" }
+            },
+            "required": ["connector", "action"]
+        })
+    }
+    async fn execute(&self, args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
+        let connector = args
+            .get("connector")
+            .and_then(|v| v.as_str())
+            .ok_or("connector is required")?;
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or("action is required")?;
+        let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
+        let c = crate::connectors::enabled_by_id(connector)
+            .ok_or_else(|| format!("no enabled connector '{connector}' configured"))?;
+        let client = reqwest::Client::new();
+        let result = crate::connectors::invoke_action(&client, &c, action, input).await?;
+        Ok(serde_json::to_string(&result).unwrap_or_default())
+    }
+}
+
 /// Register all the extra tools into a registry's add-closure.
 pub fn register(add: &mut dyn FnMut(Box<dyn Tool>)) {
     add(Box::new(AgentsMdTool));
@@ -1196,6 +1271,8 @@ pub fn register(add: &mut dyn FnMut(Box<dyn Tool>)) {
     add(Box::new(DesignListTool));
     add(Box::new(DesignUseTool));
     add(Box::new(SandboxRunTool));
+    add(Box::new(ConnectorListTool));
+    add(Box::new(ConnectorActionTool));
 }
 
 #[cfg(test)]
