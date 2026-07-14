@@ -367,6 +367,22 @@ async fn execute_run(
     tx: Option<broadcast::Sender<Value>>,
     cwd: Option<std::path::PathBuf>,
 ) {
+    // A kill/supersede that landed BEFORE this task spawned anything (kill_run_by_id is a no-op
+    // while pid is None, so supersede_prior_web_runs marks the pid-less entry killed_by_us +
+    // terminal instead) means the child must not be started at all. Spawning and then
+    // tree-killing is inherently racy on Windows: `taskkill /T` enumerates the process tree
+    // once, so a grandchild forked mid-kill (bash -> sleep) escapes the kill while holding the
+    // inherited stdout/stderr pipes, wedging this future until the orphan exits — the run then
+    // appears to live out its full sleep despite the "immediate" kill. The superseder already
+    // recorded the terminal "killed" state and "[killed]" output marker, so simply never spawn.
+    let killed_before_spawn = runs_guard()
+        .get(&id)
+        .map(|e| e.killed_by_us && e.pid.is_none())
+        .unwrap_or(false);
+    if killed_before_spawn {
+        return;
+    }
+
     let (file, cmd) = match lang_spec(&language) {
         Some(v) => v,
         None => {
@@ -944,10 +960,14 @@ mod tests {
         // No client value: terminal keeps 30 s, web gets the preview default.
         assert_eq!(resolve_timeout_ms(None, "terminal"), DEFAULT_TIMEOUT_MS);
         assert_eq!(resolve_timeout_ms(None, "web"), DEFAULT_WEB_TIMEOUT_MS);
-        assert!(
-            DEFAULT_WEB_TIMEOUT_MS > DEFAULT_TIMEOUT_MS,
-            "preview default must exceed the terminal default or the fix is vacuous"
-        );
+        // Const block (clippy::assertions_on_constants, rust 1.95): the invariant is
+        // const-evaluable, so let it fail at compile time instead of at test time.
+        const {
+            assert!(
+                DEFAULT_WEB_TIMEOUT_MS > DEFAULT_TIMEOUT_MS,
+                "preview default must exceed the terminal default or the fix is vacuous"
+            );
+        }
         // Explicit positive value wins in both modes.
         assert_eq!(resolve_timeout_ms(Some(5_000), "terminal"), 5_000);
         assert_eq!(resolve_timeout_ms(Some(5_000), "web"), 5_000);
@@ -1146,8 +1166,10 @@ mod tests {
     }
 
     /// A supersede/kill that lands BEFORE the child pid is recorded (kill_run_by_id is a
-    /// no-op while pid is None) must still kill the child: execute_run delivers the kill
-    /// as soon as the pid exists, so a superseded preview can't live out its full timeout.
+    /// no-op while pid is None) must make execute_run return promptly WITHOUT the run living
+    /// out its sleep: execute_run sees the pre-spawn kill and never starts the child at all
+    /// (spawn-then-tree-kill was racy on Windows — a grandchild forked mid-`taskkill /T`
+    /// escaped the kill holding the stdio pipes, so the run waited out its full timeout).
     #[tokio::test]
     async fn execute_run_kills_child_immediately_when_superseded_before_spawn() {
         let id = uuid::Uuid::new_v4().to_string();
@@ -1176,11 +1198,11 @@ mod tests {
             );
         }
 
-        // The child sleeps far beyond the assertion budget; only the immediate post-spawn
-        // kill can make execute_run return in time. The budget is generous (spawn + taskkill
-        // latency scales badly when the full suite saturates the machine) but stays well
-        // under the sleep, so it still discriminates kill-on-spawn from waiting out the
-        // child.
+        // The would-be child sleeps far beyond the assertion budget; only the pre-spawn
+        // early return (or, for the residual mid-spawn race, the immediate post-spawn kill)
+        // can make execute_run return in time. The budget is generous (process latency
+        // scales badly when the full suite saturates the machine) but stays well under the
+        // sleep, so it still discriminates the fast path from waiting out the child.
         let done = tokio::time::timeout(
             Duration::from_secs(120),
             execute_run(
