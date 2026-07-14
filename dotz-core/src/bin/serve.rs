@@ -14,10 +14,20 @@ async fn main() {
     }
     let web_dir = web_dir();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    if let Err(e) = dotz_core::server::serve_with_shutdown_addr(
+    let token = session_token();
+    match &token {
+        Some(t) => eprintln!(
+            "dotz-core session token ENFORCED on /api + /ws (from DOTZ_TOKEN) — open http://127.0.0.1:{port}/?token={t}"
+        ),
+        None => eprintln!(
+            "dotz-core session token disabled (set DOTZ_TOKEN to require a bearer token on /api + /ws)"
+        ),
+    }
+    if let Err(e) = dotz_core::server::serve_with_shutdown_addr_token(
         addr,
         web_dir.into(),
         dotz_core::server::shutdown_signal(),
+        token,
     )
     .await
     {
@@ -48,6 +58,16 @@ fn format_startup_error(e: &std::io::Error, addr: &SocketAddr) -> String {
         _ => format!("dotz-core server error on {addr}: {e}"),
     };
     hint
+}
+
+/// Resolve the opt-in session token from `DOTZ_TOKEN` (plan-015 follow-up). Whitespace is
+/// trimmed; an unset or empty value disables enforcement, keeping the documented
+/// browser-against-serve dev flow fully backward compatible.
+fn session_token() -> Option<String> {
+    std::env::var("DOTZ_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Resolve the static UI directory from `DOTZ_WEB_DIR`. An empty-but-set env var is treated as
@@ -83,6 +103,29 @@ mod tests {
         match prev {
             Some(p) => std::env::set_var("DOTZ_WEB_DIR", p),
             None => std::env::remove_var("DOTZ_WEB_DIR"),
+        }
+        drop(guard);
+    }
+
+    /// `DOTZ_TOKEN` is trimmed, and an empty/whitespace/unset value disables enforcement — the
+    /// backward-compatible default for the browser-against-serve dev flow.
+    #[test]
+    fn session_token_trims_and_treats_empty_as_disabled() {
+        let guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("DOTZ_TOKEN").ok();
+
+        std::env::set_var("DOTZ_TOKEN", "  abc123  ");
+        assert_eq!(session_token().as_deref(), Some("abc123"));
+        std::env::set_var("DOTZ_TOKEN", "   ");
+        assert_eq!(session_token(), None);
+        std::env::set_var("DOTZ_TOKEN", "");
+        assert_eq!(session_token(), None);
+        std::env::remove_var("DOTZ_TOKEN");
+        assert_eq!(session_token(), None);
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_TOKEN", p),
+            None => std::env::remove_var("DOTZ_TOKEN"),
         }
         drop(guard);
     }
