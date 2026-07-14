@@ -16,6 +16,10 @@ const PORT: u16 = 4317;
 // build time) so the UI never shows a stale hardcoded version string.
 const SHIM_TEMPLATE: &str = r#"
 (function () {
+  // Per-process session token (plan-015 follow-up): web/app.js sends it on every /api fetch
+  // (x-dotz-token header) and appends ?token= to the /ws and browser-frame <img> URLs. Injected
+  // here (initialization script) so it is never embedded in served HTML.
+  window.DOTZ_TOKEN = "__DOTZ_TOKEN__";
   const invoke = (m, a) => window.__TAURI__.core.invoke('bridge', { method: m, args: a || [] });
   let statusCb = null;
   window.dotz = {
@@ -53,9 +57,13 @@ const SHIM_TEMPLATE: &str = r#"
 })();
 "#;
 
-/// Build the `window.dotz` injection script with the real package version substituted in.
-fn shim(version: &str) -> String {
-    SHIM_TEMPLATE.replace("__DOTZ_VERSION__", version)
+/// Build the `window.dotz` injection script with the real package version and the per-process
+/// session token substituted in. The token is pure hex (see `dotz_core::server::generate_token`),
+/// so it needs no escaping inside the JS string literal.
+fn shim(version: &str, token: &str) -> String {
+    SHIM_TEMPLATE
+        .replace("__DOTZ_VERSION__", version)
+        .replace("__DOTZ_TOKEN__", token)
 }
 
 #[tauri::command]
@@ -131,6 +139,10 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // (e.g. a previous dotz instance or another service) we fail fast here instead of opening a
     // window that connects to the wrong server while our own server task errors in the background.
     let listener = bind_listener(addr)?;
+    // Per-process session token (plan-015 follow-up): generated fresh on every launch, enforced
+    // by the embedded server on /api + /ws, and handed to the WebView exclusively through the
+    // initialization script below — out-of-band, never via served HTML.
+    let token = dotz_core::server::generate_token();
 
     let builder = tauri::Builder::default()
         // single-instance first (Tauri 2 requirement): relaunching focuses the running window.
@@ -175,9 +187,15 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = shutdown_rx.changed().await;
             };
 
+            let server_token = token.clone();
             let server_task = tauri::async_runtime::spawn(async move {
-                if let Err(e) =
-                    dotz_core::server::serve_with_shutdown(listener, web_dir, shutdown).await
+                if let Err(e) = dotz_core::server::serve_with_shutdown_token(
+                    listener,
+                    web_dir,
+                    shutdown,
+                    Some(server_token),
+                )
+                .await
                 {
                     eprintln!("dotz-core server error: {e}");
                 }
@@ -215,7 +233,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .title("dotz · ultra code")
                 .inner_size(1480.0, 920.0)
                 .min_inner_size(1000.0, 700.0)
-                .initialization_script(shim(&app.package_info().version.to_string()))
+                .initialization_script(shim(&app.package_info().version.to_string(), &token))
                 .build()?;
             Ok(())
         });
@@ -291,6 +309,20 @@ fn bind_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shim must substitute BOTH placeholders — a leftover `__DOTZ_TOKEN__` would inject a
+    /// useless literal token and brick every authenticated call from the WebView.
+    #[test]
+    fn shim_substitutes_version_and_token() {
+        let s = shim("9.9.9", "aabbccdd");
+        assert!(s.contains("version: \"9.9.9\""), "version substituted: {s}");
+        assert!(
+            s.contains("window.DOTZ_TOKEN = \"aabbccdd\";"),
+            "token substituted: {s}"
+        );
+        assert!(!s.contains("__DOTZ_VERSION__"));
+        assert!(!s.contains("__DOTZ_TOKEN__"));
+    }
 
     /// Binding to an already-occupied port must fail fast with a clear error message instead of
     /// letting the Tauri shell open a window against the wrong server.
