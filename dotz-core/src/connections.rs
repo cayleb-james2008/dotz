@@ -8,7 +8,7 @@
 //!   - vercel: `vercel whoami` (read-only; exit 0 + non-empty output => logged in, account = last line)
 //!   - neon:   READ ~/.config/neonctl/credentials.json (present & non-empty => logged in). Never calls
 //!     neonctl — it has no on-PATH CLI / no logout command here, so status keys off the file.
-use axum::{http::StatusCode, routing::get, Json, Router};
+use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::process::Command;
@@ -344,9 +344,16 @@ fn all_status() -> Vec<ConnectionStatus> {
 /// off the async runtime thread. A slow or hanging `gh auth status` call must not delay other
 /// REST handlers or the WebSocket event fan-out.
 async fn get_connections() -> Json<Value> {
-    let connections = tokio::task::spawn_blocking(all_status)
+    let cli = tokio::task::spawn_blocking(all_status)
         .await
         .unwrap_or_else(|_| Vec::new());
+    // The three CLI providers (real, read-only), then any configured gateway connectors. With no
+    // connector configured, `gateway_statuses()` returns empty and this stays byte-identical.
+    let mut connections: Vec<Value> = cli
+        .into_iter()
+        .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
+        .collect();
+    connections.extend(crate::connectors::gateway_statuses().await);
     Json(json!({ "connections": connections }))
 }
 
@@ -361,18 +368,84 @@ async fn disabled() -> (StatusCode, Json<Value>) {
     )
 }
 
-/// Register the connections routes with stateless handlers. Status is real (read-only); login/logout
-/// return 501 and spawn nothing.
+/// POST/GET /api/connections/{id}/login. For a configured, enabled GATEWAY connector this
+/// initiates the gateway connect flow; the three CLI providers (github/vercel/neon) stay 501
+/// (safety: dotz never spawns their login). Optional body { provider, authType?, values? }:
+/// with authType=="api_key" + values, dotz issues PUT {gateway}/api/connections/<provider> so the
+/// operator's raw credentials go to the GATEWAY (never stored in dotz); otherwise dotz returns the
+/// gateway connect URL for the console/OAuth flow. `provider` defaults to the connector id.
+async fn login(Path(id): Path<String>, body: Option<Json<Value>>) -> (StatusCode, Json<Value>) {
+    let Some(c) = crate::connectors::enabled_by_id(&id) else {
+        return disabled().await; // unknown id / CLI provider — unchanged 501
+    };
+    let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let provider = body
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or(id.as_str())
+        .to_string();
+    let auth_type = body.get("authType").and_then(|v| v.as_str());
+    let values = body.get("values").cloned();
+    match (auth_type, values) {
+        (Some("api_key"), Some(values)) => {
+            let client = reqwest::Client::new();
+            match crate::connectors::put_connection(&client, &c, &provider, "api_key", values).await
+            {
+                Ok(resp) => (
+                    StatusCode::OK,
+                    Json(json!({ "ok": true, "provider": provider, "connection": resp })),
+                ),
+                Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "ok": false, "error": e }))),
+            }
+        }
+        _ => {
+            let connect_url = crate::connectors::connect_url(&c, &provider);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "provider": provider,
+                    "connectUrl": connect_url,
+                    "hint": "open the gateway console to finish connecting (OAuth / interactive); \
+                             for api_key providers POST { authType: \"api_key\", values: {..} }",
+                })),
+            )
+        }
+    }
+}
+
+/// POST /api/connections/{id}/logout. For a gateway connector this deletes the gateway-held
+/// connection (DELETE {gateway}/api/connections/<provider>); CLI providers stay 501 (safety).
+async fn logout(Path(id): Path<String>, body: Option<Json<Value>>) -> (StatusCode, Json<Value>) {
+    let Some(c) = crate::connectors::enabled_by_id(&id) else {
+        return disabled().await;
+    };
+    let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let provider = body
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or(id.as_str())
+        .to_string();
+    let client = reqwest::Client::new();
+    match crate::connectors::delete_connection(&client, &c, &provider).await {
+        Ok(resp) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "provider": provider, "result": resp })),
+        ),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "ok": false, "error": e }))),
+    }
+}
+
+/// Register the connections routes with stateless handlers. Status is real (read-only). For the
+/// three CLI providers login/logout stay 501 (they spawn nothing); a configured gateway connector's
+/// login/logout is proxied to the gateway (credentials stay behind the gateway).
 pub fn router() -> Router<()> {
     Router::new()
         .route("/api/connections", get(get_connections))
-        .route(
-            "/api/connections/{provider}/login",
-            get(disabled).post(disabled),
-        )
+        .route("/api/connections/{provider}/login", get(login).post(login))
         .route(
             "/api/connections/{provider}/logout",
-            axum::routing::post(disabled),
+            axum::routing::post(logout),
         )
 }
 
@@ -496,5 +569,98 @@ mod tests {
         assert!(ids.contains(&"github"), "github missing: {ids:?}");
         assert!(ids.contains(&"vercel"), "vercel missing: {ids:?}");
         assert!(ids.contains(&"neon"), "neon missing: {ids:?}");
+    }
+
+    // Serialize the DOTZ_CONFIG_DIR-mutating gateway tests. An async-aware mutex is used because
+    // the guard is held across `.await` points (a std MutexGuard across await can stall the
+    // executor and trips clippy::await_holding_lock under -D warnings).
+    static GW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// login for an UNKNOWN id (including the three CLI providers) must stay 501 — the safety
+    /// contract for github/vercel/neon is unchanged when no gateway connector is configured.
+    #[tokio::test]
+    async fn login_unknown_provider_stays_501() {
+        let _g = GW_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("dotz-conn-none-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+
+        let (code, _body) = login(Path("github".to_string()), None).await;
+        assert_eq!(
+            code,
+            StatusCode::NOT_IMPLEMENTED,
+            "CLI providers must keep the 501 safety stub"
+        );
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// login for a configured GATEWAY connector with an api_key body must PUT the credentials to
+    /// the gateway (`PUT /api/connections/<provider>`) and return 200 — credentials go to the
+    /// gateway, never stored in dotz.
+    #[tokio::test]
+    async fn login_gateway_connector_api_key_puts_to_gateway() {
+        use axum::{routing::put, Router as AxRouter};
+        use std::sync::{Arc, Mutex as SMutex};
+
+        let _g = GW_LOCK.lock().await;
+
+        // Stub gateway capturing the PUT path + body.
+        let captured: Arc<SMutex<(String, Value)>> =
+            Arc::new(SMutex::new((String::new(), Value::Null)));
+        let cap = captured.clone();
+        let app = AxRouter::new().route(
+            "/api/connections/{provider}",
+            put(
+                move |axum::extract::Path(provider): axum::extract::Path<String>,
+                      axum::extract::Json(body): axum::extract::Json<Value>| {
+                    let cap = cap.clone();
+                    async move {
+                        *cap.lock().unwrap() = (provider, body);
+                        axum::Json(json!({ "status": "connected" }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = std::env::temp_dir().join(format!("dotz-conn-gw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        std::fs::write(
+            dir.join("connectors.json"),
+            format!(
+                r#"[{{ "id": "gw", "gateway_base_url": "http://127.0.0.1:{}", "enabled": true }}]"#,
+                addr.port()
+            ),
+        )
+        .unwrap();
+
+        let body =
+            json!({ "provider": "github", "authType": "api_key", "values": { "api_key": "k" } });
+        let (code, out) = login(Path("gw".to_string()), Some(Json(body))).await;
+        assert_eq!(code, StatusCode::OK, "gateway login should succeed: {:?}", out.0);
+        assert_eq!(out.0["ok"], json!(true));
+        assert_eq!(out.0["provider"], "github");
+
+        let (put_provider, put_body) = captured.lock().unwrap().clone();
+        assert_eq!(put_provider, "github", "PUT must target the provider path");
+        assert_eq!(put_body["authType"], "api_key");
+        assert_eq!(put_body["values"]["api_key"], "k");
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        server.abort();
     }
 }
