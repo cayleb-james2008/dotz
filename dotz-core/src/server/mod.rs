@@ -1,6 +1,10 @@
 //! axum HTTP/WS server. Mirrors src/server.ts route groups; serves the static `web/` UI.
 mod guard;
 
+// Re-exported for the Tauri shell (src-tauri), which generates the per-process session
+// token and injects it into the WebView via its initialization script.
+pub use guard::generate_token;
+
 use crate::{
     config::{self, CleanPatch, DotzConfig},
     profiles, types,
@@ -35,8 +39,18 @@ fn state_config(s: &AppState) -> std::sync::MutexGuard<'_, DotzConfig> {
 }
 
 /// Build the app: REST API + static `web/` UI fallback. Unmatched paths fall through to the
-/// unchanged `web/` SPA, which talks to this backend over `location.host`.
+/// unchanged `web/` SPA, which talks to this backend over `location.host`. Delegates to
+/// [`app_with_token`] with the session token disabled, so every existing caller and test is
+/// behaviorally unchanged.
 pub fn app(web_dir: PathBuf, state: Shared) -> Router {
+    app_with_token(web_dir, state, None)
+}
+
+/// Build the app with an optional per-process session token (plan-015 follow-up). The token is
+/// threaded per-router-instance through a closure `from_fn` layer — NOT a process global —
+/// because the test suite runs many servers in one process and each must be independently
+/// configurable. `None` disables the token guard entirely.
+pub fn app_with_token(web_dir: PathBuf, state: Shared, token: Option<String>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/providers", get(providers))
@@ -67,6 +81,16 @@ pub fn app(web_dir: PathBuf, state: Shared) -> Router {
         .merge(crate::checkpoint::router())
         .merge(crate::commands::router())
         .fallback_service(ServeDir::new(web_dir).append_index_html_on_directories(true))
+        // Session-token guard (plan-015 follow-up), applied INSIDE the origin layer below. When a
+        // token is configured, `/ws` and `/api/*` (except `/api/health`) require it via the
+        // `x-dotz-token` header or `?token=`; missing/wrong -> 401 JSON, deliberately distinct
+        // from the origin guard's 403. With `token = None` this layer is a pass-through.
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let token = token.clone();
+                async move { guard::token_guard(token, req, next).await }
+            },
+        ))
         // Origin/Host allowlist guard (applied last so it wraps every route above, including the
         // static fallback and the `/ws` upgrade). Rejects present-and-disallowed Origin/Host with
         // 403; a missing Origin passes so the Tauri IPC shim / same-origin fetches keep working.
@@ -241,6 +265,18 @@ pub async fn serve_with_shutdown(
     web_dir: PathBuf,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    serve_with_shutdown_token(listener, web_dir, shutdown, None).await
+}
+
+/// [`serve_with_shutdown`] with an optional per-process session token (see [`app_with_token`]).
+/// `None` keeps the historical unauthenticated behavior; the Tauri shell passes
+/// `Some(generate_token())` and hands the same token to the WebView out-of-band.
+pub async fn serve_with_shutdown_token(
+    listener: tokio::net::TcpListener,
+    web_dir: PathBuf,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    token: Option<String>,
+) -> std::io::Result<()> {
     // Reset the shutdown watch so a fresh server start doesn't inherit a prior shutdown signal
     // (e.g. in tests that start/stop the server multiple times, or a re-bind after a clean exit).
     shutdown_watch().send_modify(|v| *v = false);
@@ -269,7 +305,7 @@ pub async fn serve_with_shutdown(
     // shutdown signal to all active WebSocket handlers. This lets them close their sockets
     // promptly so axum's drain phase completes instead of hanging on long-lived connections.
     let sw = shutdown_watch().clone();
-    axum::serve(listener, app(web_dir, state))
+    axum::serve(listener, app_with_token(web_dir, state, token))
         .with_graceful_shutdown(async move {
             shutdown.await;
             let _ = sw.send(true);
@@ -285,8 +321,19 @@ pub async fn serve_with_shutdown_addr(
     web_dir: PathBuf,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    serve_with_shutdown_addr_token(addr, web_dir, shutdown, None).await
+}
+
+/// [`serve_with_shutdown_addr`] with an optional per-process session token (see
+/// [`app_with_token`]). Used by the headless `serve` bin when `DOTZ_TOKEN` is set.
+pub async fn serve_with_shutdown_addr_token(
+    addr: SocketAddr,
+    web_dir: PathBuf,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    token: Option<String>,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_with_shutdown(listener, web_dir, shutdown).await
+    serve_with_shutdown_token(listener, web_dir, shutdown, token).await
 }
 
 #[cfg(test)]
@@ -667,6 +714,160 @@ mod tests {
 
         let _ = tx.send(());
         let _ = handle.await.unwrap();
+    }
+
+    /// Router-level proof of the session-token guard (plan-015 follow-up): with an explicit
+    /// token, `/api` routes and the `/ws` upgrade require it — 401 without / with a wrong one
+    /// (distinct from the origin guard's 403), 200 with the `x-dotz-token` header OR the
+    /// `?token=` query (the headerless-caller path used by WS and `<img>`) — while
+    /// `/api/health` and the static shell stay unauthenticated.
+    #[tokio::test]
+    async fn token_guard_enforces_token_on_api_and_ws() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::connect_async;
+
+        let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dummy.local_addr().unwrap();
+        drop(dummy);
+
+        let token = generate_token();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _: () = rx.await.unwrap_or(());
+        };
+        // web_dir(): the real web/ dir resolved from the manifest — the static-shell probe below
+        // needs an index.html to prove "/" stays unauthenticated (a bare "web" 404s from the
+        // test CWD).
+        let handle = tokio::spawn(serve_with_shutdown_addr_token(
+            addr,
+            web_dir(),
+            shutdown,
+            Some(token.clone()),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        // No token -> 401 (NOT the origin guard's 403).
+        let r = client
+            .get(format!("{base}/api/models"))
+            .send()
+            .await
+            .expect("GET /api/models without token");
+        assert_eq!(
+            r.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "/api/models without a token must be 401"
+        );
+
+        // Correct header -> 200.
+        let r = client
+            .get(format!("{base}/api/models"))
+            .header("x-dotz-token", &token)
+            .send()
+            .await
+            .expect("GET /api/models with header token");
+        assert!(
+            r.status().is_success(),
+            "/api/models with the header token must pass, got {}",
+            r.status()
+        );
+
+        // Correct ?token= query -> 200 (headerless callers: WS handshake, <img> src).
+        let r = client
+            .get(format!("{base}/api/models?token={token}"))
+            .send()
+            .await
+            .expect("GET /api/models with query token");
+        assert!(
+            r.status().is_success(),
+            "/api/models with ?token= must pass, got {}",
+            r.status()
+        );
+
+        // Wrong token -> 401.
+        let r = client
+            .get(format!("{base}/api/models"))
+            .header("x-dotz-token", "wrong-token")
+            .send()
+            .await
+            .expect("GET /api/models with wrong token");
+        assert_eq!(
+            r.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "/api/models with a wrong token must be 401"
+        );
+
+        // /api/health and the static shell stay open (probes + SPA load need no token).
+        let r = client
+            .get(format!("{base}/api/health"))
+            .send()
+            .await
+            .expect("GET /api/health without token");
+        assert!(
+            r.status().is_success(),
+            "/api/health must stay unauthenticated, got {}",
+            r.status()
+        );
+        let r = client
+            .get(format!("{base}/"))
+            .send()
+            .await
+            .expect("GET / without token");
+        assert!(
+            r.status().is_success(),
+            "the static shell must stay unauthenticated, got {}",
+            r.status()
+        );
+
+        // WS: the handshake without the token must be rejected; with ?token= it completes.
+        let resp = client
+            .post(format!("{base}/api/sessions"))
+            .header("x-dotz-token", &token)
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("POST /api/sessions with token");
+        assert!(
+            resp.status().is_success(),
+            "session creation with the token must pass, got {}",
+            resp.status()
+        );
+        let summary = resp.json::<Value>().await.unwrap();
+        let sid = summary["sessionId"].as_str().unwrap().to_string();
+
+        let no_token =
+            connect_async(format!("ws://127.0.0.1:{}/ws?sessionId={sid}", addr.port())).await;
+        assert!(
+            no_token.is_err(),
+            "the WS handshake without a token must be rejected"
+        );
+
+        let (mut ws, _) = connect_async(format!(
+            "ws://127.0.0.1:{}/ws?sessionId={sid}&token={token}",
+            addr.port()
+        ))
+        .await
+        .expect("the WS handshake with ?token= must complete");
+        let ready = ws.next().await.unwrap().unwrap();
+        assert!(
+            ready.to_text().unwrap().contains("\"ready\""),
+            "first WS frame should be ready: {ready:?}"
+        );
+        drop(ws);
+
+        let _ = tx.send(());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("server should shut down within 10s")
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "server should exit cleanly: {:?}",
+            result.err()
+        );
+        crate::agent::session::dispose(&sid);
     }
 
     #[tokio::test]

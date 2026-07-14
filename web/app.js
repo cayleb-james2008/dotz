@@ -87,6 +87,9 @@ const el = (tag, cls, txt) => {
   return e;
 };
 async function api(path, opts) {
+  opts = opts || {};
+  // Stamp the session token on every API call (backend requires it on /api/* except /api/health).
+  if (DOTZ_TOKEN) opts = Object.assign({}, opts, { headers: Object.assign({ "x-dotz-token": DOTZ_TOKEN }, opts.headers) });
   const r = await fetch(path, opts);
   const body = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(body.error || r.statusText);
@@ -97,6 +100,23 @@ const patch = (p, b) => api(p, { method: "PATCH", headers: { "content-type": "ap
 const del = (p) => api(p, { method: "DELETE" });
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const truncate = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + "…" : s || "");
+
+// Loopback session token (plan-015 follow-up). The Tauri shell injects window.DOTZ_TOKEN via its
+// initialization script; the serve-bin flow (DOTZ_TOKEN set) carries ?token= in the opened URL.
+// Persisted to sessionStorage so an in-app reload keeps working without re-carrying the query.
+// Empty string = token disabled (backend enforces nothing) — every call site degrades to the
+// exact pre-token behavior.
+const DOTZ_TOKEN = (() => {
+  let t = "";
+  try {
+    t = window.DOTZ_TOKEN || new URLSearchParams(location.search).get("token") || sessionStorage.getItem("dotz.token") || "";
+  } catch { t = window.DOTZ_TOKEN || ""; }
+  if (t) { try { sessionStorage.setItem("dotz.token", t); } catch { /* storage unavailable */ } }
+  return t;
+})();
+// Token as a query suffix for headerless callers (the WS handshake and <img> src cannot set
+// request headers). `sep` is "?" or "&" depending on whether the URL already has a query.
+const tokenQS = (sep) => (DOTZ_TOKEN ? `${sep}token=${encodeURIComponent(DOTZ_TOKEN)}` : "");
 
 init().catch((e) => pushError("init failed: " + e.message));
 
@@ -902,7 +922,7 @@ function connectWS() {
   if (state.ws) { _wsIntentional = true; try { state.ws.close(); } catch {} }
   _wsIntentional = false;
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws?sessionId=${state.sessionId}`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws?sessionId=${state.sessionId}${tokenQS("&")}`);
   state.ws = ws;
   setConn("off", "ws connecting…");
   ws.onopen = () => {
@@ -2080,7 +2100,9 @@ async function loadDesignPreview(id, label) {
   if (!iframe) return;
   if (lbl) lbl.textContent = label || id;
   try {
-    const r = await fetch(`/api/design/systems/${encodeURIComponent(id)}/components`);
+    // Raw fetch on purpose: this endpoint returns HTML for the iframe srcdoc, and api()
+    // JSON-parses the body. Still needs the session token like every other /api call.
+    const r = await fetch(`/api/design/systems/${encodeURIComponent(id)}/components`, DOTZ_TOKEN ? { headers: { "x-dotz-token": DOTZ_TOKEN } } : undefined);
     if (!r.ok) throw new Error("preview unavailable");
     iframe.srcdoc = await r.text();
   } catch (e) {
@@ -3313,7 +3335,7 @@ function renderBrowserObservation(observation) {
   const owner = observation.owner || {};
   ph.textContent = `${observation.status} | ${owner.projectId || "unowned"} | seq ${observation.seq}`;
   if (observation.frame?.available && observation.status !== "stopped") {
-    shot.src = `/api/browser/frame?sessionId=${encodeURIComponent(observation.sessionId)}&afterSeq=${Math.max(-1, observation.frame.seq - 1)}&t=${observation.frame.seq}`;
+    shot.src = `/api/browser/frame?sessionId=${encodeURIComponent(observation.sessionId)}&afterSeq=${Math.max(-1, observation.frame.seq - 1)}&t=${observation.frame.seq}${tokenQS("&")}`;
     shot.classList.remove("hidden"); ph.classList.add("hidden");
   } else { shot.classList.add("hidden"); ph.classList.remove("hidden"); }
   let details = panel.querySelector(".browser-observation");
