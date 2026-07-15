@@ -425,6 +425,13 @@ pub fn run(id: &str, session_id: &str, args: &Value) -> Result<(), String> {
         return Err("expanded template body is empty".to_string());
     }
     let sess = session::get(session_id).ok_or_else(|| "no such session".to_string())?;
+    // Fire-and-forget command-run telemetry for the palette-clicked preset. Only
+    // the bare command NAME ("/implement") is recorded — never the args, never
+    // the expanded body — and telemetry is a no-op until the operator opts in.
+    let cmd = format!("/{id}");
+    tokio::spawn(async move {
+        crate::telemetry::record_command_run(cmd).await;
+    });
     tokio::spawn(async move {
         session::run_turn(sess, prompt).await;
     });

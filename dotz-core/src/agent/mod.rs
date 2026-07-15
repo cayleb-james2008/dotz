@@ -49,6 +49,57 @@ fn not_found() -> (StatusCode, Json<Value>) {
     )
 }
 
+/// Extract the bare slash-command NAME from a user-typed prompt, if any.
+///
+/// Returns `Some("/implement")` for `"/implement the thing"`, and `None` for
+/// plain prose or a token that isn't a clean slash command. Mirrors the PII-free
+/// contract pinned in `telemetry::tests::test_no_pii_in_event_payload`: the
+/// result is the command name only — never its arguments, never file paths —
+/// so it's safe to hand to `telemetry::record_command_run`. A token with an
+/// embedded slash after position 0 (e.g. `/a/b`) is rejected as a path, and
+/// any arguments after the command are stripped.
+fn slash_command_name(prompt: &str) -> Option<&str> {
+    // `split_whitespace` already skips leading/trailing whitespace, so no `trim()`
+    // is needed (clippy::trim_split_whitespace). It also yields `None` for an
+    // empty or all-whitespace string, which is the desired "no command" result.
+    let token = prompt.split_whitespace().next()?;
+    let name = token.strip_prefix('/')?;
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(token)
+}
+
+#[cfg(test)]
+mod slash_command_name_tests {
+    use super::slash_command_name;
+
+    #[test]
+    fn extracts_bare_command_name() {
+        assert_eq!(slash_command_name("/implement the thing"), Some("/implement"));
+        assert_eq!(slash_command_name("/ultra-code-review"), Some("/ultra-code-review"));
+    }
+
+    #[test]
+    fn ignores_plain_prose() {
+        assert_eq!(slash_command_name("just a question"), None);
+        assert_eq!(slash_command_name(""), None);
+        assert_eq!(slash_command_name("   "), None);
+    }
+
+    #[test]
+    fn rejects_path_like_and_bare_slash() {
+        assert_eq!(slash_command_name("/"), None);
+        assert_eq!(slash_command_name("/a/b"), None);
+        assert_eq!(slash_command_name("/implement/some/path"), None);
+    }
+
+    #[test]
+    fn trims_leading_whitespace() {
+        assert_eq!(slash_command_name("   /scout-and-plan\n"), Some("/scout-and-plan"));
+    }
+}
+
 // ---- REST handlers (server.ts 546-719) ----
 
 async fn create_session(
@@ -682,6 +733,16 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                     "prompt" | "steer" | "followUp" => {
                         if body.trim().is_empty() {
                             continue;
+                        }
+                        // Fire-and-forget command-run telemetry when the user typed a
+                        // slash command (e.g. "/implement …"). Only the bare command
+                        // NAME is recorded — never the arguments — and telemetry is a
+                        // no-op until the operator opts in via settings.
+                        if let Some(cmd) = slash_command_name(&body) {
+                            let cmd = cmd.to_string();
+                            tokio::spawn(async move {
+                                crate::telemetry::record_command_run(cmd).await;
+                            });
                         }
                         if let Some(sess) = session::get(&session_id) {
                             tokio::spawn(async move {
