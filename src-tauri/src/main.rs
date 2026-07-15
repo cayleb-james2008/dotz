@@ -201,6 +201,15 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             });
             app.manage(shutdown_tx);
+
+            // Fire-and-forget the app-launch telemetry signal. Opt-in by default —
+            // record_app_launch is a silent no-op until the operator enables telemetry
+            // in settings, so this never blocks or sends anything without consent.
+            // Spawned on the Tauri async runtime (already running here) so it can't
+            // delay window creation.
+            tauri::async_runtime::spawn(async move {
+                dotz_core::telemetry::record_app_launch().await;
+            });
             // Keep the server task's JoinHandle so the Exit handler can actually await the
             // drain — signalling shutdown without awaiting it lets the process die mid-drain,
             // truncating in-flight requests and WS close frames. Mutex<Option<..>> because the

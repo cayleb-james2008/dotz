@@ -22,6 +22,7 @@ pub mod self_eval;
 pub mod server;
 pub mod skills;
 pub mod specs;
+pub mod telemetry;
 pub mod templates;
 pub mod types;
 pub mod util;
