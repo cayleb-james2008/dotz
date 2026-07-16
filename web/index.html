@@ -169,6 +169,14 @@
             <span id="settings-update-status" class="settings-value">—</span>
           </div>
           <button id="settings-check-update" class="btn-go">CHECK FOR UPDATES</button>
+          <div class="settings-row" id="settings-telemetry-row">
+            <span class="settings-label" title="Anonymous, PII-free usage signals (daily-active + command-run count). Opt-in, off by default.">Anonymous telemetry</span>
+            <button id="settings-telemetry-toggle" class="btn-mini" role="switch" aria-checked="false">OFF</button>
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">Telemetry sink</span>
+            <span id="settings-telemetry-endpoint" class="settings-value">disabled</span>
+          </div>
         </div>
         <div class="settings-foot">
           <button id="settings-close" class="btn-mini">CLOSE</button>

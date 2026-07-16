@@ -80,6 +80,7 @@ pub fn app_with_token(web_dir: PathBuf, state: Shared, token: Option<String>) ->
         .merge(crate::browser::router())
         .merge(crate::checkpoint::router())
         .merge(crate::commands::router())
+        .merge(crate::telemetry::router())
         .fallback_service(ServeDir::new(web_dir).append_index_html_on_directories(true))
         // Session-token guard (plan-015 follow-up), applied INSIDE the origin layer below. When a
         // token is configured, `/ws` and `/api/*` (except `/api/health`) require it via the
