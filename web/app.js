@@ -3119,9 +3119,11 @@ function bindSettings() {
     $("settings-version").textContent = (window.dotz && window.dotz.version) || "browser";
     $("settings-feed").textContent = (window.dotz && window.dotz.electron) ? "configured" : "not configured (browser/dev)";
     $("settings-update-status").textContent = state.updateStatus || "—";
+    refreshTelemetry();
     $("settings-close").focus();
   };
   $("settings-close").onclick = () => $("settings-card").classList.add("hidden");
+  bindTelemetryToggle();
   $("settings-check-update").onclick = () => {
     if (window.dotz && window.dotz.update && window.dotz.update.check) {
       window.dotz.update.check();
@@ -3129,6 +3131,53 @@ function bindSettings() {
     } else {
       $("settings-update-status").textContent = "updates only available in packaged app with feed";
     }
+  };
+}
+
+/* Opt-in telemetry toggle (settings panel). One click flips PII-free usage telemetry on/off via
+   the window.dotz.telemetry bridge; unavailable in a plain browser/dev build, where we disable the
+   control instead of pretending it works. */
+function renderTelemetry(status) {
+  const btn = $("settings-telemetry-toggle");
+  const ep = $("settings-telemetry-endpoint");
+  if (!btn) return;
+  if (!status) {
+    // No bridge (browser/dev) or a failed call — telemetry isn't controllable here.
+    btn.textContent = "N/A";
+    btn.setAttribute("aria-checked", "false");
+    btn.disabled = true;
+    if (ep) ep.textContent = "packaged app only";
+    return;
+  }
+  const on = !!status.enabled;
+  btn.disabled = false;
+  btn.textContent = on ? "ON" : "OFF";
+  btn.classList.toggle("btn-go", on);
+  btn.setAttribute("aria-checked", on ? "true" : "false");
+  if (ep) ep.textContent = on ? (status.endpoint || "enabled (no sink)") : "disabled";
+}
+
+async function refreshTelemetry() {
+  if (!window.dotz || !window.dotz.telemetry || typeof window.dotz.telemetry.status !== "function") {
+    renderTelemetry(null);
+    return;
+  }
+  renderTelemetry(await window.dotz.telemetry.status());
+}
+
+function bindTelemetryToggle() {
+  const btn = $("settings-telemetry-toggle");
+  if (!btn || btn._dotzBound) return;
+  btn._dotzBound = true;
+  btn.onclick = async () => {
+    if (!window.dotz || !window.dotz.telemetry || typeof window.dotz.telemetry.setEnabled !== "function") {
+      renderTelemetry(null);
+      return;
+    }
+    const turningOn = btn.getAttribute("aria-checked") !== "true";
+    btn.disabled = true;
+    const status = await window.dotz.telemetry.setEnabled(turningOn);
+    renderTelemetry(status);
   };
 }
 
