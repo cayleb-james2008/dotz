@@ -15,9 +15,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "createUpdaterArtifacts": true,
-    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
     "resources": {
       "../web": "web",
       "../.pi": ".pi",
@@ -30,7 +35,7 @@
       "endpoints": [
         "https://github.com/cayleb-james2008/dotz/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzMTgzMTA5QUU3RTlBMEQKUldRTm1uNnVDVEVZOHo1eE0vV1kxOC9VMjRlUjlxVytmTDNNcW1pbDk5dnQ4Smo1T0RBWDZYMUwK"
+      "pubkey": "ZFc1MGNuVnpkR1ZrSUdOdmJXMWxiblE2SUcxcGJtbHphV2R1SUhCMVlteHBZeUJyWlhrNklFRTFOVVZGTWpkRVFUUkJSVVUzUWtJS1VsZFROelUyTm10bVpVcGxjR1JvVTJ0UFNscFFSRWRrT1doclZtcE9SRGszWmtGaVNFZHdRM1l4YmpKNWRrVlhibU5ETlhCcGVWb0s="
     }
   }
 }
