@@ -395,7 +395,10 @@ async fn login(Path(id): Path<String>, body: Option<Json<Value>>) -> (StatusCode
                     StatusCode::OK,
                     Json(json!({ "ok": true, "provider": provider, "connection": resp })),
                 ),
-                Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "ok": false, "error": e }))),
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "ok": false, "error": e })),
+                ),
             }
         }
         _ => {
@@ -432,7 +435,10 @@ async fn logout(Path(id): Path<String>, body: Option<Json<Value>>) -> (StatusCod
             StatusCode::OK,
             Json(json!({ "ok": true, "provider": provider, "result": resp })),
         ),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "ok": false, "error": e }))),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "ok": false, "error": e })),
+        ),
     }
 }
 
@@ -647,7 +653,12 @@ mod tests {
         let body =
             json!({ "provider": "github", "authType": "api_key", "values": { "api_key": "k" } });
         let (code, out) = login(Path("gw".to_string()), Some(Json(body))).await;
-        assert_eq!(code, StatusCode::OK, "gateway login should succeed: {:?}", out.0);
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "gateway login should succeed: {:?}",
+            out.0
+        );
         assert_eq!(out.0["ok"], json!(true));
         assert_eq!(out.0["provider"], "github");
 

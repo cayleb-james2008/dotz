@@ -34,14 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_millis() as i64
-}
+use std::time::{Duration, Instant};
 
 /// Directory holding self-eval reports + the rolling history. Override with
 /// `DOTZ_SELF_EVAL_DIR`; defaults to `<dotz_dir>/ai-agents/self-eval`. An empty-but-set env
@@ -428,7 +421,7 @@ impl Report {
         let total_wall_ms = cases.iter().map(|c| c.wall_ms).sum();
         Report {
             release: release.into(),
-            created_at: now_ms(),
+            created_at: crate::util::now_ms(),
             passed,
             total,
             pass_rate,

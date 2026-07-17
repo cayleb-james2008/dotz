@@ -417,13 +417,6 @@ fn store_guard() -> std::sync::MutexGuard<'static, HashMap<String, WorkflowRun>>
 
 const ACTIVE_CAP: usize = 100;
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
@@ -593,7 +586,7 @@ pub fn create(
     inputs: &[CreateStepInput],
     run_budget: Option<Budget>,
 ) -> Result<WorkflowRun, CycleError> {
-    let now = now_ms();
+    let now = crate::util::now_ms();
 
     let mut steps: Vec<WorkflowStep> = inputs
         .iter()
@@ -758,7 +751,7 @@ pub fn start(id: &str) -> Option<WorkflowRun> {
     let run = {
         let mut active = store_guard();
         let run = active.get_mut(id)?;
-        let now = now_ms();
+        let now = crate::util::now_ms();
         run.status = "running".to_string();
         run.started_at = Some(now);
         run.updated_at = now;
@@ -788,7 +781,7 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
     let run_snapshot = {
         let mut active = store_guard();
         let run = active.get_mut(run_id)?;
-        let now = now_ms();
+        let now = crate::util::now_ms();
         let mut changed: HashSet<String> = HashSet::new();
 
         let step_idx = run.steps.iter().position(|s| s.id == step_id)?;
@@ -1040,7 +1033,7 @@ pub fn abort(id: &str) -> Option<WorkflowRun> {
     let run = {
         let mut active = store_guard();
         let run = active.get_mut(id)?;
-        let now = now_ms();
+        let now = crate::util::now_ms();
         let mut changed: HashSet<String> = HashSet::new();
         run.status = "aborted".to_string();
         run.ended_at = Some(now);
@@ -1080,7 +1073,7 @@ pub fn get_active(id: &str) -> Option<WorkflowRun> {
 pub fn mark_interrupted(run_id: &str) -> Option<usize> {
     let mut active = store_guard();
     let run = active.get_mut(run_id)?;
-    let now = now_ms();
+    let now = crate::util::now_ms();
     let mut count = 0;
     for step in run.steps.iter_mut() {
         if step.status == "running" {
@@ -1198,7 +1191,7 @@ pub fn resume_sync(run_id: &str) -> Option<WorkflowRun> {
     }
 
     // Mark running and persist.
-    let now = now_ms();
+    let now = crate::util::now_ms();
     run.status = "running".to_string();
     if run.started_at.is_none() {
         run.started_at = Some(now);
@@ -1671,7 +1664,7 @@ async fn rerun_step_handler(
                 s.started_at = None;
                 s.ended_at = None;
             }
-            run.updated_at = now_ms();
+            run.updated_at = crate::util::now_ms();
             persist(run);
             // Emit a step_state event so the UI reflects the reset + new task.
             let step = run.steps.iter().find(|s| s.id == step_id).cloned().unwrap();
@@ -1822,7 +1815,7 @@ async fn patch_step_handler(
             Some(r) => r,
             None => return Err(not_found("no such workflow run")),
         };
-        let now = now_ms();
+        let now = crate::util::now_ms();
         // Update children references: remove old, add new.
         let step_id_c = step_id.clone();
         for s in run.steps.iter_mut() {
@@ -1921,7 +1914,7 @@ async fn insert_steps_handler(
     }
 
     let existing_count = run.steps.len();
-    let now = now_ms();
+    let now = crate::util::now_ms();
     let mut new_steps: Vec<WorkflowStep> = Vec::with_capacity(body.steps.len());
     let mut new_step_ids: Vec<String> = Vec::with_capacity(body.steps.len());
 
@@ -2171,7 +2164,7 @@ pub fn patch_parents(
     let updated = {
         let mut active = store_guard();
         let run = active.get_mut(run_id).ok_or(CycleError)?;
-        let now = now_ms();
+        let now = crate::util::now_ms();
         // Rebuild children references.
         let step_id_c = step_id.to_string();
         for s in run.steps.iter_mut() {
@@ -2230,7 +2223,7 @@ pub fn patch_parents(
 pub fn insert_steps(run_id: &str, inputs: &[CreateStepInput]) -> Result<WorkflowRun, CycleError> {
     let run = get_active(run_id).ok_or(CycleError)?;
     let existing_count = run.steps.len();
-    let now = now_ms();
+    let now = crate::util::now_ms();
     let mut new_step_ids: Vec<String> = Vec::with_capacity(inputs.len());
 
     let new_steps: Vec<WorkflowStep> = inputs
@@ -2382,7 +2375,7 @@ pub fn patch_model(
     let updated = {
         let mut active = store_guard();
         let run = active.get_mut(run_id).ok_or(CycleError)?;
-        let now = now_ms();
+        let now = crate::util::now_ms();
         if let Some(step) = run.steps.iter_mut().find(|s| s.id == step_id) {
             step.model = model.map(|s| s.to_string());
         }
@@ -2439,7 +2432,7 @@ pub async fn rerun_step_and_dispatch(
     {
         let mut active = store_guard();
         let run = active.get_mut(run_id)?;
-        let now = now_ms();
+        let now = crate::util::now_ms();
         if let Some(s) = run.steps.iter_mut().find(|s| s.id == step_id) {
             s.task = new_task;
             s.error = None;
@@ -4095,7 +4088,7 @@ mod tests {
     /// Build a `WorkflowRun` with steps in the given statuses — a synthetic workflow for
     /// summary tests that doesn't require the create/start/step_state lifecycle.
     fn synthetic_run(statuses: &[&str]) -> WorkflowRun {
-        let now = now_ms();
+        let now = crate::util::now_ms();
         let steps: Vec<WorkflowStep> = statuses
             .iter()
             .enumerate()

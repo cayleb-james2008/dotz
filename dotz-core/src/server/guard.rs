@@ -77,9 +77,7 @@ fn host_only(hostport: &str) -> &str {
 /// `tauri.localhost`, which is handled by the exact Tauri-origin allowlist instead.
 fn is_loopback_host(host: &str) -> bool {
     let h = host_only(host);
-    h.eq_ignore_ascii_case("127.0.0.1")
-        || h.eq_ignore_ascii_case("localhost")
-        || h == "::1"
+    h.eq_ignore_ascii_case("127.0.0.1") || h.eq_ignore_ascii_case("localhost") || h == "::1"
 }
 
 /// Should a request carrying this `Origin` header value be allowed? `true` for the Tauri
