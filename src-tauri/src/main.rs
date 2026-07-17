@@ -106,7 +106,12 @@ fn telemetry_status() -> Value {
 /// Turning it OFF clears the endpoint (dotz_core::telemetry::set_enabled), a no-op here.
 fn telemetry_set_enabled(enabled: bool) -> Value {
     dotz_core::telemetry::set_enabled(enabled);
-    if enabled && dotz_core::telemetry::load_config().endpoint.trim().is_empty() {
+    if enabled
+        && dotz_core::telemetry::load_config()
+            .endpoint
+            .trim()
+            .is_empty()
+    {
         dotz_core::telemetry::set_endpoint(format!("http://127.0.0.1:{PORT}/telemetry/ingest"));
     }
     telemetry_status()
@@ -318,8 +323,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .and_then(|s| s.lock().ok().and_then(|mut g| g.take()));
             if let Some(task) = server_task {
                 tauri::async_runtime::block_on(async {
-                    let _ =
-                        tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
                 });
             }
         }

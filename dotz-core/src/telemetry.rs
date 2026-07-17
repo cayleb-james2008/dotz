@@ -605,12 +605,20 @@ mod tests {
     #[test]
     fn test_utc_day_index_rolls_on_day_boundary() {
         assert_eq!(utc_day_index(0), 0, "epoch is day 0");
-        assert_eq!(utc_day_index(86_400_000 - 1), 0, "last ms of day 0 is still day 0");
+        assert_eq!(
+            utc_day_index(86_400_000 - 1),
+            0,
+            "last ms of day 0 is still day 0"
+        );
         assert_eq!(utc_day_index(86_400_000), 1, "first ms of day 1 rolls over");
         assert_eq!(utc_day_index(86_400_000 + 1), 1);
         assert_eq!(utc_day_index(2 * 86_400_000), 2);
         // div_euclid keeps a pre-epoch (negative) millis floored, not truncated toward zero.
-        assert_eq!(utc_day_index(-1), -1, "one ms before epoch is day -1, not 0");
+        assert_eq!(
+            utc_day_index(-1),
+            -1,
+            "one ms before epoch is day -1, not 0"
+        );
     }
 
     /// The once-per-day gate: `claim_day_if_new` fires exactly once per distinct day and advances
@@ -635,7 +643,10 @@ mod tests {
             // A new day boundary -> a fresh claim, and the marker advances.
             assert!(claim_day_if_new(20_001), "a new day must fire");
             assert_eq!(load_last_active_day(), Some(20_001));
-            assert!(!claim_day_if_new(20_001), "the new day is now also idempotent");
+            assert!(
+                !claim_day_if_new(20_001),
+                "the new day is now also idempotent"
+            );
         });
     }
 
@@ -708,9 +719,17 @@ mod tests {
                 }
                 server.abort();
 
-                assert_eq!(lines.len(), 1, "receiver must append exactly one JSONL line");
+                assert_eq!(
+                    lines.len(),
+                    1,
+                    "receiver must append exactly one JSONL line"
+                );
                 let got: Value = serde_json::from_str(&lines[0]).expect("sink line must be JSON");
-                assert_eq!(got["eventType"], json!("dailyActive"), "event type persisted");
+                assert_eq!(
+                    got["eventType"],
+                    json!("dailyActive"),
+                    "event type persisted"
+                );
                 assert_eq!(
                     got["sessionId"].as_str().unwrap_or("").len(),
                     36,
@@ -721,8 +740,12 @@ mod tests {
                     "ts must be a plausible recent millis epoch: {got}"
                 );
                 // PII-free invariant on the wire: only the fixed key set, no command/path leak.
-                let keys: Vec<&str> =
-                    got.as_object().unwrap().keys().map(String::as_str).collect();
+                let keys: Vec<&str> = got
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
                 for k in &keys {
                     assert!(
                         matches!(*k, "eventType" | "sessionId" | "ts"),
