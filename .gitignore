@@ -1,6 +1,8 @@
 node_modules/
 dist/
 release/
+# local copies of shipped installers + latest.json (scripts/release.ps1, gh release download)
+release-archive/
 assets/models/
 .env
 .env.local
