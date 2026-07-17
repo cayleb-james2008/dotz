@@ -27,11 +27,10 @@ fn workspace_root() -> &'static Path {
 /// Cargo.toml must keep the exact (`=`) requirement, not a range.
 #[test]
 fn cargo_toml_keeps_exact_ort_pin() {
-    let manifest = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
-    )
-    .expect("read dotz-core/Cargo.toml")
-    .replace("\r\n", "\n");
+    let manifest =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("read dotz-core/Cargo.toml")
+            .replace("\r\n", "\n");
     let want = format!("ort = {{ version = \"={PINNED}\"");
     assert!(
         manifest.contains(&want),

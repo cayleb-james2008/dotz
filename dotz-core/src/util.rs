@@ -125,4 +125,16 @@ mod tests {
             "now_ms should be a plausible recent timestamp, got {t}"
         );
     }
+
+    /// `now_ms()` must be monotonic (non-decreasing) when called twice in sequence. This
+    /// guards the consolidation of the local copies in `workflows.rs` and `self_eval.rs`
+    /// into the shared helper: every call site — whether in workflow step-state transitions,
+    /// run-record timestamps, or self-eval report creation — must see the same wall clock
+    /// and produce timestamps that never go backward.
+    #[test]
+    fn now_ms_is_monotonic() {
+        let t1 = now_ms();
+        let t2 = now_ms();
+        assert!(t2 >= t1, "now_ms must be monotonic: t1={t1}, t2={t2}");
+    }
 }

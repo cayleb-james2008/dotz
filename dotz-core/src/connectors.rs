@@ -96,7 +96,9 @@ fn parse_registry(raw: &str, source: &str) -> Vec<Connector> {
     let v: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("connectors: {source} is not valid JSON ({e}); ignoring (no connectors loaded)");
+            eprintln!(
+                "connectors: {source} is not valid JSON ({e}); ignoring (no connectors loaded)"
+            );
             return Vec::new();
         }
     };
@@ -221,7 +223,10 @@ pub async fn fetch_catalog(client: &reqwest::Client, c: &Connector) -> Result<Va
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err(format!("gateway '{}' catalog returned HTTP {}", c.id, status));
+        return Err(format!(
+            "gateway '{}' catalog returned HTTP {}",
+            c.id, status
+        ));
     }
     Ok(body)
 }
@@ -353,7 +358,10 @@ async fn probe_status(client: &reqwest::Client, c: &Connector) -> Value {
             base,
             true,
             false,
-            Some(format!("gateway reachable but returned HTTP {}", resp.status())),
+            Some(format!(
+                "gateway reachable but returned HTTP {}",
+                resp.status()
+            )),
         ),
         Err(_) => merge_status(
             base,
@@ -410,7 +418,10 @@ mod tests {
     fn registry_is_empty_and_off_by_default_when_no_file() {
         with_tmp_dir(|_| {
             assert!(load_connectors().is_empty(), "no file => empty registry");
-            assert!(enabled_connectors().is_empty(), "no file => nothing enabled");
+            assert!(
+                enabled_connectors().is_empty(),
+                "no file => nothing enabled"
+            );
             assert!(enabled_by_id("anything").is_none());
             // gateway_statuses must return empty WITHOUT touching the network.
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -496,7 +507,11 @@ mod tests {
                 token_ref: "".into(),
                 ..c
             };
-            assert_eq!(resolve_token(&no_auth).unwrap(), None, "empty ref => no auth");
+            assert_eq!(
+                resolve_token(&no_auth).unwrap(),
+                None,
+                "empty ref => no auth"
+            );
         });
     }
 
@@ -555,7 +570,10 @@ mod tests {
         assert_eq!(out["ok"], json!(true));
 
         let (path, auth, body) = captured.lock().unwrap().clone();
-        assert_eq!(path, "github.create_issue", "path must be the dotted action");
+        assert_eq!(
+            path, "github.create_issue",
+            "path must be the dotted action"
+        );
         assert_eq!(auth, "Bearer tkn-abc", "bearer token must be sent");
         assert_eq!(
             body,

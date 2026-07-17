@@ -76,8 +76,14 @@ mod slash_command_name_tests {
 
     #[test]
     fn extracts_bare_command_name() {
-        assert_eq!(slash_command_name("/implement the thing"), Some("/implement"));
-        assert_eq!(slash_command_name("/ultra-code-review"), Some("/ultra-code-review"));
+        assert_eq!(
+            slash_command_name("/implement the thing"),
+            Some("/implement")
+        );
+        assert_eq!(
+            slash_command_name("/ultra-code-review"),
+            Some("/ultra-code-review")
+        );
     }
 
     #[test]
@@ -96,7 +102,10 @@ mod slash_command_name_tests {
 
     #[test]
     fn trims_leading_whitespace() {
-        assert_eq!(slash_command_name("   /scout-and-plan\n"), Some("/scout-and-plan"));
+        assert_eq!(
+            slash_command_name("   /scout-and-plan\n"),
+            Some("/scout-and-plan")
+        );
     }
 }
 
