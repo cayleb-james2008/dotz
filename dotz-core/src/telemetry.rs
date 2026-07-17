@@ -39,7 +39,7 @@
 //! Both degrade to defaults on corrupt/missing files (never panic), matching
 //! the graceful-degradation contract every other dotz config file follows.
 use crate::util;
-use axum::{routing::post, Json, Router};
+use axum::{http::HeaderMap, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -50,6 +50,12 @@ use std::path::PathBuf;
 pub struct TelemetryConfig {
     pub enabled: bool,
     pub endpoint: String,
+    /// Shared receiver token for standalone-receiver mode (see `router_with_token`). Sent as the
+    /// `x-dotz-telemetry-token` header on every event POST when non-empty. Empty = no token
+    /// (the in-app loopback receiver). `serde(default)` keeps pre-token `telemetry.json` files
+    /// loading unchanged.
+    #[serde(default)]
+    pub token: String,
 }
 
 impl Default for TelemetryConfig {
@@ -58,6 +64,7 @@ impl Default for TelemetryConfig {
         TelemetryConfig {
             enabled: false,
             endpoint: String::new(),
+            token: String::new(),
         }
     }
 }
@@ -95,6 +102,9 @@ pub fn load_config() -> TelemetryConfig {
             if let Some(e) = v.get("endpoint").and_then(|x| x.as_str()) {
                 cfg.endpoint = e.to_string();
             }
+            if let Some(t) = v.get("token").and_then(|x| x.as_str()) {
+                cfg.token = t.to_string();
+            }
         } else {
             eprintln!(
                 "telemetry: {} is not valid JSON; telemetry stays OFF until the file is fixed.",
@@ -118,13 +128,15 @@ pub fn is_enabled() -> bool {
 }
 
 /// Public: turn telemetry on/off and persist the choice. Also wipes the
-/// endpoint to empty when turning OFF so a later re-enable does not silently
-/// resume sending to a stale endpoint (operator must re-confirm the endpoint).
+/// endpoint (and its paired receiver token) when turning OFF so a later
+/// re-enable does not silently resume sending to a stale endpoint (operator
+/// must re-confirm the endpoint).
 pub fn set_enabled(enabled: bool) {
     let mut cfg = load_config();
     cfg.enabled = enabled;
     if !enabled {
         cfg.endpoint = String::new();
+        cfg.token = String::new();
     }
     if let Err(e) = save_config(&cfg) {
         eprintln!("telemetry: failed to persist enabled={enabled}: {e}");
@@ -140,6 +152,53 @@ pub fn set_endpoint(endpoint: impl Into<String>) {
     if let Err(e) = save_config(&cfg) {
         eprintln!("telemetry: failed to persist endpoint: {e}");
     }
+}
+
+/// Public: set the shared receiver token sent with every event POST (standalone-receiver mode).
+/// Empty clears it. Persisted immediately, mirroring `set_endpoint`.
+pub fn set_token(token: impl Into<String>) {
+    let mut cfg = load_config();
+    cfg.token = token.into();
+    if let Err(e) = save_config(&cfg) {
+        eprintln!("telemetry: failed to persist token: {e}");
+    }
+}
+
+/// The app's own local receiver endpoint for the server bound on `port` — the guaranteed-working
+/// default sink (`/telemetry/ingest` is merged into the main axum app, see `router`).
+pub fn local_ingest_endpoint(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/telemetry/ingest")
+}
+
+/// Can `endpoint` answer HTTP at all? ANY response counts as reachable — a GET on the POST-only
+/// ingest route yields 405, which still proves a live receiver without polluting the sink — and
+/// only connect/DNS/timeout failures count as unreachable. 2 s ceiling so a settings-panel
+/// refresh never hangs the UI. Empty endpoints are unreachable by definition.
+pub async fn endpoint_reachable(endpoint: &str) -> bool {
+    if endpoint.trim().is_empty() {
+        return false;
+    }
+    reqwest::Client::new()
+        .get(endpoint)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok()
+}
+
+/// Enable telemetry AND guarantee a collectable sink — the enabled-implies-working-endpoint
+/// invariant. An empty or unreachable endpoint is replaced with this app's own local receiver
+/// (`local_ingest_endpoint`), so one settings click always yields a working send -> receive loop
+/// instead of a silently dropped event stream (the pre-fix failure mode: enabled + dead endpoint
+/// collected nothing, invisibly). A REACHABLE custom endpoint (e.g. the operator's standalone
+/// receiver) is left untouched. Returns the resulting persisted config for the caller's UI.
+pub async fn enable_with_working_endpoint(local_port: u16) -> TelemetryConfig {
+    set_enabled(true);
+    let cfg = load_config();
+    if !endpoint_reachable(&cfg.endpoint).await {
+        set_endpoint(local_ingest_endpoint(local_port));
+    }
+    load_config()
 }
 
 // ---- session id -------------------------------------------------------------
@@ -229,12 +288,16 @@ pub async fn record_event(event: TelemetryEvent) {
     // Best-effort: a 5s ceiling so a hung ledger endpoint never blocks the UI.
     // Errors are swallowed — telemetry is non-critical and must not surface
     // to the operator as a crash or a failed command.
-    let _ = reqwest::Client::new()
+    let mut req = reqwest::Client::new()
         .post(&cfg.endpoint)
         .json(&payload)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await;
+        .timeout(std::time::Duration::from_secs(5));
+    // Standalone-receiver mode: attach the shared token so a non-loopback receiver
+    // (`router_with_token`) accepts the event. Empty = the tokenless in-app receiver.
+    if !cfg.token.trim().is_empty() {
+        req = req.header(TOKEN_HEADER, cfg.token.trim());
+    }
+    let _ = req.send().await;
 }
 
 /// Convenience: record an `AppLaunch` event. Async wrapper so the launcher can
@@ -329,16 +392,22 @@ pub async fn record_daily_active_if_new_day() {
     }
 }
 
-// ---- local receiver ---------------------------------------------------------
+// ---- receiver ---------------------------------------------------------------
 //
-// A minimal loopback sink so the send -> receive path is end-to-end and testable on one machine:
-// the opt-in emitter can POST to this route and the operator can read the collected events out of
-// a local JSONL file. Merged into the axum app so it inherits the origin/Host allowlist guard
-// (loopback / no-Origin only). Deliberately NOT under `/api/` so the app's own emitter can loop
-// back without carrying the per-process session token (which telemetry POSTs never attach).
+// A minimal sink so the send -> receive path is end-to-end: the opt-in emitter POSTs to this
+// route and the operator reads the collected events out of a local JSONL file. Two hostings:
+//
+//   * In-app (loopback): `router()` merged into the main axum app, inheriting the origin/Host
+//     allowlist guard (loopback / no-Origin only). Deliberately NOT under `/api/` so the app's
+//     own emitter can loop back without carrying the per-process session token.
+//   * Standalone (`telemetry receive` bin): `router_with_token(Some(..))` served on an
+//     operator-chosen non-loopback addr WITHOUT the origin guard (external installs carry a
+//     non-loopback Host), gated instead by a long-lived shared token — this is what makes the
+//     external-user half of the weekly-active metric collectable at all.
 
-/// The append-only JSONL sink the local receiver writes to.
-fn sink_file() -> PathBuf {
+/// The append-only JSONL sink the receiver writes to (`~/.dotz/telemetry_sink.jsonl`,
+/// `DOTZ_CONFIG_DIR` honored). Public so the `telemetry` bin + docs name the same path.
+pub fn sink_file() -> PathBuf {
     dotz_dir().join("telemetry_sink.jsonl")
 }
 
@@ -357,23 +426,119 @@ fn append_to_sink(event: &Value) -> std::io::Result<()> {
     Ok(())
 }
 
-/// POST `/telemetry/ingest` — the local receiver. Appends the posted event to the JSONL sink and
-/// returns `{ ok }`. The body is stored verbatim: the emitter only ever sends the fixed PII-free
-/// schema (`test_no_pii_in_event_payload` pins it), so no field filtering is needed here.
-async fn ingest(Json(event): Json<Value>) -> Json<Value> {
-    match append_to_sink(&event) {
-        Ok(()) => Json(json!({ "ok": true })),
-        Err(e) => {
-            eprintln!("telemetry receiver: failed to append event to sink: {e}");
-            Json(json!({ "ok": false }))
-        }
-    }
+/// The request header carrying the shared receiver token in standalone-receiver mode. Distinct
+/// from the per-process session token header (`x-dotz-token`, `server::guard::TOKEN_HEADER`):
+/// this one is a long-lived shared secret the operator hands to each opted-in external install.
+pub const TOKEN_HEADER: &str = "x-dotz-telemetry-token";
+
+/// The receiver's router with an optional shared-token gate. `None` = the tokenless in-app
+/// loopback receiver. `Some(token)` = standalone mode: a missing/wrong `x-dotz-telemetry-token`
+/// header gets `401` and never touches the sink (constant-time compare via `guard::token_ok`,
+/// same as the session token). POST `/telemetry/ingest` appends the posted event verbatim to the
+/// JSONL sink and returns `{ ok }` — the emitter only ever sends the fixed PII-free schema
+/// (`test_no_pii_in_event_payload` pins it), so no field filtering is needed here.
+pub fn router_with_token(token: Option<String>) -> Router<()> {
+    Router::new().route(
+        "/telemetry/ingest",
+        post(move |headers: HeaderMap, Json(event): Json<Value>| {
+            let token = token.clone();
+            async move {
+                let provided = headers.get(TOKEN_HEADER).and_then(|v| v.to_str().ok());
+                if !crate::server::guard::token_ok(token.as_deref(), provided) {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "ok": false, "error": "missing or invalid telemetry token" })),
+                    );
+                }
+                match append_to_sink(&event) {
+                    Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+                    Err(e) => {
+                        eprintln!("telemetry receiver: failed to append event to sink: {e}");
+                        (StatusCode::OK, Json(json!({ "ok": false })))
+                    }
+                }
+            }
+        }),
+    )
 }
 
-/// The receiver's router, merged into the main axum app (see `server::app_with_token`). Stateless
-/// `Router<()>`, matching the other cold modules' `router()` convention.
+/// The tokenless in-app receiver, merged into the main axum app (see `server::app_with_token`).
+/// Stateless `Router<()>`, matching the other cold modules' `router()` convention.
 pub fn router() -> Router<()> {
-    Router::new().route("/telemetry/ingest", post(ingest))
+    router_with_token(None)
+}
+
+// ---- weekly-active aggregation ----------------------------------------------
+//
+// The fleet metric is "distinct opted-in installs active per UTC ISO week" (target: 5 external
+// weekly-active users). The sink stores one JSON line per event ({eventType, sessionId, ts, ..});
+// aggregation is pure over that text so the `telemetry weekly` subcommand and tests share it.
+// No chrono: two textbook civil-date helpers (Howard Hinnant's algorithms) are all ISO-8601
+// week numbering needs (ponytail: no calendar dep for one label format).
+
+/// Days since 1970-01-01 -> (year, month, day), proleptic Gregorian (Hinnant `civil_from_days`).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// (year, month, day) -> days since 1970-01-01 (Hinnant `days_from_civil`).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = i64::from(if m > 2 { m - 3 } else { m + 9 });
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// ISO-8601 week label (e.g. "2026-W29") for a UTC millis-epoch timestamp. ISO weeks run
+/// Mon–Sun and belong to the year of their Thursday, so computing the containing Thursday's
+/// calendar date and its week-of-year index gives the label directly. Pinned against Python
+/// `date.isocalendar()` anchors in `test_iso_week_matches_isocalendar_anchors`.
+pub fn iso_week(ts_ms: i64) -> String {
+    let day = ts_ms.div_euclid(86_400_000);
+    let dow = (day + 3).rem_euclid(7); // Monday=0 … Sunday=6 (1970-01-01 was a Thursday)
+    let thursday = day - dow + 3;
+    let (y, _, _) = civil_from_days(thursday);
+    let week = (thursday - days_from_civil(y, 1, 1)) / 7 + 1;
+    format!("{y}-W{week:02}")
+}
+
+/// Aggregate sink JSONL into per-ISO-week rows `(week, distinct installs, events)`, week-sorted.
+/// "Distinct installs" = distinct `sessionId` (the stable per-install telemetry id). Lines that
+/// are not JSON or lack `sessionId`/`ts` are skipped — a truncated tail line from a killed
+/// receiver must not sink the whole report.
+pub fn weekly_active(jsonl: &str) -> Vec<(String, usize, usize)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut weeks: BTreeMap<String, (BTreeSet<String>, usize)> = BTreeMap::new();
+    for line in jsonl.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let (Some(id), Some(ts)) = (
+            v.get("sessionId").and_then(|x| x.as_str()),
+            v.get("ts").and_then(|x| x.as_i64()),
+        ) else {
+            continue;
+        };
+        let entry = weeks.entry(iso_week(ts)).or_default();
+        entry.0.insert(id.to_string());
+        entry.1 += 1;
+    }
+    weeks
+        .into_iter()
+        .map(|(w, (ids, n))| (w, ids.len(), n))
+        .collect()
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -756,13 +921,15 @@ mod tests {
         });
     }
 
-    /// set_enabled(false) must also clear the endpoint so a later re-enable
-    /// does not silently resume sending to a stale address.
+    /// set_enabled(false) must also clear the endpoint (and its paired receiver token) so a
+    /// later re-enable does not silently resume sending to a stale address.
     #[test]
     fn test_set_enabled_false_clears_endpoint() {
         with_tmp_dir(|_| {
             set_endpoint("http://example.invalid/fleet");
+            set_token("shared-secret");
             assert!(load_config().endpoint.contains("example.invalid"));
+            assert_eq!(load_config().token, "shared-secret");
 
             set_enabled(false);
             let cfg = load_config();
@@ -772,6 +939,225 @@ mod tests {
                 "turning off must clear the endpoint, got {:?}",
                 cfg.endpoint
             );
+            assert!(
+                cfg.token.is_empty(),
+                "turning off must clear the receiver token, got {:?}",
+                cfg.token
+            );
         });
+    }
+
+    /// The enabled-implies-working-endpoint invariant: enabling with an endpoint that is empty or
+    /// unreachable must fall back to the app's own local receiver, and the resulting endpoint must
+    /// actually collect — a real event sent through `record_event` lands in the sink. This is the
+    /// regression pin for the audit's "enabled but pointed at a dead endpoint, silent failure".
+    #[test]
+    fn test_enable_with_unreachable_endpoint_defaults_to_local_receiver() {
+        with_tmp_dir(|dir| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                // The app's "own" receiver: the real router on a loopback ephemeral port.
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let local_port = listener.local_addr().unwrap().port();
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, router()).await.unwrap();
+                });
+
+                // A guaranteed-dead endpoint: bind an ephemeral port, then drop the listener so
+                // connecting to it is refused (no other process can have grabbed it mid-test
+                // reliably enough to matter for loopback).
+                let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let dead_port = dead.local_addr().unwrap().port();
+                drop(dead);
+                set_endpoint(format!("http://127.0.0.1:{dead_port}/telemetry/ingest"));
+                assert!(
+                    !endpoint_reachable(&load_config().endpoint).await,
+                    "the dropped port must probe unreachable"
+                );
+
+                // Enabling must repair the endpoint to the local receiver…
+                let cfg = enable_with_working_endpoint(local_port).await;
+                assert!(cfg.enabled, "must be enabled");
+                assert_eq!(
+                    cfg.endpoint,
+                    local_ingest_endpoint(local_port),
+                    "unreachable endpoint must be replaced with the local receiver"
+                );
+                assert!(
+                    endpoint_reachable(&cfg.endpoint).await,
+                    "enabled implies a REACHABLE endpoint"
+                );
+
+                // …and the repaired endpoint must actually collect end-to-end.
+                record_event(TelemetryEvent::AppLaunch).await;
+                let sink = dir.join("telemetry_sink.jsonl");
+                let mut got = String::new();
+                for _ in 0..40 {
+                    if let Ok(raw) = std::fs::read_to_string(&sink) {
+                        if !raw.trim().is_empty() {
+                            got = raw;
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                server.abort();
+                assert!(
+                    got.contains("appLaunch"),
+                    "the repaired endpoint must collect the event: sink = {got:?}"
+                );
+            });
+        });
+    }
+
+    /// Enabling with a REACHABLE custom endpoint must keep it — the invariant repairs dead sinks,
+    /// it does not stomp an operator-configured standalone receiver.
+    #[test]
+    fn test_enable_keeps_reachable_custom_endpoint() {
+        with_tmp_dir(|_| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                // A live "custom" receiver on its own port…
+                let custom = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let custom_port = custom.local_addr().unwrap().port();
+                let server = tokio::spawn(async move {
+                    axum::serve(custom, router()).await.unwrap();
+                });
+                let custom_ep = format!("http://127.0.0.1:{custom_port}/telemetry/ingest");
+                set_endpoint(&custom_ep);
+
+                // …must survive enable_with_working_endpoint aimed at a DIFFERENT local port.
+                let cfg = enable_with_working_endpoint(custom_port.wrapping_add(1)).await;
+                server.abort();
+                assert_eq!(
+                    cfg.endpoint, custom_ep,
+                    "a reachable custom endpoint must not be replaced"
+                );
+            });
+        });
+    }
+
+    /// Standalone-receiver token gate: with a token configured, a POST without (or with a wrong)
+    /// `x-dotz-telemetry-token` header gets 401 and never touches the sink; the real emitter with
+    /// the matching token in its config gets through and the event lands.
+    #[test]
+    fn test_receiver_token_rejects_missing_and_accepts_matching() {
+        with_tmp_dir(|dir| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, router_with_token(Some("s3cret".into())))
+                        .await
+                        .unwrap();
+                });
+                let url = format!("http://127.0.0.1:{}/telemetry/ingest", addr.port());
+                let sink = dir.join("telemetry_sink.jsonl");
+                let client = reqwest::Client::new();
+
+                // No token -> 401, nothing written.
+                let r = client.post(&url).json(&json!({"probe": 1})).send().await.unwrap();
+                assert_eq!(r.status(), 401, "missing token must be rejected");
+                // Wrong token -> 401 too.
+                let r = client
+                    .post(&url)
+                    .header(TOKEN_HEADER, "wrong")
+                    .json(&json!({"probe": 2}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), 401, "wrong token must be rejected");
+                assert!(!sink.exists(), "rejected posts must never touch the sink");
+
+                // The real emitter, configured with the matching shared token -> lands.
+                set_endpoint(&url);
+                set_token("s3cret");
+                set_enabled(true);
+                record_daily_active().await;
+                let mut got = String::new();
+                for _ in 0..40 {
+                    if let Ok(raw) = std::fs::read_to_string(&sink) {
+                        if !raw.trim().is_empty() {
+                            got = raw;
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                server.abort();
+                let lines: Vec<&str> = got.lines().collect();
+                assert_eq!(lines.len(), 1, "exactly the authorized event lands: {got:?}");
+                assert!(got.contains("dailyActive"), "authorized event persisted: {got:?}");
+            });
+        });
+    }
+
+    /// Pin the ISO-week labels against `datetime.date.isocalendar()` anchors (verified with
+    /// CPython 3.x): year-boundary weeks are where hand-rolled week math dies, so every anchor
+    /// here is a boundary case except the mid-year sanity row.
+    #[test]
+    fn test_iso_week_matches_isocalendar_anchors() {
+        // (y, m, d, expected label) — ts is the UTC midnight of that date.
+        let anchors = [
+            (1970, 1, 1, "1970-W01"),   // epoch, a Thursday
+            (2016, 1, 1, "2015-W53"),   // Friday belonging to the PREVIOUS iso year
+            (2021, 1, 1, "2020-W53"),   // same shape, leap-adjacent
+            (2024, 12, 30, "2025-W01"), // Monday belonging to the NEXT iso year
+            (2025, 12, 29, "2026-W01"), // Monday starting 2026-W01
+            (2026, 1, 1, "2026-W01"),   // Thursday anchor day itself
+            (2026, 7, 17, "2026-W29"),  // mid-year sanity (today, at authoring time)
+            (2026, 12, 28, "2026-W53"), // Monday of a 53-week iso year
+        ];
+        for (y, m, d, want) in anchors {
+            let ts = days_from_civil(y, m, d) * 86_400_000;
+            assert_eq!(iso_week(ts), want, "{y}-{m:02}-{d:02}");
+            // Last millisecond of the same UTC day must stay in the same week.
+            assert_eq!(iso_week(ts + 86_399_999), want, "{y}-{m:02}-{d:02} 23:59:59.999");
+        }
+        // The civil-date helpers must be inverses around the anchors.
+        for (y, m, d, _) in anchors {
+            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+        }
+    }
+
+    /// The aggregator counts DISTINCT session ids per ISO week (the weekly-active metric),
+    /// tolerates garbage lines, and keys strictly off `ts`+`sessionId`.
+    #[test]
+    fn test_weekly_active_counts_distinct_ids_per_week() {
+        let wk1 = days_from_civil(2026, 7, 13) * 86_400_000; // Monday of 2026-W29
+        let wk2 = days_from_civil(2026, 7, 20) * 86_400_000; // Monday of 2026-W30
+        let line = |id: &str, ts: i64| {
+            format!(r#"{{"eventType":"dailyActive","sessionId":"{id}","ts":{ts}}}"#)
+        };
+        let jsonl = [
+            line("aaa", wk1),
+            line("aaa", wk1 + 86_400_000), // same install again in wk1 -> still 1 distinct
+            line("bbb", wk1 + 2 * 86_400_000),
+            line("bbb", wk2), // same install active NEXT week counts there too
+            line("ccc", wk2),
+            "not json at all".to_string(),          // must be skipped
+            r#"{"eventType":"x","ts":1}"#.into(),   // no sessionId -> skipped
+            r#"{"sessionId":"zzz"}"#.into(),        // no ts -> skipped
+        ]
+        .join("\n");
+
+        let rows = weekly_active(&jsonl);
+        assert_eq!(
+            rows,
+            vec![
+                ("2026-W29".to_string(), 2, 3), // aaa+bbb distinct, 3 events
+                ("2026-W30".to_string(), 2, 2), // bbb+ccc distinct, 2 events
+            ]
+        );
     }
 }

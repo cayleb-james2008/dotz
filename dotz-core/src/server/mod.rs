@@ -1,5 +1,6 @@
 //! axum HTTP/WS server. Mirrors src/server.ts route groups; serves the static `web/` UI.
-mod guard;
+// pub(crate): telemetry::router_with_token reuses guard::token_ok for its shared-token check.
+pub(crate) mod guard;
 
 // Re-exported for the Tauri shell (src-tauri), which generates the per-process session
 // token and injects it into the WebView via its initialization script.
