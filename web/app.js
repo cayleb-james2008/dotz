@@ -3154,7 +3154,15 @@ function renderTelemetry(status) {
   btn.textContent = on ? "ON" : "OFF";
   btn.classList.toggle("btn-go", on);
   btn.setAttribute("aria-checked", on ? "true" : "false");
-  if (ep) ep.textContent = on ? (status.endpoint || "enabled (no sink)") : "disabled";
+  if (ep) {
+    /* reachable === false is a live probe verdict from the backend: the sink endpoint is
+       configured but not answering — events are being dropped. Surface it loudly instead of
+       the old silent failure; true/undefined/null render as before. */
+    const dead = on && status.reachable === false;
+    const sink = on ? (status.endpoint || "enabled (no sink)") : "disabled";
+    ep.textContent = dead ? sink + " — UNREACHABLE (events are not being collected)" : sink;
+    ep.classList.toggle("red", dead);
+  }
 }
 
 async function refreshTelemetry() {

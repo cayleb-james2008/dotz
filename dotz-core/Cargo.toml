@@ -14,6 +14,10 @@ path = "src/bin/serve.rs"
 name = "selfeval"
 path = "src/bin/selfeval.rs"
 
+[[bin]]
+name = "telemetry"
+path = "src/bin/telemetry.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "process", "fs", "io-util", "time"] }
 axum = { version = "0.8", features = ["ws"] }

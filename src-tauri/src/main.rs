@@ -82,39 +82,44 @@ async fn bridge(app: tauri::AppHandle, method: String, args: Vec<Value>) -> Resu
         // Opt-in telemetry controls (see dotz_core::telemetry). Routed through the already-
         // ACL-allowed `bridge` command so no new capability entry is needed for the remote
         // http origin the WebView loads.
-        "telemetry_status" => Ok(telemetry_status()),
+        "telemetry_status" => Ok(telemetry_status().await),
         "telemetry_set_enabled" => {
             let enabled = args.first().and_then(Value::as_bool).unwrap_or(false);
-            Ok(telemetry_set_enabled(enabled))
+            Ok(telemetry_set_enabled(enabled).await)
         }
         _ => Err(format!("unknown method: {method}")),
     }
 }
 
-/// Current opt-in telemetry state for the settings UI: `{ enabled, endpoint }`. Reads the
-/// persisted config each call so the toggle reflects on-disk truth (including a hand-edited file).
-fn telemetry_status() -> Value {
+/// Current opt-in telemetry state for the settings UI: `{ enabled, endpoint, reachable }`. Reads
+/// the persisted config each call so the toggle reflects on-disk truth (including a hand-edited
+/// file). `reachable` is a LIVE probe of the configured endpoint (2 s ceiling; `null` when
+/// disabled or endpoint-less) so the settings panel shows a dead sink instead of the pre-fix
+/// silent failure mode — enabled, pointed at a dead endpoint, collecting nothing invisibly.
+async fn telemetry_status() -> Value {
     let cfg = dotz_core::telemetry::load_config();
-    json!({ "enabled": cfg.enabled, "endpoint": cfg.endpoint })
+    let reachable = if cfg.enabled && !cfg.endpoint.trim().is_empty() {
+        json!(dotz_core::telemetry::endpoint_reachable(&cfg.endpoint).await)
+    } else {
+        Value::Null
+    };
+    json!({ "enabled": cfg.enabled, "endpoint": cfg.endpoint, "reachable": reachable })
 }
 
-/// Flip opt-in telemetry from the settings UI and return the new status. Turning it ON with no
-/// endpoint configured defaults the sink to this app's own local receiver so the daily-active +
-/// command-run signals are actually collected end-to-end (set_enabled alone leaves the endpoint
-/// empty, which record_event treats as a no-op — one click would otherwise collect nothing). The
-/// operator can still point telemetry at the fleet ledger by editing ~/.dotz/telemetry.json.
-/// Turning it OFF clears the endpoint (dotz_core::telemetry::set_enabled), a no-op here.
-fn telemetry_set_enabled(enabled: bool) -> Value {
-    dotz_core::telemetry::set_enabled(enabled);
-    if enabled
-        && dotz_core::telemetry::load_config()
-            .endpoint
-            .trim()
-            .is_empty()
-    {
-        dotz_core::telemetry::set_endpoint(format!("http://127.0.0.1:{PORT}/telemetry/ingest"));
+/// Flip opt-in telemetry from the settings UI and return the new status. Turning it ON runs the
+/// enabled-implies-working-endpoint invariant (dotz_core::telemetry::enable_with_working_endpoint):
+/// an EMPTY or UNREACHABLE endpoint defaults to this app's own local receiver so the daily-active
+/// and command-run signals are actually collected end-to-end — one click always yields a working
+/// send -> receive loop. A reachable custom endpoint (e.g. the operator's standalone `telemetry
+/// receive` collector, configured by editing ~/.dotz/telemetry.json) is kept. Turning it OFF
+/// clears the endpoint and token (dotz_core::telemetry::set_enabled).
+async fn telemetry_set_enabled(enabled: bool) -> Value {
+    if enabled {
+        dotz_core::telemetry::enable_with_working_endpoint(PORT).await;
+    } else {
+        dotz_core::telemetry::set_enabled(false);
     }
-    telemetry_status()
+    telemetry_status().await
 }
 
 async fn pick_directory(app: &tauri::AppHandle) -> Value {
@@ -248,6 +253,18 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Spawned on the Tauri async runtime (already running here) so it can't
             // delay window creation.
             tauri::async_runtime::spawn(async move {
+                // Self-heal (audit 2026-07-17): an enabled install whose endpoint was never set
+                // (or was wiped) silently dropped every event. Default it to this app's own
+                // receiver. A NON-empty endpoint — reachable or not — is left alone here: a
+                // launch-time network flake must not rewrite an operator-configured remote sink
+                // (the settings panel surfaces reachability, and re-toggling ON repairs it).
+                if dotz_core::telemetry::is_enabled()
+                    && dotz_core::telemetry::load_config().endpoint.trim().is_empty()
+                {
+                    dotz_core::telemetry::set_endpoint(dotz_core::telemetry::local_ingest_endpoint(
+                        PORT,
+                    ));
+                }
                 dotz_core::telemetry::record_app_launch().await;
                 // Daily-active heartbeat: the other half of the weekly-active metric. Gated to at
                 // most once per UTC calendar day inside dotz-core, and (like record_app_launch) a
