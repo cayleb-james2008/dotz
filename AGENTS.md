@@ -87,6 +87,8 @@ WebView2 window** — no build step, no framework, no separate frontend bundle.
 
 - `dotz-core/src/bin/serve.rs` — headless backend on `http://127.0.0.1:4317`.
 - `dotz-core/src/bin/selfeval.rs` — the self-eval harness.
+- `dotz-core/src/bin/telemetry.rs` — standalone telemetry receiver (`receive`, shared-token gated
+  for non-loopback binds) + weekly-active aggregator (`weekly`). See `docs/telemetry.md`.
 
 ### src-tauri
 
@@ -190,6 +192,14 @@ npm install && npm run fetch-model      # ship agent-browser binary + fetch all-
 
 CI (`.github/workflows/ci.yml`) runs on `windows-latest`: `cargo fmt --all -- --check`,
 `cargo clippy -p dotz-core --all-targets -- -D warnings`, `cargo test -p dotz-core`.
+
+**LLVM OOM is not a code failure.** On the 16 GB dev host with the live fleet resident, an
+unbounded build/test run can die of memory pressure — LLVM OOM / "paging file too small" /
+exit 1455 / `STATUS_STACK_BUFFER_OVERRUN` — and the wreckage masquerades as compile errors
+inside crates.io deps (E0460/E0786/E0463 cascades). `.cargo/config.toml` pins `build.jobs = 2`
+to prevent it; also bound test parallelism (`cargo test -- --test-threads=2`). If one of those
+signatures still appears, re-run the same command once bounded before treating the gate as red —
+only a reproducible second failure is code-red.
 
 ## Provider config
 

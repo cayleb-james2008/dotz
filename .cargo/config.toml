@@ -1,0 +1,7 @@
+# Bounded build parallelism (fix-wave 2026-07-17): the dev host is 16 GB with the live fleet
+# resident, and default-parallel rustc/LLVM OOMs there — paging-file exhaustion that masquerades
+# as phantom compile errors INSIDE crates.io deps (E0460/E0786/E0463 cascades) or exit 1455 /
+# STATUS_STACK_BUFFER_OVERRUN. Two jobs keep clippy/test honest and cost little wall time on this
+# workspace. See AGENTS.md "Verification commands" for the matching re-run-once rule.
+[build]
+jobs = 2
