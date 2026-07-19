@@ -259,11 +259,14 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // launch-time network flake must not rewrite an operator-configured remote sink
                 // (the settings panel surfaces reachability, and re-toggling ON repairs it).
                 if dotz_core::telemetry::is_enabled()
-                    && dotz_core::telemetry::load_config().endpoint.trim().is_empty()
+                    && dotz_core::telemetry::load_config()
+                        .endpoint
+                        .trim()
+                        .is_empty()
                 {
-                    dotz_core::telemetry::set_endpoint(dotz_core::telemetry::local_ingest_endpoint(
-                        PORT,
-                    ));
+                    dotz_core::telemetry::set_endpoint(
+                        dotz_core::telemetry::local_ingest_endpoint(PORT),
+                    );
                 }
                 dotz_core::telemetry::record_app_launch().await;
                 // Daily-active heartbeat: the other half of the weekly-active metric. Gated to at

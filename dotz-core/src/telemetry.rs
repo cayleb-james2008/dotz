@@ -1066,7 +1066,12 @@ mod tests {
                 let client = reqwest::Client::new();
 
                 // No token -> 401, nothing written.
-                let r = client.post(&url).json(&json!({"probe": 1})).send().await.unwrap();
+                let r = client
+                    .post(&url)
+                    .json(&json!({"probe": 1}))
+                    .send()
+                    .await
+                    .unwrap();
                 assert_eq!(r.status(), 401, "missing token must be rejected");
                 // Wrong token -> 401 too.
                 let r = client
@@ -1096,8 +1101,15 @@ mod tests {
                 }
                 server.abort();
                 let lines: Vec<&str> = got.lines().collect();
-                assert_eq!(lines.len(), 1, "exactly the authorized event lands: {got:?}");
-                assert!(got.contains("dailyActive"), "authorized event persisted: {got:?}");
+                assert_eq!(
+                    lines.len(),
+                    1,
+                    "exactly the authorized event lands: {got:?}"
+                );
+                assert!(
+                    got.contains("dailyActive"),
+                    "authorized event persisted: {got:?}"
+                );
             });
         });
     }
@@ -1122,7 +1134,11 @@ mod tests {
             let ts = days_from_civil(y, m, d) * 86_400_000;
             assert_eq!(iso_week(ts), want, "{y}-{m:02}-{d:02}");
             // Last millisecond of the same UTC day must stay in the same week.
-            assert_eq!(iso_week(ts + 86_399_999), want, "{y}-{m:02}-{d:02} 23:59:59.999");
+            assert_eq!(
+                iso_week(ts + 86_399_999),
+                want,
+                "{y}-{m:02}-{d:02} 23:59:59.999"
+            );
         }
         // The civil-date helpers must be inverses around the anchors.
         for (y, m, d, _) in anchors {
@@ -1145,9 +1161,9 @@ mod tests {
             line("bbb", wk1 + 2 * 86_400_000),
             line("bbb", wk2), // same install active NEXT week counts there too
             line("ccc", wk2),
-            "not json at all".to_string(),          // must be skipped
-            r#"{"eventType":"x","ts":1}"#.into(),   // no sessionId -> skipped
-            r#"{"sessionId":"zzz"}"#.into(),        // no ts -> skipped
+            "not json at all".to_string(),        // must be skipped
+            r#"{"eventType":"x","ts":1}"#.into(), // no sessionId -> skipped
+            r#"{"sessionId":"zzz"}"#.into(),      // no ts -> skipped
         ]
         .join("\n");
 
