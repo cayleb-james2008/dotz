@@ -108,10 +108,7 @@ fn weekly(args: &[String]) {
         println!("no countable events in {}", sink.display());
         return;
     }
-    println!(
-        "{:<10}  {:>17}  {:>7}",
-        "iso-week", "distinct-installs", "events"
-    );
+    println!("{:<10}  {:>17}  {:>7}", "iso-week", "distinct-installs", "events");
     for (week, installs, events) in rows {
         println!("{week:<10}  {installs:>17}  {events:>7}");
     }

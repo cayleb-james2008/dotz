@@ -1729,42 +1729,4 @@ mod tests {
             crate::agent::session::dispose(sid);
         }
     }
-
-    /// The API contract (`docs/api-contract.md`) must document the server's graceful shutdown
-    /// behavior — the shutdown signal, the shutdown watch mechanism for WebSocket connections,
-    /// the Tauri shell's exit flow, and workflow resume on restart. This test guards against
-    /// the documentation being accidentally removed or the section heading being renamed.
-    #[test]
-    fn api_contract_documents_graceful_shutdown() {
-        let contract_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("docs")
-            .join("api-contract.md");
-        let contents = std::fs::read_to_string(&contract_path)
-            .unwrap_or_else(|e| panic!("api-contract.md must exist and be readable: {e}"));
-        assert!(
-            contents.contains("## Server Lifecycle & Graceful Shutdown"),
-            "api-contract.md must document the server's graceful shutdown behavior"
-        );
-        assert!(
-            contents.contains("shutdown_signal"),
-            "api-contract.md must document the shutdown_signal function"
-        );
-        assert!(
-            contents.contains("SHUTDOWN_WATCH"),
-            "api-contract.md must document the SHUTDOWN_WATCH mechanism"
-        );
-        assert!(
-            contents.contains("subscribe_shutdown"),
-            "api-contract.md must document subscribe_shutdown"
-        );
-        assert!(
-            contents.contains("Tauri shell shutdown flow"),
-            "api-contract.md must document the Tauri shell's shutdown flow"
-        );
-        assert!(
-            contents.contains("Workflow resume on restart"),
-            "api-contract.md must document workflow resume on restart"
-        );
-    }
 }

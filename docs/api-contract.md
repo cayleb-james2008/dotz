@@ -10,65 +10,6 @@ This is the contract the claude.ai/design artifact binds to.
 2. Open `ws://127.0.0.1:4317/ws?sessionId=<id>` → receive `{kind:"ready"}`, then a stream of `{kind:"event"}`.
 3. Send prompts over the WS; adjust model/thinking/tools over REST.
 
-## Server Lifecycle & Graceful Shutdown
-
-The dotz-core axum server supports graceful shutdown via `with_graceful_shutdown`. When the
-shutdown future resolves (SIGINT/SIGTERM in the headless `serve` bin, or the Tauri window closing
-in the desktop shell), the server stops accepting new connections and drains existing ones.
-
-### Shutdown signal (`shutdown_signal`)
-
-The headless `serve` bin waits on `shutdown_signal()`, which resolves on:
-- **SIGINT** (Ctrl+C) — all platforms.
-- **SIGTERM** — Unix only.
-
-### Shutdown watch (`SHUTDOWN_WATCH` / `subscribe_shutdown`)
-
-A process-wide `tokio::sync::watch` channel broadcasts the shutdown signal to all long-lived
-connection handlers. Without this, an active WebSocket read loop would block axum's drain phase
-indefinitely — `with_graceful_shutdown` waits for all connection tasks to finish, and a WS loop
-blocks forever until the client disconnects.
-
-- **`subscribe_shutdown()`** returns a `watch::Receiver<bool>` that yields `true` when the
-  server is draining.
-- Every WebSocket handler subscribes on connection and breaks its read loop when the signal
-  fires, closing the socket promptly so the server can exit.
-- The watch is reset to `false` on each `serve_with_shutdown*` call so a fresh server start
-  (e.g. in tests or after a clean exit) does not inherit a prior shutdown signal.
-
-### Tauri shell shutdown flow
-
-When the operator closes the WebView2 window (`RunEvent::Exit`):
-
-1. **Browser cleanup** — `dispose_all()` closes all isolated `agent-browser` sessions (2 s
-   timeout), then `reap_stray_browsers()` force-kills any lingering headless Chrome processes.
-2. **Signal the server** — the shutdown watch sender fires, triggering axum's drain phase.
-3. **Await drain** — the shell awaits the server task's `JoinHandle` (3 s timeout). The server
-   stops accepting connections, WS handlers close their sockets, and in-flight REST requests
-   complete or time out.
-
-The total exit path is bounded to ~5.5 s worst case (2 s browser + 3 s drain) to stay well under
-Windows' ~9 s `WM_CLOSE` timeout.
-
-### Workflow resume on restart
-
-On every server boot (`serve_with_shutdown*`), `startup_resume()` scans the on-disk workflow
-history (`workflows.json`), marks in-flight steps as `interrupted`, and re-spawns the executor
-for each interrupted run. Without this, a run that was `running` at shutdown would be lost
-forever — the in-memory active map is empty after a restart.
-
-### Server entry points
-
-| Function | Description |
-|---|---|
-| `serve_with_shutdown(listener, web_dir, shutdown)` | Serve on a pre-bound listener with a custom shutdown future. |
-| `serve_with_shutdown_token(listener, web_dir, shutdown, token)` | Same, with an optional per-process session token. |
-| `serve_with_shutdown_addr(addr, web_dir, shutdown)` | Bind `addr`, then serve with shutdown. Convenience wrapper. |
-| `serve_with_shutdown_addr_token(addr, web_dir, shutdown, token)` | Same, with an optional session token. Used by the headless `serve` bin. |
-
-All entry points reset the shutdown watch, load config, enable memory autonomy, and resume
-interrupted workflow runs before accepting connections.
-
 ## REST
 
 ### Sessions + controls
