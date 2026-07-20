@@ -812,6 +812,22 @@ pub async fn capture_exchange(
             if count >= AUTO_CONSOLIDATE_EVERY {
                 maybe_auto_consolidate(cwd);
             }
+            // If Cognee is configured, also remember the captured facts into the graph memory
+            // (fire-and-forget, background on the Cognee side). The local store is the
+            // always-on cache; Cognee adds entities + relationships via its background cognify.
+            // Best-effort: a Cognee failure is logged, not fatal — the local capture already
+            // succeeded.
+            if crate::cognee::enabled() {
+                let facts_text = kept
+                    .iter()
+                    .map(|m| m.memory.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let cognee_cwd = cwd.map(str::to_string);
+                tokio::spawn(async move {
+                    let _ = crate::cognee::remember(&facts_text, cognee_cwd.as_deref()).await;
+                });
+            }
         }
         kept
     })
@@ -901,8 +917,55 @@ async fn on_blocking<T: Send + 'static>(
 }
 
 /// `recall` off the reactor — for pre-turn recall in `run_turn` / subagent dispatch.
+///
+/// When Cognee is configured (`DOTZ_COGNEE_URL`), this ALSO queries Cognee's graph memory
+/// (`/api/v1/recall`) in parallel with the local rusqlite+ONNX store, then merges the results.
+/// The local store stays the always-on cache (works offline, immediate); Cognee adds the graph
+/// memory (entities + relationships) on top. Cognee failures are best-effort (logged, not fatal)
+/// — the local results are always returned.
 pub async fn recall_async(query: String, cwd: Option<String>) -> Vec<MemoryView> {
-    on_blocking(Vec::new, move || recall(&query, cwd.as_deref())).await
+    // Fire the local recall on the blocking pool (the existing path — rusqlite + ONNX).
+    let local_query = query.clone();
+    let local_cwd = cwd.clone();
+    let local = on_blocking(Vec::new, move || recall(&local_query, local_cwd.as_deref())).await;
+
+    // If Cognee is configured, query it in parallel + merge. Best-effort: any Cognee failure
+    // (unreachable, 402 budget exhausted, parse error) yields nothing — the local results stand.
+    if crate::cognee::enabled() {
+        let cognee_query = query.clone();
+        let cognee_cwd = cwd.clone();
+        let cognee_items = crate::cognee::recall(&cognee_query, cognee_cwd.as_deref(), 6).await;
+        if let Some(items) = cognee_items {
+            // Merge Cognee graph results into the local results. Dedup by memory text (a fact
+            // may appear in both stores — keep the local one since it has the dotz scope/category
+            // metadata, and add Cognee-only graph entries as new items).
+            let local_texts: std::collections::HashSet<String> =
+                local.iter().map(|m| m.memory.clone()).collect();
+            let mut merged = local;
+            for item in items {
+                // Cognee returns `text` (graph/session) or `content` (graph_context). Normalize
+                // to a memory string; skip empty.
+                let text = item.text.or(item.content).unwrap_or_default();
+                let text = text.trim();
+                if text.is_empty() || local_texts.contains(text) {
+                    continue;
+                }
+                merged.push(MemoryView {
+                    id: format!("cognee:{}", text.len()),
+                    memory: text.to_string(),
+                    scope: "cognee".to_string(),
+                    category: item.source.clone(),
+                    folder: None,
+                    score: item.score,
+                    created_at: None,
+                    updated_at: None,
+                });
+            }
+            return merged;
+        }
+    }
+
+    local
 }
 
 /// `search_public` off the reactor — for the memory_search tool.

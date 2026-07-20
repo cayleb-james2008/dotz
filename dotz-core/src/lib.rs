@@ -5,6 +5,7 @@ pub mod agent;
 pub mod auth;
 pub mod browser;
 pub mod checkpoint;
+pub mod cognee;
 pub mod commands;
 pub mod config;
 pub mod connections;
