@@ -433,6 +433,23 @@
         <div class="panel-body connections-body">
           <div class="conn-note">dotz reads each provider's CLI auth on this computer — log in from a terminal (e.g. gh auth login) and the status updates here. No OAuth app, no client secret stored.</div>
           <div id="conn-list" class="conn-list"><div class="dim mono">checking local logins…</div></div>
+
+          <!-- Provider API keys: set a key in-UI so the first chat doesn't error with
+               "missing api key for provider 'ollama'". Keys are sent over the authed api()
+               channel, never displayed again after save (only a redacted set/not-set status),
+               and clearable per provider. -->
+          <div class="conn-keys-section">
+            <div class="sb-pane-head">PROVIDER API KEYS</div>
+            <div id="conn-keys-status" class="conn-keys-status"><div class="dim mono">loading key status…</div></div>
+            <div class="conn-key-form">
+              <select id="conn-key-provider" class="pf-select" aria-label="provider"></select>
+              <input id="conn-key-input" class="pf-input" type="password" placeholder="paste provider api key…" autocomplete="off" spellcheck="false" />
+              <button id="conn-key-toggle" class="btn-mini" type="button" title="show or hide the key as you type" aria-label="Show or hide key">show</button>
+              <button id="conn-key-save" class="btn-mini btn-go">SAVE</button>
+              <button id="conn-key-clear" class="btn-mini btn-stop">CLEAR</button>
+            </div>
+            <div id="conn-key-error" class="conn-key-error dim mono hidden"></div>
+          </div>
         </div>
       </div>
     </template>
@@ -611,6 +628,47 @@ Project doctrine — conventions, architecture, standing instructions. Edits tak
       </div>
     </template>
 
-    <script src="/app.js"></script>
+    <template id="tpl-marketplace">
+      <div class="panel" data-panel="marketplace" role="region" aria-label="Marketplace">
+        <div class="panel-head" draggable="true"><span class="panel-icon">⚑</span> MARKETPLACE <button class="panel-close">×</button></div>
+        <div class="panel-body skills-body">
+          <div class="templates-toolbar">
+            <input id="marketplace-search" class="pf-input" placeholder="search presets…" />
+            <select id="marketplace-kind-filter" class="pf-select" aria-label="filter by kind"></select>
+            <button id="marketplace-refresh" class="btn-mini" title="re-fetch the catalog">↻</button>
+          </div>
+          <div id="marketplace-count" class="skills-count dim mono">loading…</div>
+          <div id="marketplace-grid" class="marketplace-grid"></div>
+        </div>
+      </div>
+    </template>
+
+    <!-- B3: PERF dashboard — local-only, opt-in perf metrics (turn/graph/embed/tool/first-turn
+         latency as p50/p95/p99/max + sparklines). Privacy moat: the buffer is in-memory only and
+         never sent remotely unless the operator explicitly exports. Inline styles keep this
+         self-contained without touching styles.css (ponytail: promote to styles.css classes
+         if more perf widgets land). -->
+    <template id="tpl-perf">
+      <div class="panel" data-panel="perf" role="region" aria-label="Performance">
+        <div class="panel-head" draggable="true"><span class="panel-icon">⚡</span> PERFORMANCE <button class="panel-close">×</button></div>
+        <div class="panel-body" style="padding:12px;overflow-y:auto;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap;">
+            <span id="perf-privacy" class="dim mono" style="font-size:11px;letter-spacing:1px;">Local-only · opt-in · never sent remotely</span>
+            <span style="flex:1;"></span>
+            <button id="perf-toggle" class="btn-mini btn-go" title="toggle perf recording">RECORD</button>
+            <button id="perf-clear" class="btn-mini" title="clear the perf buffer">CLEAR</button>
+            <span id="perf-status" class="dim mono" style="font-size:11px;letter-spacing:1px;">Recording OFF</span>
+          </div>
+          <div id="perf-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;"></div>
+        </div>
+      </div>
+    </template>
+
+    <script type="module" src="/main.js"></script>
+    <!-- C1: first-run wizard overlay. Loads after main.js so it can reuse the same api()/state
+         helpers. Self-contained: builds its own DOM + inline styles, so no edits to styles.css.
+         Hidden forever once POST /api/first-run/complete writes the ~/.dotz/first-run-done
+         marker (the state route returns wizardNeeded:false on the next launch). -->
+    <script type="module" src="/wizard.js"></script>
   </body>
 </html>

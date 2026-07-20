@@ -74,6 +74,32 @@ fn user_dir() -> PathBuf {
     config::dotz_dir().join("ai-agents/templates")
 }
 
+/// `~/.dotz/presets/<name>/prompts/` — the marketplace preset prompt scan root (C8). Each
+/// installed prompt preset ships its prompt files under this path; surfacing them here means an
+/// installed prompt preset appears in the TEMPLATES panel + the slash palette exactly like a
+/// bundled `.pi/prompts/*.md`. The preset's own manifest/SKILL.md (not a prompt) is NOT scanned
+/// here — only the `prompts/` subdir of each preset. Mirrors `bundled_dir()`'s parse path.
+/// # ponytail: a custom loader that reads a per-preset manifest for richer metadata (tags,
+/// origin, version) is the follow-up; for now we reuse `parse_bundled` so the file format is
+/// identical to `.pi/prompts/*.md`.
+fn preset_prompt_dirs() -> Vec<PathBuf> {
+    let presets_root = config::dotz_dir().join("presets");
+    let entries = match std::fs::read_dir(&presets_root) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for ent in entries.flatten() {
+        if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let prompts = ent.path().join("prompts");
+            if prompts.is_dir() {
+                out.push(prompts);
+            }
+        }
+    }
+    out
+}
+
 fn ensure_user_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(user_dir())
 }
@@ -267,13 +293,19 @@ fn user_templates() -> Vec<Template> {
     out
 }
 
-/// All templates: bundled first, then user templates shadow by id.
+/// All templates: bundled first, then preset prompts, then user templates shadow by id.
+/// Preset prompts are sourced from `~/.dotz/presets/<name>/prompts/*.md` (C8) and use
+/// `source: "preset"` so the UI can distinguish them from bundled + user templates.
 fn list_all() -> Vec<Template> {
     let _guard = user_lock();
     let bundled = bundled_templates();
+    let preset = preset_templates();
     let user = user_templates();
     let mut by_id: HashMap<String, Template> = HashMap::new();
     for t in bundled {
+        by_id.insert(t.id.clone(), t);
+    }
+    for t in preset {
         by_id.insert(t.id.clone(), t);
     }
     for t in user {
@@ -281,6 +313,31 @@ fn list_all() -> Vec<Template> {
     }
     let mut out: Vec<Template> = by_id.into_values().collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Scan `~/.dotz/presets/<name>/prompts/*.md` for installed prompt presets (C8). Each file is
+/// parsed by `parse_bundled` (same frontmatter format as `.pi/prompts/*.md`); the `source` is
+/// relabeled to `"preset"` so the UI's source chip distinguishes marketplace presets from
+/// bundled + user templates.
+fn preset_templates() -> Vec<Template> {
+    let mut out = Vec::new();
+    for dir in preset_prompt_dirs() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            if let Some(mut t) = parse_bundled(&path) {
+                t.source = "preset".to_string();
+                out.push(t);
+            }
+        }
+    }
     out
 }
 
@@ -575,8 +632,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct DirGuard {
         prev: Option<String>,
         dir: PathBuf,
@@ -594,7 +649,7 @@ mod tests {
     }
 
     fn isolated_user_dir() -> DirGuard {
-        let guard = TEST_LOCK
+        let guard = crate::util::dotz_config_dir_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();

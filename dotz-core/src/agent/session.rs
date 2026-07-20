@@ -291,6 +291,9 @@ pub fn create(opts: CreateOpts) -> Result<Value, String> {
 
     let id = uuid::Uuid::new_v4().to_string();
     let (tx, _rx) = broadcast::channel::<Value>(1024);
+    // Snapshot the project_id for the SessionStart hook payload before it's moved into the
+    // session struct below (the struct takes ownership).
+    let hook_project_id = project_id.clone();
     let session = AgentSession {
         id: id.clone(),
         provider: model.provider.clone(),
@@ -310,6 +313,27 @@ pub fn create(opts: CreateOpts) -> Result<Value, String> {
     };
     let summary = session.summary();
     store_guard().insert(id.clone(), std::sync::Arc::new(Mutex::new(session)));
+
+    // Install the global hook registry for this cwd (idempotent; a project switch reloads).
+    // Best-effort: a load failure (unreadable config) is logged inside `load`, never fatal.
+    crate::hooks::load_for_cwd(std::path::Path::new(&cwd));
+
+    // Fire SessionStart hooks (best-effort, fire-and-forget). `create` is sync, so we spawn the
+    // async fire only when a tokio runtime is present (the server + Tauri shell always have one;
+    // a sync caller like a test harness without a runtime silently skips — matching the
+    // `finish_turn` memory-capture pattern at line ~1255).
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let payload = json!({
+            "sessionId": id,
+            "projectId": hook_project_id,
+            "profileId": profile_id,
+            "cwd": cwd,
+        });
+        tokio::spawn(async move {
+            let _ = crate::hooks::fire(crate::hooks::HookEvent::SessionStart, &payload).await;
+        });
+    }
+
     Ok(summary)
 }
 
@@ -492,6 +516,13 @@ impl Drop for TurnGuard {
 /// Run one prompt to completion: assemble, append user msg, loop (stream → maybe tools → repeat).
 /// This is the public entry the WS `prompt` handler calls. It blocks until the turn finishes.
 pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
+    // B3: capture the turn start for perf recording. The three terminal paths
+    // (finish_turn / finish_error / finish_round_cap) each record TurnLatency
+    // against this; the very first turn in the process ALSO records
+    // FirstTurnLatency (cold-start). The perf module no-ops when recording is
+    // disabled, so this is zero overhead in the default privacy-moat state.
+    let turn_start_ms = crate::util::now_ms();
+    let sess_id_for_perf = session_guard(&session).id.clone();
     // Reject turns against a session that has been disposed from the live store. A prompt task
     // spawned just before disposal may still hold an Arc and would otherwise start a new turn
     // (and replace the cancelled cancellation token) after the session is gone.
@@ -647,6 +678,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
         let resolved = match provider::resolve(&round_provider, &round_model) {
             Some(r) => r,
             None => {
+                record_turn_perf(&sess_id_for_perf, turn_start_ms);
                 finish_error(
                     &session,
                     &format!(
@@ -720,6 +752,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
                 // Record the failure (classified). If this degrades the provider, the next
                 // turn will automatically fail over to the backup.
                 super::provider_health::record_failure(&round_provider, &e).await;
+                record_turn_perf(&sess_id_for_perf, turn_start_ms);
                 finish_error(&session, &e, tool_results);
                 return;
             }
@@ -730,6 +763,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
                     &format!("stream task panicked: {e}"),
                 )
                 .await;
+                record_turn_perf(&sess_id_for_perf, turn_start_ms);
                 finish_error(
                     &session,
                     &format!("stream task panicked: {e}"),
@@ -783,6 +817,7 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
 
         if calls.is_empty() || stop_reason == "aborted" {
             // No tools → turn is done (tool_results is empty unless tools ran earlier).
+            record_turn_perf(&sess_id_for_perf, turn_start_ms);
             finish_turn(&session, assistant_msg, tool_results);
             return;
         }
@@ -800,10 +835,50 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
                     },
                 );
             }
-            // Execute without holding the session lock (the registry is stateless).
-            // subagent is special-cased so its SubagentDetails reach result.details (the workflow bridge reads it).
-            let (result_value, is_error, result_text) =
-                execute_tool(&session, &name, &args, &ctx, &call_id).await;
+
+            // PreToolUse hook: fires BEFORE the tool executes. A `deny` short-circuits the
+            // call — the tool is not run and the deny reason is surfaced as the tool result
+            // (isError=true) so the model sees why it was blocked. Best-effort: a hook error is
+            // logged inside `hooks::fire` and fails open (allow). The payload carries the tool
+            // call shape + session id; the payload may contain file contents / args, so it is
+            // never logged (only event/handler/index are logged).
+            let pre_payload = json!({
+                "sessionId": sess_id,
+                "toolName": name,
+                "args": args,
+                "toolCallId": call_id,
+            });
+            let pre = crate::hooks::fire(crate::hooks::HookEvent::PreToolUse, &pre_payload).await;
+            let (result_value, is_error, result_text): (Value, bool, String) = if pre.deny {
+                let reason = pre
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "blocked by PreToolUse hook".into());
+                let rv = json!({
+                    "content": [{ "type": "text", "text": reason.clone() }],
+                    "isError": true,
+                });
+                (rv, true, reason)
+            } else {
+                // Execute without holding the session lock (the registry is stateless).
+                // subagent is special-cased so its SubagentDetails reach result.details (the workflow bridge reads it).
+                execute_tool(&session, &name, &args, &ctx, &call_id).await
+            };
+
+            // PostToolUse hook: observer-only, fires AFTER the tool executes. Cannot modify the
+            // result. Fire-and-forget semantics within the turn (we still await so the hook
+            // completes before the next tool call, but its outcome is ignored — a deny here is
+            // not honored because the tool already ran). The payload includes the result + isError.
+            let post_payload = json!({
+                "sessionId": sess_id,
+                "toolName": name,
+                "args": args,
+                "toolCallId": call_id,
+                "result": result_value,
+                "isError": is_error,
+            });
+            let _ = crate::hooks::fire(crate::hooks::HookEvent::PostToolUse, &post_payload).await;
+
             {
                 let mut s = session_guard(&session);
                 emit(
@@ -843,7 +918,28 @@ pub async fn run_turn(session: Arc<Mutex<AgentSession>>, prompt: String) {
     }
 
     // Hit the round cap — finish with whatever the last assistant message was.
+    record_turn_perf(&sess_id_for_perf, turn_start_ms);
     finish_round_cap(&session, tool_results);
+}
+
+/// B3: record TurnLatency (and FirstTurnLatency on the process's very first turn)
+/// to the perf ring buffer. No-op when perf recording is disabled (the privacy
+/// moat). Defined here (not in telemetry.rs) so the fire point is a one-liner at
+/// each terminal path and the grep acceptance test finds `PerfMetric::TurnLatency`.
+fn record_turn_perf(session_id: &str, turn_start_ms: i64) {
+    let elapsed = (crate::util::now_ms() - turn_start_ms).max(0) as f64;
+    crate::telemetry::record(
+        crate::telemetry::PerfMetric::TurnLatency,
+        elapsed,
+        Some(session_id),
+    );
+    if crate::telemetry::claim_first_turn() {
+        crate::telemetry::record(
+            crate::telemetry::PerfMetric::FirstTurnLatency,
+            elapsed,
+            Some(session_id),
+        );
+    }
 }
 
 /// Finish a turn that has hit the per-profile round cap by reusing the last assistant message.
@@ -1266,6 +1362,47 @@ fn finish_turn(
             let _ = crate::living_docs::capture_exchange(cwd_opt, &user_text, &assistant_text);
         });
     }
+
+    // Fire `Stop` hooks (best-effort, fire-and-forget). The lead agent's turn has ended —
+    // `reason` derives from the final message's stop_reason: "aborted" → aborted, "error" →
+    // error, anything else (stop/None/end_turn) → completed. `finish_error` fires its own Stop
+    // hook with reason "error" (the final_msg there always carries stop_reason="error").
+    fire_stop_hook(session, final_msg.stop_reason.as_deref());
+}
+
+/// Fire the `Stop` lifecycle hook for the lead session's turn end. Best-effort + fire-and-forget:
+/// a hook error/timeout is logged inside `hooks::fire` and never blocks turn cleanup. `reason`
+/// is one of `completed|aborted|error` (the spec contract). Unknown/missing stop_reasons map to
+/// `completed` (the common end-of-turn case).
+fn fire_stop_hook(session: &std::sync::Arc<Mutex<AgentSession>>, stop_reason: Option<&str>) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let (session_id, project_id, profile_id, cwd) = {
+        let s = session_guard(session);
+        (
+            s.id.clone(),
+            s.project_id.clone(),
+            s.profile_id.clone(),
+            s.cwd.to_string_lossy().to_string(),
+        )
+    };
+    let reason = match stop_reason {
+        Some("aborted") => "aborted",
+        Some("error") => "error",
+        _ => "completed",
+    }
+    .to_string();
+    let payload = json!({
+        "sessionId": session_id,
+        "projectId": project_id,
+        "profileId": profile_id,
+        "cwd": cwd,
+        "reason": reason,
+    });
+    tokio::spawn(async move {
+        let _ = crate::hooks::fire(crate::hooks::HookEvent::Stop, &payload).await;
+    });
 }
 
 /// Finish the turn with an error assistant message (stopReason "error").
@@ -1310,6 +1447,11 @@ fn finish_error(
             will_retry: false,
         },
     );
+    drop(s);
+
+    // Fire `Stop` hooks with reason "error". `finish_error` always sets stop_reason="error" on
+    // the final message, so we pass that explicitly. Best-effort + fire-and-forget.
+    fire_stop_hook(session, Some("error"));
 }
 
 /// Abort the running turn (CancellationToken). The select! in run_turn observes it.

@@ -482,6 +482,26 @@ async fn recv_broadcast(rx: &mut broadcast::Receiver<Value>) -> Option<Value> {
     }
 }
 
+/// Receive the next WORKFLOW broadcast frame, accounting for lag. Identical to
+/// [`recv_broadcast`] except a `Lagged(n)` result increments the workflow event-lag counter
+/// (surfaced in `/api/health` as `eventLagCount`) and logs a warn, so a slow WebSocket client
+/// dropping workflow frames is observable instead of silent. The session and provider-health
+/// broadcasts use the plain [`recv_broadcast`] — only the workflow channel has a lag counter
+/// today. `Lagged` is recoverable: the receiver resyncs to the newest frame and we keep
+/// streaming; `Closed` ends the fan.
+async fn recv_workflow_broadcast(rx: &mut broadcast::Receiver<Value>) -> Option<Value> {
+    loop {
+        match rx.recv().await {
+            Ok(frame) => return Some(frame),
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                crate::workflows::record_event_lag(n);
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
 /// Configurable WebSocket keep-alive interval. Browsers and most clients auto-respond to ping
 /// frames with pong, which keeps idle connections alive through proxies/firewalls. Defaults to
 /// 30s; override with `DOTZ_WS_PING_INTERVAL_MS` (e.g. for fast tests).
@@ -660,7 +680,7 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                         })),
                     }
                 }
-                frame = recv_broadcast(&mut wf_rx) => {
+                frame = recv_workflow_broadcast(&mut wf_rx) => {
                     match frame {
                         Some(f) => {
                             if sink.send(WsMessage::Text(f.to_string().into())).await.is_err() {

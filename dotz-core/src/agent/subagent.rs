@@ -859,7 +859,7 @@ pub async fn run_single_agent_public(
     cwd: &str,
 ) -> SingleResult {
     let discovery = discover_agents(cwd, "user");
-    run_single_agent_with_progress(
+    let result = run_single_agent_with_progress(
         &discovery.agents,
         agent_name,
         task,
@@ -869,7 +869,13 @@ pub async fn run_single_agent_public(
         None,
         None,
     )
-    .await
+    .await;
+    // Fire the SubagentStop lifecycle hook. `run_single_agent_public` is the selfeval/bin path —
+    // no workflow bus + no step id, so `runId`/`stepId` are null. The hook is an observer; it
+    // does NOT emit `step_*` graph events (subagent.rs already did that internally + the
+    // selfeval path has no graph). Best-effort: a hook error is logged + never blocks the result.
+    fire_subagent_stop(None, None, &result).await;
+    result
 }
 
 /// Public single-agent entry WITH a context bus. The workflow executor uses this so each
@@ -886,7 +892,7 @@ pub async fn run_single_agent_with_bus(
     let discovery = discover_agents(cwd, "user");
     // Call the inner loop directly (no progress channel needed) so we can thread `step_id` for
     // live per-tool `step_tool` streaming onto the workflow node.
-    run_single_agent_inner(
+    let result = run_single_agent_inner(
         &discovery.agents,
         agent_name,
         task,
@@ -897,7 +903,39 @@ pub async fn run_single_agent_with_bus(
         None,
         step_id,
     )
-    .await
+    .await;
+    // Fire the SubagentStop lifecycle hook with the run id (from the bus) + step id. This is the
+    // executor path — the graph's `step_tool`/`step_thinking` events were already emitted inside
+    // `run_single_agent_inner`; this hook is an ADDITIONAL observer point and does NOT emit any
+    // `step_*` events (subagent.rs remains the sole emitter). Best-effort: logged + non-blocking.
+    let run_id = bus.map(|b| b.run_id().to_string());
+    let step_id_owned = step_id.map(|s| s.to_string());
+    fire_subagent_stop(run_id, step_id_owned, &result).await;
+    result
+}
+
+/// Fire the `SubagentStop` lifecycle hook. `status` derives from the `SingleResult`:
+/// `is_failed()` → `"error"`, else `"done"`. (`"skipped"` is set by the workflow executor at a
+/// higher level when a step's parents failed — this hook fires from the subagent run boundary
+/// where a run either happened (`done`/`error`) or didn't (`skipped` is never reached here).
+/// # ponytail: ceiling = if a `skipped` SubagentStop is needed, the executor's skip path would
+/// fire the hook directly with `status:"skipped"` — the run boundary can't synthesize it.
+async fn fire_subagent_stop(
+    run_id: Option<String>,
+    step_id: Option<String>,
+    result: &SingleResult,
+) {
+    let status = if result.is_failed() { "error" } else { "done" };
+    let payload = json!({
+        "sessionId": null,
+        "stepId": step_id,
+        "runId": run_id,
+        "status": status,
+        "agent": result.agent,
+        "exitCode": result.exit_code,
+        "stopReason": result.stop_reason,
+    });
+    let _ = crate::hooks::fire(crate::hooks::HookEvent::SubagentStop, &payload).await;
 }
 
 // ---- streaming accumulator (a no-event subset of session::Accumulator) ----

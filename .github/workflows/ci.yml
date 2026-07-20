@@ -15,3 +15,10 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy -p dotz-core --all-targets -- -D warnings
       - run: cargo test -p dotz-core
+      # Cold-start perf gate: compiles + runs the Embedder::load() bench. NON-GATING for now — it
+      # only records the number so regressions are visible in the run log. The bench skips cleanly
+      # when the bundled ONNX model is absent (no `npm run fetch-model` here) so a fresh checkout
+      # stays green. Once docs/perf-baseline.json carries a real cold_start_ms, wire up
+      # `npm install && npm run fetch-model` before this step and add a `--versus baseline`
+      # comparison that fails the gate on a regression beyond the threshold.
+      - run: cargo bench --bench cold_start -- --bench

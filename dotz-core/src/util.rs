@@ -46,6 +46,20 @@ pub fn no_window_tokio(cmd: &mut tokio::process::Command) -> &mut tokio::process
     cmd
 }
 
+/// Shared lock for tests that mutate the `DOTZ_CONFIG_DIR` env var. Both `config::tests` and
+/// `telemetry::tests` (and any other module that flips `DOTZ_CONFIG_DIR` to a tmp dir) MUST hold
+/// this lock for the whole test body — otherwise two modules' `with_tmp_dir` helpers can race:
+/// module A sets `DOTZ_CONFIG_DIR` to dir-a, module B sets it to dir-b, module A's `load_config()`
+/// reads from dir-b and sees an empty/wrong config. Observed as an intermittent flake in
+/// `telemetry::tests::test_set_enabled_false_clears_endpoint` when a `config::tests::*` test runs
+/// concurrently. A single process-wide mutex is the root-cause fix; per-module locks only
+/// serialize within their own module.
+#[cfg(test)]
+pub fn dotz_config_dir_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

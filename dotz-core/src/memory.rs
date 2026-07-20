@@ -131,15 +131,65 @@ fn embedder_guard() -> std::sync::MutexGuard<'static, Option<Embedder>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Test-only probe: true when the global embedder has been populated (by `warm_embedder` or a
+/// prior `embed_text` call). Used by the Q1 warm-up acceptance test to assert that `warm()`
+/// leaves the global initialized so the first `embed_text` call is <50ms.
+#[cfg(test)]
+pub(crate) fn embedder_is_warmed() -> bool {
+    embedder_guard().is_some()
+}
+
 fn embed_text(text: &str) -> Result<Vec<f32>, String> {
     let mut g = embedder_guard();
-    if g.is_none() {
+    // B3: record EmbedLatency around the embed() call ONLY when the embedder was
+    // already loaded — the cold-load itself is Q1 warm-up's concern, not the perf
+    // dashboard's. The perf module no-ops when recording is disabled (privacy moat).
+    let was_loaded = g.is_some();
+    if !was_loaded {
         *g = Some(Embedder::load().map_err(|e| format!("embedder load: {e}"))?);
     }
-    g.as_mut()
+    let embed_start = crate::util::now_ms();
+    let result = g
+        .as_mut()
         .unwrap()
         .embed(text)
-        .map_err(|e| format!("embed: {e}"))
+        .map_err(|e| format!("embed: {e}"));
+    if was_loaded {
+        let elapsed = (crate::util::now_ms() - embed_start).max(0) as f64;
+        crate::telemetry::record(crate::telemetry::PerfMetric::EmbedLatency, elapsed, None);
+    }
+    result
+}
+
+/// Pre-load the ONNX session + tokenizer and install it into the shared global embedder that
+/// [`embed_text`] reads, so the first `embed_text`/`recall_async` call after launch is <50ms
+/// instead of paying the multi-second ONNX session load on the first chat turn. Safe to call
+/// when the bundled model files are missing — logs a warning and leaves the global `None`, so
+/// a later `embed_text` will attempt the load itself and surface the error.
+///
+/// Call this from `serve.rs::main` and `src-tauri/src/main.rs` via
+/// `tokio::task::spawn_blocking(memory::warm_embedder)` BEFORE awaiting the server bind so the
+/// warm-up runs concurrently with axum binding and never blocks the server from accepting
+/// connections. Idempotent: a second call is a no-op once the global is populated.
+pub fn warm_embedder() {
+    if !crate::embed::model_files_present() {
+        eprintln!(
+            "embedder warm-up skipped: bundled model files not present (run `npm run fetch-model`)"
+        );
+        return;
+    }
+    let mut g = embedder_guard();
+    if g.is_some() {
+        // Already warmed (e.g. a prior call won the race) — don't load a second session.
+        return;
+    }
+    match Embedder::load() {
+        Ok(e) => {
+            *g = Some(e);
+            eprintln!("embedder warmed up and installed into the memory global");
+        }
+        Err(err) => eprintln!("embedder warm-up failed (first turn will be slower): {err}"),
+    }
 }
 
 fn enc_emb(v: &[f32]) -> Vec<u8> {
@@ -1784,5 +1834,48 @@ mod tests {
             None => std::env::remove_var("DOTZ_CONFIG_DIR"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Q1 acceptance: `warm_embedder()` must install the loaded ONNX session into the shared
+    /// global that `embed_text` reads, so the first `embed_text`/`recall_async` call after
+    /// launch is <50ms (a hot cache hit) instead of paying the multi-second ONNX session load
+    /// on the first chat turn. The global is a process-static `OnceLock`, so this is most
+    /// meaningful when no prior test has triggered a lazy load; either way, after `warm_embedder`
+    /// the global MUST be populated.
+    #[test]
+    fn warm_embedder_populates_shared_global() {
+        // The bundled model is present in the normal workspace layout (the embed.rs tests
+        // assert this). warm_embedder() must load it and install into the global.
+        warm_embedder();
+        assert!(
+            embedder_is_warmed(),
+            "warm_embedder() must populate the shared global embedder so the first embed_text \
+             call is a hot cache hit (<50ms), not a multi-second ONNX session load"
+        );
+    }
+
+    /// Q1 acceptance: `warm_embedder()` must NOT panic when the bundled model files are
+    /// missing — that's the expected state on a fresh install before `npm run fetch-model`.
+    /// It logs a warning and leaves the global untouched, so a later `embed_text` will attempt
+    /// the load itself and surface the error rather than crashing the server task.
+    #[test]
+    fn warm_embedder_with_missing_model_does_not_panic() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("DOTZ_MODELS").ok();
+        let tmp = std::env::temp_dir().join(format!("dotz-warm-missing-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("DOTZ_MODELS", &tmp);
+        assert!(
+            !crate::embed::model_files_present(),
+            "precondition: model files absent"
+        );
+
+        // Must return cleanly — no panic.
+        warm_embedder();
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_MODELS", p),
+            None => std::env::remove_var("DOTZ_MODELS"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

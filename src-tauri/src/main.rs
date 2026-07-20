@@ -233,6 +233,14 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
 
             let server_token = token.clone();
+            // Pre-load the ONNX embedder on a blocking worker so the first chat turn after
+            // launch doesn't pay the multi-second ONNX session load. Spawned BEFORE the server
+            // task so the warm-up runs concurrently with axum binding — the server accepts
+            // connections immediately, the embedder just finishes loading in the background.
+            // Safe when model files are missing (logs a warn, leaves the global None).
+            tauri::async_runtime::spawn_blocking(|| {
+                dotz_core::memory::warm_embedder();
+            });
             let server_task = tauri::async_runtime::spawn(async move {
                 if let Err(e) = dotz_core::server::serve_with_shutdown_token(
                     listener,
@@ -259,11 +267,14 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // launch-time network flake must not rewrite an operator-configured remote sink
                 // (the settings panel surfaces reachability, and re-toggling ON repairs it).
                 if dotz_core::telemetry::is_enabled()
-                    && dotz_core::telemetry::load_config().endpoint.trim().is_empty()
+                    && dotz_core::telemetry::load_config()
+                        .endpoint
+                        .trim()
+                        .is_empty()
                 {
-                    dotz_core::telemetry::set_endpoint(dotz_core::telemetry::local_ingest_endpoint(
-                        PORT,
-                    ));
+                    dotz_core::telemetry::set_endpoint(
+                        dotz_core::telemetry::local_ingest_endpoint(PORT),
+                    );
                 }
                 dotz_core::telemetry::record_app_launch().await;
                 // Daily-active heartbeat: the other half of the weekly-active metric. Gated to at

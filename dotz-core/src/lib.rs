@@ -2,6 +2,7 @@
 //! Replaces the Node Fastify server + pi SDK + mem0 stack, behind the identical HTTP/WS contract
 //! (see docs/api-contract.md). The vanilla `web/` UI is served unchanged.
 pub mod agent;
+pub mod auth;
 pub mod browser;
 pub mod checkpoint;
 pub mod commands;
@@ -11,9 +12,13 @@ pub mod connectors;
 pub mod context_bus;
 pub mod design;
 pub mod embed;
+pub mod hooks;
 pub mod leaderboard;
 pub mod living_docs;
+pub mod marketplace;
+pub mod mcp;
 pub mod memory;
+pub mod plugins;
 pub mod profiles;
 pub mod projects;
 pub mod run_record;

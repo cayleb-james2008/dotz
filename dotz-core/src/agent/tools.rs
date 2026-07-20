@@ -83,12 +83,23 @@ pub trait Tool: Send + Sync {
     fn parameters(&self) -> Value;
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String>;
 
-    /// OpenAI tool spec: {type:"function", function:{name, description, parameters}}.
+    /// The name the `ToolRegistry` keys the tool under. Defaults to `self.name()`; a `PluginTool`
+    /// overrides this to return its `<plugin>:<tool>` prefixed name (so the dynamic plugin tool
+    /// name doesn't collide with the built-in tool names). # ponytail: a default trait method
+    /// avoids touching every built-in tool impl to add the override.
+    fn registration_name(&self) -> String {
+        self.name().to_string()
+    }
+
+    /// OpenAI tool spec: {type:"function", function:{name, description, parameters}}. The
+    /// `function.name` uses `registration_name()` so the agent sees the prefixed plugin tool
+    /// name (`<plugin>:<tool>`), matching the registry key + the `/api/sessions/:id/tools`
+    /// surface.
     fn spec(&self) -> Value {
         json!({
             "type": "function",
             "function": {
-                "name": self.name(),
+                "name": self.registration_name(),
                 "description": self.description(),
                 "parameters": self.parameters(),
             }
@@ -791,19 +802,31 @@ impl Tool for BrowserStopTool {
     }
 }
 
-/// The tool registry. Holds every tool; `active` is the subset the model sees.
+/// The tool registry. Holds every tool; `active` is the subset the model sees. Keyed on the
+/// tool's `registration_name()` (a `String`, not `&'static str`) so plugin tools with dynamic
+/// `<plugin>:<tool>` names can be registered alongside the built-in static-named tools.
 pub struct ToolRegistry {
-    tools: BTreeMap<&'static str, Box<dyn Tool>>,
+    tools: BTreeMap<String, Box<dyn Tool>>,
     active: Vec<String>,
 }
 
 impl ToolRegistry {
-    /// Build the registry with all built-ins + Phase-4 stubs. Active set defaults to the core
-    /// functional tools (matching pi's default read/write/edit/bash + the dotz extras).
+    /// Build the registry with all built-ins + Phase-4 stubs + any plugin tools (C4). Active set
+    /// defaults to the core functional tools (matching pi's default read/write/edit/bash + the
+    /// dotz extras) plus all plugin tools. Plugin tools are registered under their prefixed
+    /// `<plugin>:<tool>` name (so they don't shadow built-ins).
     pub fn new() -> Self {
-        let mut tools: BTreeMap<&'static str, Box<dyn Tool>> = BTreeMap::new();
+        Self::new_with_plugins(&crate::plugins::load_all())
+    }
+
+    /// Build the registry with all built-ins + a specific set of plugin manifests. Used by tests
+    /// to inject a known plugin set without touching `~/.dotz/plugins/`. Production `new()`
+    /// loads plugins from disk; this entry point lets tests assert plugin-tool registration
+    /// deterministically.
+    pub fn new_with_plugins(manifests: &[crate::plugins::PluginManifest]) -> Self {
+        let mut tools: BTreeMap<String, Box<dyn Tool>> = BTreeMap::new();
         let mut add = |t: Box<dyn Tool>| {
-            tools.insert(t.name(), t);
+            tools.insert(t.registration_name(), t);
         };
         add(Box::new(ReadTool));
         add(Box::new(WriteTool));
@@ -824,8 +847,13 @@ impl ToolRegistry {
         add(Box::new(crate::context_bus::ContextWriteTool));
         // The remaining pi tools: agents_md, create_agent/skill, rsi_baseline/compare, human_gate.
         super::extra_tools::register(&mut add);
+        // C4: register plugin tools. Each plugin tool is wrapped in a `PluginTool` (defined in
+        // `extra_tools.rs`) under its prefixed `<plugin>:<tool>` name.
+        crate::plugins::register_tools(manifests, &mut add);
 
-        let active = vec![
+        // Active set: built-ins + plugin tools. Plugin tools are active by default so the agent
+        // can call them (the plan profile excludes them via the PLAN_TOOLS allowlist — see below).
+        let mut active: Vec<String> = vec![
             "read",
             "write",
             "edit",
@@ -867,19 +895,29 @@ impl ToolRegistry {
             "sandbox_run",
             "connector_action",
             "connector_list",
+            "mcp_call",
             "context_read",
             "context_write",
         ]
         .into_iter()
         .map(String::from)
         .collect();
+        // Plugin tools are active by default (so the agent can call them). The plan profile
+        // excludes them because PLAN_TOOLS is a fixed allowlist that doesn't list the `*:plugin`
+        // names — `set_active` filters by the registry, and PLAN_TOOLS doesn't contain any
+        // plugin-prefixed names, so they're dropped when the plan profile is applied.
+        for m in manifests {
+            for tool in &m.tools {
+                active.push(crate::plugins::registration_name(&m.name, &tool.name));
+            }
+        }
 
         ToolRegistry { tools, active }
     }
 
     /// All tool names (for GET /api/sessions/:id/tools `all`).
     pub fn all_names(&self) -> Vec<String> {
-        self.tools.keys().map(|s| s.to_string()).collect()
+        self.tools.keys().cloned().collect()
     }
 
     /// Active tool names (for `getActiveToolNames`).
@@ -914,7 +952,15 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| format!("no such tool: {name}"))?;
-        tool.execute(args, ctx).await
+        // B3: record ToolCallLatency around the execution. The perf module no-ops
+        // when recording is disabled (privacy moat), so this is zero overhead by
+        // default. The tool name is NOT recorded (only the metric tag + latency) —
+        // the privacy moat keeps the perf buffer free of what the agent did.
+        let tool_start = crate::util::now_ms();
+        let result = tool.execute(args, ctx).await;
+        let elapsed = (crate::util::now_ms() - tool_start).max(0) as f64;
+        crate::telemetry::record(crate::telemetry::PerfMetric::ToolCallLatency, elapsed, None);
+        result
     }
 }
 

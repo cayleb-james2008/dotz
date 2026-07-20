@@ -255,7 +255,10 @@ const fn pm(id: &'static str, label: &'static str, free_form: bool) -> ProviderM
     }
 }
 
-/// The 11 known providers, in UI order.
+/// The known providers, in UI order. `gateway` (C6) is a generic OpenAI-compatible passthrough
+/// behind ONE endpoint + ONE key + a model allowlist (OmniRoute / OpenRouter-as-gateway / LiteLLM
+/// / any OpenAI-compat gateway). It is free-form (the model id is whatever the gateway routes to)
+/// and sits last so it has the lowest UI priority.
 pub fn providers() -> Vec<ProviderMeta> {
     vec![
         pm("openrouter", "OpenRouter", true),
@@ -270,6 +273,7 @@ pub fn providers() -> Vec<ProviderMeta> {
         pm("deepseek", "DeepSeek", false),
         pm("cohere", "Cohere", false),
         pm("local", "Local (Ollama/LM Studio)", true),
+        pm("gateway", "Gateway", true),
     ]
 }
 
@@ -313,6 +317,24 @@ pub fn low_cost_models() -> Vec<ModelRef> {
     ]
 }
 
+/// C6: the low-cost worker list extended with the configured gateway model allowlist. Each
+/// allowlist entry becomes a `gateway/<model>` ModelRef so the lead agent can disperse subagent
+/// tasks to gateway-routed models (OmniRoute/OpenRouter-as-gateway/LiteLLM) the same way it
+/// dispatches to the native providers. When no gateway is configured (or the allowlist is empty)
+/// this is byte-identical to [`low_cost_models`], so a gateway-free install is unchanged.
+pub fn low_cost_models_with_gateway() -> Vec<ModelRef> {
+    let mut out = low_cost_models();
+    if let Some(gw) = crate::config::load().gateway {
+        for id in gw.model_allowlist.iter().filter(|s| !s.trim().is_empty()) {
+            out.push(ModelRef {
+                provider: "gateway".into(),
+                model_id: id.trim().to_string(),
+            });
+        }
+    }
+    out
+}
+
 fn resolve_subagent_model(override_value: Option<&str>) -> String {
     override_value
         .map(|s| s.trim())
@@ -327,7 +349,7 @@ fn resolve_subagent_model(override_value: Option<&str>) -> String {
 /// Render the subagent-model directive for system-prompt injection (port of renderLowCostModels).
 pub fn render_low_cost_models() -> String {
     let sub = resolve_subagent_model(std::env::var("DOTZ_SUBAGENT_MODEL").ok().as_deref());
-    let list = low_cost_models()
+    let list = low_cost_models_with_gateway()
         .iter()
         .map(|m| format!("{}/{}", m.provider, m.model_id))
         .collect::<Vec<_>>()
@@ -351,6 +373,29 @@ pub fn strip_matching_provider_prefix(provider: &str, model_id: &str) -> String 
         }
     }
     trimmed.to_string()
+}
+
+/// C6: parse a "provider/model-id" string into a `ModelRef`. The provider segment is lowercased
+/// (so "Gateway/gpt-5.6" normalizes to "gateway"), and a redundant matching provider prefix is
+/// stripped from the model id so the upstream API receives a bare id (so "gateway/gateway/x" →
+/// ("gateway", "x"), not ("gateway", "gateway/x")). A bare id with no slash is treated as an
+/// unknown provider with the whole string as the model id — callers that want the ollama fallback
+/// (subagent dispatch) keep using their own fallback. This is the Rust-side `resolveModel` used by
+/// the gateway route + the acceptance test; it does NOT validate the provider against the known
+/// list (the caller validates separately where that matters).
+pub fn resolve_model_ref(s: &str) -> ModelRef {
+    let trimmed = s.trim();
+    match trimmed.split_once('/') {
+        Some((p, m)) if !p.is_empty() && !m.is_empty() => {
+            let provider = p.to_ascii_lowercase();
+            let model_id = strip_matching_provider_prefix(&provider, m);
+            ModelRef { provider, model_id }
+        }
+        _ => ModelRef {
+            provider: trimmed.to_ascii_lowercase(),
+            model_id: trimmed.to_string(),
+        },
+    }
 }
 
 /// (executive, subagent) defaults for a provider, if known.
@@ -454,10 +499,12 @@ mod tests {
     #[test]
     fn providers_list_is_stable() {
         let p = providers();
-        assert_eq!(p.len(), 12);
+        assert_eq!(p.len(), 13);
         assert!(p.iter().any(|pm| pm.id == "ollama" && pm.free_form));
         assert!(p.iter().any(|pm| pm.id == "nvidia-nim" && pm.free_form));
         assert!(p.iter().any(|pm| pm.id == "anthropic" && !pm.free_form));
+        // C6: gateway is a free-form provider (model id is whatever the gateway routes to).
+        assert!(p.iter().any(|pm| pm.id == "gateway" && pm.free_form));
     }
 
     #[test]
@@ -833,5 +880,170 @@ mod tests {
         assert_eq!(json["maxCost"], serde_json::json!(5.0));
         assert!(json.get("maxTokens").is_none());
         assert!(json.get("maxInputTokens").is_none());
+    }
+
+    // ---- C6: gateway provider (OmniRoute / OpenRouter-as-gateway / LiteLLM passthrough) ----
+
+    /// C6: the `gateway` ProviderMeta must be free-form (the model id is whatever the gateway
+    /// routes to, not a fixed dropdown).
+    #[test]
+    fn gateway_provider_meta_is_free_form() {
+        let all = providers();
+        let gw = all
+            .iter()
+            .find(|p| p.id == "gateway")
+            .expect("gateway must be a known provider");
+        assert!(gw.free_form, "gateway must be free_form");
+        assert_eq!(gw.label, "Gateway");
+        // Gateway is the lowest-priority entry (last in the list).
+        let ids: Vec<&str> = all.iter().map(|p| p.id).collect();
+        assert_eq!(ids.last().copied(), Some("gateway"));
+    }
+
+    /// C6: `is_known_provider` must recognize "gateway" so config validation + the model picker
+    /// accept it the same way as the other 12 providers.
+    #[test]
+    fn gateway_is_a_known_provider() {
+        assert!(is_known_provider("gateway"));
+        assert!(provider_ids().contains(&"gateway"));
+    }
+
+    /// C6: `resolve_model_ref("gateway/gpt-5.6")` → `(provider: "gateway", model_id: "gpt-5.6")`.
+    /// A bare model id (no slash) is treated as an unknown provider with the whole string as the
+    /// model id — callers that want an ollama fallback keep using their own fallback.
+    #[test]
+    fn resolve_model_for_gateway_prefix() {
+        let m = resolve_model_ref("gateway/gpt-5.6");
+        assert_eq!(m.provider, "gateway");
+        assert_eq!(m.model_id, "gpt-5.6");
+    }
+
+    /// C6: the provider segment is lowercased so a mixed-case "Gateway/..." still resolves.
+    #[test]
+    fn resolve_model_ref_lowercases_provider_segment() {
+        let m = resolve_model_ref("Gateway/claude-sonnet-5");
+        assert_eq!(m.provider, "gateway");
+        assert_eq!(m.model_id, "claude-sonnet-5");
+    }
+
+    /// C6: a redundant matching provider prefix is stripped so the upstream gateway receives a
+    /// bare model id (so "gateway/gateway/x" → ("gateway", "x"), matching the executive/subagent
+    /// normalization behavior for the other free-form providers).
+    #[test]
+    fn resolve_model_ref_strips_redundant_gateway_prefix() {
+        let m = resolve_model_ref("gateway/gateway/gpt-5.6");
+        assert_eq!(m.provider, "gateway");
+        assert_eq!(m.model_id, "gpt-5.6");
+    }
+
+    /// C6: a model id with a foreign provider prefix is preserved (not corrupted) so
+    /// cross-provider namespaces survive — e.g. an OpenRouter-style "anthropic/claude-..." id
+    /// routed through a gateway keeps its upstream namespace.
+    #[test]
+    fn resolve_model_ref_preserves_foreign_prefix() {
+        let m = resolve_model_ref("gateway/anthropic/claude-sonnet-5");
+        assert_eq!(m.provider, "gateway");
+        assert_eq!(m.model_id, "anthropic/claude-sonnet-5");
+    }
+
+    /// C6: a bare id with no slash is treated as an unknown provider + the whole string as the
+    /// model id. Callers wanting the ollama fallback (subagent dispatch) keep their own fallback.
+    #[test]
+    fn resolve_model_ref_bare_id_has_no_provider_fallback() {
+        let m = resolve_model_ref("gpt-5.6");
+        assert_eq!(m.provider, "gpt-5.6");
+        assert_eq!(m.model_id, "gpt-5.6");
+    }
+
+    /// C6: when a gateway config has a model allowlist, those models appear in the
+    /// runtime-extended low-cost list (as `gateway/<model>` entries) so the lead agent can dispatch
+    /// subagent tasks to gateway-routed models. Uses a temp DOTZ_CONFIG_DIR so it never touches
+    /// the operator's real config; serialized on the shared config-dir test lock.
+    #[test]
+    fn gateway_model_allowlist_in_low_cost_models() {
+        let guard = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("dotz-types-gateway-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+
+        // Write a config with a gateway allowlist. The base config fields are required by
+        // DotzConfig::load's normalization; gateway is the C6 addition.
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({
+                "provider": "ollama",
+                "executiveModel": "glm-5.2",
+                "subagentModel": "minimax-m3",
+                "thinkingLevel": "high",
+                "gateway": {
+                    "baseUrl": "https://api.omniroute.ai/v1",
+                    "apiKeyRef": "OMNIROUTE_API_KEY",
+                    "presets": ["omniroute"],
+                    "modelAllowlist": ["gpt-5.6", "claude-sonnet-5", "glm-5.2"],
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let models = low_cost_models_with_gateway();
+        // The base low-cost workers are still present (gateway-free install is unchanged).
+        assert!(models
+            .iter()
+            .any(|m| m.provider == "ollama" && m.model_id == "minimax-m3"));
+        // Each allowlist entry appears as a gateway/<model> entry.
+        for id in ["gpt-5.6", "claude-sonnet-5", "glm-5.2"] {
+            assert!(
+                models
+                    .iter()
+                    .any(|m| m.provider == "gateway" && m.model_id == id),
+                "low_cost_models_with_gateway must include gateway/{id}"
+            );
+        }
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(guard);
+    }
+
+    /// C6: with NO gateway configured, `low_cost_models_with_gateway` is byte-identical to
+    /// `low_cost_models` — a gateway-free install is unchanged.
+    #[test]
+    fn low_cost_models_with_gateway_unchanged_when_no_config() {
+        let guard = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("dotz-types-gateway-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+
+        // No config.json → load() returns defaults with gateway: None.
+        let extended = low_cost_models_with_gateway();
+        let base = low_cost_models();
+        assert_eq!(
+            extended.len(),
+            base.len(),
+            "no gateway config → extended list must equal the base list"
+        );
+        assert!(
+            !extended.iter().any(|m| m.provider == "gateway"),
+            "no gateway config → no gateway entries"
+        );
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(guard);
     }
 }

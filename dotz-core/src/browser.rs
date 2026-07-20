@@ -348,6 +348,64 @@ fn resolve_executable() -> Result<PathBuf, String> {
     Ok(PathBuf::from(bare))
 }
 
+/// True when the resolved `agent-browser` binary is actually present on disk. Used by the
+/// first-run wizard (`GET /api/first-run/state`) so the UI can tell the operator whether the
+/// browser panel will work out of the box or whether they need to run `npm install` first.
+/// Mirrors [`resolve_executable`] exactly: `DOTZ_BROWSER_BIN` wins (must exist), then the
+/// bundled `node_modules/agent-browser/bin/<name>` path, then a PATH lookup for the bare
+/// `agent-browser[.exe]` name (so a system install is recognized).
+pub fn binary_present() -> bool {
+    match resolve_executable() {
+        // An explicit DOTZ_BROWSER_BIN points at a specific file; honor it only if it exists.
+        Ok(path)
+            if std::env::var("DOTZ_BROWSER_BIN")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false) =>
+        {
+            path.exists()
+        }
+        // The bundled path is already existence-checked inside resolve_executable; the PATH
+        // fallback returns a bare name that we must still resolve against $PATH.
+        Ok(path) => {
+            if path.is_absolute() || path.parent().is_some_and(|p| !p.as_os_str().is_empty()) {
+                path.exists()
+            } else {
+                lookup_in_path(&path)
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Best-effort `$PATH` lookup for a bare executable name (mirrors `which`/`where`). Returns true
+/// if the name resolves to an existing file in any `PATH` entry. On Windows, `.exe` is tried
+/// both as-given and with an explicit `.exe` suffix (the bare fallback is already `.exe`-suffixed,
+/// so this is mostly defensive for a future Unix/Windows cross-call).
+fn lookup_in_path(name: &Path) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if candidate.exists() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            if name.extension().is_none() {
+                let with_exe = candidate.with_extension("exe");
+                if with_exe.exists() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 // ---- agent-browser JSON-output parsing (mirror parseJsonOutput/dataValue/stringValue) ----
 /// agent-browser prints one JSON object per command. Parse the LAST JSON line (newest), falling back
 /// to the whole-trimmed parse, then to the raw string.
@@ -2219,5 +2277,47 @@ mod tests {
         let _ = state(None);
         let _ = list();
         assert!(frame("no-such", -1).is_none());
+    }
+
+    /// `binary_present` must reflect whether the resolved `agent-browser` binary is on disk.
+    /// With `DOTZ_BROWSER_BIN` pointed at a temp file that exists, it returns true; pointed at a
+    /// missing path, it returns false. With the env var cleared, it falls back to the bundled /
+    /// PATH lookup, which on a dev host without `npm install` returns false (and on a packaged
+    /// install with the bundled binary returns true) — so we only assert the explicit-DOTZ_BROWSER_BIN
+    /// branch here to keep the test host-independent.
+    #[test]
+    fn binary_present_matches_disk_state_for_explicit_bin() {
+        let _guard = BROWSER_TIMEOUT_TEST_LOCK.blocking_lock();
+        let dir =
+            std::env::temp_dir().join(format!("dotz-browser-bin-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_path = if cfg!(windows) {
+            dir.join("fake-agent-browser.bat")
+        } else {
+            dir.join("fake-agent-browser.sh")
+        };
+        std::fs::write(&bin_path, "exit 0\n").unwrap();
+
+        let prev = std::env::var("DOTZ_BROWSER_BIN").ok();
+        std::env::set_var("DOTZ_BROWSER_BIN", bin_path.to_string_lossy().to_string());
+        assert!(
+            binary_present(),
+            "binary_present must be true when DOTZ_BROWSER_BIN points at an existing file"
+        );
+
+        std::env::set_var(
+            "DOTZ_BROWSER_BIN",
+            dir.join("does-not-exist").to_string_lossy().to_string(),
+        );
+        assert!(
+            !binary_present(),
+            "binary_present must be false when DOTZ_BROWSER_BIN points at a missing file"
+        );
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_BROWSER_BIN", p),
+            None => std::env::remove_var("DOTZ_BROWSER_BIN"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

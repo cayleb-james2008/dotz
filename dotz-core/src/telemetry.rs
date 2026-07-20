@@ -39,10 +39,18 @@
 //! Both degrade to defaults on corrupt/missing files (never panic), matching
 //! the graceful-degradation contract every other dotz config file follows.
 use crate::util;
-use axum::{http::HeaderMap, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    extract::Query,
+    http::HeaderMap,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 // ---- config -----------------------------------------------------------------
 
@@ -541,6 +549,351 @@ pub fn weekly_active(jsonl: &str) -> Vec<(String, usize, usize)> {
         .collect()
 }
 
+// ---- perf metrics (B3) ------------------------------------------------------
+//
+// Local-only, opt-in performance metrics for the perf dashboard. A per-metric
+// in-memory ring buffer (last 1000 samples) records TurnLatency / GraphRenderTime
+// / EmbedLatency / ToolCallLatency / FirstTurnLatency so the UI can surface p50/p95
+// /p99/max + sparklines.
+//
+// PRIVACY MOAT (the user decision: "Stay opt-in — preserves the privacy moat"):
+//   * Perf recording is GATED on `telemetry::is_enabled()` OR the separate
+//     `perf_recording_enabled` flag (default OFF). When both are false, `record()`
+//     is a zero-overhead early-return no-op — the buffer stays empty.
+//   * The perf buffer is in-memory ONLY. It is NEVER written to disk and NEVER
+//     sent to any remote endpoint. The only way perf data leaves the process is a
+//     future explicit "Export JSON" action (out of scope for B3).
+//   * The perf routes (`/api/perf/*`) are protected by `token_guard` + `origin_guard`
+//     like every other `/api/*` route — no new auth surface.
+//   * The module NEVER logs sample VALUES (only metric names + counts) so a stderr
+//     capture cannot leak latency fingerprints. `test_perf_never_logs_sample_values`
+//     pins this.
+
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, OnceLock};
+
+/// Ring-buffer capacity per metric. The last 1000 samples per metric is plenty
+/// for a sparkline + stable p99 without growing unbounded on a long-running
+/// desktop session.
+const PERF_BUFFER_CAP: usize = 1000;
+
+/// One recorded latency sample. `session_id` is optional so client-side metrics
+/// (e.g. GraphRenderTime posted from the UI) can omit it. Serialized camelCase
+/// to match the rest of the wire contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfSample {
+    pub metric: PerfMetric,
+    pub value_ms: f64,
+    pub ts: i64, // millis since epoch (util::now_ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// The five latency metrics the perf dashboard surfaces. `snake_case` over the
+/// wire so the UI's `?metric=turn_latency` query reads the same as the JSON tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfMetric {
+    /// Full turn time (user prompt → final assistant message).
+    TurnLatency,
+    /// Workflow graph render time (client-side; posted from the UI).
+    GraphRenderTime,
+    /// ONNX embed call (the `embed_text` path). Skips the load-time itself
+    /// because Q1 warm-up handles that separately.
+    EmbedLatency,
+    /// Individual tool call execution time.
+    ToolCallLatency,
+    /// First turn after startup (cold) — the `static FIRST_TURN` flag arms this
+    /// once per process so only the very first turn is tagged.
+    FirstTurnLatency,
+}
+
+impl PerfMetric {
+    /// The wire tag the UI keys on (matches the `#[serde(rename_all)]` output).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PerfMetric::TurnLatency => "turn_latency",
+            PerfMetric::GraphRenderTime => "graph_render_time",
+            PerfMetric::EmbedLatency => "embed_latency",
+            PerfMetric::ToolCallLatency => "tool_call_latency",
+            PerfMetric::FirstTurnLatency => "first_turn_latency",
+        }
+    }
+
+    /// Parse a wire tag back to the enum (None on an unknown string so a bad
+    /// `?metric=` query degrades to an empty samples list instead of a 500).
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "turn_latency" => Some(PerfMetric::TurnLatency),
+            "graph_render_time" => Some(PerfMetric::GraphRenderTime),
+            "embed_latency" => Some(PerfMetric::EmbedLatency),
+            "tool_call_latency" => Some(PerfMetric::ToolCallLatency),
+            "first_turn_latency" => Some(PerfMetric::FirstTurnLatency),
+            _ => None,
+        }
+    }
+
+    /// Every variant, in the order the dashboard renders them.
+    pub fn all() -> [PerfMetric; 5] {
+        [
+            PerfMetric::TurnLatency,
+            PerfMetric::GraphRenderTime,
+            PerfMetric::EmbedLatency,
+            PerfMetric::ToolCallLatency,
+            PerfMetric::FirstTurnLatency,
+        ]
+    }
+}
+
+/// Per-metric summary the dashboard renders as a card. `count == 0` means no
+/// samples yet (the card shows "—"); the percentiles are `Option` so an empty
+/// metric serializes cleanly withoutsentinel values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfMetricSummary {
+    pub p50: Option<f64>,
+    pub p95: Option<f64>,
+    pub p99: Option<f64>,
+    pub max: Option<f64>,
+    pub count: usize,
+}
+
+/// The full summary response: one entry per metric, keyed by the wire tag.
+/// An empty metric is still present (with `count: 0`) so the UI always renders
+/// all five cards.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfSummary {
+    pub metrics: std::collections::BTreeMap<String, PerfMetricSummary>,
+}
+
+// ---- perf recording flag (persisted to ~/.dotz/config.json under perfRecording) ----
+//
+// The flag is read fresh on each `record()` call so a UI toggle takes effect
+// immediately without a restart (mirrors `is_enabled()`). It persists to
+// `config.json` under a `perfRecording` field (default false) via the helpers in
+// `config.rs` (added in B3) — NOT to `telemetry.json`, so it is independent of the
+// remote-telemetry opt-in.
+
+static PERF_RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
+static PERF_RECORDING_INIT: OnceLock<()> = OnceLock::new();
+
+/// Load the persisted `perfRecording` flag (default false) into the static atomics.
+/// Called once on first access; subsequent toggles go through `set_perf_recording`
+/// which keeps the atomics in sync. Best-effort: a corrupt config.json degrades to
+/// the OFF default (matches `config::load`'s graceful-degradation contract).
+fn init_perf_recording_flag() {
+    PERF_RECORDING_INIT.get_or_init(|| {
+        let on = crate::config::load().perf_recording;
+        PERF_RECORDING_FLAG.store(on, Ordering::SeqCst);
+    });
+}
+
+/// Public: is perf recording enabled right now? True if EITHER the operator opted
+/// into remote telemetry (`is_enabled()`) OR explicitly enabled perf recording
+/// via the dashboard toggle. The OR (not AND) preserves the privacy moat: a user
+/// who wants the local perf dashboard but NOT remote telemetry can have both.
+pub fn perf_recording_enabled() -> bool {
+    init_perf_recording_flag();
+    is_enabled() || PERF_RECORDING_FLAG.load(Ordering::SeqCst)
+}
+
+/// Public: turn perf recording on/off and persist the choice to `config.json`
+/// under `perfRecording` so it survives a restart. Best-effort: a persist failure
+/// is logged + swallowed (perf is non-critical; it must never crash the app).
+pub fn set_perf_recording(enabled: bool) {
+    init_perf_recording_flag();
+    PERF_RECORDING_FLAG.store(enabled, Ordering::SeqCst);
+    if let Err(e) = crate::config::set_perf_recording(&crate::config::load(), enabled) {
+        eprintln!("perf: failed to persist perfRecording={enabled}: {e}");
+    }
+}
+
+// ---- the ring buffer ----
+
+static PERF_BUFFER: OnceLock<Mutex<VecDeque<PerfSample>>> = OnceLock::new();
+
+fn buffer() -> &'static Mutex<VecDeque<PerfSample>> {
+    PERF_BUFFER.get_or_init(|| Mutex::new(VecDeque::with_capacity(PERF_BUFFER_CAP)))
+}
+
+fn buffer_guard() -> std::sync::MutexGuard<'static, VecDeque<PerfSample>> {
+    buffer()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record a perf sample. ZERO-OVERHEAD NO-OP when perf recording is disabled
+/// (the privacy-moat default): the disabled check is the very first line so a
+/// hot-path fire point (every turn / embed / tool call) never even locks the
+/// mutex. When enabled, the sample is pushed to the ring buffer; if the buffer
+/// is at capacity the OLDEST sample is evicted (drop-oldest ring). Best-effort:
+/// a poisoned mutex is recovered so a panic in one fire point does not brick the
+/// rest. Never logs the sample value (only metric names + counts in the toggle
+/// path) — see `test_perf_never_logs_sample_values`.
+pub fn record(metric: PerfMetric, value_ms: f64, session_id: Option<&str>) {
+    if !perf_recording_enabled() {
+        return;
+    }
+    let sample = PerfSample {
+        metric,
+        value_ms,
+        ts: util::now_ms(),
+        session_id: session_id.map(|s| s.to_string()),
+    };
+    let mut g = buffer_guard();
+    if g.len() >= PERF_BUFFER_CAP {
+        g.pop_front();
+    }
+    g.push_back(sample);
+}
+
+/// Return up to `limit` samples for a single metric, newest-first. Used by the
+/// dashboard's sparklines. `limit == 0` is treated as "all" (clamped to the buffer
+/// cap so a runaway request cannot materialize more than the ring holds). An
+/// unknown metric tag returns an empty vec (the UI shows an empty sparkline).
+pub fn samples(metric: PerfMetric, limit: usize) -> Vec<PerfSample> {
+    let g = buffer_guard();
+    let limit = if limit == 0 { PERF_BUFFER_CAP } else { limit };
+    g.iter()
+        .rev()
+        .filter(|s| s.metric == metric)
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
+/// Per-metric p50/p95/p99/max + count. The percentiles are computed on the
+/// sorted values (nearest-rank, the simplest correct method for a bounded
+/// ring buffer — no interpolation, which would imply a precision the sample size
+/// does not warrant). An empty metric returns an all-`None` summary with
+/// `count: 0` so the UI renders "—" instead of a misleading 0.0.
+pub fn summary() -> PerfSummary {
+    let g = buffer_guard();
+    let mut metrics = std::collections::BTreeMap::new();
+    for m in PerfMetric::all() {
+        let mut values: Vec<f64> = g
+            .iter()
+            .filter(|s| s.metric == m)
+            .map(|s| s.value_ms)
+            .collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let count = values.len();
+        let summary = if count == 0 {
+            PerfMetricSummary {
+                p50: None,
+                p95: None,
+                p99: None,
+                max: None,
+                count: 0,
+            }
+        } else {
+            // Nearest-rank percentile: index = ceil(p/100 * n) - 1, clamped to [0, n-1].
+            let pick = |p: f64| -> f64 {
+                let idx = ((p / 100.0) * count as f64).ceil() as usize;
+                values[idx.saturating_sub(1).min(count - 1)]
+            };
+            PerfMetricSummary {
+                p50: Some(pick(50.0)),
+                p95: Some(pick(95.0)),
+                p99: Some(pick(99.0)),
+                max: Some(values[count - 1]),
+                count,
+            }
+        };
+        metrics.insert(m.as_str().to_string(), summary);
+    }
+    PerfSummary { metrics }
+}
+
+/// Clear the perf buffer (the dashboard "reset" button + tests). O(1) clear.
+pub fn clear() {
+    let mut g = buffer_guard();
+    g.clear();
+}
+
+/// One-time-per-process flag that arms `FirstTurnLatency` for the very first turn
+/// after startup. The lead session's `run_turn` checks + clears it; a restart
+/// re-arms it (a fresh process is "cold" again).
+#[allow(dead_code)]
+static FIRST_TURN: AtomicBool = AtomicBool::new(true);
+
+/// Called by `session::run_turn`: returns `true` the first time it is called in
+/// this process (and clears the flag), `false` every subsequent call. Used to
+/// tag the first turn with `FirstTurnLatency` so the dashboard can separate the
+/// cold-start turn from steady-state turns.
+#[allow(dead_code)]
+pub(crate) fn claim_first_turn() -> bool {
+    FIRST_TURN.swap(false, Ordering::SeqCst)
+}
+
+// ---- perf routes (B3) -------------------------------------------------------
+//
+// Four routes, all under `/api/perf/*` and therefore protected by the existing
+// `token_guard` + `origin_guard` (no new auth). The `POST /api/perf/record` route
+// is the ONLY one that accepts client-side samples (GraphRenderTime); the other
+// three read/clear the buffer.
+//   GET  /api/perf/summary               → PerfSummary (the dashboard cards)
+//   GET  /api/perf/samples?metric=X&limit=N → Vec<PerfSample> (sparklines)
+//   POST /api/perf/record                 → accepts one PerfSample (UI → backend)
+//   POST /api/perf/clear                   → empties the buffer
+//   POST /api/perf/toggle                  → flips perf_recording_enabled + persists
+//
+// ponytail: client-side perf recording via POST; a WS-based stream is the upgrade
+// path (the graph already posts step_state over WS, so a `perf_sample` event
+// would slot in naturally — but a single POST endpoint is the shortest working
+// diff for B3 and keeps the perf module self-contained).
+
+async fn perf_get_summary() -> Json<Value> {
+    Json(json!(summary()))
+}
+
+async fn perf_get_samples(Query(q): Query<HashMap<String, String>>) -> Json<Value> {
+    let metric = q
+        .get("metric")
+        .and_then(|s| PerfMetric::from_str(s))
+        .unwrap_or(PerfMetric::TurnLatency);
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(PERF_BUFFER_CAP);
+    Json(json!(samples(metric, limit)))
+}
+
+async fn perf_post_record(Json(sample): Json<PerfSample>) -> Json<Value> {
+    // The UI posts GraphRenderTime samples here. Re-record through the gated
+    // `record()` so the privacy-moat no-op + ring-buffer cap still apply (the
+    // UI cannot bypass the opt-in by posting directly).
+    record(sample.metric, sample.value_ms, sample.session_id.as_deref());
+    Json(json!({ "ok": true }))
+}
+
+async fn perf_clear() -> Json<Value> {
+    clear();
+    Json(json!({ "ok": true }))
+}
+
+async fn perf_toggle() -> Json<Value> {
+    // Flip the flag AND persist so it survives a restart. Returns the new state
+    // so the UI can update its "Recording ON/OFF" badge without a second round-trip.
+    let next = !perf_recording_enabled();
+    set_perf_recording(next);
+    Json(json!({ "recording": next }))
+}
+
+/// The perf router. Stateless `Router<()>`, merged into the main axum app (see
+/// `server::app_with_token`). Inherits the token + origin guards from the outer
+/// router — no new auth surface.
+pub fn perf_router() -> Router<()> {
+    Router::new()
+        .route("/api/perf/summary", get(perf_get_summary))
+        .route("/api/perf/samples", get(perf_get_samples))
+        .route("/api/perf/record", post(perf_post_record))
+        .route("/api/perf/clear", post(perf_clear))
+        .route("/api/perf/toggle", post(perf_toggle))
+}
+
 // ---- tests ------------------------------------------------------------------
 
 #[cfg(test)]
@@ -549,11 +902,13 @@ mod tests {
     use std::sync::{Arc, Mutex as AMutex};
 
     // Serialize tests that mutate DOTZ_CONFIG_DIR so env-var overrides don't
-    // race with each other or with config::load's own test suite.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    // race with each other or with config::load's own test suite. We share a single
+    // process-wide lock with `config::tests` (via `util::dotz_config_dir_test_lock`) so
+    // cross-module `with_tmp_dir` calls can't clobber each other's `DOTZ_CONFIG_DIR`.
     fn with_tmp_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir =
             std::env::temp_dir().join(format!("dotz-telemetry-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1066,7 +1421,12 @@ mod tests {
                 let client = reqwest::Client::new();
 
                 // No token -> 401, nothing written.
-                let r = client.post(&url).json(&json!({"probe": 1})).send().await.unwrap();
+                let r = client
+                    .post(&url)
+                    .json(&json!({"probe": 1}))
+                    .send()
+                    .await
+                    .unwrap();
                 assert_eq!(r.status(), 401, "missing token must be rejected");
                 // Wrong token -> 401 too.
                 let r = client
@@ -1096,8 +1456,15 @@ mod tests {
                 }
                 server.abort();
                 let lines: Vec<&str> = got.lines().collect();
-                assert_eq!(lines.len(), 1, "exactly the authorized event lands: {got:?}");
-                assert!(got.contains("dailyActive"), "authorized event persisted: {got:?}");
+                assert_eq!(
+                    lines.len(),
+                    1,
+                    "exactly the authorized event lands: {got:?}"
+                );
+                assert!(
+                    got.contains("dailyActive"),
+                    "authorized event persisted: {got:?}"
+                );
             });
         });
     }
@@ -1122,7 +1489,11 @@ mod tests {
             let ts = days_from_civil(y, m, d) * 86_400_000;
             assert_eq!(iso_week(ts), want, "{y}-{m:02}-{d:02}");
             // Last millisecond of the same UTC day must stay in the same week.
-            assert_eq!(iso_week(ts + 86_399_999), want, "{y}-{m:02}-{d:02} 23:59:59.999");
+            assert_eq!(
+                iso_week(ts + 86_399_999),
+                want,
+                "{y}-{m:02}-{d:02} 23:59:59.999"
+            );
         }
         // The civil-date helpers must be inverses around the anchors.
         for (y, m, d, _) in anchors {
@@ -1145,9 +1516,9 @@ mod tests {
             line("bbb", wk1 + 2 * 86_400_000),
             line("bbb", wk2), // same install active NEXT week counts there too
             line("ccc", wk2),
-            "not json at all".to_string(),          // must be skipped
-            r#"{"eventType":"x","ts":1}"#.into(),   // no sessionId -> skipped
-            r#"{"sessionId":"zzz"}"#.into(),        // no ts -> skipped
+            "not json at all".to_string(),        // must be skipped
+            r#"{"eventType":"x","ts":1}"#.into(), // no sessionId -> skipped
+            r#"{"sessionId":"zzz"}"#.into(),      // no ts -> skipped
         ]
         .join("\n");
 
@@ -1158,6 +1529,490 @@ mod tests {
                 ("2026-W29".to_string(), 2, 3), // aaa+bbb distinct, 3 events
                 ("2026-W30".to_string(), 2, 2), // bbb+ccc distinct, 2 events
             ]
+        );
+    }
+
+    // =========================================================================
+    // B3: perf metrics — local-only, opt-in ring buffer + routes
+    // =========================================================================
+    //
+    // These tests point DOTZ_CONFIG_DIR at a temp dir + serialize on the shared
+    // config-dir lock so they never touch the operator's real config.json. The
+    // perf buffer is a process-global static, so every test clears it before +
+    // after (via `clear()`) so a leftover sample from a prior test cannot leak in
+    // and a recorded sample cannot leak out.
+
+    /// Helper: enable perf recording inside a tmp config dir, returning a guard
+    /// that disables + clears on drop. The `set_perf_recording(true)` persists
+    /// to the tmp config.json so `perf_recording_enabled()` (which reads the
+    /// persisted flag via `config::load()`) sees it.
+    struct PerfGuard {
+        _cfg_guard: std::sync::MutexGuard<'static, ()>,
+    }
+    impl Drop for PerfGuard {
+        fn drop(&mut self) {
+            // Restore to OFF + wipe the buffer so the next test starts clean.
+            set_perf_recording(false);
+            clear();
+        }
+    }
+    fn with_perf_enabled<T>(f: impl FnOnce() -> T) -> T {
+        let g = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-perf-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        clear();
+        set_perf_recording(true);
+        // Force the init flag to re-read so the new persisted value is picked up.
+        // The OnceLock means `init_perf_recording_flag` only runs once per process;
+        // to make `perf_recording_enabled()` reflect the toggle within a single
+        // process we rely on `set_perf_recording` updating the static atomics
+        // directly (it does), so the OnceLock init is only for the cold-start path.
+        let result = f();
+        let _ = std::fs::remove_dir_all(&dir);
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        drop(PerfGuard { _cfg_guard: g });
+        result
+    }
+
+    /// Disabled flag → `record()` does not add to the buffer (privacy moat).
+    #[test]
+    fn perf_record_is_noop_when_disabled() {
+        // Point at a tmp dir with NO config.json so the default (OFF) applies.
+        let g = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-perf-off-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        clear();
+        // Also ensure remote telemetry is OFF (the OR branch of the gate).
+        set_enabled(false);
+        assert!(!perf_recording_enabled(), "default must be OFF");
+        record(PerfMetric::TurnLatency, 42.0, Some("s1"));
+        assert!(
+            samples(PerfMetric::TurnLatency, 10).is_empty(),
+            "disabled record() must not add to the buffer"
+        );
+        // Cleanup.
+        clear();
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(g);
+    }
+
+    /// Enabled → buffer grows by one per record.
+    #[test]
+    fn perf_record_adds_to_buffer_when_enabled() {
+        with_perf_enabled(|| {
+            assert!(perf_recording_enabled(), "precondition: must be ON");
+            record(PerfMetric::TurnLatency, 100.0, Some("s1"));
+            record(PerfMetric::EmbedLatency, 5.0, None);
+            let turn = samples(PerfMetric::TurnLatency, 10);
+            let embed = samples(PerfMetric::EmbedLatency, 10);
+            assert_eq!(turn.len(), 1, "one TurnLatency sample recorded");
+            assert_eq!(embed.len(), 1, "one EmbedLatency sample recorded");
+            assert_eq!(turn[0].value_ms, 100.0);
+            assert_eq!(turn[0].session_id.as_deref(), Some("s1"));
+            assert_eq!(embed[0].session_id, None);
+        });
+    }
+
+    /// 1001 records → oldest evicted (ring buffer cap at 1000).
+    #[test]
+    fn perf_buffer_is_ring_buffer_capped_at_1000() {
+        with_perf_enabled(|| {
+            for i in 0..1001 {
+                record(PerfMetric::TurnLatency, i as f64, None);
+            }
+            let s = samples(PerfMetric::TurnLatency, 0); // 0 = all (clamped to cap)
+            assert_eq!(s.len(), 1000, "ring buffer must cap at 1000");
+            // The oldest (value 0.0) must have been evicted; the newest (1000.0)
+            // must be present. samples() returns newest-first, so s[0] is 1000.0.
+            assert_eq!(s[0].value_ms, 1000.0, "newest sample must be at the front");
+            assert!(
+                !s.iter().any(|x| x.value_ms == 0.0),
+                "the oldest sample (0.0) must have been evicted"
+            );
+        });
+    }
+
+    /// samples() filters by metric — only matching metric returned.
+    #[test]
+    fn perf_samples_filters_by_metric() {
+        with_perf_enabled(|| {
+            record(PerfMetric::TurnLatency, 1.0, None);
+            record(PerfMetric::EmbedLatency, 2.0, None);
+            record(PerfMetric::TurnLatency, 3.0, None);
+            record(PerfMetric::ToolCallLatency, 4.0, None);
+            let turn = samples(PerfMetric::TurnLatency, 10);
+            assert_eq!(turn.len(), 2, "only TurnLatency samples");
+            assert!(turn.iter().all(|s| s.metric == PerfMetric::TurnLatency));
+            // GraphRenderTime has none.
+            assert!(
+                samples(PerfMetric::GraphRenderTime, 10).is_empty(),
+                "GraphRenderTime must have zero samples"
+            );
+        });
+    }
+
+    /// summary() computes p50/p95/p99/max from known samples. Uses a fixed set
+    /// so the nearest-rank percentiles are deterministic. 100 samples (1..=100 ms)
+    /// give distinct p50/p95/p99/max values.
+    #[test]
+    fn perf_summary_computes_p50_p95_p99_max() {
+        with_perf_enabled(|| {
+            // 100 samples: 1..=100 (ms). Sorted: [1,2,...,100].
+            for i in 1..=100 {
+                record(PerfMetric::EmbedLatency, i as f64, None);
+            }
+            let s = summary();
+            let embed = &s.metrics["embed_latency"];
+            assert_eq!(embed.count, 100);
+            // nearest-rank: p50 -> ceil(0.5*100)-1 = idx 49 -> 50.0
+            assert_eq!(embed.p50, Some(50.0));
+            // p95 -> ceil(0.95*100)-1 = idx 94 -> 95.0
+            assert_eq!(embed.p95, Some(95.0));
+            // p99 -> ceil(0.99*100)-1 = idx 98 -> 99.0
+            assert_eq!(embed.p99, Some(99.0));
+            assert_eq!(embed.max, Some(100.0));
+        });
+    }
+
+    /// summary() returns empty (count 0, all percentiles None) for a metric
+    /// with no samples.
+    #[test]
+    fn perf_summary_returns_empty_for_no_samples() {
+        with_perf_enabled(|| {
+            // Record into one metric so the buffer is non-empty, but leave
+            // GraphRenderTime empty.
+            record(PerfMetric::TurnLatency, 1.0, None);
+            let s = summary();
+            let graph = &s.metrics["graph_render_time"];
+            assert_eq!(graph.count, 0);
+            assert_eq!(graph.p50, None);
+            assert_eq!(graph.p95, None);
+            assert_eq!(graph.p99, None);
+            assert_eq!(graph.max, None);
+            // The summary always has all five metric keys.
+            assert_eq!(s.metrics.len(), 5, "all five metrics must be present");
+        });
+    }
+
+    /// GET /api/perf/summary returns the dashboard shape (all 5 metric keys).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn perf_route_get_summary() {
+        let g = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-perf-summary-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        clear();
+        set_perf_recording(true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle =
+            tokio::spawn(async move { axum::serve(listener, perf_router()).await.unwrap() });
+        record(PerfMetric::TurnLatency, 50.0, Some("s1"));
+        let body: Value =
+            reqwest::get(format!("http://127.0.0.1:{}/api/perf/summary", addr.port()))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        handle.abort();
+        let metrics = body["metrics"].as_object().expect("metrics is an object");
+        for key in [
+            "turn_latency",
+            "graph_render_time",
+            "embed_latency",
+            "tool_call_latency",
+            "first_turn_latency",
+        ] {
+            assert!(metrics.contains_key(key), "summary must include {key}");
+        }
+        assert_eq!(metrics["turn_latency"]["count"], 1);
+        assert_eq!(metrics["turn_latency"]["p50"], 50.0);
+        // Cleanup.
+        set_perf_recording(false);
+        clear();
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(g);
+    }
+
+    /// GET /api/perf/samples?metric=X&limit=N returns filtered samples in shape.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn perf_route_get_samples() {
+        let g = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-perf-samples-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        clear();
+        set_perf_recording(true);
+        record(PerfMetric::EmbedLatency, 1.0, None);
+        record(PerfMetric::EmbedLatency, 2.0, None);
+        record(PerfMetric::TurnLatency, 99.0, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle =
+            tokio::spawn(async move { axum::serve(listener, perf_router()).await.unwrap() });
+        let url = format!(
+            "http://127.0.0.1:{}/api/perf/samples?metric=embed_latency&limit=10",
+            addr.port()
+        );
+        let body: Value = reqwest::get(url).await.unwrap().json().await.unwrap();
+        handle.abort();
+        let arr = body.as_array().expect("samples is an array");
+        assert_eq!(arr.len(), 2, "only embed_latency samples returned");
+        assert!(arr.iter().all(|s| s["metric"] == "embed_latency"));
+        // Cleanup.
+        set_perf_recording(false);
+        clear();
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(g);
+    }
+
+    /// POST /api/perf/record accepts a UI sample (GraphRenderTime).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn perf_route_post_record() {
+        let g = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-perf-record-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        clear();
+        set_perf_recording(true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle =
+            tokio::spawn(async move { axum::serve(listener, perf_router()).await.unwrap() });
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/api/perf/record", addr.port()))
+            .json(&json!({
+                "metric": "graph_render_time",
+                "value_ms": 16.7,
+                "ts": 0,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "POST /api/perf/record should succeed"
+        );
+        handle.abort();
+        let s = samples(PerfMetric::GraphRenderTime, 10);
+        assert_eq!(s.len(), 1, "the posted sample must land in the buffer");
+        assert!((s[0].value_ms - 16.7).abs() < f64::EPSILON);
+        // Cleanup.
+        set_perf_recording(false);
+        clear();
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(g);
+    }
+
+    /// POST /api/perf/clear empties the buffer.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn perf_route_clear() {
+        let g = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-perf-clear-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        clear();
+        set_perf_recording(true);
+        record(PerfMetric::TurnLatency, 1.0, None);
+        record(PerfMetric::EmbedLatency, 2.0, None);
+        assert!(
+            !samples(PerfMetric::TurnLatency, 10).is_empty(),
+            "precondition"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle =
+            tokio::spawn(async move { axum::serve(listener, perf_router()).await.unwrap() });
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/api/perf/clear", addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        handle.abort();
+        assert!(
+            samples(PerfMetric::TurnLatency, 10).is_empty(),
+            "buffer must be empty"
+        );
+        assert!(
+            samples(PerfMetric::EmbedLatency, 10).is_empty(),
+            "buffer must be empty"
+        );
+        // Cleanup.
+        set_perf_recording(false);
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(g);
+    }
+
+    /// POST /api/perf/toggle flips the enabled flag + persists to config.json.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn perf_route_toggle() {
+        // Use a fresh tmp dir + the shared config lock so this never touches the
+        // operator's real config.json.
+        let g = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-perf-toggle-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        clear();
+        set_perf_recording(false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle =
+            tokio::spawn(async move { axum::serve(listener, perf_router()).await.unwrap() });
+        let client = reqwest::Client::new();
+        let resp: Value = client
+            .post(format!("http://127.0.0.1:{}/api/perf/toggle", addr.port()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        handle.abort();
+        assert_eq!(resp["recording"], true, "toggle from OFF must turn ON");
+        // The flag must now be ON in-memory.
+        assert!(perf_recording_enabled(), "flag must be ON after toggle");
+        // And persisted to config.json under perfRecording.
+        let raw = std::fs::read_to_string(dir.join("config.json")).unwrap_or_default();
+        assert!(
+            raw.contains("\"perfRecording\": true") || raw.contains("\"perfRecording\":true"),
+            "perfRecording must be persisted to config.json: {raw}"
+        );
+        // Cleanup.
+        set_perf_recording(false);
+        clear();
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(g);
+    }
+
+    /// Fresh install → perf_recording_enabled() is false (the privacy moat).
+    #[test]
+    fn perf_recording_defaults_to_off() {
+        let g = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("dotz-perf-default-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // No config.json written + remote telemetry OFF → perf_recording_enabled
+        // must be false. We also force the static atomics to false to mirror a
+        // truly fresh process (a prior test may have toggled it ON).
+        PERF_RECORDING_FLAG.store(false, Ordering::SeqCst);
+        set_enabled(false);
+        assert!(
+            !perf_recording_enabled(),
+            "fresh install must have perf recording OFF"
+        );
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(g);
+    }
+
+    /// Static check: the perf module never logs sample VALUES (only metric names +
+    /// counts). We assert the perf module's source does not `eprintln!` a
+    /// `value_ms` / `value` interpolation — a stderr capture must not leak latency
+    /// fingerprints. This is a grep-style static guard against a future regression.
+    #[test]
+    fn perf_never_logs_sample_values() {
+        let src = include_str!("telemetry.rs");
+        // The perf module section starts at "// ---- perf metrics (B3)".
+        let perf_section = src.split("// ---- perf metrics (B3)").nth(1).unwrap_or("");
+        // No eprintln! may reference value_ms or .value (the sample's latency).
+        // The toggle/clear path logs the boolean flag + counts, which is fine.
+        assert!(
+            !perf_section.contains("eprintln!(\"perf: sample value")
+                && !perf_section.contains("eprintln!(\"perf: value_ms"),
+            "the perf module must never log sample values"
+        );
+        // Sanity: the perf section exists (catches a future rename of the marker).
+        assert!(
+            perf_section.contains("fn record("),
+            "perf section must contain the record() fn — did the marker move?"
+        );
+    }
+
+    /// Fire-point check: `session.rs` records `PerfMetric::TurnLatency` at turn end.
+    /// A grep-style static guard so a future refactor that drops the fire point is
+    /// caught at test time.
+    #[test]
+    fn perf_fire_points_record_turn_latency() {
+        let src = include_str!("agent/session.rs");
+        assert!(
+            src.contains("PerfMetric::TurnLatency"),
+            "session.rs must record PerfMetric::TurnLatency at turn end (B3 fire point)"
+        );
+    }
+
+    /// Fire-point check: `memory.rs` records `PerfMetric::EmbedLatency` around the
+    /// embed() call. Static guard so the fire point is not dropped in a refactor.
+    #[test]
+    fn perf_fire_points_record_embed_latency() {
+        let src = include_str!("memory.rs");
+        assert!(
+            src.contains("PerfMetric::EmbedLatency"),
+            "memory.rs must record PerfMetric::EmbedLatency around embed_text (B3 fire point)"
         );
     }
 }

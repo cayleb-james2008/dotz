@@ -18,6 +18,7 @@ use crate::agent::event::Cost;
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -73,13 +74,37 @@ pub trait Provider: Send + Sync {
 
 /// Resolve an apiKey reference. `$VAR` / `${VAR}` → env var value (empty if unset); a bare literal is
 /// returned verbatim. This is the exact rule the .pi extensions rely on.
+///
+/// Q4: when a `$VAR` / `${VAR}` env var is unset or empty, falls back to the same key read from
+/// `~/.pi/agent/auth.json` (the documented auth path — see `.env.example`). This makes the in-UI
+/// key setter (`POST /api/provider/key`) actually work without a restart: the route writes the
+/// key to auth.json under the env-var name, and this resolver consults auth.json when the env
+/// var is missing. The auth.json read is cached in a `OnceLock` for the process life (see
+/// `auth` module ponytail ceiling); a restart picks up POST-written keys.
 pub fn resolve_api_key(reference: &str) -> String {
     let r = reference.trim();
     if let Some(var) = r.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        return std::env::var(var).unwrap_or_default();
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        // Env var missing/empty → fall back to auth.json (keyed by the same var name).
+        if let Some(key) = crate::auth::lookup_key(var) {
+            return key;
+        }
+        return String::new();
     }
     if let Some(var) = r.strip_prefix('$') {
-        return std::env::var(var).unwrap_or_default();
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        if let Some(key) = crate::auth::lookup_key(var) {
+            return key;
+        }
+        return String::new();
     }
     r.to_string()
 }
@@ -120,8 +145,108 @@ pub(crate) fn request_timeout() -> Duration {
 
 // ---- catalog (port of the .pi provider registrations + types.ts PROVIDERS) ----
 
+/// C6: the named gateway presets the UI offers when the gateway provider is selected. Each
+/// preset pre-fills the base URL + key ref so the operator doesn't have to look them up. The
+/// preset IDs are persisted in `GatewayConfig::presets` so the UI can pre-select the operator's
+/// last choice on reload. `custom` is the empty preset (the operator fills in both fields).
+pub const GATEWAY_PRESET_CUSTOM: &str = "custom";
+pub const GATEWAY_PRESET_OMNIROUTE: &str = "omniroute";
+pub const GATEWAY_PRESET_OPENROUTER_GW: &str = "openrouter-gw";
+pub const GATEWAY_PRESET_LITELLM: &str = "litellm";
+
+/// One named gateway preset. `key_ref` is an env-var NAME (e.g. `OMNIROUTE_API_KEY`), NOT a `$VAR`
+/// reference — `provider_endpoint` wraps it in `$` so `resolve_api_key` resolves it via the same
+/// env → auth.json fallback as the other providers. The key value is NEVER stored.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GatewayPreset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub base_url: &'static str,
+    pub key_ref: &'static str,
+}
+
+/// The named gateway presets, in UI order. `custom` is last so it's the "none of the above" option.
+/// These are the three named presets the spec calls out (OmniRoute + OpenRouter-as-gateway +
+/// LiteLLM); any other OpenAI-compatible gateway uses `custom`.
+pub fn gateway_presets() -> Vec<GatewayPreset> {
+    vec![
+        GatewayPreset {
+            id: GATEWAY_PRESET_OMNIROUTE,
+            label: "OmniRoute",
+            base_url: "https://api.omniroute.ai/v1",
+            key_ref: "OMNIROUTE_API_KEY",
+        },
+        GatewayPreset {
+            id: GATEWAY_PRESET_OPENROUTER_GW,
+            label: "OpenRouter (gateway mode)",
+            base_url: "https://openrouter.ai/api/v1",
+            key_ref: "OPENROUTER_API_KEY",
+        },
+        GatewayPreset {
+            id: GATEWAY_PRESET_LITELLM,
+            label: "LiteLLM",
+            base_url: "http://localhost:4000/v1",
+            key_ref: "LITELLM_API_KEY",
+        },
+        GatewayPreset {
+            id: GATEWAY_PRESET_CUSTOM,
+            label: "Custom",
+            base_url: "",
+            key_ref: "",
+        },
+    ]
+}
+
+/// C6: validate a gateway base URL for SSRF safety. Allowed:
+/// - `https://` anywhere (encrypted, trusted).
+/// - `http://localhost` / `http://127.0.0.1` (loopback) — permits a local LiteLLM proxy.
+///
+/// Rejected: any other `http://` (would let a misconfigured gateway point dotz at an arbitrary
+/// internal host). Empty/whitespace is rejected (the POST handler requires a non-empty URL).
+/// Returns `Ok(())` on accept, `Err(message)` on reject.
+pub fn validate_gateway_base_url(url: &str) -> Result<(), String> {
+    let u = url.trim();
+    if u.is_empty() {
+        return Err("baseUrl is required".to_string());
+    }
+    if let Some(rest) = u.strip_prefix("https://") {
+        if rest.is_empty() {
+            return Err("baseUrl 'https://' has no host".to_string());
+        }
+        return Ok(());
+    }
+    if let Some(rest) = u.strip_prefix("http://") {
+        // Permit only loopback hosts so a misconfigured gateway can't redirect dotz at an
+        // arbitrary internal endpoint. `localhost` / `127.0.0.1` (optionally with a port) are
+        // the documented local LiteLLM proxy hosts.
+        let host = rest
+            .split('/')
+            .next()
+            .unwrap_or(rest)
+            .split(':')
+            .next()
+            .unwrap_or(rest);
+        if host == "localhost" || host == "127.0.0.1" {
+            return Ok(());
+        }
+        return Err(format!(
+            "baseUrl must be https://, or http://localhost / http://127.0.0.1 \
+             (a non-loopback http:// URL is SSRF-unsafe): {u}"
+        ));
+    }
+    Err(format!(
+        "baseUrl must start with https:// or http://localhost / http://127.0.0.1: {u}"
+    ))
+}
+
 /// Base URL + apiKey-reference for each OpenAI-compatible provider. `local` honors
 /// DOTZ_LOCAL_BASE_URL / DOTZ_LOCAL_API_KEY exactly like .pi/extensions/local.
+/// C6: `gateway` reads its base URL + key ref from the persisted `GatewayConfig` (not a hardcoded
+/// map) so the operator points it at OmniRoute / OpenRouter-as-gateway / LiteLLM / any
+/// OpenAI-compat gateway. The key ref is stored as a bare env-var NAME in config; we wrap it in
+/// `$` here so `resolve_api_key` resolves it via the same env → auth.json fallback as the others.
+/// Returns None when the gateway section is missing/empty (so the gateway is inert until
+/// configured — `resolve` returns None and the session/subagent code surfaces a clear error).
 fn provider_endpoint(provider: &str) -> Option<(String, String)> {
     let pair = |u: &str, k: &str| Some((u.to_string(), k.to_string()));
     match provider {
@@ -155,6 +280,26 @@ fn provider_endpoint(provider: &str) -> Option<(String, String)> {
             "https://generativelanguage.googleapis.com/v1beta",
             "$GEMINI_API_KEY",
         ),
+        // C6: gateway reads its endpoint from the persisted config. The key ref is a bare env-var
+        // name in config (e.g. "OMNIROUTE_API_KEY"); we wrap it in `$` so resolve_api_key applies
+        // the env → auth.json fallback. An empty/missing section returns None (gateway is inert).
+        "gateway" => {
+            let gw = crate::config::load().gateway?;
+            if gw.is_empty() {
+                return None;
+            }
+            let base = gw.base_url.trim().to_string();
+            if base.is_empty() {
+                return None;
+            }
+            let key_ref = if gw.api_key_ref.trim().is_empty() {
+                // No key configured — empty ref → resolve_api_key returns empty (no-auth gateway).
+                String::new()
+            } else {
+                format!("${}", gw.api_key_ref.trim())
+            };
+            Some((base, key_ref))
+        }
         _ => None,
     }
 }
@@ -856,5 +1001,367 @@ mod tests {
     fn truncate_returns_input_unchanged_when_within_cap() {
         assert_eq!(truncate("hello", 400), "hello");
         assert_eq!(truncate("", 400), "");
+    }
+
+    /// Q4 acceptance: when a `$VAR` env var is unset, `resolve_api_key` must fall back to the
+    /// same key read from `~/.pi/agent/auth.json`. This is what makes the in-UI key setter
+    /// (POST /api/provider/key) actually work without a restart: the route writes the key to
+    /// auth.json under the env-var name, and this resolver consults auth.json when the env var
+    /// is missing. Uses a unique test var + temp auth dir so it never touches the operator's
+    /// real keys or env. Serialized so the env var + cache state don't race with other tests.
+    #[test]
+    fn resolve_api_key_falls_back_to_auth_json() {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+
+        // Unique var name + key value so this test is isolated from real env + other tests.
+        let var = format!("DOTZ_TEST_FALLBACK_KEY_{}", uuid::Uuid::new_v4());
+        let key_val = format!("sk-fallback-from-auth-json-{}", uuid::Uuid::new_v4());
+
+        // Ensure the env var is unset (save + restore prior value if any).
+        let prev = std::env::var(&var).ok();
+        std::env::remove_var(&var);
+
+        // Point auth.json at a temp dir + write the key under our test var.
+        let dir =
+            std::env::temp_dir().join(format!("dotz-resolve-fallback-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev_auth_dir = std::env::var("DOTZ_PI_AGENT_DIR").ok();
+        std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string());
+        let auth = serde_json::json!({ var.clone(): key_val });
+        std::fs::write(dir.join("auth.json"), auth.to_string()).unwrap();
+        crate::auth::refresh_cache();
+
+        // resolve_api_key("$VAR") with the env var UNSET must return the auth.json value.
+        let resolved = resolve_api_key(&format!("${var}"));
+        assert_eq!(
+            resolved, key_val,
+            "resolve_api_key must fall back to auth.json when the env var is unset"
+        );
+
+        // The ${VAR} form must also fall back.
+        let resolved_brace = resolve_api_key(&format!("${{{var}}}"));
+        assert_eq!(
+            resolved_brace, key_val,
+            "resolve_api_key must fall back to auth.json for the ${{VAR}} form too"
+        );
+
+        // Cleanup: restore env + remove temp dir.
+        match prev {
+            Some(p) => std::env::set_var(&var, p),
+            None => std::env::remove_var(&var),
+        }
+        match prev_auth_dir {
+            Some(p) => std::env::set_var("DOTZ_PI_AGENT_DIR", p),
+            None => std::env::remove_var("DOTZ_PI_AGENT_DIR"),
+        }
+        crate::auth::refresh_cache();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Q4: when the env var IS set, it must take precedence over auth.json (env wins). This
+    /// preserves the existing behavior so an operator who exports a key in their shell is not
+    /// silently overridden by a stale auth.json entry. Same isolation as the fallback test.
+    #[test]
+    fn resolve_api_key_env_takes_precedence_over_auth_json() {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+
+        let var = format!("DOTZ_TEST_PRECEDENCE_KEY_{}", uuid::Uuid::new_v4());
+        let env_val = format!("sk-from-env-{}", uuid::Uuid::new_v4());
+        let auth_val = format!("sk-from-auth-{}", uuid::Uuid::new_v4());
+
+        let prev = std::env::var(&var).ok();
+        std::env::set_var(&var, &env_val);
+
+        let dir =
+            std::env::temp_dir().join(format!("dotz-resolve-precedence-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev_auth_dir = std::env::var("DOTZ_PI_AGENT_DIR").ok();
+        std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string());
+        std::fs::write(
+            dir.join("auth.json"),
+            serde_json::json!({ var.clone(): auth_val }).to_string(),
+        )
+        .unwrap();
+        crate::auth::refresh_cache();
+
+        // Env var wins.
+        let resolved = resolve_api_key(&format!("${var}"));
+        assert_eq!(
+            resolved, env_val,
+            "env var must take precedence over auth.json"
+        );
+
+        match prev {
+            Some(p) => std::env::set_var(&var, p),
+            None => std::env::remove_var(&var),
+        }
+        match prev_auth_dir {
+            Some(p) => std::env::set_var("DOTZ_PI_AGENT_DIR", p),
+            None => std::env::remove_var("DOTZ_PI_AGENT_DIR"),
+        }
+        crate::auth::refresh_cache();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- C6: gateway provider (OmniRoute / OpenRouter-as-gateway / LiteLLM passthrough) ----
+    //
+    // The gateway endpoint reads from the persisted config (DOTZ_CONFIG_DIR → ~/.dotz/config.json),
+    // so these tests point DOTZ_CONFIG_DIR at a fresh temp dir + serialize on the shared config-dir
+    // lock so they never race with config::tests or touch the operator's real config.
+
+    /// RAII guard: point `DOTZ_CONFIG_DIR` at a fresh temp dir for the lifetime of the guard, and
+    /// on drop restore the prior env value + remove the temp dir. Using a guard (instead of a
+    /// closure) keeps the test body simple when we want to assert between setup and teardown.
+    struct ConfigDirGuard {
+        dir: std::path::PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn setup_config_dir() -> ConfigDirGuard {
+        let g = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "dotz-provider-gateway-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string());
+        ConfigDirGuard { dir, _guard: g }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            // The setup set it; restore is handled by the test below. Defensive: clear it.
+            std::env::remove_var("DOTZ_CONFIG_DIR");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// C6: when a gateway config is set, `provider_endpoint("gateway")` returns the configured
+    /// base URL + the `$KEY_REF` form (so resolve_api_key applies the env → auth.json fallback).
+    #[test]
+    fn gateway_endpoint_reads_from_config() {
+        let guard = setup_config_dir();
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        // Write a config with the gateway section.
+        std::fs::write(
+            guard.dir.join("config.json"),
+            serde_json::json!({
+                "provider": "ollama",
+                "executiveModel": "glm-5.2",
+                "subagentModel": "minimax-m3",
+                "thinkingLevel": "high",
+                "gateway": {
+                    "baseUrl": "https://api.omniroute.ai/v1",
+                    "apiKeyRef": "OMNIROUTE_API_KEY",
+                    "presets": ["omniroute"],
+                    "modelAllowlist": ["gpt-5.6"],
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (base, key) = provider_endpoint("gateway").expect("configured gateway must resolve");
+        assert_eq!(base, "https://api.omniroute.ai/v1");
+        assert_eq!(
+            key, "$OMNIROUTE_API_KEY",
+            "key ref must be wrapped in $ so resolve_api_key resolves it"
+        );
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        drop(guard);
+    }
+
+    /// C6: when no gateway config is present, `provider_endpoint("gateway")` returns None so the
+    /// gateway is inert (resolve() returns None, the session surfaces a clear error). This is the
+    /// graceful-degradation contract: a gateway-free install is unchanged.
+    #[test]
+    fn gateway_endpoint_defaults_when_no_config() {
+        let guard = setup_config_dir();
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        // No config.json at all.
+        assert!(provider_endpoint("gateway").is_none(), "no config → None");
+
+        // A config WITHOUT a gateway section also → None.
+        std::fs::write(
+            guard.dir.join("config.json"),
+            serde_json::json!({
+                "provider": "ollama",
+                "executiveModel": "glm-5.2",
+                "subagentModel": "minimax-m3",
+                "thinkingLevel": "high"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            provider_endpoint("gateway").is_none(),
+            "config without gateway section → None"
+        );
+
+        // An empty gateway section → None (is_empty() true).
+        std::fs::write(
+            guard.dir.join("config.json"),
+            serde_json::json!({
+                "provider": "ollama",
+                "executiveModel": "glm-5.2",
+                "subagentModel": "minimax-m3",
+                "thinkingLevel": "high",
+                "gateway": { "baseUrl": "", "apiKeyRef": "", "presets": [], "modelAllowlist": [] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            provider_endpoint("gateway").is_none(),
+            "empty gateway section → None (inert)"
+        );
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        drop(guard);
+    }
+
+    /// C6: `resolve("gateway", ...)` returns a ResolvedModel wired to the configured endpoint, and
+    /// the gateway routes to the OpenAI-compat adapter (adapter_for("gateway") → OpenAiChat).
+    #[test]
+    fn resolve_returns_metadata_for_configured_gateway() {
+        let guard = setup_config_dir();
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        std::fs::write(
+            guard.dir.join("config.json"),
+            serde_json::json!({
+                "provider": "ollama",
+                "executiveModel": "glm-5.2",
+                "subagentModel": "minimax-m3",
+                "thinkingLevel": "high",
+                "gateway": {
+                    "baseUrl": "http://localhost:4000/v1",
+                    "apiKeyRef": "LITELLM_API_KEY",
+                    "presets": ["litellm"],
+                    "modelAllowlist": ["gpt-5.6"],
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let m = resolve("gateway", "gpt-5.6").expect("configured gateway must resolve");
+        assert_eq!(m.provider, "gateway");
+        assert_eq!(m.model_id, "gpt-5.6");
+        assert_eq!(m.base_url, "http://localhost:4000/v1");
+        assert_eq!(m.api_key_ref, "$LITELLM_API_KEY");
+        // Gateway is OpenAI-compatible → adapter_for routes it to OpenAiChat (not a native one).
+        let _adapter = adapter_for("gateway"); // must not panic; type is opaque Box<dyn Provider>.
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        drop(guard);
+    }
+
+    /// C6: `resolve("gateway", ...)` returns None when no gateway is configured (so the session
+    /// surfaces a clear "not resolvable" error instead of sending an empty-key request).
+    #[test]
+    fn resolve_returns_none_for_unconfigured_gateway() {
+        let guard = setup_config_dir();
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        assert!(resolve("gateway", "gpt-5.6").is_none());
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
+            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+        }
+        drop(guard);
+    }
+
+    /// C6: the named presets include OmniRoute + OpenRouter (gateway mode) + LiteLLM + Custom, in
+    /// that order. These pre-fill the base URL + key ref so the operator doesn't have to look them up.
+    #[test]
+    fn gateway_presets_include_omniroute_openrouter_litellm() {
+        let presets = gateway_presets();
+        let ids: Vec<&str> = presets.iter().map(|p| p.id).collect();
+        assert!(ids.contains(&"omniroute"), "presets must include omniroute");
+        assert!(
+            ids.contains(&"openrouter-gw"),
+            "presets must include openrouter-gw"
+        );
+        assert!(ids.contains(&"litellm"), "presets must include litellm");
+        assert!(ids.contains(&"custom"), "presets must include custom");
+        // OmniRoute preset pre-fills the documented endpoint + key var.
+        let omniroute = presets
+            .iter()
+            .find(|p| p.id == "omniroute")
+            .expect("omniroute preset");
+        assert_eq!(omniroute.base_url, "https://api.omniroute.ai/v1");
+        assert_eq!(omniroute.key_ref, "OMNIROUTE_API_KEY");
+        // OpenRouter-as-gateway preset.
+        let or = presets
+            .iter()
+            .find(|p| p.id == "openrouter-gw")
+            .expect("openrouter-gw preset");
+        assert_eq!(or.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(or.key_ref, "OPENROUTER_API_KEY");
+        // LiteLLM preset (local proxy).
+        let litellm = presets
+            .iter()
+            .find(|p| p.id == "litellm")
+            .expect("litellm preset");
+        assert_eq!(litellm.base_url, "http://localhost:4000/v1");
+        assert_eq!(litellm.key_ref, "LITELLM_API_KEY");
+    }
+
+    /// C6: SSRF validation — https:// anywhere is accepted, http://localhost / 127.0.0.1 is
+    /// accepted (local LiteLLM proxy), any other http:// is REJECTED so a misconfigured gateway
+    /// can't redirect dotz at an arbitrary internal endpoint.
+    #[test]
+    fn validate_gateway_base_url_accepts_https_and_loopback_http() {
+        assert!(validate_gateway_base_url("https://api.omniroute.ai/v1").is_ok());
+        assert!(validate_gateway_base_url("https://openrouter.ai/api/v1").is_ok());
+        assert!(validate_gateway_base_url("http://localhost:4000/v1").is_ok());
+        assert!(validate_gateway_base_url("http://127.0.0.1:4000/v1").is_ok());
+        assert!(validate_gateway_base_url("http://localhost").is_ok());
+    }
+
+    /// C6: SSRF validation — non-loopback http:// is REJECTED (the SSRF guard).
+    #[test]
+    fn validate_gateway_base_url_rejects_non_loopback_http() {
+        assert!(validate_gateway_base_url("http://api.omniroute.ai/v1").is_err());
+        assert!(validate_gateway_base_url("http://192.168.1.5/v1").is_err());
+        assert!(validate_gateway_base_url("http://10.0.0.1/v1").is_err());
+        assert!(validate_gateway_base_url("http://169.254.169.254/latest/meta-data/").is_err());
+        // The error message names the SSRF concern so it's actionable.
+        let err = validate_gateway_base_url("http://api.example.com/v1").unwrap_err();
+        assert!(
+            err.contains("SSRF"),
+            "error must name the SSRF concern: {err}"
+        );
+    }
+
+    /// C6: SSRF validation — empty / non-http(s) / malformed schemes are rejected.
+    #[test]
+    fn validate_gateway_base_url_rejects_empty_and_non_http_schemes() {
+        assert!(validate_gateway_base_url("").is_err());
+        assert!(validate_gateway_base_url("   ").is_err());
+        assert!(validate_gateway_base_url("ftp://example.com/v1").is_err());
+        assert!(
+            validate_gateway_base_url("api.omniroute.ai/v1").is_err(),
+            "no scheme"
+        );
+        assert!(
+            validate_gateway_base_url("https://").is_err(),
+            "https:// with no host"
+        );
     }
 }

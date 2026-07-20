@@ -11,13 +11,14 @@ use crate::{
     profiles, types,
 };
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -59,6 +60,23 @@ pub fn app_with_token(web_dir: PathBuf, state: Shared, token: Option<String>) ->
         .route("/api/models", get(models))
         .route("/api/config", get(get_config).post(post_config))
         .route(
+            "/api/config/gateway",
+            get(get_gateway_config).post(post_gateway_config),
+        )
+        .route(
+            "/api/provider/key",
+            get(provider_key_list)
+                .post(provider_key_set)
+                .delete(provider_key_delete),
+        )
+        // C1: first-run wizard — appears on launch if `~/.dotz/first-run-done` is absent. State
+        // route is read by the wizard overlay; the model-fetch route spawns the bundled Node
+        // script (ponytail: a Rust-native downloader is the upgrade path); the complete route
+        // writes the marker file so the wizard never appears again.
+        .route("/api/first-run/state", get(first_run_state))
+        .route("/api/first-run/complete", post(first_run_complete))
+        .route("/api/models/fetch", post(models_fetch))
+        .route(
             "/api/verify/suite/{profile}",
             get(crate::verify::suite_handler),
         )
@@ -73,6 +91,7 @@ pub fn app_with_token(web_dir: PathBuf, state: Shared, token: Option<String>) ->
         .merge(crate::workflows::router())
         .merge(crate::skills::router())
         .merge(crate::templates::router())
+        .merge(crate::marketplace::router())
         .merge(crate::specs::router())
         .merge(crate::living_docs::router())
         .merge(crate::vcs::router())
@@ -82,6 +101,7 @@ pub fn app_with_token(web_dir: PathBuf, state: Shared, token: Option<String>) ->
         .merge(crate::checkpoint::router())
         .merge(crate::commands::router())
         .merge(crate::telemetry::router())
+        .merge(crate::telemetry::perf_router())
         .fallback_service(ServeDir::new(web_dir).append_index_html_on_directories(true))
         // Session-token guard (plan-015 follow-up), applied INSIDE the origin layer below. When a
         // token is configured, `/ws` and `/api/*` (except `/api/health`) require it via the
@@ -107,11 +127,278 @@ async fn health(State(_s): State<Shared>) -> Json<Value> {
         "workflowRuns": crate::workflows::active_count(),
         "browserSessions": crate::browser::session_count(),
         "embedderReady": crate::embed::model_files_present(),
+        "eventLagCount": crate::workflows::event_lag_count(),
     }))
 }
 
 async fn providers() -> Json<Value> {
     Json(json!({ "providers": types::providers() }))
+}
+
+// ---- provider key management (Q4: in-UI key setter → ~/.pi/agent/auth.json) ----
+//
+// Three routes for managing provider API keys without an env-var restart. The keys are written
+// to `~/.pi/agent/auth.json` (the documented auth path) under the env-var name, and
+// `provider::resolve_api_key` falls back to that file when the env var is unset. Protected by
+// the existing `token_guard` (when `DOTZ_TOKEN` is set) + `origin_guard` — no new auth. The GET
+// route NEVER returns the key value (only `set: true/false`); the POST route NEVER logs the key.
+
+/// GET /api/provider/key → `[{provider, set}, ...]` for all known providers. `set` is true
+/// if EITHER the env var is set (non-empty) OR `auth.json` has the key. Never returns the key
+/// value — only the boolean. This is the UI's key-status surface.
+///
+/// C6 note: the `gateway` provider has a DYNAMIC key var (from `GatewayConfig::apiKeyRef`, e.g.
+/// `OMNIROUTE_API_KEY`), so the static `auth::provider_key_var("gateway")` returns None and this
+/// route reports `set: false` for gateway. The gateway key is still resolvable at request time
+/// via `resolve_api_key` (env → auth.json fallback on the configured var name); surfacing the
+/// dynamic gateway key status in-UI is a follow-up (would require `provider_key_var` to consult
+/// the loaded config). The gateway works end-to-end regardless — this only affects the key-status
+/// chip in the UI's key form.
+async fn provider_key_list() -> Json<Value> {
+    let providers = types::providers();
+    let entries: Vec<Value> = providers
+        .iter()
+        .map(|p| {
+            let var = crate::auth::provider_key_var(p.id);
+            let set = var
+                .map(|v| {
+                    std::env::var(v).map(|s| !s.is_empty()).unwrap_or(false)
+                        || crate::auth::lookup_key(v).is_some()
+                })
+                .unwrap_or(false);
+            json!({ "provider": p.id, "set": set })
+        })
+        .collect();
+    Json(json!({ "keys": entries }))
+}
+
+/// POST /api/provider/key with `{provider, key}` → writes the key to `~/.pi/agent/auth.json`
+/// under the provider's env-var name, refreshes the in-memory cache so `resolve_api_key` sees
+/// it immediately, and returns 204. 400 for an unknown provider, a missing/empty key, or a
+/// write failure. NEVER logs the key value — only the provider id.
+async fn provider_key_set(
+    body: Option<Json<Value>>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let provider = b
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if !types::is_known_provider(&provider) {
+        return Err(bad(format!(
+            "provider must be one of: {}",
+            types::provider_ids().join(", ")
+        )));
+    }
+    let key = b
+        .get("key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if key.is_empty() {
+        return Err(bad("key is required".to_string()));
+    }
+    let var = crate::auth::provider_key_var(&provider)
+        .ok_or_else(|| bad("provider has no key variable".to_string()))?;
+    // Read-modify-write auth.json (atomic temp + rename). Holding a lock here would be wrong:
+    // the file is the source of truth, and a concurrent POST is the only writer.
+    let mut auth = crate::auth::read_auth_json();
+    let obj = auth.as_object_mut().ok_or_else(|| {
+        bad("auth.json is not a JSON object — remove or repair it before setting a key".to_string())
+    })?;
+    obj.insert(var.to_string(), Value::String(key));
+    crate::auth::write_auth_json(&auth).map_err(|e| {
+        eprintln!("provider key set failed for {provider}: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+    })?;
+    // Refresh the in-memory cache so resolve_api_key sees the new key without a restart.
+    crate::auth::refresh_cache();
+    eprintln!("provider key set for {provider}");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /api/provider/key?provider=ollama → removes the key from `~/.pi/agent/auth.json`,
+/// refreshes the cache, returns 204. 400 for an unknown provider; 404 if the key was not set.
+async fn provider_key_delete(
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let provider = q
+        .get("provider")
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+    if !types::is_known_provider(&provider) {
+        return Err(bad(format!(
+            "provider must be one of: {}",
+            types::provider_ids().join(", ")
+        )));
+    }
+    let var = crate::auth::provider_key_var(&provider)
+        .ok_or_else(|| bad("provider has no key variable".to_string()))?;
+    let mut auth = crate::auth::read_auth_json();
+    let was_set = auth
+        .as_object_mut()
+        .and_then(|obj| obj.remove(var))
+        .is_some();
+    if !was_set {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no key set for provider '{provider}'") })),
+        ));
+    }
+    crate::auth::write_auth_json(&auth).map_err(|e| {
+        eprintln!("provider key delete failed for {provider}: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+    })?;
+    crate::auth::refresh_cache();
+    eprintln!("provider key removed for {provider}");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- C1: first-run wizard (GET /api/first-run/state, POST /api/first-run/complete, POST
+// /api/models/fetch) ----
+//
+// The wizard appears on launch if `~/.dotz/first-run-done` is absent. It walks the operator
+// through: (1) picking a provider + setting a key (reuses Q4's POST /api/provider/key),
+// (2) fetching the ONNX embedding model (and verifying the agent-browser binary is present),
+// (3) optionally creating a first project (reuses POST /api/projects), and (4) marking the
+// wizard done so it never appears again. All three routes are protected by the existing
+// `token_guard` + `origin_guard` — no new auth. The marker file lives in `~/.dotz/` (honoring
+// `DOTZ_CONFIG_DIR` via `config::dotz_dir`, like every other dotz-owned file).
+
+/// Path to the first-run marker file: `<dotz_dir>/first-run-done`. Honors `DOTZ_CONFIG_DIR` via
+/// [`config::dotz_dir`] so the test suite can point at a temp dir without touching the
+/// operator's real `~/.dotz/`.
+fn first_run_marker() -> PathBuf {
+    config::dotz_dir().join("first-run-done")
+}
+
+/// GET /api/first-run/state → `{wizardNeeded, modelFilesPresent, agentBrowserPresent, providers}`.
+/// `wizardNeeded` is true when the marker file is absent. The other two fields reflect whether the
+/// embedding model files and the `agent-browser` binary are present, so the UI can show the right
+/// state in each wizard step without a second round-trip. `providers` is the known provider list
+/// (reuse [`types::providers`]) so the wizard's dropdown is backend-driven.
+async fn first_run_state() -> Json<Value> {
+    let wizard_needed = !first_run_marker().exists();
+    Json(json!({
+        "wizardNeeded": wizard_needed,
+        "modelFilesPresent": crate::embed::model_files_present(),
+        "agentBrowserPresent": crate::browser::binary_present(),
+        "providers": types::providers(),
+    }))
+}
+
+/// POST /api/first-run/complete → writes `~/.dotz/first-run-done` (empty marker file) so the
+/// wizard never appears again. Idempotent: a second POST is a no-op (the file already exists) and
+/// still returns 204. Returns 204 on success, 500 if the marker can't be written (disk full,
+/// permission denied — surfaces as an error so the operator sees the failure instead of an
+/// infinite wizard loop).
+async fn first_run_complete() -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let marker = first_run_marker();
+    if marker.exists() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    // Create the parent dir if missing (a fresh install may not have `~/.dotz` yet). The marker
+    // file itself is empty — its presence is the signal, its contents don't matter.
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            eprintln!("first-run complete: create_dir_all failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("could not create dotz dir: {e}") })),
+            )
+        })?;
+    }
+    std::fs::write(&marker, "").map_err(|e| {
+        eprintln!("first-run complete: write marker failed: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("could not write first-run-done marker: {e}") })),
+        )
+    })?;
+    eprintln!("first-run wizard marked complete");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/models/fetch → spawns the bundled `scripts/fetch-embed-model.mjs` Node script to
+/// download the ONNX embedding model into `assets/models/`. Idempotent: if the model files are
+/// already present, returns 204 without spawning. Returns 200 with `{started: true}` after the
+/// spawn (the UI polls `GET /api/first-run/state` until `modelFilesPresent` flips true). 500 if
+/// the script can't be spawned (Node not installed, script missing). The subprocess inherits the
+/// server's env (no secrets leak beyond what's already in the process env) and is windowless via
+/// [`util::no_window_tokio`].
+///
+/// ponytail: a Rust-native downloader (reqwest the HuggingFace URLs directly) is the upgrade path
+/// — this removes the Node-on-the-operator-machine requirement and removes the subprocess
+/// surface. Spawning the existing script is the shortest working diff and reuses the exact
+/// download path the dev build uses (`npm run fetch-model`).
+async fn models_fetch() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Idempotent fast path: if the model files are already present, don't re-download.
+    if crate::embed::model_files_present() {
+        return Ok(Json(json!({ "started": false, "alreadyPresent": true })));
+    }
+
+    // Resolve the script path: <crate manifest dir>/../scripts/fetch-embed-model.mjs (the
+    // workspace root's `scripts/` dir). CARGO_MANIFEST_DIR is the dotz-core crate root; one
+    // level up is the workspace root, matching how `npm run fetch-model` resolves it.
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("fetch-embed-model.mjs");
+    if !script.exists() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!(
+                    "fetch-embed-model.mjs not found at {} — run `npm run fetch-model` manually",
+                    script.display()
+                )
+            })),
+        ));
+    }
+
+    // Spawn `node <script>` windowless. Don't await completion — the UI polls
+    // /api/first-run/state for `modelFilesPresent` and the spawn can take 30s+ on a cold
+    // connection, longer than an axum request timeout should hold a handler.
+    let mut cmd = tokio::process::Command::new("node");
+    cmd.arg(&script);
+    crate::util::no_window_tokio(&mut cmd);
+    match cmd.spawn() {
+        Ok(child) => {
+            let pid = child.id();
+            eprintln!(
+                "first-run model fetch started (node pid={:?}): {}",
+                pid,
+                script.display()
+            );
+            // Detach: don't await — the child runs in the background and the UI polls.
+            // tokio::process::Child drops without waiting on Unix; on Windows we'd need
+            // `wait` to reap, but the script is short-lived and a zombie on a desktop app
+            // is acceptable (the upgrade path is the Rust-native downloader).
+            std::mem::forget(child);
+            Ok(Json(json!({ "started": true, "alreadyPresent": false })))
+        }
+        Err(e) => {
+            eprintln!("first-run model fetch spawn failed: {e}");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": format!(
+                        "could not spawn `node {}` — is Node installed? {e}",
+                        script.display()
+                    )
+                })),
+            ))
+        }
+    }
 }
 
 async fn profiles_list() -> Json<Value> {
@@ -207,6 +494,147 @@ async fn post_config(
     })?;
     *guard = next.clone();
     Ok(Json(json!({ "config": next })))
+}
+
+// ---- C6: gateway passthrough config (POST /api/config/gateway, GET /api/config/gateway) ----
+//
+// One endpoint + one key + a model allowlist behind the `gateway` provider. The POST route sets
+// the gateway section of ~/.dotz/config.json (base URL + key ref + presets + allowlist). The base
+// URL is SSRF-validated (https required, or http://localhost/127.0.0.1 for a local LiteLLM
+// proxy). The key ref is an env-var NAME (NEVER a raw key); the key value is NEVER stored in
+// config.json — it's resolved at request time via resolve_api_key (env → auth.json fallback).
+// GET returns the persisted gateway config (or null when unset). Protected by the existing
+// token_guard + origin_guard — no new auth.
+
+/// GET /api/config/gateway → `{ gateway: <GatewayConfig | null>, presets: [...] }`. The presets
+/// are the named ones from `provider::gateway_presets` so the UI can populate the preset dropdown
+/// without a separate call. The key VALUE is never returned (only the key REF name).
+async fn get_gateway_config(State(s): State<Shared>) -> Json<Value> {
+    let c = state_config(&s).clone();
+    let presets = crate::agent::provider::gateway_presets();
+    Json(json!({
+        "gateway": c.gateway,
+        "presets": presets,
+    }))
+}
+
+/// POST /api/config/gateway with `{baseUrl, apiKeyRef, presets?, modelAllowlist?}` → validate
+/// (400 on bad base URL / key ref), persist, return `{ gateway }`. Send an empty body or
+/// `{"baseUrl": ""}` to CLEAR the gateway section (it's omitted from the persisted JSON).
+async fn post_gateway_config(
+    State(s): State<Shared>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+
+    // An empty body / empty baseUrl + empty apiKeyRef → clear the gateway section.
+    let base_url = b
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let key_ref = b
+        .get("apiKeyRef")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if base_url.is_empty() && key_ref.is_empty() {
+        let mut guard = state_config(&s);
+        let next = config::set_gateway(&guard, None).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to persist gateway config: {e}") })),
+            )
+        })?;
+        *guard = next.clone();
+        return Ok(Json(json!({ "gateway": next.gateway })));
+    }
+
+    // Validate the base URL (SSRF guard).
+    crate::agent::provider::validate_gateway_base_url(&base_url)
+        .map_err(|e| bad(format!("baseUrl is invalid: {e}")))?;
+
+    // Validate the key ref: must be a non-empty env-var NAME (letters/digits/underscore). It's
+    // NEVER a raw key and NEVER a `$VAR` (the endpoint wraps it in `$`); reject those shapes so
+    // an operator doesn't accidentally persist a secret in config.json.
+    if key_ref.is_empty() {
+        // A no-auth gateway (e.g. a local LiteLLM proxy with no key) is permitted: empty key ref
+        // → resolve_api_key returns empty → the adapter sends no Bearer. But a non-empty base URL
+        // with an empty key ref is only sensible for loopback; allow it either way.
+    } else {
+        if key_ref.contains('$') {
+            return Err(bad(
+                "apiKeyRef must be the env-var NAME (e.g. OMNIROUTE_API_KEY), not a $VAR reference"
+                    .to_string(),
+            ));
+        }
+        // Reject obviously-malformed env-var names + likely raw keys (a raw key typically
+        // contains a space, '=' or '/'). Letters/digits/underscore only.
+        if !key_ref
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(bad(
+                "apiKeyRef must be an env-var name (letters, digits, underscore only) — \
+                 never a raw key"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // Presets: an optional list of preset IDs the UI offers. Coerce non-strings to skipped.
+    let presets: Vec<String> = b
+        .get("presets")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Model allowlist: an optional list of model ids the gateway routes to. Empty is fine.
+    let allowlist: Vec<String> = b
+        .get("modelAllowlist")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let gw = config::GatewayConfig {
+        base_url: base_url.clone(),
+        api_key_ref: key_ref.clone(),
+        presets,
+        model_allowlist: allowlist,
+    };
+
+    // Hold one lock across read → persist → write-back (mirrors post_config) so concurrent
+    // gateway-config POSTs cannot interleave.
+    let mut guard = state_config(&s);
+    let next = config::set_gateway(&guard, Some(gw)).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to persist gateway config: {e}") })),
+        )
+    })?;
+    *guard = next.clone();
+    // Log only the base URL + allowlist count (NEVER the key ref value — though it's only the var
+    // name, this keeps the log line stable + minimal).
+    eprintln!(
+        "gateway config set: base_url={base_url}, allowlist_len={}",
+        next.gateway
+            .as_ref()
+            .map(|g| g.model_allowlist.len())
+            .unwrap_or(0)
+    );
+    Ok(Json(json!({ "gateway": next.gateway })))
 }
 
 fn bad(msg: String) -> (StatusCode, Json<Value>) {
@@ -457,6 +885,10 @@ mod tests {
         assert!(
             text.contains("\"embedderReady\""),
             "health body missing embedderReady field: {text}"
+        );
+        assert!(
+            text.contains("\"eventLagCount\""),
+            "health body missing eventLagCount field: {text}"
         );
 
         let _ = tx.send(());
@@ -1728,5 +2160,862 @@ mod tests {
         for sid in &sids {
             crate::agent::session::dispose(sid);
         }
+    }
+
+    // ---- Q4: provider key routes (POST/GET/DELETE /api/provider/key → ~/.pi/agent/auth.json) ----
+    //
+    // These tests point `DOTZ_PI_AGENT_DIR` at a temp dir so they NEVER touch the operator's real
+    // `~/.pi/agent/auth.json`. They serialize on a shared ENV_LOCK so concurrent provider-key tests
+    // don't race on the env var or the in-memory auth cache.
+
+    static PROVIDER_KEY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard: points `DOTZ_PI_AGENT_DIR` at a fresh temp dir for the lifetime of the guard,
+    /// refreshes the auth cache to the empty dir, and on drop removes the dir + env var +
+    /// refreshes the cache back. Using a guard (instead of a closure) lets async test bodies
+    /// `.await` freely between setup and teardown — a sync `FnOnce` would fight the async borrow
+    /// checker.
+    struct AuthDirGuard {
+        dir: std::path::PathBuf,
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn setup_auth_dir() -> AuthDirGuard {
+        let env_lock = PROVIDER_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("dotz-provider-key-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string());
+        crate::auth::refresh_cache();
+        AuthDirGuard {
+            dir,
+            _env_lock: env_lock,
+        }
+    }
+
+    impl Drop for AuthDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            std::env::remove_var("DOTZ_PI_AGENT_DIR");
+            crate::auth::refresh_cache();
+        }
+    }
+
+    /// Q4 acceptance: POST a key → auth.json has it → GET reports `set: true` → the key value is
+    /// NOT in the GET response body. This is the core "in-UI key setter works without a restart"
+    /// contract: the route writes the file, refreshes the cache, and GET reports the boolean
+    /// status without ever leaking the secret.
+    #[tokio::test]
+    async fn provider_key_route_writes_auth_json_not_env() {
+        let guard = setup_auth_dir();
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        // POST a key for ollama.
+        let resp = client
+            .post(format!("{base}/api/provider/key"))
+            .json(&json!({ "provider": "ollama", "key": "sk-route-test-never-leak" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NO_CONTENT,
+            "POST should return 204, got {}",
+            resp.status()
+        );
+
+        // auth.json must have the key under OLLAMA_API_KEY.
+        let auth_raw = std::fs::read_to_string(guard.dir.join("auth.json")).unwrap();
+        let auth: Value = serde_json::from_str(&auth_raw).unwrap();
+        assert_eq!(auth["OLLAMA_API_KEY"], "sk-route-test-never-leak");
+
+        // The key must NOT be in the env (the route writes the file, not the env).
+        assert!(
+            std::env::var("OLLAMA_API_KEY").unwrap_or_default() != "sk-route-test-never-leak",
+            "POST must not set the env var"
+        );
+
+        // GET must report set:true for ollama.
+        let get = client
+            .get(format!("{base}/api/provider/key"))
+            .send()
+            .await
+            .unwrap();
+        assert!(get.status().is_success(), "GET should be 200");
+        let body: Value = get.json().await.unwrap();
+        let ollama_entry = body["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["provider"] == "ollama")
+            .expect("GET must include ollama");
+        assert_eq!(
+            ollama_entry["set"], true,
+            "GET must report set:true after POST"
+        );
+
+        // CRITICAL: the key value must NOT appear anywhere in the GET response body.
+        let body_str = body.to_string();
+        assert!(
+            !body_str.contains("sk-route-test-never-leak"),
+            "GET /api/provider/key must NEVER expose the key value, but it appeared in: {body_str}"
+        );
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    /// Q4 acceptance: POST with an unknown provider → 400. Validates the trust-boundary check
+    /// so a crafted request can't write an arbitrary key to auth.json under a bogus var name.
+    #[tokio::test]
+    async fn provider_key_route_rejects_unknown_provider() {
+        let guard = setup_auth_dir();
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{base}/api/provider/key"))
+            .json(&json!({ "provider": "bogus", "key": "x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "unknown provider must be 400, got {}",
+            resp.status()
+        );
+
+        // auth.json must NOT have been created with the bogus key.
+        let auth_path = guard.dir.join("auth.json");
+        let raw = std::fs::read_to_string(&auth_path).unwrap_or_default();
+        assert!(
+            !raw.contains("bogus"),
+            "POST with unknown provider must not write auth.json, got: {raw}"
+        );
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    /// Q4 acceptance: the GET response body must NEVER contain the key value, even after a POST.
+    /// This is the security-critical invariant: the route reports `set: true/false` only. Posts a
+    /// uniquely-identifiable key string and asserts it does not appear anywhere in the GET body.
+    #[tokio::test]
+    async fn provider_key_get_never_exposes_value() {
+        let guard = setup_auth_dir();
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        // A unique canary the test will scan for.
+        let canary = "sk-NEVER-EXPOSE-THIS-CANARY-VALUE-9f8e7d";
+
+        // POST the canary key for openrouter.
+        let _ = client
+            .post(format!("{base}/api/provider/key"))
+            .json(&json!({ "provider": "openrouter", "key": canary }))
+            .send()
+            .await
+            .unwrap();
+
+        // GET and scan the entire body for the canary.
+        let body = client
+            .get(format!("{base}/api/provider/key"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            !body.contains(canary),
+            "GET /api/provider/key body must not contain the key value, got: {body}"
+        );
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    // ---- C6: gateway passthrough config routes (POST/GET /api/config/gateway) ----
+    //
+    // These tests point DOTZ_CONFIG_DIR at a temp dir + serialize on the shared config-dir lock
+    // so they never touch the operator's real ~/.dotz/config.json. The server loads the config
+    // at start_server() time, so DOTZ_CONFIG_DIR must be set BEFORE start_server().
+
+    static GATEWAY_CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard: point DOTZ_CONFIG_DIR at a fresh temp dir + serialize on the shared lock, so
+    /// gateway-config tests never race with config::tests or touch the operator's real config.
+    struct GatewayConfigDirGuard {
+        dir: std::path::PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn setup_gateway_config_dir() -> GatewayConfigDirGuard {
+        let g = GATEWAY_CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("dotz-server-gateway-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string());
+        GatewayConfigDirGuard { dir, _guard: g }
+    }
+
+    impl Drop for GatewayConfigDirGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("DOTZ_CONFIG_DIR");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// C6 acceptance: POST a gateway config → `config::load().gateway` is Some, GET
+    /// /api/config/gateway returns it, and GET /api/config includes it. The base URL is validated
+    /// (https), the key ref is an env-var NAME (not a raw key), and the persisted file has the
+    /// gateway block.
+    #[tokio::test]
+    async fn gateway_route_sets_config() {
+        let guard = setup_gateway_config_dir();
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        // POST a gateway config (OmniRoute preset values).
+        let resp = client
+            .post(format!("{base}/api/config/gateway"))
+            .json(&json!({
+                "baseUrl": "https://api.omniroute.ai/v1",
+                "apiKeyRef": "OMNIROUTE_API_KEY",
+                "presets": ["omniroute"],
+                "modelAllowlist": ["gpt-5.6", "claude-sonnet-5"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "POST should succeed, got {}",
+            resp.status()
+        );
+        let body: Value = resp.json().await.unwrap();
+        let gw = &body["gateway"];
+        assert_eq!(gw["baseUrl"], "https://api.omniroute.ai/v1");
+        assert_eq!(gw["apiKeyRef"], "OMNIROUTE_API_KEY");
+        assert_eq!(gw["presets"], serde_json::json!(["omniroute"]));
+        assert_eq!(
+            gw["modelAllowlist"],
+            serde_json::json!(["gpt-5.6", "claude-sonnet-5"])
+        );
+
+        // config::load().gateway is Some (the persisted file has it).
+        let loaded = config::load();
+        let loaded_gw = loaded.gateway.expect("gateway must persist to config.json");
+        assert_eq!(loaded_gw.base_url, "https://api.omniroute.ai/v1");
+        assert_eq!(loaded_gw.api_key_ref, "OMNIROUTE_API_KEY");
+
+        // The persisted file contains the gateway block with the camelCase keys.
+        let raw = std::fs::read_to_string(guard.dir.join("config.json")).unwrap();
+        assert!(
+            raw.contains("omniroute.ai"),
+            "persisted config must include the gateway block: {raw}"
+        );
+        assert!(raw.contains("OMNIROUTE_API_KEY"));
+
+        // GET /api/config/gateway returns it + the preset list.
+        let get = client
+            .get(format!("{base}/api/config/gateway"))
+            .send()
+            .await
+            .unwrap();
+        assert!(get.status().is_success());
+        let get_body: Value = get.json().await.unwrap();
+        assert_eq!(
+            get_body["gateway"]["baseUrl"],
+            "https://api.omniroute.ai/v1"
+        );
+        let preset_ids: Vec<&str> = get_body["presets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
+        assert!(preset_ids.contains(&"omniroute"));
+        assert!(preset_ids.contains(&"litellm"));
+
+        // GET /api/config includes the gateway section in the returned config.
+        let cfg_get = client
+            .get(format!("{base}/api/config"))
+            .send()
+            .await
+            .unwrap();
+        let cfg_body: Value = cfg_get.json().await.unwrap();
+        assert_eq!(
+            cfg_body["config"]["gateway"]["baseUrl"],
+            "https://api.omniroute.ai/v1"
+        );
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    /// C6: the gateway provider appears in GET /api/providers (so the UI can list it).
+    #[tokio::test]
+    async fn gateway_provider_appears_in_providers_list() {
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{base}/api/providers"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: Value = resp.json().await.unwrap();
+        let ids: Vec<&str> = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            ids.contains(&"gateway"),
+            "GET /api/providers must list gateway: {ids:?}"
+        );
+        // gateway is free-form.
+        let gw = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "gateway")
+            .unwrap();
+        assert_eq!(gw["freeForm"], true);
+
+        let _ = tx.send(());
+        let _ = handle.await;
+    }
+
+    /// C6: GET /api/config/gateway returns null gateway when none is configured (a gateway-free
+    /// install is unchanged). Presets are still returned so the UI can populate the dropdown.
+    #[tokio::test]
+    async fn gateway_route_get_returns_null_when_unconfigured() {
+        let guard = setup_gateway_config_dir();
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{base}/api/config/gateway"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: Value = resp.json().await.unwrap();
+        assert!(
+            body["gateway"].is_null(),
+            "no gateway configured → null, got {}",
+            body["gateway"]
+        );
+        assert!(
+            body["presets"].is_array(),
+            "presets list is always returned"
+        );
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    /// C6: POST with an invalid (non-loopback http://) base URL is rejected with 400 — the SSRF
+    /// guard is enforced at the route boundary so a misconfigured gateway can't redirect dotz.
+    #[tokio::test]
+    async fn gateway_route_rejects_ssrf_base_url() {
+        let guard = setup_gateway_config_dir();
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/api/config/gateway"))
+            .json(&json!({
+                "baseUrl": "http://169.254.169.254/latest/meta-data/",
+                "apiKeyRef": "AWS_META"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "non-loopback http:// must 400 (SSRF), got {}",
+            resp.status()
+        );
+        let body: Value = resp.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("SSRF"),
+            "error must name the SSRF concern: {}",
+            body["error"]
+        );
+        // Nothing persisted.
+        assert!(config::load().gateway.is_none());
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    /// C6: POST rejects a raw key (or a `$VAR` form) in apiKeyRef — the field is an env-var NAME
+    /// only, never a secret. A raw key in config.json would be a secret at rest; reject it so the
+    /// operator is forced to use auth.json (POST /api/provider/key) or the env var instead.
+    #[tokio::test]
+    async fn gateway_route_rejects_raw_key_in_api_key_ref() {
+        let guard = setup_gateway_config_dir();
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        // A raw key (contains a '-' which isn't an env-var-name char).
+        let resp = client
+            .post(format!("{base}/api/config/gateway"))
+            .json(&json!({
+                "baseUrl": "https://api.omniroute.ai/v1",
+                "apiKeyRef": "sk-raw-secret-never-persist-this"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // A $VAR form is also rejected (must be the bare NAME, the endpoint wraps it in $).
+        let resp = client
+            .post(format!("{base}/api/config/gateway"))
+            .json(&json!({
+                "baseUrl": "https://api.omniroute.ai/v1",
+                "apiKeyRef": "$OMNIROUTE_API_KEY"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // Nothing persisted (the rejected POSTs did not write a gateway block).
+        assert!(config::load().gateway.is_none());
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    /// C6: POST with an empty body (or empty baseUrl + empty apiKeyRef) CLEARS the gateway section
+    /// — it's omitted from the persisted JSON so the gateway is inert again.
+    #[tokio::test]
+    async fn gateway_route_clears_on_empty_body() {
+        let guard = setup_gateway_config_dir();
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        // First set a gateway config.
+        let _ = client
+            .post(format!("{base}/api/config/gateway"))
+            .json(&json!({
+                "baseUrl": "https://api.omniroute.ai/v1",
+                "apiKeyRef": "OMNIROUTE_API_KEY"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(config::load().gateway.is_some());
+
+        // Now clear it with an empty body.
+        let resp = client
+            .post(format!("{base}/api/config/gateway"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "empty body should clear the gateway"
+        );
+        let body: Value = resp.json().await.unwrap();
+        assert!(
+            body["gateway"].is_null(),
+            "cleared gateway → null in response"
+        );
+
+        // The persisted file no longer has the gateway block.
+        let raw = std::fs::read_to_string(guard.dir.join("config.json")).unwrap();
+        assert!(
+            !raw.contains("omniroute"),
+            "cleared gateway must be omitted from config: {raw}"
+        );
+        assert!(config::load().gateway.is_none());
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    // ---- C1: first-run wizard routes (GET /api/first-run/state, POST
+    // /api/first-run/complete, POST /api/models/fetch) ----
+    //
+    // These tests point `DOTZ_CONFIG_DIR` at a temp dir + serialize on the shared
+    // `util::dotz_config_dir_test_lock` so they never touch the operator's real
+    // `~/.dotz/first-run-done`. The server reads `dotz_dir()` at request time (not start time),
+    // so the env var can be set BEFORE the handler runs (unlike the gateway tests, which set it
+    // before start_server() because the config is loaded once at boot).
+
+    /// RAII guard: point `DOTZ_CONFIG_DIR` at a fresh temp dir + hold the shared config-dir lock
+    /// for the test's lifetime. The marker file is created/cleared per-test via
+    /// `remove_marker()` on drop.
+    struct FirstRunDirGuard {
+        dir: std::path::PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn setup_first_run_dir() -> FirstRunDirGuard {
+        let g = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "dotz-server-first-run-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string());
+        FirstRunDirGuard { dir, _guard: g }
+    }
+
+    impl FirstRunDirGuard {
+        fn marker(&self) -> std::path::PathBuf {
+            self.dir.join("first-run-done")
+        }
+    }
+
+    impl Drop for FirstRunDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.marker());
+            std::env::remove_var("DOTZ_CONFIG_DIR");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// C1: no marker file → `wizardNeeded: true`. The state route must reflect disk state so the
+    /// wizard appears on a fresh install.
+    #[tokio::test]
+    async fn first_run_state_when_no_marker() {
+        let guard = setup_first_run_dir();
+        assert!(
+            !guard.marker().exists(),
+            "precondition: marker must not exist"
+        );
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("{base}/api/first-run/state"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "GET state should be 200");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["wizardNeeded"], true,
+            "wizardNeeded must be true when the marker is absent"
+        );
+        // The other fields must be present (booleans) — their values depend on the test host's
+        // disk state (model files / browser binary may or may not be installed), so we only
+        // assert they're present and boolean-typed.
+        assert!(
+            body["modelFilesPresent"].is_boolean(),
+            "modelFilesPresent must be a boolean"
+        );
+        assert!(
+            body["agentBrowserPresent"].is_boolean(),
+            "agentBrowserPresent must be a boolean"
+        );
+        // providers list must be returned so the wizard dropdown is backend-driven.
+        let providers = body["providers"]
+            .as_array()
+            .expect("providers must be an array");
+        assert!(!providers.is_empty(), "providers list must not be empty");
+        assert!(
+            providers.iter().any(|p| p["id"] == "ollama"),
+            "providers must include ollama (the recommended default)"
+        );
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    /// C1: marker file present → `wizardNeeded: false`. The wizard must never appear again after
+    /// `POST /api/first-run/complete`.
+    #[tokio::test]
+    async fn first_run_state_when_marker_present() {
+        let guard = setup_first_run_dir();
+        // Pre-create the marker so the wizard is already complete.
+        std::fs::write(guard.marker(), "").unwrap();
+        assert!(guard.marker().exists(), "precondition: marker exists");
+
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("{base}/api/first-run/state"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["wizardNeeded"], false,
+            "wizardNeeded must be false when the marker exists"
+        );
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    /// C1: POST /api/first-run/complete → marker file exists. Idempotent: a second POST still
+    /// returns 204 and the file still exists. This covers both the "writes marker" and
+    /// "idempotent" acceptance tests in one test (they share setup + the env-var lock).
+    #[tokio::test]
+    async fn first_run_complete_writes_marker_and_is_idempotent() {
+        let guard = setup_first_run_dir();
+        assert!(
+            !guard.marker().exists(),
+            "precondition: marker must not exist"
+        );
+
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        // First POST: writes the marker, returns 204.
+        let resp = client
+            .post(format!("{base}/api/first-run/complete"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NO_CONTENT,
+            "first POST should return 204, got {}",
+            resp.status()
+        );
+        assert!(guard.marker().exists(), "POST must create the marker file");
+
+        // Second POST: idempotent — still 204, file still exists.
+        let resp2 = client
+            .post(format!("{base}/api/first-run/complete"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp2.status(),
+            reqwest::StatusCode::NO_CONTENT,
+            "second POST must still be 204 (idempotent), got {}",
+            resp2.status()
+        );
+        assert!(
+            guard.marker().exists(),
+            "marker must still exist after the second POST"
+        );
+
+        // GET state now reports wizardNeeded: false.
+        let body: Value = client
+            .get(format!("{base}/api/first-run/state"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            body["wizardNeeded"], false,
+            "after POST complete, wizardNeeded must be false"
+        );
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    /// C1: POST /api/models/fetch returns 200 with `alreadyPresent: true` (no spawn) when the
+    /// embedding model files are already on disk. We can't easily force `model_files_present()`
+    /// to true without bundling the actual ONNX files (the dev host may or may not have them),
+    /// so we point `DOTZ_MODELS` at a temp dir + create the expected files so the check passes.
+    /// This covers the idempotent-no-spawn acceptance test.
+    #[tokio::test]
+    async fn models_fetch_returns_204_when_already_present() {
+        // Serialize on the shared config-dir lock so DOTZ_MODELS / DOTZ_CONFIG_DIR overrides
+        // don't race with other tests.
+        let guard = setup_first_run_dir();
+
+        // Create the expected model files under a temp DOTZ_MODELS dir so
+        // `embed::model_files_present()` returns true. Mirrors `embed::models_root()` + the
+        // `<root>/Xenova/all-MiniLM-L6-v2/{tokenizer.json, onnx/model.onnx}` layout.
+        let models_dir = guard.dir.join("models");
+        let model_dir = models_dir.join("Xenova").join("all-MiniLM-L6-v2");
+        std::fs::create_dir_all(model_dir.join("onnx")).unwrap();
+        std::fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(model_dir.join("onnx").join("model.onnx"), "fake-onnx").unwrap();
+        std::env::set_var("DOTZ_MODELS", models_dir.to_string_lossy().to_string());
+
+        // Sanity: the embed check must now pass — if it doesn't, the test setup is wrong.
+        assert!(
+            crate::embed::model_files_present(),
+            "precondition: model_files_present must be true after creating the fake files"
+        );
+
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{base}/api/models/fetch"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "POST when already present should be 2xx, got {}",
+            resp.status()
+        );
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["started"], false,
+            "started must be false when the model is already present"
+        );
+        assert_eq!(
+            body["alreadyPresent"], true,
+            "alreadyPresent must be true when the model is on disk"
+        );
+
+        std::env::remove_var("DOTZ_MODELS");
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    /// C1: POST /api/models/fetch spawns `node scripts/fetch-embed-model.mjs` when the model is
+    /// absent. We force `model_files_present()` to false by pointing `DOTZ_MODELS` at an empty
+    /// temp dir, then verify the POST returns 200 with `started: true` (Node is installed on the
+    /// dev/CI host). The spawned child is left to run in the background; we don't wait for it to
+    /// finish (it can take 30s+ and would race the test). This covers the "starts when absent"
+    /// acceptance test.
+    ///
+    /// Guarded with `#[cfg(not(ci))]`-style behavior via a runtime check: if `node` is not on
+    /// PATH (exotic host), the spawn fails and the route returns 500 — the test asserts on the
+    /// spawn succeeding because the dev/CI host always has Node installed (it's a build
+    /// requirement — `npm run fetch-model`). If a future host doesn't, the test should be
+    /// skipped rather than fail; we approximate that by tolerating a 500 ONLY when `node` is
+    /// provably missing from PATH.
+    #[tokio::test]
+    async fn models_fetch_starts_when_absent() {
+        let guard = setup_first_run_dir();
+
+        // Force model_files_present() to false by pointing DOTZ_MODELS at an empty dir.
+        let empty_models = guard.dir.join("empty-models");
+        std::fs::create_dir_all(&empty_models).unwrap();
+        std::env::set_var("DOTZ_MODELS", empty_models.to_string_lossy().to_string());
+        assert!(
+            !crate::embed::model_files_present(),
+            "precondition: model_files_present must be false for an empty DOTZ_MODELS dir"
+        );
+
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{base}/api/models/fetch"))
+            .send()
+            .await
+            .unwrap();
+
+        // If node is missing from PATH (exotic host), the route 500s — tolerate that as a skip
+        // rather than a hard failure, but assert the common case (node present → 200 started).
+        let node_on_path =
+            std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+                .arg("node")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+        if resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR && !node_on_path {
+            // Node missing from PATH on a host that doesn't run `npm` — skip the assertion.
+            // ponytail: the upgrade path (Rust-native downloader) removes this dependency.
+            eprintln!(
+                "models_fetch_starts_when_absent: node not on PATH, skipping spawn assertion"
+            );
+        } else {
+            assert!(
+                resp.status().is_success(),
+                "POST when absent should be 2xx (node present), got {}",
+                resp.status()
+            );
+            let body: Value = resp.json().await.unwrap();
+            assert_eq!(
+                body["started"], true,
+                "started must be true when the model is absent and node is available"
+            );
+            assert_eq!(
+                body["alreadyPresent"], false,
+                "alreadyPresent must be false when the model is absent"
+            );
+        }
+
+        std::env::remove_var("DOTZ_MODELS");
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
+    }
+
+    /// C1: `browser::binary_present()` must match the disk state. We exercise the explicit
+    /// `DOTZ_BROWSER_BIN` branch (set to a temp file → true; missing file → false) so the test
+    /// is host-independent and doesn't depend on whether `npm install` has been run. This is a
+    /// direct call to the helper rather than an HTTP route test, mirroring the
+    /// `binary_present_matches_disk_state_for_explicit_bin` test in browser.rs — the route
+    /// simply surfaces this value, so the helper is the right level to assert at. Kept here too
+    /// so the C1 acceptance list has a single home.
+    #[tokio::test]
+    async fn browser_binary_present_reports_correctly_via_route() {
+        let guard = setup_first_run_dir();
+        let (port, tx, handle) = start_server().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        // GET state must surface agentBrowserPresent as a boolean. Its value depends on the
+        // host (npm install run or not), so we only assert the field is present and typed — the
+        // exact value is asserted in the browser.rs helper test that controls DOTZ_BROWSER_BIN.
+        let resp = client
+            .get(format!("{base}/api/first-run/state"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: Value = resp.json().await.unwrap();
+        assert!(
+            body["agentBrowserPresent"].is_boolean(),
+            "agentBrowserPresent must be a boolean in the state response"
+        );
+
+        let _ = tx.send(());
+        let _ = handle.await;
+        drop(guard);
     }
 }

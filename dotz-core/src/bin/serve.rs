@@ -23,6 +23,11 @@ async fn main() {
             "dotz-core session token disabled (set DOTZ_TOKEN to require a bearer token on /api + /ws)"
         ),
     }
+    // Pre-load the ONNX embedder on a blocking worker so the first chat turn after launch
+    // doesn't pay the multi-second session load. Runs concurrently with the server bind below
+    // — the server accepts connections immediately, the embedder just finishes loading in the
+    // background. Safe when model files are missing (logs a warn, leaves the global None).
+    spawn_embedder_warmup();
     if let Err(e) = dotz_core::server::serve_with_shutdown_addr_token(
         addr,
         web_dir.into(),
@@ -34,6 +39,18 @@ async fn main() {
         eprintln!("{}", format_startup_error(&e, &addr));
         std::process::exit(1);
     }
+}
+
+/// Pre-load the ONNX embedder session + tokenizer on a blocking worker thread so the first
+/// `memory::recall_async()` call after launch doesn't pay the multi-second ONNX session load
+/// on the first chat turn. Spawned BEFORE the server bind is awaited so the warm-up runs
+/// concurrently with axum binding — the server accepts connections immediately, the embedder
+/// just finishes loading in the background. Safe to call when model files are missing (logs a
+/// warning, leaves the global `None`). Idempotent.
+fn spawn_embedder_warmup() {
+    tokio::task::spawn_blocking(|| {
+        dotz_core::memory::warm_embedder();
+    });
 }
 
 /// Format a server startup `io::Error` into a clear, actionable message. A bare OS error like

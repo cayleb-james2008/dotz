@@ -1,0 +1,5 @@
+{
+  "cold_start_ms": null,
+  "measured_at": null,
+  "note": "Run 'cargo bench --bench cold_start -- --save-baseline main' on a clean main branch to populate this baseline. CI compares against this once cold_start_ms is set; until then the bench step is non-gating and only records the number."
+}

@@ -103,6 +103,12 @@ fn home_join(rest: &[&str]) -> PathBuf {
 /// Ordered scan roots, LOWEST priority first (later roots overwrite earlier same-named skills).
 /// Mirrors `scanRoots()` in skills.ts exactly, including the `DOTZ_SKILLS_PATHS` override appended
 /// at the end (highest priority). Read fresh each load so env overrides take effect.
+///
+/// C3 (MCP): a `~/.dotz/mcp-prompts/` root is appended near the end so MCP prompt templates
+/// (synced by a future C3 follow-up from `mcp::client::list_prompts` into per-server
+/// `SKILL.md` files) are surfaced THROUGH `skills.rs` — the single skill-discovery path.
+/// `# ponytail:` full prompt sync (polling connected servers, generating SKILL.md files) is the
+/// follow-up; for now we only add the scan root so a manually-populated dir works.
 fn scan_roots() -> Vec<(PathBuf, &'static str)> {
     let pi = pi_dir();
     let mut roots: Vec<(PathBuf, &'static str)> = vec![
@@ -134,7 +140,32 @@ fn scan_roots() -> Vec<(PathBuf, &'static str)> {
         (home_join(&[".config", "opencode", "skills"]), "opencode"),
         (pi.join("skills"), "dotz"),
         (user_skills_dir(), "dotz"),
+        // C3: MCP prompt templates live under `~/.dotz/mcp-prompts/` (per-server SKILL.md files
+        // generated from `mcp::client::list_prompts`). Surfaces THROUGH skills.rs — not a
+        // parallel loader.
+        (crate::config::dotz_dir().join("mcp-prompts"), "mcp"),
+        // C8: marketplace presets live under `~/.dotz/presets/<name>/` and may ship a
+        // `SKILL.md` (skill presets) or nested `skills/<name>/SKILL.md` trees. Surfaced THROUGH
+        // skills.rs — the single skill-discovery path — so an installed preset's skills appear
+        // in the index + system prompt exactly like a bundled `.pi` skill. Source label
+        // "preset" so the UI can distinguish them from bundled/curated pools.
+        (crate::config::dotz_dir().join("presets"), "preset"),
+        // C4: plugins live under `~/.dotz/plugins/<name>/`. Each plugin dir is a scan root so its
+        // `SKILL.md` (the plugin's skill body) is loaded THROUGH skills.rs — the single
+        // skill-discovery path. The plugin manifest (`plugin.toml`) is parsed by `plugins.rs`;
+        // the `SKILL.md` is parsed by this module. The source is `"plugin"` so the UI can
+        // distinguish plugin-sourced skills.
+        //
+        // We add the individual plugin dirs (not the `plugins/` root) so each plugin's `SKILL.md`
+        // is discovered with its parent-dir name as the skill name fallback (matching the other
+        // scan roots). `plugins::plugin_dirs()` returns the list of direct child dirs.
+        // # ponytail: the plugin scan is a separate root per plugin dir; ceiling = if plugins
+        // grow to thousands, batch them under one root + walk. For now, one root per plugin is
+        // fine (the typical install has <10 plugins).
     ];
+    for plugin_dir in crate::plugins::plugin_dirs() {
+        roots.push((plugin_dir, "plugin"));
+    }
     // Operator override: DOTZ_SKILLS_PATHS=dir1<sep>dir2 (path.delimiter — ';' on Windows,
     // ':' on Unix). Each existing dir is appended at the end (highest priority).
     if let Ok(extra) = std::env::var("DOTZ_SKILLS_PATHS") {
@@ -150,6 +181,14 @@ fn extra_skills_roots(raw: &str) -> Vec<(PathBuf, &'static str)> {
         .filter(|p| !p.as_os_str().is_empty() && p.exists())
         .map(|p| (p, "dotz"))
         .collect()
+}
+
+/// Test-only public accessor for [`scan_roots`], so the marketplace integration test can assert
+/// the presets root is included without duplicating the root-resolution logic. Hidden from
+/// production callers via the `#[cfg(test)]` gate.
+#[cfg(test)]
+pub fn scan_roots_public() -> Vec<(PathBuf, &'static str)> {
+    scan_roots()
 }
 
 /// Recursively collect files named (case-insensitively) `skill.md` under `root`. Unreadable dirs

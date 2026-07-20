@@ -26,6 +26,26 @@ pub fn model_files_present() -> bool {
     base.join("tokenizer.json").exists() && base.join("onnx").join("model.onnx").exists()
 }
 
+/// Pre-load the ONNX session + tokenizer so the first embed call doesn't pay the multi-second
+/// load cost. Safe to call when model files are missing — logs a warning and returns. This
+/// loads + drops the `Embedder` (warming OS file caches + validating the model); it does NOT
+/// install into the `memory.rs` global. To make the first `embed_text` call <50ms, call
+/// [`crate::memory::warm_embedder`] instead, which loads once and installs into the shared
+/// global. This void form exists for the standalone `serve` bin + readiness probes that don't
+/// share the memory global, and for the missing-model acceptance test.
+pub fn warm() {
+    if !model_files_present() {
+        eprintln!(
+            "embedder warm-up skipped: bundled model files not present (run `npm run fetch-model`)"
+        );
+        return;
+    }
+    match Embedder::load() {
+        Ok(_) => eprintln!("embedder warmed up"),
+        Err(e) => eprintln!("embedder warm-up failed (first turn will be slower): {e}"),
+    }
+}
+
 /// assets/models root: DOTZ_MODELS (the models dir) | DOTZ_ASSETS/models | <cwd>/assets/models |
 /// <workspace>/assets/models derived from the crate manifest dir. The manifest fallback makes
 /// tests and binaries runnable from the `dotz-core` crate dir as well as the workspace root.
@@ -269,6 +289,63 @@ mod tests {
             !model_files_present(),
             "bogus DOTZ_MODELS dir should report embedder not ready"
         );
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_MODELS", p),
+            None => std::env::remove_var("DOTZ_MODELS"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `warm()` must NOT panic when the bundled model files are missing — that's the expected
+    /// state on a fresh install before `npm run fetch-model` runs. It logs a warning and
+    /// returns, so the first chat turn after launch degrades to a lazy load instead of
+    /// crashing the server task. Uses the same `ENV_LOCK` serialization as
+    /// `model_files_present_matches_disk_state` so the bogus `DOTZ_MODELS` override does not
+    /// race with other tests sharing the process env.
+    #[test]
+    fn embed_warmup_with_missing_model_does_not_panic() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("DOTZ_MODELS").ok();
+        let tmp = std::env::temp_dir().join(format!(
+            "dotz-embed-warmup-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("DOTZ_MODELS", &tmp);
+        assert!(!model_files_present(), "precondition: model files absent");
+
+        // Must return cleanly — no panic, no Result to unwrap.
+        warm();
+
+        match prev {
+            Some(p) => std::env::set_var("DOTZ_MODELS", p),
+            None => std::env::remove_var("DOTZ_MODELS"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `warm()` with missing model files must return in well under the multi-second ONNX load
+    /// cost — the missing-files fast path (log + return) is what lets the server bind proceed
+    /// concurrently. If `warm()` blocked on a doomed load attempt, the spawn_blocking call in
+    /// `serve.rs` would still let the server bind, but a void caller that forgets
+    /// spawn_blocking would stall. This pins the fast-path ceiling at 50 ms so a future change
+    /// that accidentally moves the load before the present-check is caught.
+    #[test]
+    fn embed_warmup_missing_model_fast_path_returns_quickly() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("DOTZ_MODELS").ok();
+        let tmp =
+            std::env::temp_dir().join(format!("dotz-embed-warmup-fast-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("DOTZ_MODELS", &tmp);
+
+        let start = std::time::Instant::now();
+        warm();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "warm() missing-model fast path must return in <50ms (server-bind concurrent), got {elapsed:?}"
+        );
+
         match prev {
             Some(p) => std::env::set_var("DOTZ_MODELS", p),
             None => std::env::remove_var("DOTZ_MODELS"),

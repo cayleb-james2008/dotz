@@ -29,7 +29,10 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -352,6 +355,30 @@ pub(crate) fn emit_event(run_id: &str, event: Value) {
         "runId": run_id,
         "event": event,
     }));
+}
+
+/// Cumulative count of workflow events dropped because a subscriber's receiver lagged behind
+/// the broadcast channel (capacity 1024). A slow WebSocket client (or a flood of step_state
+/// events from a large fan-out) overflows the per-receiver buffer; tokio's broadcast returns
+/// `RecvError::Lagged(n)` and silently skips `n` events. This counter makes that loss
+/// observable so operators can see when the UI graph panel missed frames, and is surfaced in
+/// `/api/health` as `eventLagCount`. Incremented by the WebSocket fan-out's workflow receiver
+/// loop in `agent::mod::recv_workflow_broadcast`.
+static EVENT_LAG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Record that `n` workflow events were dropped due to receiver lag. Called by the WS fan-out
+/// when `broadcast::Receiver::recv()` returns `RecvError::Lagged(n)`. Public to the agent
+/// module's receiver loop; idempotent and lock-free.
+pub(crate) fn record_event_lag(n: u64) {
+    EVENT_LAG_COUNT.fetch_add(n, Ordering::Relaxed);
+    eprintln!("workflow event lag: {n} events dropped");
+}
+
+/// Total workflow events dropped to receiver lag since process start. Surfaced in
+/// `/api/health` as `eventLagCount` so operators and the UI can see when the broadcast channel
+/// overflowed. Monotonically increasing; never resets.
+pub fn event_lag_count() -> u64 {
+    EVENT_LAG_COUNT.load(Ordering::Relaxed)
 }
 
 fn emit_workflow_start(run: &WorkflowRun) {
@@ -4285,5 +4312,57 @@ mod tests {
             assert_eq!(read_all().len(), 1, "upsert should not duplicate");
             assert!(!tmp.exists(), "upsert atomic write must not leave .tmp");
         });
+    }
+
+    /// Q6 acceptance: when a workflow broadcast subscriber falls behind (the channel capacity
+    /// is 1024), `Receiver::recv()` returns `RecvError::Lagged(n)` and `n` events are silently
+    /// dropped. `record_event_lag(n)` must increment the global `EVENT_LAG_COUNT` so the loss
+    /// is observable in `/api/health` (`eventLagCount`) instead of silent. This test floods
+    /// more than 1024 events with a slow subscriber, confirms the receiver reports lag, and
+    /// confirms `event_lag_count()` increased by the lagged amount.
+    #[test]
+    fn broadcast_lag_increments_counter_and_warns() {
+        let before = event_lag_count();
+
+        // Subscribe a receiver we will NOT drain — its per-receiver buffer (capacity 1024)
+        // overflows once we send more than 1024 events.
+        let mut rx = subscribe_events();
+
+        // Flood enough events to overflow the 1024-buffer with margin. emit_event is the
+        // pub(crate) sender used by every workflow mutation; sending >1024 guarantees lag.
+        for _ in 0..1500 {
+            emit_event(
+                "lag-test-run",
+                json!({ "type": "step_state", "stepId": "x" }),
+            );
+        }
+
+        // The next recv() must report lag (not Ok, not Closed). tokio's broadcast receiver
+        // resyncs to the newest frame after lag, so a single recv() surfaces the total skipped.
+        let lag = match rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Lagged(n)) => n,
+            other => panic!(
+                "expected RecvError::Lagged after flooding >1024 events with a slow subscriber, got {other:?}"
+            ),
+        };
+        assert!(lag > 0, "lag count must be non-zero after overflow");
+
+        // record_event_lag is what the WS fan-out calls on Lagged(n). Simulate that call so the
+        // counter reflects the loss, then assert the public accessor observed it.
+        record_event_lag(lag);
+        let after = event_lag_count();
+        assert!(
+            after >= before + lag,
+            "event_lag_count must increase by the lagged amount: before={before}, lag={lag}, after={after}"
+        );
+    }
+
+    /// Q6: `event_lag_count()` must be a monotonically-increasing, lock-free read that never
+    /// panics and starts at 0 (or whatever the process baseline is). A plain call with no
+    /// prior lag must return a u64 — this pins the public surface so the health endpoint can
+    /// serialize it as `eventLagCount` without unwrapping.
+    #[test]
+    fn event_lag_count_returns_u64_without_panicking() {
+        let _ = event_lag_count();
     }
 }

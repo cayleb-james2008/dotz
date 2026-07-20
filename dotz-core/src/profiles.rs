@@ -81,6 +81,12 @@ const BACKEND_DOMAIN: &str = "\n\n## Domain: back-end, data & infra\nPrefer bori
 /// render time with the resolved design-systems dir, matching profiles.ts's interpolation.
 const DESIGN_DOMAIN: &str = "\n\n## Domain: graphic & visual design — Open Design (native to dotz)\ndotz ships Open Design natively. For ANY graphic/design artifact (UI, landing page, poster, logo, brand, deck, social card, illustration):\n\n1. PICK a design system. 150+ are bundled at {SYS}/<slug>/ (e.g. stripe, linear, apple, notion, vercel, figma). READ that system's DESIGN.md and tokens.css FIRST and honor its tokens — never invent off-brand colors/spacing. Browse them in the DESIGN panel or via GET /api/design/systems.\n2. USE design skills. 150+ Open Design skills are in the skill pool (source: design) — load the relevant one with the `skill` tool (e.g. canvas-design, brand-guidelines, ad-creative, article-magazine, algorithmic-art).\n3. AUTHOR a real, self-contained HTML/CSS artifact: paste the chosen system's :root tokens FIRST, then build everything with var(...). Avoid AI-slop (no purple gradients, fake glassmorphism, generic SaaS cards); meet WCAG contrast, real focus states, 44px touch targets.\n4. PREVIEW & EXPORT in the DESIGN panel — render the artifact, then export HTML or PDF.";
 
+const DEBUG_DOMAIN: &str = "\n\n## Domain: systematic debugging — root-cause only\nFollow the 4-phase root-cause loop: UNDERSTAND (read the code, form a hypothesis) -> REPRODUCE (a failing test or exact repro steps) -> ISOLATE (bisect to the smallest input that triggers it) -> FIX (the actual cause, not the symptom). Never patch a symptom — a symptom patch is a second bug wearing a coat. Write the regression test FIRST, watch it fail, then make it pass with the fix. If you cannot write a failing test, you have not isolated the bug. Use `memory_search` for prior fixes to the same symbol; do not re-derive a solved problem.";
+
+const REFACTOR_DOMAIN: &str = "\n\n## Domain: safe refactoring — behavior-preserving\nBehavior is frozen: the test suite MUST pass before and after every step. Smallest diff, one conceptual change per step, never mix a refactor with a feature or a fix. Commit between steps (`vcs_atomic_commit`) so a bad step is one revert away. Move in test-backed slices: if a slice has no test, write one before touching it. Use `read` + `grep` to confirm a symbol has no hidden callers before renaming. Never delete a test to make the build green — a deleted test is a regression you have already shipped.";
+
+const DOCS_DOMAIN: &str = "\n\n## Domain: documentation — living and accurate\nMaintain living docs: use `living_docs_read` and `living_docs_suggest` to keep docs in sync with code, and `agents_md` to keep project `AGENTS.md` doctrine current. Every code snippet in a doc must compile or run — a snippet that does not is worse than no snippet (it teaches the wrong thing). No marketing fluff; audience-aware tone (operator vs contributor vs end user). Update the doc as part of the change that made it stale, not in a separate pass. Prefer deletion over rot: a deleted stale doc cannot mislead.";
+
 /// The "New Model, New Project" domain doctrine (NEW-MODEL-NEW-PROJECT profile). Appended to
 /// WORKFLOW_DOCTRINE: one-line idea in, a complete open-source repo shipped to GitHub out.
 const NEW_MODEL_NEW_PROJECT_DOMAIN: &str = r#"
@@ -135,15 +141,30 @@ const PLAN_TOOLS: &[&str] = &[
     "vcs_status",
 ];
 
-/// True for one of the six known profile ids.
+/// True for one of the ten known profile ids.
 pub fn is_valid(id: &str) -> bool {
     matches!(
         id,
-        "workflow" | "solo" | "plan" | "frontend" | "backend" | "design" | "new-model-new-project"
+        "workflow"
+            | "solo"
+            | "plan"
+            | "frontend"
+            | "backend"
+            | "design"
+            | "new-model-new-project"
+            | "debug"
+            | "refactor"
+            | "docs"
     )
 }
 
 /// Resolve a profile by id (default = "workflow"), returning its runtime config.
+///
+/// # ponytail: a custom-profile loader that reads `~/.dotz/presets/<name>/manifest.json` and
+/// surfaces installed profile presets here is the C8 follow-up. For now the profile list is
+/// the hardcoded ten below; marketplace presets can only be prompts/agents/skills/design (which
+/// already scan dirs) — a profile preset installs to disk but doesn't appear in this list until
+/// the custom loader lands.
 pub fn get(id: Option<&str>) -> Profile {
     match id.unwrap_or("workflow") {
         "solo" => Profile {
@@ -182,6 +203,24 @@ pub fn get(id: Option<&str>) -> Profile {
             workflow: true,
             tools: None,
         },
+        "debug" => Profile {
+            id: "debug",
+            thinking_level: "high",
+            workflow: true,
+            tools: None,
+        },
+        "refactor" => Profile {
+            id: "refactor",
+            thinking_level: "high",
+            workflow: true,
+            tools: None,
+        },
+        "docs" => Profile {
+            id: "docs",
+            thinking_level: "medium",
+            workflow: true,
+            tools: None,
+        },
         _ => Profile {
             id: "workflow",
             thinking_level: "high",
@@ -204,6 +243,9 @@ pub fn doctrine(id: &str, design_systems_dir: &str) -> String {
             DESIGN_DOMAIN.replace("{SYS}", design_systems_dir)
         ),
         "new-model-new-project" => format!("{WORKFLOW_DOCTRINE}{NEW_MODEL_NEW_PROJECT_DOMAIN}"),
+        "debug" => format!("{WORKFLOW_DOCTRINE}{DEBUG_DOMAIN}"),
+        "refactor" => format!("{WORKFLOW_DOCTRINE}{REFACTOR_DOMAIN}"),
+        "docs" => format!("{WORKFLOW_DOCTRINE}{DOCS_DOMAIN}"),
         _ => WORKFLOW_DOCTRINE.to_string(),
     };
     format!("{ULTRA_CODE_OVERRIDE_DOCTRINE}\n\n{profile_doctrine}")
@@ -216,7 +258,10 @@ pub fn doctrine(id: &str, design_systems_dir: &str) -> String {
 pub fn max_rounds(id: &str) -> usize {
     match id {
         "new-model-new-project" => 400,
+        "refactor" => 40,
+        "debug" => 30,
         "workflow" => 60,
+        "docs" => 20,
         _ => 12,
     }
 }
@@ -232,7 +277,7 @@ pub struct ProfileSummary {
     pub model: ModelRef,
 }
 
-/// The 6 profiles, in order, matching PROFILES in profiles.ts. (default = "workflow")
+/// The 10 profiles, in order, matching PROFILES in profiles.ts. (default = "workflow")
 pub fn summaries() -> Vec<ProfileSummary> {
     let m = default_model;
     vec![
@@ -292,6 +337,30 @@ pub fn summaries() -> Vec<ProfileSummary> {
             thinking_level: "high",
             model: m(),
         },
+        ProfileSummary {
+            id: "debug",
+            name: "DEBUG",
+            tagline: "Systematic root-cause debugging · 4-phase",
+            workflow: true,
+            thinking_level: "high",
+            model: m(),
+        },
+        ProfileSummary {
+            id: "refactor",
+            name: "REFACTOR",
+            tagline: "Safe behavior-preserving refactoring",
+            workflow: true,
+            thinking_level: "high",
+            model: m(),
+        },
+        ProfileSummary {
+            id: "docs",
+            name: "DOCS",
+            tagline: "Living documentation authoring & maintenance",
+            workflow: true,
+            thinking_level: "medium",
+            model: m(),
+        },
     ]
 }
 
@@ -309,6 +378,9 @@ mod tests {
             "backend",
             "design",
             "new-model-new-project",
+            "debug",
+            "refactor",
+            "docs",
         ] {
             assert!(is_valid(id), "{id} should be valid");
         }
@@ -333,6 +405,9 @@ mod tests {
             "backend",
             "design",
             "new-model-new-project",
+            "debug",
+            "refactor",
+            "docs",
         ] {
             let d = doctrine(id, "C:/design-systems");
             assert!(
@@ -383,5 +458,58 @@ mod tests {
                 "pantheon doctrine must mention: {needle}"
             );
         }
+    }
+
+    /// The three Phase-1 quick-win profiles (debug / refactor / docs) must each resolve to a
+    /// `Profile` via `get()`, appear in `summaries()`, and carry a doctrine that builds on
+    /// WORKFLOW_DOCTRINE with their own domain suffix. Guards against a future edit that adds the
+    /// id to `is_valid` but forgets the `get()` arm or the doctrine branch.
+    #[test]
+    fn all_new_profiles_resolve() {
+        for id in ["debug", "refactor", "docs"] {
+            let p = get(Some(id));
+            assert_eq!(p.id, id, "get({id:?}) must return the {id} profile");
+            assert!(is_valid(id), "{id} must be in the is_valid allow-list");
+            assert!(
+                p.workflow,
+                "{id} is a workflow-domain profile (workflow=true)"
+            );
+            // Each new profile's doctrine starts with the Ultra Code override and contains both
+            // the shared WORKFLOW_DOCTRINE and its own domain heading.
+            let d = doctrine(id, "C:/design-systems");
+            assert!(
+                d.starts_with(ULTRA_CODE_OVERRIDE_DOCTRINE),
+                "{id} doctrine must start with the Ultra Code override"
+            );
+            assert!(
+                d.contains(WORKFLOW_DOCTRINE),
+                "{id} doctrine must build on WORKFLOW_DOCTRINE"
+            );
+        }
+        // Domain-specific needles: each doctrine must mention its own domain heading.
+        assert!(
+            doctrine("debug", "").contains("systematic debugging"),
+            "debug doctrine must mention systematic debugging"
+        );
+        assert!(
+            doctrine("refactor", "").contains("safe refactoring"),
+            "refactor doctrine must mention safe refactoring"
+        );
+        assert!(
+            doctrine("docs", "").contains("living and accurate"),
+            "docs doctrine must mention living and accurate"
+        );
+        // The three new ids appear in summaries() (the /api/profiles surface).
+        let ids: Vec<&str> = summaries().iter().map(|s| s.id).collect();
+        for id in ["debug", "refactor", "docs"] {
+            assert!(
+                ids.contains(&id),
+                "{id} must appear in summaries() (/api/profiles)"
+            );
+        }
+        // max_rounds returns the spec'd ceilings (debug 30, refactor 40, docs 20).
+        assert_eq!(max_rounds("debug"), 30);
+        assert_eq!(max_rounds("refactor"), 40);
+        assert_eq!(max_rounds("docs"), 20);
     }
 }

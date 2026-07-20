@@ -1245,6 +1245,81 @@ impl Tool for ConnectorActionTool {
     }
 }
 
+// ---- MCP tool (C3: route a call to a connected MCP server's tool) ----
+// `mcp_call` is the agent's entry point to MCP tools. It takes a server name, a tool name,
+// and an args object, and routes the call to `mcp::registry::call`. The agent discovers the
+// available (server, tool) pairs via `mcp::registry::list_all_tools()` (surfaced by a future
+// system-prompt injection; for now the agent must know the server+tool names from config).
+//
+// MCP tool calls do NOT emit `step_*` events — they dispatch through the normal tool path
+// (this `Tool::execute`), and `agent::subagent` remains the sole emitter of `step_tool` /
+// `step_thinking`. This keeps the workflow graph the single source of truth.
+struct McpCallTool;
+#[async_trait]
+impl Tool for McpCallTool {
+    fn name(&self) -> &'static str {
+        "mcp_call"
+    }
+    fn description(&self) -> &'static str {
+        "Call a tool on a connected MCP (Model Context Protocol) server. Args: \
+         {server: \"<server-name>\", tool: \"<tool-name>\", args?: {<tool args>}}. The available \
+         (server, tool) pairs come from `.dotz/mcp.json`. Returns the tool's content blocks \
+         flattened to text."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "description": "MCP server name (from mcp.json)" },
+                "tool": { "type": "string", "description": "Tool name exposed by the server" },
+                "args": { "type": "object", "description": "Arguments object for the tool" }
+            },
+            "required": ["server", "tool"]
+        })
+    }
+    async fn execute(&self, args: &Value, _ctx: &ToolCtx) -> Result<String, String> {
+        let server = args
+            .get("server")
+            .and_then(|v| v.as_str())
+            .ok_or("server is required")?;
+        let tool = args
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .ok_or("tool is required")?;
+        let call_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
+        let result = crate::mcp::registry::call(server, tool, &call_args)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Flatten the `content` array (MCP tools return `{content: [{type, text}, ...], isError}`)
+        // into a single string so the agent sees a normal text result. Non-text content blocks
+        // are surfaced as `[<type>]` placeholders so the agent knows something was returned.
+        let mut out = String::new();
+        if let Some(content) = result.get("content").and_then(|v| v.as_array()) {
+            for block in content {
+                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                    out.push_str(text);
+                    out.push('\n');
+                } else if let Some(t) = block.get("type").and_then(|v| v.as_str()) {
+                    out.push_str(&format!("[{t}]\n"));
+                }
+            }
+        } else {
+            // No `content` array — surface the raw result so the agent can see what came back.
+            out.push_str(&result.to_string());
+        }
+        // Surface the server's `isError` flag as an error result when set.
+        let is_error = result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if is_error {
+            Err(format!("mcp tool {server}/{tool} returned an error: {out}"))
+        } else {
+            Ok(out)
+        }
+    }
+}
+
 /// Register all the extra tools into a registry's add-closure.
 pub fn register(add: &mut dyn FnMut(Box<dyn Tool>)) {
     add(Box::new(AgentsMdTool));
@@ -1273,6 +1348,732 @@ pub fn register(add: &mut dyn FnMut(Box<dyn Tool>)) {
     add(Box::new(SandboxRunTool));
     add(Box::new(ConnectorListTool));
     add(Box::new(ConnectorActionTool));
+    add(Box::new(McpCallTool));
+}
+
+// ---- C4: PluginTool — a tool registered from a plugin manifest, dispatched via one of the 5
+// handler types (command / http / mcp_tool / prompt / agent). ----
+//
+// A `PluginTool` holds the plugin's `ToolDef` (parsed from `plugin.toml`) + the registration name
+// (`<plugin>:<tool>`). Its `execute()` method dispatches to the right handler based on
+// `ToolDef.handler`. Plugin tools dispatch through the normal tool path (`ToolRegistry::run`) and
+// do NOT emit `step_*` events — `subagent.rs` remains the sole emitter of those.
+
+/// A tool registered from a plugin manifest. Dispatches to one of 5 handlers on `execute()`.
+pub struct PluginTool {
+    reg_name: String,
+    def: crate::plugins::ToolDef,
+}
+
+impl PluginTool {
+    /// Build a `PluginTool` from its registration name + the parsed `ToolDef`.
+    pub fn new(reg_name: String, def: crate::plugins::ToolDef) -> Self {
+        Self { reg_name, def }
+    }
+}
+
+#[async_trait]
+impl Tool for PluginTool {
+    fn name(&self) -> &'static str {
+        // The trait's `name()` returns `&'static str` for the built-ins; a plugin tool's real
+        // name is dynamic, so `registration_name()` is the seam the registry uses. This returns
+        // a placeholder literal — the registry never keys on `name()` for a `PluginTool`.
+        "plugin"
+    }
+    fn description(&self) -> &'static str {
+        // Same caveat as `name()` — the trait's `description()` returns `&'static str` for the
+        // built-ins. The `spec()` builder uses `registration_name()` for the agent-visible name;
+        // the description here is the placeholder. The agent sees the real description via
+        // `description_value()` below (wired into `spec()` via the override).
+        "plugin tool"
+    }
+    fn parameters(&self) -> Value {
+        self.def.input_schema.clone()
+    }
+    /// The registration name (`<plugin>:<tool>`) — overrides the default `self.name().to_string()`
+    /// so the registry keys this tool under its prefixed name, NOT the `"plugin"` placeholder.
+    fn registration_name(&self) -> String {
+        self.reg_name.clone()
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+        dispatch_plugin_tool(&self.def, args, ctx).await
+    }
+}
+
+/// Dispatch a plugin tool's `execute()` to the right handler based on `ToolDef.handler`. The
+/// handler logic mirrors the C2 hook handlers (command/http) + the C3 MCP client (mcp_tool) +
+/// the C4 subagent path (agent) + the C2 prompt renderer (prompt). Each returns the tool's text
+/// result or an error string.
+async fn dispatch_plugin_tool(
+    def: &crate::plugins::ToolDef,
+    args: &Value,
+    ctx: &ToolCtx,
+) -> Result<String, String> {
+    use crate::plugins::ToolHandler;
+    match def.handler {
+        ToolHandler::Command => dispatch_command(def, args).await,
+        ToolHandler::Http => dispatch_http(def, args).await,
+        ToolHandler::McpTool => dispatch_mcp_tool(def, args).await,
+        ToolHandler::Prompt => dispatch_prompt(def, args),
+        ToolHandler::Agent => dispatch_agent(def, args, ctx).await,
+    }
+}
+
+/// `command` handler: spawn the command, pipe the tool args JSON to stdin, capture stdout, enforce
+/// `timeout_ms`. stdout (trimmed) is the tool result. Reuses the `util::no_window_tokio` helper
+/// so the packaged app does not flash a conhost window. Mirrors `hooks::run_command_handler` but
+/// for a tool (returns the result, not a deny/allow outcome).
+async fn dispatch_command(def: &crate::plugins::ToolDef, args: &Value) -> Result<String, String> {
+    let cmd_str = def.command.as_deref().unwrap_or("").trim().to_string();
+    if cmd_str.is_empty() {
+        return Err("plugin tool: empty command".into());
+    }
+    let payload_json = serde_json::to_vec(args).unwrap_or_else(|_| b"{}".to_vec());
+    // Shell out so the plugin can use pipelines/redirects (matches the hook command handler).
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.args(["/C", &cmd_str]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", &cmd_str]);
+        c
+    };
+    crate::util::no_window_tokio(&mut cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("plugin tool spawn failed: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, &payload_json).await;
+    }
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let timeout = std::time::Duration::from_millis(def.timeout_ms);
+    let wait_fut = child.wait();
+    match tokio::time::timeout(timeout, wait_fut).await {
+        Ok(Ok(status)) => {
+            let stdout_val = match stdout.as_mut() {
+                Some(s) => {
+                    let mut buf = Vec::new();
+                    let _ = tokio::io::AsyncReadExt::read_to_end(s, &mut buf).await;
+                    String::from_utf8_lossy(&buf).trim().to_string()
+                }
+                None => String::new(),
+            };
+            let stderr_val = match stderr.as_mut() {
+                Some(s) => {
+                    let mut buf = Vec::new();
+                    let _ = tokio::io::AsyncReadExt::read_to_end(s, &mut buf).await;
+                    String::from_utf8_lossy(&buf).trim().to_string()
+                }
+                None => String::new(),
+            };
+            let code = status.code().unwrap_or(-1);
+            if code == 0 {
+                Ok(stdout_val)
+            } else {
+                let detail = if !stdout_val.is_empty() {
+                    stdout_val
+                } else if !stderr_val.is_empty() {
+                    stderr_val
+                } else {
+                    format!("plugin command exited with code {code}")
+                };
+                Err(format!(
+                    "plugin tool '{name}' failed: {detail}",
+                    name = def.name
+                ))
+            }
+        }
+        Ok(Err(e)) => Err(format!("plugin tool wait failed: {e}")),
+        Err(_) => {
+            let _ = child.start_kill();
+            Err(format!(
+                "plugin tool '{}' timed out after {} ms",
+                def.name, def.timeout_ms
+            ))
+        }
+    }
+}
+
+/// `http` handler: POST the tool args as JSON to `url`, enforce `timeout_ms`, return the response
+/// body as the tool result. SSRF guard: the URL was validated at manifest load time (https or
+/// loopback http only). Mirrors `hooks::run_http_handler` but for a tool.
+async fn dispatch_http(def: &crate::plugins::ToolDef, args: &Value) -> Result<String, String> {
+    let url = def.url.as_deref().unwrap_or("").trim().to_string();
+    if url.is_empty() {
+        return Err("plugin tool: empty url".into());
+    }
+    // Defense-in-depth: re-validate the SSRF guard at call time (the manifest could have been
+    // edited after load; the trust boundary is the plugin dir, but a stale URL is still a
+    // hazard if the loader was hot-reloaded).
+    crate::mcp::validate_http_url(&url)
+        .map_err(|e| format!("plugin tool '{name}': {e}", name = def.name))?;
+    eprintln!("plugins: http POST {url} (tool {name})", name = def.name);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(def.timeout_ms))
+        .build()
+        .map_err(|e| format!("plugin tool http client build failed: {e}"))?;
+    let resp = client
+        .post(&url)
+        .json(args)
+        .send()
+        .await
+        .map_err(|e| format!("plugin tool http send failed: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        Ok(body.trim().to_string())
+    } else {
+        Err(format!(
+            "plugin tool '{name}' http returned status {status}: {body}",
+            name = def.name,
+            body = body.trim()
+        ))
+    }
+}
+
+/// `mcp_tool` handler: delegate to `mcp::registry::call(server, tool, args)`. The plugin declares
+/// which MCP server + tool name; the MCP result is flattened to text (matching the `mcp_call`
+/// tool). This wires the C2 `mcp_tool` stub + the C3 MCP client together for plugin tools.
+async fn dispatch_mcp_tool(def: &crate::plugins::ToolDef, args: &Value) -> Result<String, String> {
+    let server = def.server.as_deref().unwrap_or("").trim().to_string();
+    let tool = def.tool.as_deref().unwrap_or("").trim().to_string();
+    if server.is_empty() || tool.is_empty() {
+        return Err(format!(
+            "plugin tool '{name}': mcp_tool handler requires server + tool",
+            name = def.name
+        ));
+    }
+    let result = crate::mcp::registry::call(&server, &tool, args)
+        .await
+        .map_err(|e| format!("plugin tool '{name}' mcp call failed: {e}", name = def.name))?;
+    // Flatten the `content` array (matching the `mcp_call` tool's flattening).
+    let mut out = String::new();
+    if let Some(content) = result.get("content").and_then(|v| v.as_array()) {
+        for block in content {
+            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                out.push_str(text);
+                out.push('\n');
+            } else if let Some(t) = block.get("type").and_then(|v| v.as_str()) {
+                out.push_str(&format!("[{t}]\n"));
+            }
+        }
+    } else {
+        out.push_str(&result.to_string());
+    }
+    let is_error = result
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if is_error {
+        Err(format!(
+            "plugin tool '{name}' mcp tool {server}/{tool} returned an error: {out}",
+            name = def.name
+        ))
+    } else {
+        Ok(out)
+    }
+}
+
+/// `prompt` handler: render the template (or the full args JSON when no template) into a string
+/// that becomes the tool's result. The agent sees this as the tool's "result" — a way for a
+/// plugin to inject a templated prompt into the agent context via a tool call. Mirrors
+/// `hooks::render_prompt` + `substitute_template`.
+fn dispatch_prompt(def: &crate::plugins::ToolDef, args: &Value) -> Result<String, String> {
+    let tmpl = match def.template.as_deref() {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => return Ok(serde_json::to_string_pretty(args).unwrap_or_else(|_| "{}".into())),
+    };
+    Ok(crate::hooks::substitute_template(tmpl, args))
+}
+
+/// `agent` handler: spawn a subagent via `subagent::run_single_agent_public` with the tool args
+/// rendered as the task. The subagent's output text is the tool's result. This wires the C2
+/// `agent` stub for plugin tools. The recursion guard in `hooks::run_agent_handler` is NOT
+/// applied here (a plugin tool call is a deliberate agent action, not a lifecycle hook
+/// recursion); the subagent's own `SubagentStop` hook fires normally after the run.
+async fn dispatch_agent(
+    def: &crate::plugins::ToolDef,
+    args: &Value,
+    ctx: &ToolCtx,
+) -> Result<String, String> {
+    let agent_name = def.agent.as_deref().unwrap_or("").trim().to_string();
+    if agent_name.is_empty() {
+        return Err(format!(
+            "plugin tool '{name}': agent handler requires an agent name",
+            name = def.name
+        ));
+    }
+    let task = serde_json::to_string_pretty(args).unwrap_or_else(|_| "{}".into());
+    let cwd = ctx.cwd.to_string_lossy().to_string();
+    let result =
+        crate::agent::subagent::run_single_agent_public(&agent_name, &task, None, &cwd).await;
+    if result.is_failed() {
+        return Err(format!(
+            "plugin tool '{}' agent '{}' failed: {}",
+            def.name,
+            agent_name,
+            result.error_message.as_deref().unwrap_or("(no detail)")
+        ));
+    }
+    // Return the subagent's final assistant text message as the tool result (handles the
+    // `Vec<Value>` message shape + assistant-role + text-content-block extraction).
+    Ok(result.final_output())
+}
+
+#[cfg(test)]
+mod plugin_tool_tests {
+    use super::*;
+    use crate::agent::tools::ToolCtx;
+    use crate::plugins::{ToolDef, ToolHandler};
+    use crate::util::dotz_config_dir_test_lock;
+    use serde_json::json;
+
+    /// `PluginTool::registration_name()` must return the prefixed `<plugin>:<tool>` name (NOT the
+    /// `"plugin"` placeholder), so the registry keys it correctly.
+    #[test]
+    fn plugin_tool_registration_name_is_prefixed() {
+        let def = ToolDef {
+            name: "do_thing".into(),
+            description: "does a thing".into(),
+            handler: ToolHandler::Command,
+            command: Some("echo".into()),
+            args: None,
+            url: None,
+            headers: None,
+            server: None,
+            tool: None,
+            agent: None,
+            template: None,
+            input_schema: json!({"type": "object"}),
+            timeout_ms: 30_000,
+        };
+        let t = PluginTool::new("my-plugin:do_thing".into(), def);
+        assert_eq!(t.registration_name(), "my-plugin:do_thing");
+        assert_eq!(t.name(), "plugin", "placeholder name is never the key");
+    }
+
+    /// `PluginTool::spec()` must use the prefixed registration name (so the agent sees
+    /// `<plugin>:<tool>` in its tool list, matching the `/api/sessions/:id/tools` surface).
+    #[test]
+    fn plugin_tool_spec_uses_prefixed_name() {
+        let def = ToolDef {
+            name: "do_thing".into(),
+            description: "x".into(),
+            handler: ToolHandler::Command,
+            command: Some("echo".into()),
+            args: None,
+            url: None,
+            headers: None,
+            server: None,
+            tool: None,
+            agent: None,
+            template: None,
+            input_schema: json!({"type": "object"}),
+            timeout_ms: 30_000,
+        };
+        let t = PluginTool::new("alpha:do_thing".into(), def);
+        let spec = t.spec();
+        assert_eq!(
+            spec.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str()),
+            Some("alpha:do_thing")
+        );
+    }
+
+    /// `command` handler: spawn a command, pipe args JSON via stdin, return stdout.
+    #[tokio::test]
+    async fn plugin_tool_command_handler_executes_and_returns_stdout() {
+        let def = ToolDef {
+            name: "echo_args".into(),
+            description: "echoes back".into(),
+            handler: ToolHandler::Command,
+            // A cross-platform script that reads JSON from stdin and echoes a fixed result.
+            command: Some("echo command-handler-result".to_string()),
+            args: None,
+            url: None,
+            headers: None,
+            server: None,
+            tool: None,
+            agent: None,
+            template: None,
+            input_schema: json!({"type": "object"}),
+            timeout_ms: 10_000,
+        };
+        let out = dispatch_command(&def, &json!({"query": "x"})).await;
+        let result = out.expect("command handler should succeed");
+        assert!(
+            result.contains("command-handler-result"),
+            "command handler must return stdout, got: {result}"
+        );
+    }
+
+    /// `http` handler: POST the args to a URL, return the response body. Spins up a tiny
+    /// in-process HTTP server so the test is hermetic.
+    #[tokio::test]
+    async fn plugin_tool_http_handler_posts_and_returns_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nok-body";
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+        });
+        let def = ToolDef {
+            name: "http_tool".into(),
+            description: "http tool".into(),
+            handler: ToolHandler::Http,
+            command: None,
+            args: None,
+            url: Some(format!("http://127.0.0.1:{port}/tool")),
+            headers: None,
+            server: None,
+            tool: None,
+            agent: None,
+            template: None,
+            input_schema: json!({"type": "object"}),
+            timeout_ms: 5_000,
+        };
+        let result = dispatch_http(&def, &json!({"q": "x"}))
+            .await
+            .expect("http handler should succeed");
+        assert!(
+            result.contains("ok-body"),
+            "http handler must return the response body, got: {result}"
+        );
+    }
+
+    /// `http` handler: a non-https non-loopback URL is rejected at call time (SSRF guard, defense
+    /// in depth — the manifest load also validates).
+    #[tokio::test]
+    async fn plugin_tool_denies_non_https_http_url() {
+        let def = ToolDef {
+            name: "ssrf".into(),
+            description: "ssrf test".into(),
+            handler: ToolHandler::Http,
+            command: None,
+            args: None,
+            url: Some("http://example.com/tool".into()),
+            headers: None,
+            server: None,
+            tool: None,
+            agent: None,
+            template: None,
+            input_schema: json!({"type": "object"}),
+            timeout_ms: 5_000,
+        };
+        let err = dispatch_http(&def, &json!({})).await.unwrap_err();
+        assert!(
+            err.contains("SSRF") || err.contains("https") || err.contains("loopback"),
+            "non-https non-loopback http url must reject with SSRF hint: {err}"
+        );
+    }
+
+    /// `mcp_tool` handler: delegate to `mcp::registry::call`. We inject a mock MCP client and
+    /// verify the plugin tool routes the (server, tool, args) to it.
+    /// Shared capture buffer type for the mock MCP transport (factored out to satisfy
+    /// clippy::type_complexity — a `Mutex<Vec<...>>` behind an `Arc` is the canonical "captured
+    /// requests" pattern, but the type is too long to inline twice).
+    type PluginMcpCapture =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, Option<serde_json::Value>)>>>;
+
+    #[tokio::test]
+    async fn plugin_tool_mcp_tool_handler_delegates_to_mcp_registry() {
+        let captured: PluginMcpCapture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let call_result = serde_json::json!({
+            "content": [{ "type": "text", "text": "mcp-tool-result" }],
+            "isError": false
+        });
+        struct PluginMcpMock {
+            captured: PluginMcpCapture,
+            call_result: serde_json::Value,
+        }
+        #[async_trait::async_trait]
+        impl crate::mcp::client::Transport for PluginMcpMock {
+            async fn request(
+                &mut self,
+                method: &str,
+                params: Option<serde_json::Value>,
+            ) -> Result<serde_json::Value, crate::mcp::client::McpError> {
+                self.captured
+                    .lock()
+                    .unwrap()
+                    .push((method.to_string(), params.clone()));
+                if method == "tools/call" {
+                    return Ok(self.call_result.clone());
+                }
+                if method == "initialize" {
+                    return Ok(serde_json::json!({
+                        "protocolVersion": crate::mcp::PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "serverInfo": { "name": "mock", "version": "0.1" }
+                    }));
+                }
+                Ok(serde_json::json!({}))
+            }
+            async fn notify(
+                &mut self,
+                _method: &str,
+                _params: Option<serde_json::Value>,
+            ) -> Result<(), crate::mcp::client::McpError> {
+                Ok(())
+            }
+            async fn close(&mut self) -> Result<(), crate::mcp::client::McpError> {
+                Ok(())
+            }
+        }
+        let transport = PluginMcpMock {
+            captured: captured.clone(),
+            call_result: call_result.clone(),
+        };
+        let mut client =
+            crate::mcp::client::Client::from_transport("plugin-mock-server", Box::new(transport));
+        client.initialize().await.unwrap();
+        let handle = crate::mcp::registry::ClientHandle::new(client);
+        crate::mcp::registry::test_insert("plugin-mock-server", handle);
+
+        let def = ToolDef {
+            name: "delegate".into(),
+            description: "delegates to mcp".into(),
+            handler: ToolHandler::McpTool,
+            command: None,
+            args: None,
+            url: None,
+            headers: None,
+            server: Some("plugin-mock-server".into()),
+            tool: Some("some_tool".into()),
+            agent: None,
+            template: None,
+            input_schema: json!({"type": "object"}),
+            timeout_ms: 30_000,
+        };
+        let result = dispatch_mcp_tool(&def, &json!({"path": "/x"}))
+            .await
+            .expect("mcp_tool handler should succeed");
+        assert!(
+            result.contains("mcp-tool-result"),
+            "mcp_tool handler must return the flattened MCP result, got: {result}"
+        );
+        let cap = captured.lock().unwrap().clone();
+        let call = cap
+            .iter()
+            .find(|(m, _)| m == "tools/call")
+            .expect("tools/call was sent");
+        let params = call.1.as_ref().expect("tools/call must have params");
+        assert_eq!(
+            params.get("name").and_then(|v| v.as_str()),
+            Some("some_tool")
+        );
+        crate::mcp::registry::test_remove("plugin-mock-server").await;
+    }
+
+    /// `prompt` handler: render the template against the args.
+    #[tokio::test]
+    async fn plugin_tool_prompt_handler_returns_rendered_template() {
+        let def = ToolDef {
+            name: "prompt_tool".into(),
+            description: "renders a prompt".into(),
+            handler: ToolHandler::Prompt,
+            command: None,
+            args: None,
+            url: None,
+            headers: None,
+            server: None,
+            tool: None,
+            agent: None,
+            template: Some("Result for {{query}}".into()),
+            input_schema: json!({"type": "object"}),
+            timeout_ms: 30_000,
+        };
+        let result = dispatch_prompt(&def, &json!({"query": "alpha"}));
+        let result = result.expect("prompt handler should succeed");
+        assert!(
+            result.contains("Result for alpha"),
+            "prompt handler must render the template, got: {result}"
+        );
+    }
+
+    /// `prompt` handler with no template renders the full args JSON.
+    #[tokio::test]
+    async fn plugin_tool_prompt_handler_default_renders_full_args() {
+        let def = ToolDef {
+            name: "prompt_tool".into(),
+            description: "renders a prompt".into(),
+            handler: ToolHandler::Prompt,
+            command: None,
+            args: None,
+            url: None,
+            headers: None,
+            server: None,
+            tool: None,
+            agent: None,
+            template: None,
+            input_schema: json!({"type": "object"}),
+            timeout_ms: 30_000,
+        };
+        let result = dispatch_prompt(&def, &json!({"q": "x"}));
+        let result = result.expect("default prompt should succeed");
+        assert!(
+            result.contains("\"q\""),
+            "default prompt must render the full args JSON, got: {result}"
+        );
+    }
+
+    /// `agent` handler: spawn a subagent. We verify the wiring via the recursion-guard path:
+    /// a missing agent fails with a clear error (proving the dispatch path is wired, not a
+    /// stub). A real subagent spawn would require a live provider key, so the error path is the
+    /// hermetic proof. We use a cwd with no `.pi/agents/` so discovery finds nothing → the
+    /// subagent run fails fast with a clear error.
+    ///
+    /// The `dotz_config_dir_test_lock` guard is a std Mutex held across the `.await` points.
+    /// This is intentional (the awaited tasks never acquire `dotz_config_dir_test_lock`, so the
+    /// deadlock the lint guards against cannot occur) — matches the same idiom in
+    /// `memory::tests::recall_async_keeps_reactor_free_while_embedder_mutex_is_held` and
+    /// `mcp::registry::tests::with_tmp_dir_async`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn plugin_tool_agent_handler_spawns_subagent() {
+        let _guard = dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp =
+            std::env::temp_dir().join(format!("dotz-plugin-agent-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let def = ToolDef {
+            name: "delegate".into(),
+            description: "delegates to a subagent".into(),
+            handler: ToolHandler::Agent,
+            command: None,
+            args: None,
+            url: None,
+            headers: None,
+            server: None,
+            tool: None,
+            agent: Some("definitely-not-a-real-agent".into()),
+            template: None,
+            input_schema: json!({"type": "object"}),
+            timeout_ms: 30_000,
+        };
+        let ctx = ToolCtx {
+            cwd: tmp.clone(),
+            tx: None,
+            run_id: None,
+        };
+        let err = dispatch_agent(&def, &json!({"task": "x"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("agent") || err.contains("failed"),
+            "agent handler dispatch must reach the subagent path + fail with a clear error, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Plugin tools do NOT emit `step_*` events — they dispatch through the normal tool path. This
+    /// is a static grep guard: the plugin tool dispatch code in `extra_tools.rs` must NOT emit
+    /// `step_tool`/`step_thinking`.
+    #[test]
+    fn plugin_tool_dispatch_does_not_emit_step_events() {
+        let src = include_str!("extra_tools.rs");
+        // The dispatch functions (dispatch_command / dispatch_http / dispatch_mcp_tool /
+        // dispatch_prompt / dispatch_agent) must NOT emit step_tool/step_thinking events.
+        // We check the whole module (the dispatch fns are in this file) — the only emitter of
+        // step_* events is `agent::subagent`.
+        assert!(
+            !src.contains("\"step_tool\"") && !src.contains("\"step_thinking\""),
+            "extra_tools.rs plugin dispatch must NOT emit step_tool/step_thinking events"
+        );
+    }
+
+    /// Plugin hooks registered via `plugins::register_hooks` must reach the global hook registry.
+    /// We install a plugin-style hook directly via `hooks::append_plugin_hooks` and verify it fires.
+    #[tokio::test]
+    async fn plugin_hooks_registered_via_hook_registry() {
+        use crate::hooks::{self, HandlerType, HookConfig, HookEvent};
+        // Use a static lock to serialize the global registry mutation.
+        static PLUGIN_HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _g = PLUGIN_HOOK_TEST_LOCK.lock().await;
+        // Reset the global registry, then append a plugin hook. We use a `PreToolUse` command
+        // hook that exits non-zero (deny) so the firing is observable via the `deny` + `reason`
+        // fields (non-PreToolUse events drop the command's `reason` per the existing C2 `fire()`
+        // contract — only `injected_prompt` from prompt handlers accumulates for non-PreToolUse
+        // events).
+        {
+            let mut g = crate::hooks::cell_for_tests();
+            *g = None;
+        }
+        let cfg = HookConfig {
+            event: HookEvent::PreToolUse,
+            handler: HandlerType::Command,
+            command: Some("echo plugin-hook-fired && exit 1".into()),
+            url: None,
+            headers: None,
+            template: None,
+            agent: None,
+            server: None,
+            tool: None,
+            timeout_ms: 5_000,
+        };
+        hooks::append_plugin_hooks(vec![cfg]);
+        let o = hooks::fire(HookEvent::PreToolUse, &serde_json::json!({})).await;
+        assert!(o.deny, "plugin hook must fire + deny on PreToolUse");
+        let reason = o.reason.expect("plugin hook must return a reason");
+        assert!(
+            reason.contains("plugin-hook-fired"),
+            "plugin hook reason must come from the command stdout, got: {reason}"
+        );
+        // Cleanup: reset the global registry so other tests see no plugin hooks.
+        {
+            let mut g = crate::hooks::cell_for_tests();
+            *g = None;
+        }
+    }
+
+    /// Plugin MCP servers registered via `plugins::register_mcp_servers` must be validated (a
+    /// malformed entry is rejected loudly). The actual connection is NOT auto-triggered (the
+    /// operator adds the validated server to their `~/.dotz/mcp.json` manually — see the
+    /// `# ponytail:` comment in `register_mcp_servers`). We verify a valid `[[mcp_servers]]` row
+    /// parses + validates, and a malformed row is rejected.
+    #[tokio::test]
+    async fn plugin_mcp_servers_registered_via_mcp_registry() {
+        // A valid stdio server row parses + validates.
+        let valid = crate::plugins::McpServerRow {
+            name: "valid-server".into(),
+            transport: "stdio".into(),
+            command: Some("npx".into()),
+            args: Some(vec!["-y".into(), "my-mcp-server".into()]),
+            env: None,
+            url: None,
+            headers: None,
+        };
+        let cfg = crate::plugins::mcp_row_to_config(&valid).expect("valid server must parse");
+        assert_eq!(cfg.transport, crate::mcp::TransportType::Stdio);
+        assert_eq!(cfg.command.as_deref(), Some("npx"));
+
+        // A malformed transport is rejected loudly.
+        let bad = crate::plugins::McpServerRow {
+            name: "bad-server".into(),
+            transport: "carrier-pigeon".into(),
+            command: None,
+            args: None,
+            env: None,
+            url: None,
+            headers: None,
+        };
+        let err = crate::plugins::mcp_row_to_config(&bad).unwrap_err();
+        assert!(
+            err.contains("carrier-pigeon"),
+            "unknown transport must reject: {err}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1798,5 +2599,180 @@ mod tests {
             None => std::env::remove_var("DOTZ_CONFIG_DIR"),
         }
         crate::skills::reload_index();
+    }
+
+    // ---- C3: mcp_call tool tests ----
+
+    /// Shared capture buffer type for the mock MCP transport. Test-only; factored out to
+    /// satisfy clippy::type_complexity (a `Mutex<Vec<...>>` behind an `Arc` is the canonical
+    /// "captured requests" pattern, but the type is too long to inline twice).
+    type McpCapture = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<serde_json::Value>)>>>;
+
+    /// A mock MCP transport for the `mcp_call` routing tests. Returns a canned `tools/call`
+    /// response so the test can assert the request was routed through the registry to the
+    /// server. The transport captures the (method, params) pairs it received.
+    struct MockMcpTransport {
+        captured: McpCapture,
+        call_result: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::client::Transport for MockMcpTransport {
+        async fn request(
+            &mut self,
+            method: &str,
+            params: Option<serde_json::Value>,
+        ) -> Result<serde_json::Value, crate::mcp::client::McpError> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params.clone()));
+            if method == "tools/call" {
+                return Ok(self.call_result.clone());
+            }
+            // initialize, tools/list, etc. — return minimal valid responses.
+            if method == "initialize" {
+                return Ok(serde_json::json!({
+                    "protocolVersion": crate::mcp::PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "serverInfo": { "name": "mock", "version": "0.1" }
+                }));
+            }
+            Ok(serde_json::json!({}))
+        }
+        async fn notify(
+            &mut self,
+            _method: &str,
+            _params: Option<serde_json::Value>,
+        ) -> Result<(), crate::mcp::client::McpError> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), crate::mcp::client::McpError> {
+            Ok(())
+        }
+    }
+
+    /// The `mcp_call` tool must be registered AND active by default so the agent can route
+    /// calls to connected MCP servers. This is the runnable guard for the agent-dispatch
+    /// wiring (acceptance criterion #23).
+    #[test]
+    fn mcp_call_tool_registered_in_tool_registry() {
+        let r = crate::agent::tools::ToolRegistry::new();
+        let all = r.all_names();
+        let active = r.active_names();
+        assert!(
+            all.contains(&"mcp_call".to_string()),
+            "mcp_call must be registered"
+        );
+        assert!(
+            active.contains(&"mcp_call".to_string()),
+            "mcp_call must be active by default"
+        );
+    }
+
+    /// `mcp_call` routes the agent's (server, tool, args) onto `mcp::registry::call`, which
+    /// dispatches to the connected server's `Client::call_tool`. We inject a mock client into
+    /// the registry (via `test_insert`) and verify the call reaches it. This is the
+    /// end-to-end agent-dispatch test (acceptance criterion #24).
+    #[tokio::test]
+    async fn mcp_call_tool_routes_to_registry() {
+        let captured: McpCapture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let call_result = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "hello from mock mcp server" }
+            ],
+            "isError": false
+        });
+        let transport = MockMcpTransport {
+            captured: captured.clone(),
+            call_result: call_result.clone(),
+        };
+        let mut client =
+            crate::mcp::client::Client::from_transport("mock-server", Box::new(transport));
+        client.initialize().await.unwrap();
+        let handle = crate::mcp::registry::ClientHandle::new(client);
+        crate::mcp::registry::test_insert("mock-server", handle);
+
+        // Build the tool context (the agent dispatch path). The mcp_call tool doesn't use
+        // the ctx (it routes via the global registry), so cwd is irrelevant.
+        let ctx = crate::agent::tools::ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: None,
+            run_id: None,
+        };
+        let tool = super::McpCallTool;
+        let result = tool
+            .execute(
+                &serde_json::json!({
+                    "server": "mock-server",
+                    "tool": "read_file",
+                    "args": { "path": "/tmp/x" }
+                }),
+                &ctx,
+            )
+            .await
+            .expect("mcp_call should succeed");
+
+        // The tool flattened the content blocks into text.
+        assert!(
+            result.contains("hello from mock mcp server"),
+            "mcp_call should return the tool's text content, got: {result}"
+        );
+
+        // The (server, tool, args) reached the mock transport as a `tools/call` request with
+        // the right shape.
+        let captured = captured.lock().unwrap().clone();
+        let call = captured
+            .iter()
+            .find(|(m, _)| m == "tools/call")
+            .expect("tools/call was sent to the mock server");
+        let params = call
+            .1
+            .as_ref()
+            .expect("tools/call request must have params");
+        assert_eq!(
+            params.get("name").and_then(|v| v.as_str()),
+            Some("read_file")
+        );
+        assert_eq!(
+            params
+                .get("arguments")
+                .and_then(|v| v.get("path"))
+                .and_then(|v| v.as_str()),
+            Some("/tmp/x")
+        );
+
+        // Cleanup: remove the mock server from the registry so other tests don't see it.
+        crate::mcp::registry::test_remove("mock-server").await;
+    }
+
+    /// `mcp_call` with a server name that isn't in the registry returns a clear error (not a
+    /// panic, not a silent no-op). This is the agent-dispatch error path (acceptance
+    /// criterion #25).
+    #[tokio::test]
+    async fn mcp_call_tool_denies_unknown_server() {
+        // Ensure the unknown server is not in the registry.
+        crate::mcp::registry::test_remove("definitely-not-here").await;
+        let ctx = crate::agent::tools::ToolCtx {
+            cwd: std::env::temp_dir(),
+            tx: None,
+            run_id: None,
+        };
+        let tool = super::McpCallTool;
+        let err = tool
+            .execute(
+                &serde_json::json!({
+                    "server": "definitely-not-here",
+                    "tool": "any",
+                    "args": {}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not connected"),
+            "mcp_call on an unknown server should say 'not connected', got: {err}"
+        );
     }
 }

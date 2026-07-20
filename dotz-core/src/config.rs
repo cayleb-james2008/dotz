@@ -4,6 +4,45 @@ use crate::types;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// C6: configuration for the `gateway` provider — a generic OpenAI-compatible passthrough behind
+/// ONE endpoint + ONE key + a model allowlist (OmniRoute / OpenRouter-as-gateway / LiteLLM / any
+/// OpenAI-compat gateway). Lives under `gateway` in `~/.dotz/config.json`. All fields are
+/// optional so an empty/missing section degrades gracefully (the gateway endpoint resolves to
+/// empty strings and `provider_endpoint` returns None → gateway is inert).
+///
+/// `api_key_ref` is an env-var NAME (e.g. `"OMNIROUTE_API_KEY"`), NOT a `$VAR` reference and NEVER
+/// a raw key — `provider_endpoint` wraps it in `$` before handing it to `resolve_api_key`, so the
+/// key is resolved via the same env → auth.json fallback as the other providers. The key value is
+/// NEVER stored in config.json (only the var name).
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GatewayConfig {
+    /// Base URL of the OpenAI-compatible gateway, e.g. `https://api.omniroute.ai/v1`. Validated
+    /// by `provider::validate_gateway_base_url` before persist (https required, or http://localhost
+    /// /127.0.0.1 to permit local LiteLLM proxies; other http:// is rejected as SSRF protection).
+    #[serde(rename = "baseUrl", default)]
+    pub base_url: String,
+    /// Env-var NAME holding the gateway key (e.g. `OMNIROUTE_API_KEY`). Never the raw key.
+    #[serde(rename = "apiKeyRef", default)]
+    pub api_key_ref: String,
+    /// Named presets the UI offers when the gateway provider is selected. The preset IDs are
+    /// `omniroute`, `openrouter-gw`, `litellm`, `custom` (see `provider::gateway_presets`); the
+    /// persisted list is the operator's selection so the UI can pre-select it on reload.
+    #[serde(default)]
+    pub presets: Vec<String>,
+    /// Model ids the gateway routes to. Surfaced to the lead agent as `gateway/<model>` entries
+    /// in the low-cost worker list so subagent tasks can be dispatched to gateway models.
+    #[serde(rename = "modelAllowlist", default)]
+    pub model_allowlist: Vec<String>,
+}
+
+impl GatewayConfig {
+    /// True when the section is effectively unset (no base URL and no key ref). Used by
+    /// `provider_endpoint` to treat a missing/empty gateway as inert (returns None).
+    pub fn is_empty(&self) -> bool {
+        self.base_url.trim().is_empty() && self.api_key_ref.trim().is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DotzConfig {
     pub provider: String,
@@ -13,6 +52,19 @@ pub struct DotzConfig {
     pub subagent_model: String,
     #[serde(rename = "thinkingLevel")]
     pub thinking_level: String,
+    /// C6: optional gateway passthrough config. `None` when absent from config.json (a
+    /// gateway-free install). Loaded leniently: a malformed `gateway` object is dropped to
+    /// `None` rather than failing the whole config load (so a bad gateway block can't brick the
+    /// rest of the config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<GatewayConfig>,
+    /// B3: perf-dashboard recording opt-in. Default false (the privacy moat — perf data
+    /// stays on the machine). Independent of the remote-telemetry opt-in (`telemetry.rs`)
+    /// so an operator can have the local perf dashboard without enabling remote telemetry.
+    /// Persisted under `perfRecording` so it survives a restart. `serde(default)` keeps
+    /// pre-B3 config.json files loading unchanged.
+    #[serde(rename = "perfRecording", default)]
+    pub perf_recording: bool,
 }
 
 impl Default for DotzConfig {
@@ -23,6 +75,8 @@ impl Default for DotzConfig {
             executive_model: exec.to_string(),
             subagent_model: sub.to_string(),
             thinking_level: "high".to_string(),
+            gateway: None,
+            perf_recording: false,
         }
     }
 }
@@ -166,6 +220,28 @@ pub fn load() -> DotzConfig {
                     cfg.thinking_level = t.to_string();
                 }
             }
+            // C6: parse the optional gateway section leniently. A malformed `gateway` object is
+            // dropped to None (with a stderr warning) rather than failing the whole config load —
+            // a bad gateway block must not brick provider/model/thinking. `gateway: null` and a
+            // missing field both leave `cfg.gateway = None`.
+            if let Some(gw_v) = v.get("gateway") {
+                if !gw_v.is_null() {
+                    match serde_json::from_value::<GatewayConfig>(gw_v.clone()) {
+                        Ok(gw) => cfg.gateway = Some(gw),
+                        Err(e) => eprintln!(
+                            "config: {} has a malformed 'gateway' section ({e}); \
+                             ignoring it. Fix or remove the gateway block to restore it.",
+                            config_file().display()
+                        ),
+                    }
+                }
+            }
+            // B3: parse the optional perfRecording flag (default false). Any non-bool value is
+            // ignored so a corrupt field never bricks the config — matches the lenient gateway
+            // parse contract.
+            if let Some(b) = v.get("perfRecording").and_then(|x| x.as_bool()) {
+                cfg.perf_recording = b;
+            }
         }
     }
     // If the user changed provider but never set an executive/subagent model, derive both from the
@@ -232,15 +308,40 @@ pub fn update(current: &DotzConfig, clean: &CleanPatch) -> std::io::Result<DotzC
     Ok(next)
 }
 
+/// C6: set (or clear) the gateway section of the config, persist, and return the new config.
+/// `gateway = None` clears the section (it is omitted from the persisted JSON via
+/// `skip_serializing_if`). Validation (SSRF base-URL check, key-ref shape) happens in the POST
+/// handler before this is called. Persist failures are propagated so the REST handler can
+/// surface a 500. The gateway config is independent of provider/model/thinking, so this does NOT
+/// touch `apply_env` (DOTZ_SUBAGENT_MODEL is unaffected by the gateway).
+pub fn set_gateway(
+    current: &DotzConfig,
+    gateway: Option<GatewayConfig>,
+) -> std::io::Result<DotzConfig> {
+    let mut next = current.clone();
+    next.gateway = gateway;
+    save(&next)?;
+    Ok(next)
+}
+
+/// B3: set the `perfRecording` flag in the config, persist, and return the new config. The flag
+/// is independent of the remote-telemetry opt-in (`telemetry.rs`) — it gates the LOCAL perf
+/// dashboard only. Persist failures are propagated so the perf toggle route can surface a 500.
+/// The perf flag is independent of provider/model/thinking, so this does NOT touch `apply_env`.
+pub fn set_perf_recording(current: &DotzConfig, on: bool) -> std::io::Result<DotzConfig> {
+    let mut next = current.clone();
+    next.perf_recording = on;
+    save(&next)?;
+    Ok(next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static LOCK: Mutex<()> = Mutex::new(());
-
     fn with_tmp_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = crate::util::dotz_config_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("dotz-config-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
@@ -263,6 +364,8 @@ mod tests {
                 executive_model: "nex-agi/nex-n2-pro".into(),
                 subagent_model: "minimax-m3".into(),
                 thinking_level: "medium".into(),
+                gateway: None,
+                perf_recording: false,
             };
             save(&cfg).unwrap();
             assert!(dir.join("config.json").exists());
@@ -343,6 +446,8 @@ mod tests {
                 executive_model: "nex-agi/nex-n2-pro".into(),
                 subagent_model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free".into(),
                 thinking_level: "medium".into(),
+                gateway: None,
+                perf_recording: false,
             };
             apply_env(&cfg);
             assert_eq!(
@@ -375,6 +480,8 @@ mod tests {
                 executive_model: "glm-5.2".into(),
                 subagent_model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free".into(),
                 thinking_level: "medium".into(),
+                gateway: None,
+                perf_recording: false,
             };
             apply_env(&cfg);
             assert_eq!(
@@ -395,6 +502,8 @@ mod tests {
                 executive_model: "nex-agi/nex-n2-pro:free".into(),
                 subagent_model: "OpenRouter/nvidia/nemotron-3-ultra-550b-a55b:free".into(),
                 thinking_level: "medium".into(),
+                gateway: None,
+                perf_recording: false,
             };
             apply_env(&cfg);
             assert_eq!(
@@ -430,6 +539,8 @@ mod tests {
                 executive_model: "anthropic/claude-3.5-sonnet-latest".into(),
                 subagent_model: "anthropic/claude-3.5-sonnet-latest".into(),
                 thinking_level: "medium".into(),
+                gateway: None,
+                perf_recording: false,
             };
             apply_env(&cfg);
             assert_eq!(
@@ -464,6 +575,8 @@ mod tests {
                 executive_model: "nex-agi/nex-n2-pro:free".into(),
                 subagent_model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free".into(),
                 thinking_level: "medium".into(),
+                gateway: None,
+                perf_recording: false,
             };
             apply_env(&cfg);
             assert_eq!(
@@ -482,6 +595,8 @@ mod tests {
                 executive_model: "nex-agi/nex-n2-pro".into(),
                 subagent_model: "minimax-m3".into(),
                 thinking_level: "medium".into(),
+                gateway: None,
+                perf_recording: false,
             };
             save(&cfg).unwrap();
 
@@ -520,6 +635,8 @@ mod tests {
                 executive_model: "glm-5.2".into(),
                 subagent_model: "minimax-m3".into(),
                 thinking_level: "medium".into(),
+                gateway: None,
+                perf_recording: false,
             };
             save(&cfg).unwrap();
 
@@ -578,6 +695,8 @@ mod tests {
                 executive_model: "glm-5.2".into(),
                 subagent_model: "minimax-m3".into(),
                 thinking_level: "high".into(),
+                gateway: None,
+                perf_recording: false,
             };
             let patch = CleanPatch {
                 provider: Some("openrouter".into()),
@@ -606,6 +725,8 @@ mod tests {
                 executive_model: "glm-5.2".into(),
                 subagent_model: "minimax-m3".into(),
                 thinking_level: "high".into(),
+                gateway: None,
+                perf_recording: false,
             };
             let patch = CleanPatch {
                 provider: Some("openrouter".into()),
@@ -628,6 +749,8 @@ mod tests {
                 executive_model: "glm-5.2".into(),
                 subagent_model: "minimax-m3".into(),
                 thinking_level: "high".into(),
+                gateway: None,
+                perf_recording: false,
             };
             let patch = CleanPatch {
                 thinking_level: Some("xhigh".into()),
@@ -654,6 +777,8 @@ mod tests {
                 executive_model: "nex-agi/nex-n2-pro".into(),
                 subagent_model: "".into(),
                 thinking_level: "medium".into(),
+                gateway: None,
+                perf_recording: false,
             };
             apply_env(&cfg);
             assert_eq!(
@@ -709,6 +834,8 @@ mod tests {
                 executive_model: "glm-5.2".into(),
                 subagent_model: "minimax-m3".into(),
                 thinking_level: "high".into(),
+                gateway: None,
+                perf_recording: false,
             };
             let patch = CleanPatch {
                 provider: Some("openrouter".into()),
@@ -794,6 +921,229 @@ mod tests {
                 "invalid JSON config must fall back to the default thinking level"
             );
         });
+    }
+
+    // ---- C6: gateway config section ----
+
+    /// C6: a persisted gateway section round-trips through save/load.
+    #[test]
+    fn save_and_load_round_trips_gateway_section() {
+        with_tmp_dir(|dir| {
+            let cfg = DotzConfig {
+                provider: "ollama".into(),
+                executive_model: "glm-5.2".into(),
+                subagent_model: "minimax-m3".into(),
+                thinking_level: "high".into(),
+                gateway: Some(GatewayConfig {
+                    base_url: "https://api.omniroute.ai/v1".into(),
+                    api_key_ref: "OMNIROUTE_API_KEY".into(),
+                    presets: vec!["omniroute".into()],
+                    model_allowlist: vec!["gpt-5.6".into(), "claude-sonnet-5".into()],
+                }),
+                perf_recording: false,
+            };
+            save(&cfg).unwrap();
+            assert!(dir.join("config.json").exists());
+
+            let loaded = load();
+            let gw = loaded
+                .gateway
+                .as_ref()
+                .expect("gateway section must round-trip");
+            assert_eq!(gw.base_url, "https://api.omniroute.ai/v1");
+            assert_eq!(gw.api_key_ref, "OMNIROUTE_API_KEY");
+            assert_eq!(gw.presets, vec!["omniroute".to_string()]);
+            assert_eq!(
+                gw.model_allowlist,
+                vec!["gpt-5.6".to_string(), "claude-sonnet-5".to_string()]
+            );
+        });
+    }
+
+    /// C6: a missing gateway section loads as None (gateway-free install is unchanged).
+    #[test]
+    fn load_returns_none_gateway_when_section_absent() {
+        with_tmp_dir(|_| {
+            let file = config_file();
+            std::fs::write(
+                &file,
+                r#"{
+  "provider": "ollama",
+  "executiveModel": "glm-5.2",
+  "subagentModel": "minimax-m3",
+  "thinkingLevel": "high"
+}"#,
+            )
+            .unwrap();
+            let loaded = load();
+            assert!(loaded.gateway.is_none(), "missing gateway section → None");
+        });
+    }
+
+    /// C6: `gateway: null` loads as None (an explicit null clears the section).
+    #[test]
+    fn load_returns_none_gateway_when_section_null() {
+        with_tmp_dir(|_| {
+            let file = config_file();
+            std::fs::write(
+                &file,
+                r#"{
+  "provider": "ollama",
+  "executiveModel": "glm-5.2",
+  "subagentModel": "minimax-m3",
+  "thinkingLevel": "high",
+  "gateway": null
+}"#,
+            )
+            .unwrap();
+            let loaded = load();
+            assert!(loaded.gateway.is_none(), "explicit null gateway → None");
+        });
+    }
+
+    /// C6: a malformed gateway section is dropped to None WITHOUT bricking the rest of the config
+    /// (provider/model/thinking still load). The parse failure is surfaced to stderr.
+    #[test]
+    fn load_drops_malformed_gateway_without_bricking_config() {
+        with_tmp_dir(|_| {
+            let file = config_file();
+            std::fs::write(
+                &file,
+                r#"{
+  "provider": "ollama",
+  "executiveModel": "glm-5.2",
+  "subagentModel": "minimax-m3",
+  "thinkingLevel": "high",
+  "gateway": { "baseUrl": 12345 }
+}"#,
+            )
+            .unwrap();
+            let loaded = load();
+            // The non-gateway fields still load.
+            assert_eq!(loaded.provider, "ollama");
+            assert_eq!(loaded.executive_model, "glm-5.2");
+            // The malformed gateway is dropped to None (not panicked on).
+            assert!(
+                loaded.gateway.is_none(),
+                "malformed gateway → None, not a panic"
+            );
+        });
+    }
+
+    /// C6: `set_gateway` persists the gateway section and returns the new config; the persisted
+    /// file includes it; a subsequent `load()` sees it.
+    #[test]
+    fn set_gateway_persists_and_returns_new_config() {
+        with_tmp_dir(|dir| {
+            let base = load();
+            assert!(base.gateway.is_none());
+
+            let gw = GatewayConfig {
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_ref: "OPENROUTER_API_KEY".into(),
+                presets: vec!["openrouter-gw".into()],
+                model_allowlist: vec!["anthropic/claude-sonnet-5".into()],
+            };
+            let next = set_gateway(&base, Some(gw.clone())).unwrap();
+            assert_eq!(next.gateway.as_ref().unwrap().base_url, gw.base_url);
+
+            // Persisted file contains the gateway block.
+            let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
+            assert!(raw.contains("openrouter.ai/api/v1"));
+            assert!(raw.contains("OPENROUTER_API_KEY"));
+
+            // A fresh load sees it.
+            let reloaded = load();
+            assert_eq!(reloaded.gateway.as_ref().unwrap().base_url, gw.base_url);
+            assert_eq!(
+                reloaded.gateway.as_ref().unwrap().model_allowlist,
+                vec!["anthropic/claude-sonnet-5".to_string()]
+            );
+        });
+    }
+
+    /// C6: `set_gateway(None)` clears an existing gateway section (omitted from persisted JSON).
+    #[test]
+    fn set_gateway_none_clears_existing_section() {
+        with_tmp_dir(|dir| {
+            let cfg = DotzConfig {
+                provider: "ollama".into(),
+                executive_model: "glm-5.2".into(),
+                subagent_model: "minimax-m3".into(),
+                thinking_level: "high".into(),
+                gateway: Some(GatewayConfig {
+                    base_url: "https://api.omniroute.ai/v1".into(),
+                    api_key_ref: "OMNIROUTE_API_KEY".into(),
+                    presets: vec![],
+                    model_allowlist: vec![],
+                }),
+                perf_recording: false,
+            };
+            save(&cfg).unwrap();
+            assert!(dir.join("config.json").exists());
+
+            let next = set_gateway(&cfg, None).unwrap();
+            assert!(next.gateway.is_none());
+
+            let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
+            assert!(
+                !raw.contains("omniroute"),
+                "clearing the gateway must omit it from the persisted JSON, got: {raw}"
+            );
+        });
+    }
+
+    /// C6: `GatewayConfig::is_empty` is true when both base URL + key ref are empty (the gateway
+    /// is inert), false otherwise.
+    #[test]
+    fn gateway_config_is_empty_when_both_fields_blank() {
+        assert!(GatewayConfig::default().is_empty());
+        assert!(GatewayConfig {
+            base_url: "   ".into(),
+            api_key_ref: "".into(),
+            presets: vec![],
+            model_allowlist: vec![],
+        }
+        .is_empty());
+        assert!(!GatewayConfig {
+            base_url: "https://api.omniroute.ai/v1".into(),
+            api_key_ref: "".into(),
+            presets: vec![],
+            model_allowlist: vec![],
+        }
+        .is_empty());
+        assert!(!GatewayConfig {
+            base_url: "".into(),
+            api_key_ref: "OMNIROUTE_API_KEY".into(),
+            presets: vec![],
+            model_allowlist: vec![],
+        }
+        .is_empty());
+    }
+
+    /// C6: a config with a gateway section must still serialize the other fields unchanged, and
+    /// the gateway section uses the camelCase JSON keys the UI contract expects.
+    #[test]
+    fn gateway_section_uses_camel_case_json_keys() {
+        let cfg = DotzConfig {
+            provider: "ollama".into(),
+            executive_model: "glm-5.2".into(),
+            subagent_model: "minimax-m3".into(),
+            thinking_level: "high".into(),
+            gateway: Some(GatewayConfig {
+                base_url: "http://localhost:4000/v1".into(),
+                api_key_ref: "LITELLM_API_KEY".into(),
+                presets: vec!["litellm".into()],
+                model_allowlist: vec!["gpt-5.6".into()],
+            }),
+            perf_recording: false,
+        };
+        let json = serde_json::to_value(&cfg).unwrap();
+        let gw = &json["gateway"];
+        assert_eq!(gw["baseUrl"], "http://localhost:4000/v1");
+        assert_eq!(gw["apiKeyRef"], "LITELLM_API_KEY");
+        assert_eq!(gw["presets"], serde_json::json!(["litellm"]));
+        assert_eq!(gw["modelAllowlist"], serde_json::json!(["gpt-5.6"]));
     }
 }
 
