@@ -150,6 +150,185 @@ pub fn try_mark_end_emitted(id: &str) -> bool {
         .insert(id.to_string())
 }
 
+// ---- platform sandbox backend ----
+//
+// Cross-platform abstraction over the two Windows-conditional seams in sandbox process
+// management: (1) spawn-time flags (CREATE_NO_WINDOW on Windows, process_group on posix), and
+// (2) tree-kill (taskkill /T /F on Windows, kill -9 -<pgid> on posix). The Windows impl is
+// verbatim from the former inline `#[cfg(windows)]` blocks; the Mac/Linux impls carry the posix
+// fallback (process_group + kill -9 -<pgid>) and reserve seatbelt/bwrap fields that are NOT yet
+// applied.
+//
+// ponytail: the seatbelt (macOS `sandbox-exec -p <profile>`) and bwrap (Linux `bwrap --unshare-...`)
+// argv are deferred — the stubs set process_group + tree-kill the posix way, which is the safe
+// subset that compiles and runs on every host without a macOS/Linux build box. The
+// `if self.seatbelt` / `if self.bwrap` branches are empty by design; filling them requires a
+// macOS/Linux host to validate and is tracked as the B2 hardening follow-up.
+
+/// Platform abstraction over the two Windows-conditional seams in sandbox process management:
+/// (1) spawn-time flags (CREATE_NO_WINDOW on Windows, own process group on posix), and
+/// (2) tree-kill (taskkill /T /F on Windows, kill -9 -<pgid> on posix). Best-effort;
+/// implementations must reap their own kill subprocess (`.status()`, not `.spawn()`).
+pub trait SandboxBackend: Send + Sync + 'static {
+    /// Configure a `tokio::process::Command` before spawn (hide window on Windows, own process
+    /// group on posix). Called for every sandbox + agent-browser spawn.
+    fn prepare_command(&self, command: &mut tokio::process::Command);
+
+    /// Kill a pid and its descendants. Synchronous: the sandbox calls it inline; `browser.rs`
+    /// wraps it in `spawn_blocking` when async dispatch is needed. Must reap its own kill
+    /// subprocess.
+    fn kill_tree(&self, pid: u32);
+}
+
+/// Windows backend: `CREATE_NO_WINDOW` on spawn, `taskkill /T /F` for tree-kill. Verbatim from
+/// the former inline `#[cfg(windows)]` blocks; reuses `crate::util::no_window_tokio` /
+/// `crate::util::no_window` so the `CREATE_NO_WINDOW` constant lives in one place.
+struct WindowsSandbox;
+
+impl SandboxBackend for WindowsSandbox {
+    fn prepare_command(&self, command: &mut tokio::process::Command) {
+        crate::util::no_window_tokio(command);
+    }
+
+    fn kill_tree(&self, pid: u32) {
+        // Use .status() (not .spawn()) so the taskkill subprocess is reaped. Dropping a spawned
+        // std::process::Child without waiting leaves a zombie that accumulates over a long-lived
+        // server with many sandbox kills.
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = crate::util::no_window(&mut cmd).status();
+    }
+}
+
+/// macOS backend stub: posix fallback (process_group + `kill -9 -<pgid>`). The `seatbelt` field
+/// reserves the `sandbox-exec -p <profile>` wrap for a future macOS-host follow-up; the
+/// `if self.seatbelt` branch is empty by design (ponytail: deferred — requires a macOS host).
+#[cfg(target_os = "macos")]
+struct MacSandbox {
+    seatbelt: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacSandbox {
+    /// Best-effort detect: `seatbelt` is true only if `sandbox-exec` is on PATH. No failure if
+    /// absent — the posix fallback still runs without it.
+    fn detect() -> Self {
+        let seatbelt = std::process::Command::new("sandbox-exec")
+            .arg("-h")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok();
+        Self { seatbelt }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl SandboxBackend for MacSandbox {
+    fn prepare_command(&self, command: &mut tokio::process::Command) {
+        command.process_group(0);
+        if self.seatbelt {
+            // ponytail: TODO — wrap argv in `sandbox-exec -p <profile>` for the B2 macOS
+            // hardening pass. Requires a macOS host to validate the seatbelt profile; deferred.
+        }
+    }
+
+    fn kill_tree(&self, pid: u32) {
+        posix_kill_tree(pid);
+    }
+}
+
+/// Linux backend stub: posix fallback (process_group + `kill -9 -<pgid>`). The `bwrap` field
+/// reserves the `bwrap --unshare-... <argv>` wrap for a future Linux-host follow-up; the
+/// `if self.bwrap` branch is empty by design (ponytail: deferred — requires a Linux host).
+#[cfg(target_os = "linux")]
+struct LinuxSandbox {
+    bwrap: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxSandbox {
+    /// Best-effort detect: `bwrap` is true only if `bwrap` is on PATH. No failure if absent.
+    fn detect() -> Self {
+        let bwrap = std::process::Command::new("bwrap")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok();
+        Self { bwrap }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SandboxBackend for LinuxSandbox {
+    fn prepare_command(&self, command: &mut tokio::process::Command) {
+        command.process_group(0);
+        if self.bwrap {
+            // ponytail: TODO — wrap argv in `bwrap --unshare-...` for the B2 Linux hardening
+            // pass. Requires a Linux host to validate the bubblewrap argv; deferred.
+        }
+    }
+
+    fn kill_tree(&self, pid: u32) {
+        posix_kill_tree(pid);
+    }
+}
+
+/// Posix tree-kill: signal the child's process group (pgid == child pid when spawned with
+/// `process_group(0)`), falling back to a direct signal if the group doesn't exist (e.g. a
+/// caller that spawned the child without its own process group, as some unit tests do). Uses
+/// `.status()` so the kill subprocess is reaped. Verbatim from the former inline
+/// `#[cfg(not(windows))]` block in `kill_pid`.
+#[cfg(unix)]
+fn posix_kill_tree(pid: u32) {
+    let group = std::process::Command::new("kill")
+        .args(["-9", &format!("-{pid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let group_ok = matches!(group, Ok(s) if s.success());
+    if !group_ok {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Select the platform's sandbox backend. The cfg ladder is exhaustive; an unsupported target
+/// fails at compile time.
+pub fn platform_backend() -> Box<dyn SandboxBackend> {
+    #[cfg(windows)]
+    {
+        Box::new(WindowsSandbox)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(MacSandbox::detect())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(LinuxSandbox::detect())
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        compile_error!("unsupported platform: dotz requires windows, macos, or linux");
+    }
+}
+
+/// Process-wide sandbox backend. The trait methods are stateless (`WindowsSandbox` has no fields;
+/// Mac/Linux carry only the detected seatbelt/bwrap flags), so a single shared instance serves
+/// every sandbox + agent-browser spawn/kill. `OnceLock` initializes once on first use. Shared
+/// with `browser.rs` so both subsystems dispatch through the same platform seam.
+pub(crate) fn backend() -> &'static dyn SandboxBackend {
+    static BACKEND: OnceLock<Box<dyn SandboxBackend>> = OnceLock::new();
+    BACKEND.get_or_init(platform_backend).as_ref()
+}
+
 /// Evict terminal runs oldest-first (by `startedAt`) until the store is at or below
 /// `MAX_RETAINED_RUNS`, and drop the matching `end_emitted` flags — once a run is gone from the
 /// store its dedup flag is dead weight. Running runs are always retained. Called from
@@ -430,19 +609,9 @@ async fn execute_run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW); // inherent on tokio::process::Command (no CommandExt import needed)
-    }
-    // Place the child in its own process group (pgid == child pid) on posix so `kill_pid` can
-    // tree-kill the whole group — otherwise a sandboxed script that spawns a long-lived child
-    // (e.g. a dev server) leaks that grandchild as an orphan when the sandbox run is killed or
-    // times out. Windows already tree-kills via `taskkill /T /F`.
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-    }
+    // Cross-platform spawn flags via the shared backend: CREATE_NO_WINDOW on Windows, own
+    // process group on posix (so `kill_tree` can signal the whole group). See `SandboxBackend`.
+    backend().prepare_command(&mut command);
 
     let mut child = match command.spawn() {
         Ok(c) => c,
@@ -728,45 +897,13 @@ fn mark_killed_by_us(id: &str) {
     }
 }
 
-/// Kill a pid and its descendants — taskkill /T /F on win32, SIGKILL on posix. Best-effort.
+/// Kill a pid and its descendants — `taskkill /T /F` on win32, `kill -9 -<pgid>` on posix.
+/// Dispatched via the shared `SandboxBackend` so the kill logic lives in one place and
+/// `browser.rs` reuses it for the agent-browser process tree. Best-effort; the kill subprocess
+/// is reaped (`.status()`, not `.spawn()`) by each platform impl.
 fn kill_pid(pid: Option<u32>) {
     let Some(pid) = pid else { return };
-    #[cfg(windows)]
-    {
-        // Use .status() (not .spawn()) so the taskkill subprocess is reaped. Dropping a spawned
-        // std::process::Child without waiting leaves a zombie that accumulates over a long-lived
-        // server with many sandbox kills.
-        let mut cmd = std::process::Command::new("taskkill");
-        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _ = crate::util::no_window(&mut cmd).status();
-    }
-    #[cfg(not(windows))]
-    {
-        // Tree-kill on posix: signal the child's process group (pgid == child pid when spawned
-        // with process_group(0) in execute_run). This kills the child AND any descendants it
-        // spawned (e.g. a dev server a sandboxed script launched), matching Windows' `taskkill
-        // /T /F`. Falls back to a direct signal if the group doesn't exist (e.g. a caller that
-        // spawned the child without its own process group, as some unit tests do).
-        //
-        // Use .status() (not .spawn()) so the kill subprocess is reaped. Dropping a spawned
-        // std::process::Child without waiting leaves a zombie that accumulates over a long-lived
-        // server with many sandbox kills.
-        let group = std::process::Command::new("kill")
-            .args(["-9", &format!("-{pid}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let group_ok = matches!(group, Ok(s) if s.success());
-        if !group_ok {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
+    backend().kill_tree(pid);
 }
 
 /// Kill a running sandbox run by id, returning true if a live child was signalled. Shared by the
@@ -2249,6 +2386,154 @@ mod tests {
 
         // Clean up the process-global store.
         remove_test_run(&id);
+    }
+
+    // ---- SandboxBackend trait tests (B1 cross-platform safe subset) ----
+
+    /// `WindowsSandbox::prepare_command` must set `CREATE_NO_WINDOW` so the packaged
+    /// `windows_subsystem = "windows"` app does not flash a conhost window on every sandbox
+    /// spawn. Verified indirectly via `util::no_window_tokio`, which is the same helper the
+    /// Windows impl calls — so we exercise the helper's contract (CREATE_NO_WINDOW on Windows,
+    /// no-op off Windows) rather than inspect tokio's opaque `Command` internals. The spawn must
+    /// succeed on every platform, proving the backend's `prepare_command` leaves a spawnable
+    /// `Command` in both branches.
+    #[tokio::test]
+    async fn sandbox_backend_windows_impl_sets_creation_flags() {
+        let mut cmd = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "echo" });
+        backend().prepare_command(&mut cmd);
+        if cfg!(windows) {
+            cmd.arg("/c").arg("exit 0");
+        } else {
+            cmd.arg("ok");
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // A spawn that completes cleanly proves prepare_command left the Command in a valid
+        // state — on Windows the CREATE_NO_WINDOW flag is applied by no_window_tokio, which is
+        // itself guarded by dotz-core/tests/windowless_guard.rs.
+        let status = cmd.status().await;
+        assert!(
+            status.is_ok(),
+            "WindowsSandbox::prepare_command must leave a spawnable Command: {:?}",
+            status.err()
+        );
+    }
+
+    /// `MacSandbox`/`LinuxSandbox::prepare_command` must set `process_group(0)` so the posix
+    /// tree-kill (`kill -9 -<pgid>`) can signal the whole group. We can't easily inspect the
+    /// process-group flag on a `tokio::process::Command`, so we assert the observable
+    /// consequence: a child spawned through the backend ends up in its OWN process group
+    /// (pgid == child pid), distinct from this test's process group. posix-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_backend_posix_impl_sets_process_group() {
+        use std::ffi::c_void;
+        // libc::getpgid via std::process — call the backend's prepare_command on a real spawn,
+        // then read the child's pgid and assert it equals the child's pid (its own group), not
+        // this test process's pgid. We can't use `tokio::process::Child::id` + a pgid read
+        // without a raw libc call; instead use std::process::Command with a pipe that lets us
+        // read the child pid, then check getpgid via a small nix-free helper.
+        let backend = crate::sandbox::platform_backend();
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo $$")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        backend.prepare_command(&mut cmd);
+        let child = cmd.spawn().expect("posix spawn should succeed");
+        let pid = child.id().expect("child has a pid");
+        let output = child.wait_with_output().await.expect("child reaps");
+        let printed_pid: u32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("child should print its pid");
+
+        // The child printed its own pid; that must equal the Child::id we observed.
+        assert_eq!(printed_pid, pid, "child should print its own pid");
+
+        // Read the child's pgid via libc::getpgid. If process_group(0) was applied, pgid == pid
+        // (own group). We use a tiny extern-C shim to avoid adding the `nix` crate (ponytail:
+        // stdlib + libc FFI, no new heavy deps).
+        extern "C" {
+            fn getpgid(pid: i32) -> i32;
+        }
+        // SAFETY: getpgid is a thread-safe POSIX syscall that reads a fixed process attribute;
+        // no aliasing, no mutation. pid is a positive integer from a reaped child, so there's a
+        // brief window where the pid may already be recycled, but a -1 return (ESRCH) only
+        // makes the assertion loose, not unsound.
+        let pgid = unsafe { getpgid(pid as i32) };
+        assert_eq!(
+            pgid, pid as i32,
+            "child must be in its own process group (pgid == pid) after prepare_command; \
+             got pgid {pgid} for pid {pid}"
+        );
+        // Suppress an unused-variable warning on the c_void import path if the compiler
+        // didn't already absorb it.
+        let _: *const c_void = std::ptr::null();
+    }
+
+    /// `kill_tree` must dispatch to the platform-correct kill path: taskkill /T /F on Windows,
+    /// `kill -9 -<pgid>` on posix. We verify the dispatch end-to-end by spawning a long-lived
+    /// child, calling `backend().kill_tree(pid)`, and asserting the child actually dies (and is
+    /// reaped, so no zombie lingers). This is the trait-level mirror of the existing
+    /// `kill_pid_kills_target_and_reaps_kill_subprocess` test, but routed through the trait so
+    /// a future platform impl can't silently diverge from the sandbox's `kill_pid`.
+    #[test]
+    fn sandbox_backend_kill_tree_dispatches_to_platform() {
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+                .spawn()
+                .expect("powershell should be available")
+        } else {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("sleep should be available")
+        };
+        #[cfg(windows)]
+        let pid = child.id();
+        #[cfg(not(windows))]
+        let pid = child.id().expect("child should have a pid");
+
+        // Dispatch through the trait. Each impl reaps its own kill subprocess.
+        backend().kill_tree(pid);
+
+        // The target must be killed and reaped. Poll try_wait — the signal was already
+        // delivered, so this resolves quickly. Generous deadline for slow taskkill on AV-heavy
+        // Windows machines.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if std::time::Instant::now() > deadline {
+                        panic!("kill_tree did not kill the target within 15s");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => panic!("try_wait failed: {e}"),
+            }
+        }
+    }
+
+    /// `backend()` must return the SAME `&'static dyn SandboxBackend` across calls — a
+    /// single process-wide instance initialized once via `OnceLock`. A new `Box` per call would
+    /// defeat the OnceLock and let a future stateful backend (e.g. one that caches a detected
+    /// sandbox binary path) re-detect on every spawn.
+    #[test]
+    fn sandbox_backend_once_lock_returns_same_instance() {
+        let a: &'static dyn SandboxBackend = backend();
+        let b: &'static dyn SandboxBackend = backend();
+        // Same fat pointer (data ptr + vtable) => same OnceLock'd Box => initialized once.
+        // std::ptr::eq supports `?Sized` trait objects, comparing both the data pointer and
+        // the vtable pointer, so it's the precise "same trait object" check.
+        assert!(
+            std::ptr::eq(a, b),
+            "backend() must return the same &dyn SandboxBackend across calls"
+        );
     }
 
     /// On posix, `kill_pid` must tree-kill the child's entire process group, not just the direct

@@ -216,12 +216,15 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if std::env::var("DOTZ_ASSETS").is_err() {
                 std::env::set_var("DOTZ_ASSETS", res.join("assets"));
             }
-            // In-app browser binary (bundled as a resource).
+            // In-app browser binary (bundled as a resource under agent-browser/bin/<name>).
+            // Uses binary_name() so the Tauri shell resolves the right per-platform binary
+            // instead of hardcoding the Windows .exe — the tauri.conf.json resource mapping now
+            // bundles the whole agent-browser/bin/ directory.
             if std::env::var("DOTZ_BROWSER_BIN").is_err() {
+                let name = dotz_core::browser::binary_name();
                 std::env::set_var(
                     "DOTZ_BROWSER_BIN",
-                    res.join("agent-browser")
-                        .join("agent-browser-win32-x64.exe"),
+                    res.join("agent-browser").join("bin").join(name),
                 );
             }
 

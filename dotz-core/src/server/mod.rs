@@ -296,18 +296,17 @@ async fn first_run_state() -> Json<Value> {
     }))
 }
 
-/// POST /api/first-run/complete → writes `~/.dotz/first-run-done` (empty marker file) so the
-/// wizard never appears again. Idempotent: a second POST is a no-op (the file already exists) and
-/// still returns 204. Returns 204 on success, 500 if the marker can't be written (disk full,
-/// permission denied — surfaces as an error so the operator sees the failure instead of an
-/// infinite wizard loop).
+/// POST /api/first-run/complete → writes `~/.dotz/first-run-done` (a versioned marker file)
+/// so the wizard never appears again. Idempotent: a second POST is a no-op (the file already
+/// exists) and still returns 204. The marker carries a schema version + timestamp so a future
+/// upgrade that needs to re-show the wizard can gate on `v` (e.g. `if v < 2 { re-show }`)
+/// without a migration. Returns 204 on success, 500 if the marker can't be written.
 async fn first_run_complete() -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let marker = first_run_marker();
     if marker.exists() {
         return Ok(StatusCode::NO_CONTENT);
     }
-    // Create the parent dir if missing (a fresh install may not have `~/.dotz` yet). The marker
-    // file itself is empty — its presence is the signal, its contents don't matter.
+    // Create the parent dir if missing (a fresh install may not have `~/.dotz` yet).
     if let Some(parent) = marker.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             eprintln!("first-run complete: create_dir_all failed: {e}");
@@ -317,14 +316,18 @@ async fn first_run_complete() -> Result<StatusCode, (StatusCode, Json<Value>)> {
             )
         })?;
     }
-    std::fs::write(&marker, "").map_err(|e| {
+    // Versioned marker: {"v":1,"ts":<millis>}. The `v` field lets a future upgrade gate a
+    // re-show of the wizard on schema version (e.g. v2 adds a new step → re-show if v < 2).
+    // The `ts` field is for diagnostics ("when did the operator first complete setup?").
+    let body = format!("{{\"v\":1,\"ts\":{}}}\n", crate::util::now_ms());
+    std::fs::write(&marker, &body).map_err(|e| {
         eprintln!("first-run complete: write marker failed: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("could not write first-run-done marker: {e}") })),
         )
     })?;
-    eprintln!("first-run wizard marked complete");
+    eprintln!("first-run wizard marked complete (v1)");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2815,6 +2818,15 @@ mod tests {
             resp.status()
         );
         assert!(guard.marker().exists(), "POST must create the marker file");
+        // The marker is versioned: {"v":1,"ts":<millis>}. Assert the schema so a future
+        // upgrade that gates a wizard re-show on `v` has the contract pinned.
+        let body = std::fs::read_to_string(guard.marker()).expect("read marker");
+        let parsed: Value = serde_json::from_str(&body).expect("marker must be valid JSON");
+        assert_eq!(parsed["v"], 1, "marker must carry v:1, got: {body}");
+        assert!(
+            parsed["ts"].as_i64().unwrap_or(0) > 1_577_836_800_000,
+            "marker ts must be a plausible recent epoch millis, got: {body}"
+        );
 
         // Second POST: idempotent — still 204, file still exists.
         let resp2 = client

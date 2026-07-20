@@ -302,8 +302,10 @@ fn sessions_guard() -> std::sync::MutexGuard<'static, HashMap<String, SessionRec
 }
 
 // ---- executable resolution (mirror executableCandidates) ----
-/// The agent-browser binary name for this target. win32-x64 is the shipped target.
-fn binary_name() -> &'static str {
+/// The agent-browser binary name for this target. win32-x64 is the shipped target, but the
+/// stubs now resolve the right per-platform name so a future macOS/Linux build can find the
+/// matching binary in the bundled `agent-browser/bin/` directory.
+pub fn binary_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "agent-browser-win32-x64.exe"
     } else if cfg!(target_os = "macos") {
@@ -635,11 +637,9 @@ async fn run(
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file))
         .env("AGENT_BROWSER_HEADED", "false");
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW); // inherent on tokio::process::Command (no CommandExt import needed)
-    }
+    // Cross-platform spawn flags via the shared sandbox backend: CREATE_NO_WINDOW on Windows,
+    // own process group on posix (so the tree-kill reaches the headless Chrome grandchild).
+    crate::sandbox::backend().prepare_command(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -682,34 +682,24 @@ async fn run(
     }
 }
 
-/// Kill a pid and its descendant tree — taskkill /T /F on win32, kill -9 on posix. Best-effort.
+/// Kill a pid and its descendant tree — `taskkill /T /F` on win32, `kill -9 -<pgid>` on posix.
+/// Best-effort. Dispatched through the shared `sandbox::backend()` so browser + sandbox use the
+/// SAME platform kill path. This FIXES the former posix gap: the old inline `#[cfg(not(windows))]`
+/// branch sent `kill -9 <pid>` (single-pid only), so a headless Chrome grandchild that the
+/// agent-browser child spawned leaked as an orphan on timeout/stop. The backend's posix
+/// `kill_tree` signals the whole process group (`kill -9 -<pgid>`), matching sandbox.rs parity.
 ///
 /// The kill is dispatched on a blocking thread (spawn_blocking) and not awaited by the caller:
 /// `CreateProcess` for taskkill.exe is a synchronous syscall that can take several hundred ms
 /// under load, and running it inline on the timeout path would stall a tokio worker thread for
 /// that whole time (and let the caller's wall-clock timeout balloon past its budget). Inside the
-/// blocking task the kill subprocess IS waited on (`.status()`, not `.spawn()`) so it gets
-/// reaped — dropping a spawned `std::process::Child` without waiting leaves a zombie that
-/// accumulates over a long-lived server with many browser kills (same fix as sandbox::kill_pid).
+/// blocking task the kill subprocess IS waited on (`.status()`, not `.spawn()`) by each backend
+/// impl, so it gets reaped — dropping a spawned `std::process::Child` without waiting leaves a
+/// zombie that accumulates over a long-lived server with many browser kills.
 fn kill_pid(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     tokio::task::spawn_blocking(move || {
-        #[cfg(windows)]
-        {
-            let mut cmd = std::process::Command::new("taskkill");
-            cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            let _ = crate::util::no_window(&mut cmd).status();
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
+        crate::sandbox::backend().kill_tree(pid);
     });
 }
 
@@ -2319,5 +2309,31 @@ mod tests {
             None => std::env::remove_var("DOTZ_BROWSER_BIN"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `binary_name()` is `pub` so `src-tauri/src/main.rs` can resolve the bundled agent-browser
+    /// path without hardcoding the Windows `.exe`. On Windows it must return the shipped
+    /// `agent-browser-win32-x64.exe`; on macOS/Linux it returns the per-arch name for the
+    /// future cross-platform build. This guards the pub-visibility + the Windows name against a
+    /// regression that re-hardcodes the `.exe` in main.rs.
+    #[test]
+    fn browser_binary_name_is_pub_and_returns_correct_name() {
+        // pub-visibility: the call compiles only because binary_name is `pub fn`.
+        let name = binary_name();
+        if cfg!(target_os = "windows") {
+            assert_eq!(name, "agent-browser-win32-x64.exe");
+        } else if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") {
+                assert_eq!(name, "agent-browser-darwin-arm64");
+            } else {
+                assert_eq!(name, "agent-browser-darwin-x64");
+            }
+        } else if cfg!(target_arch = "aarch64") {
+            assert_eq!(name, "agent-browser-linux-arm64");
+        } else {
+            assert_eq!(name, "agent-browser-linux-x64");
+        }
+        // Never empty — main.rs builds a path with it.
+        assert!(!name.is_empty(), "binary_name must never be empty");
     }
 }

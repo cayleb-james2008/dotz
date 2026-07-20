@@ -16,18 +16,22 @@
   "bundle": {
     "active": true,
     "targets": [
-      "nsis"
+      "nsis",
+      "dmg",
+      "appimage",
+      "deb"
     ],
     "createUpdaterArtifacts": true,
     "icon": [
       "icons/icon.ico",
-      "icons/icon.png"
+      "icons/icon.png",
+      "icons/icon.icns"
     ],
     "resources": {
       "../web": "web",
       "../.pi": ".pi",
       "../assets": "assets",
-      "../node_modules/agent-browser/bin/agent-browser-win32-x64.exe": "agent-browser/agent-browser-win32-x64.exe"
+      "../node_modules/agent-browser/bin": "agent-browser/bin"
     }
   },
   "plugins": {

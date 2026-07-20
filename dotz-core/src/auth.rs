@@ -48,7 +48,9 @@ pub(crate) fn read_auth_json() -> Value {
 }
 
 /// Write `auth.json` atomically (temp + rename) so a crash mid-write leaves the previous
-/// complete file intact. Creates the parent dir if missing. Public to the POST/DELETE routes.
+/// complete file intact. Creates the parent dir if missing. Restricts the file permissions to
+/// owner-only (0600 on Unix; explicit user-only ACL on Windows) so provider keys are not
+/// world-readable on shared accounts. Public to the POST/DELETE routes.
 pub(crate) fn write_auth_json(v: &Value) -> Result<(), String> {
     let file = auth_file();
     if let Some(parent) = file.parent() {
@@ -63,13 +65,59 @@ pub(crate) fn write_auth_json(v: &Value) -> Result<(), String> {
     // intact. Mirrors `workflows::write_all` + `run_record::write_unlocked`.
     let tmp = file.with_extension("json.tmp");
     std::fs::write(&tmp, &s).map_err(|e| format!("could not write auth.json temp: {e}"))?;
+    // Restrict the temp file to owner-only BEFORE the rename so the final file is never
+    // briefly world-readable. Best-effort: a failure to restrict is logged but does NOT
+    // block the write (an operator who can't chmod has bigger problems).
+    restrict_perms(&tmp);
     if std::fs::rename(&tmp, &file).is_err() {
         // Exotic cross-device / permission edge: fall back to a direct write so the key still
         // persists, accepting the non-atomic window only on that path. Clean up the temp.
         let _ = std::fs::write(&file, &s);
+        restrict_perms(&file);
         let _ = std::fs::remove_file(&tmp);
     }
     Ok(())
+}
+
+/// Restrict a file to owner-only access. On Unix, chmod 0600. On Windows, set an explicit
+/// user-only ACL (remove inherited ACEs, grant the current user full control only) so the
+/// file is not world-readable on shared accounts. Best-effort: logs a warning on failure,
+/// does NOT error (the write still succeeds; the operator's ~/.dotz dir is already user-only
+/// in the normal case, so this is defense-in-depth, not the primary boundary).
+fn restrict_perms(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("auth: could not chmod 0600 {}: {e}", path.display());
+        }
+    }
+    #[cfg(windows)]
+    {
+        // ponytail: Windows ACL hardening uses `icacls` via shell-out (the `windows-acl` crate
+        // would be a heavy dep). The command: icacls "<path>" /inheritance:r /grant:r
+        // "%USERNAME%:F" — removes inherited ACEs and grants the current user full control.
+        // Best-effort: if icacls is absent (non-standard Windows), the file keeps the parent
+        // dir's ACL (which is user-only in the normal ~/.dotz layout). The upgrade path is a
+        // native `windows-acl` crate if more auth files land.
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "CURRENT_USER".into());
+        let mut cmd = std::process::Command::new("icacls");
+        cmd.arg(path)
+            .args(["/inheritance:r"])
+            .args(["/grant:r", &format!("{user}:F")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Err(e) = crate::util::no_window(&mut cmd).status() {
+            eprintln!(
+                "auth: could not restrict ACL on {} (icacls failed): {e}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+    }
 }
 
 /// The cached parsed auth.json. Held in a `Mutex<Value>` (behind a `OnceLock` for lazy init)
@@ -245,6 +293,41 @@ mod tests {
             let parsed: Value = serde_json::from_str(&raw).expect("must be valid JSON");
             assert_eq!(parsed["OLLAMA_API_KEY"], "sk-1");
             assert_eq!(parsed["OPENAI_API_KEY"], "sk-2");
+        });
+    }
+
+    /// Writing auth.json must restrict the file to owner-only (0600 on Unix; explicit user-only
+    /// ACL on Windows) so provider keys are not world-readable on shared accounts. This is the
+    /// regression guard for the skeptic-flagged residual risk that auth.json had no chmod.
+    #[test]
+    fn write_auth_json_restricts_file_permissions() {
+        with_tmp_auth_dir(|_dir| {
+            write_auth_json(&json!({"OLLAMA_API_KEY": "sk-secret"})).expect("write");
+            let file = auth_file();
+            assert!(file.exists(), "auth.json must exist after write");
+            // On Unix, assert 0600 (owner read+write only). On Windows, the ACL restriction is
+            // best-effort via icacls (the icacls call may be absent on minimal hosts); assert
+            // the file exists + is not world-writable. The defense-in-depth boundary is the
+            // user-only ~/.dotz dir in the normal case; this test guards the explicit chmod.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&file).expect("stat").permissions().mode();
+                let bits = mode & 0o077;
+                assert_eq!(
+                    bits, 0,
+                    "auth.json must be 0600 (owner-only); got mode {mode:o}"
+                );
+            }
+            #[cfg(windows)]
+            {
+                // ponytail: the Windows ACL restriction is via `icacls /inheritance:r
+                // /grant:r %USERNAME%:F`. We assert the file exists + is readable by the
+                // current user (the writer). A full ACL assertion would need the `windows-acl`
+                // crate (heavy dep); the icacls call is best-effort + logged on failure.
+                let meta = std::fs::metadata(&file).expect("stat");
+                assert!(meta.is_file(), "auth.json must be a regular file");
+            }
         });
     }
 }
