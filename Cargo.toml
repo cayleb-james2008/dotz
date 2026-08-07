@@ -19,7 +19,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # lancedb: embedded vector database for production-scale semantic search.
 # Supplements rusqlite as the memory store grows; Rust-native, in-process.
-# Uncomment when integrating: lancedb = "0."
+lancedb = "0.33"
 # winres: Windows resource compiler — embeds app icon, version info, and manifest
 # into the .exe at build time. Add as a build-dependency in src-tauri.
 # Uncomment when integrating: winres = "0.1"

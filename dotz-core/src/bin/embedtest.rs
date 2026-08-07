@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw =
         std::fs::read_to_string(std::env::var("DOTZ_EMBED_FIXTURE").unwrap_or_else(|_| {
             "fixtures/js_embeddings.json".to_string()
-        }))?
+        }))?;
     let j: serde_json::Value = serde_json::from_str(&raw)?;
     let texts: Vec<String> = j["texts"]
         .as_array()
