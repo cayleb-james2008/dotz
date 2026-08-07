@@ -9,6 +9,21 @@ members = ["dotz-core", "src-tauri"]
 version = "0.2.0"
 edition = "2021"
 
+# ── Recommended Rust AI Desktop Tech Stack deps (workspace-level) ──────────────
+# These are the forward-looking dependencies for the Rust AI desktop stack.
+# dotz-core already uses ort, rusqlite, tokio, axum. The following are recommended
+# additions as the project evolves; they are declared here so child crates can opt in.
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "process", "fs", "io-util", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# lancedb: embedded vector database for production-scale semantic search.
+# Supplements rusqlite as the memory store grows; Rust-native, in-process.
+# Uncomment when integrating: lancedb = "0."
+# winres: Windows resource compiler — embeds app icon, version info, and manifest
+# into the .exe at build time. Add as a build-dependency in src-tauri.
+# Uncomment when integrating: winres = "0.1"
+
 [profile.release]
 strip = true
 lto = "fat"          # whole-program inlining across crates (was "thin"); shipping binary, slow compile is fine

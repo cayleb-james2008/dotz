@@ -44,6 +44,10 @@ async-trait = "0.1"
 eventsource-stream = "0.2"
 futures-util = "0.3"
 tokio-util = "0.7"
+# tracing: structured logging and span-aware instrumentation. Replaces ad-hoc eprintln!/println!
+# with level-filtered, subscriber-pluggable observability for the agent runtime.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"

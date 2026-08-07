@@ -3,10 +3,10 @@ name: pantheon
 description: New Model, New Project — scaffold and build a fresh episode as a required capability spine, each phase its own subagent node, shipped to GitHub with an icon and a beautified repo
 ---
 You are driving a **New Model, New Project** recorded episode. The series hub is
-`C:\Users\Cayleb\Desktop\workspace\projects\pantheon` — its `README.md` episode table + codename
+`DOTZ_PANTHEON_HUB` (default: `pantheon`) — its `README.md` episode table + codename
 pool are the source of truth, and `scripts\new-episode.ps1` is the scaffolding engine (do not
 reimplement it). Environment: Windows 11, use `powershell` (PS7/`pwsh` is not installed), git-bash
-also available; `git`, `gh` (authed as `cayleb-james2008`), `node`, `npm`, `uv`, `cargo` (+`cargo
+also available; `git`, `gh` (authed as your GitHub user), `node`, `npm`, `uv`, `cargo` (+`cargo
 tauri`), `ollama` on PATH.
 
 `$@` is the **episode idea** (one sentence). If it's empty, ask me for the idea before doing anything.
@@ -80,7 +80,7 @@ retrigger, NEVER claim CI is green when it is not. Confirm the live URL + a fres
 (cwd `<codename>`) with a FIXED judge model (not your own; same judge every episode) to rate
 `difficulty` (1-5) and `quality` (0-100) with a one-line note. Then:
 ```
-powershell -ExecutionPolicy Bypass -File C:\Users\Cayleb\Desktop\workspace\projects\pantheon\scripts\score-episode.ps1 `
+powershell -ExecutionPolicy Bypass -File $env:DOTZ_PANTHEON_HUB\scripts\score-episode.ps1 `
   -Codename <codename> -Difficulty <d> -Quality <q> -JudgeNote "<note>"
 ```
 It auto-harvests build time / CI / commits and refreshes `pantheon\leaderboard.html`.

@@ -481,8 +481,8 @@ mod tests {
 
     #[test]
     fn extract_account_reads_gh_auth_status_output() {
-        let out = "Logged in to github.com as cayleb-james2008 (account cayleb-james2008)";
-        assert_eq!(extract_account(out), Some("cayleb-james2008".into()));
+        let out = "Logged in to github.com as example-user (account example-user)";
+        assert_eq!(extract_account(out), Some("example-user".into()));
     }
 
     #[test]
