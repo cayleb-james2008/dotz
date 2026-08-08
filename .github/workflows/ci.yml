@@ -18,13 +18,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy -p dotz-core --all-targets -- -D warnings
-      - run: cargo test -p dotz-core
-      # Cold-start perf gate (Windows-only): fetches the bundled ONNX model, then runs the
-      # Embedder::load() bench against the committed baseline (docs/perf-baseline.json, 526ms
-      # on 2026-07-20). A regression beyond 15% fails the gate. The bench step is guarded so a
-      # fresh checkout without the model stays green — `npm run fetch-model` is run first.
+      # Fetch the bundled ONNX embedding model BEFORE tests — the embed/memory tests require it
+      # (assets/models/ is gitignored, so a fresh checkout has no model). The script is
+      # cross-platform Node, so it runs on every OS.
       - run: npm install && npm run fetch-model
-        if: matrix.os == 'windows-latest'
+      - run: cargo test -p dotz-core
+      # Cold-start perf gate (Windows-only): runs the Embedder::load() bench against the
+      # committed baseline (docs/perf-baseline.json, 526ms on 2026-07-20). A regression beyond
+      # 15% fails the gate. The model is already fetched above.
       - run: cargo bench --bench cold_start -- --bench
         if: matrix.os == 'windows-latest'
 

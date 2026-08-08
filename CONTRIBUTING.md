@@ -109,6 +109,12 @@ Use the [GitHub issue templates](.github/ISSUE_TEMPLATE/) to report bugs or requ
 Include as much context as possible: OS, Rust version, steps to reproduce, expected vs. actual
 behavior.
 
+## Community Standards
+
+All participants in the dotz community are expected to follow our
+[Code of Conduct](CODE_OF_CONDUCT.md). Be respectful, constructive, and inclusive in all
+interactions — issues, PRs, and discussions.
+
 ## License
 
 By contributing, you agree that your contributions are licensed under the [MIT License](LICENSE).

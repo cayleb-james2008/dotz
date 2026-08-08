@@ -66,7 +66,7 @@ The desired visual quality is inspired by premium brand-guidelines decks with:
 - UI mockups used as brand applications
 - browser chrome / app headers / terminal frames
 - image-led panels with subtle overlays
-- halftone, grain, scanline, or print texture
+- dot-matrix, grain, scanline, or print texture
 - geometric construction diagrams
 - small labels and page-number details
 - muted but powerful accent colors
@@ -324,7 +324,7 @@ Large type specimen, alphabet row, or primary/secondary type pairing.
 Card, folder, badge, poster, label, seal, packaging, or object mockup.
 
 ## 8. Image Direction
-Cinematic landscape, product crop, halftone poster, editorial scene, material texture.
+Cinematic landscape, product crop, dot-matrix poster, editorial scene, material texture.
 
 ## 9. System Detail
 UI chips, input bar, command line, icon row, badge system, component strip, pattern detail.
@@ -346,7 +346,7 @@ For boards like the uploaded references, use:
    - terminal, prompt bar, input state, install command, dashboard fragment
 
 4. **Atmosphere / Campaign Image**
-   - halftone landscape, cinematic image, product-world visual, or art-directed photo
+   - dot-matrix landscape, cinematic image, product-world visual, or art-directed photo
 
 5. **Symbol / Construction / Badge**
    - logo mark in target, seal, geometric frame, icon construction
@@ -534,7 +534,7 @@ Use for:
 music, creative tools, events, gaming-adjacent, cultural products.
 
 Visual cues:
-- halftone
+- dot-matrix
 - CRT texture
 - analog print
 - bold accent color
@@ -567,7 +567,7 @@ Use details like:
 - image masks
 - soft shadows
 - low-opacity texture
-- halftone image treatment
+- dot-matrix image treatment
 - one highlighted word
 - one accent chip
 - one strong icon state
@@ -632,7 +632,7 @@ Use:
 - cinematic mountains
 - dusk skies
 - landscapes with brand overlays
-- halftone clouds
+- dot-matrix clouds
 - CRT screen scenes
 - dark product closeups
 - dramatic object crops

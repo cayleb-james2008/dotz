@@ -31,7 +31,7 @@ od:
 
 ## 1. Skill Meta
 **Name:** Industrial Brutalism & Tactical Telemetry Interface Engineering
-**Description:** Advanced proficiency in architecting web interfaces that synthesize mid-century Swiss Typographic design, industrial manufacturing manuals, and retro-futuristic aerospace/military terminal interfaces. This discipline requires absolute mastery over rigid modular grids, extreme typographic scale contrast, purely utilitarian color palettes, and the programmatic simulation of analog degradation (halftones, CRT scanlines, bitmap dithering). The objective is to construct digital environments that project raw functionality, mechanical precision, and high data density, deliberately discarding conventional consumer UI patterns.
+**Description:** Advanced proficiency in architecting web interfaces that synthesize mid-century Swiss Typographic design, industrial manufacturing manuals, and retro-futuristic aerospace/military terminal interfaces. This discipline requires absolute mastery over rigid modular grids, extreme typographic scale contrast, purely utilitarian color palettes, and the programmatic simulation of analog degradation (dot-matrix patterns, CRT scanlines, bitmap dithering). The objective is to construct digital environments that project raw functionality, mechanical precision, and high data density, deliberately discarding conventional consumer UI patterns.
 
 ## 2. Visual Archetypes
 The design system operates by merging two distinct but highly compatible visual paradigms. **Pick ONE per project and commit to it. Do not alternate or mix both modes within the same interface.**
@@ -68,7 +68,7 @@ Typography is the primary structural and decorative infrastructure. Imagery is s
 ### 3.3 Textural Contrast (Artistic Disruption)
 *   **Classification:** High-Contrast Serif.
 *   **Optimal Web Fonts:** Playfair Display, EB Garamond, Times New Roman.
-*   **Implementation Parameters:** Used exceedingly sparingly. Must be subjected to heavy post-processing (halftone filters, 1-bit dithering) to degrade vector perfection and create textural juxtaposition against the clean sans-serifs.
+*   **Implementation Parameters:** Used exceedingly sparingly. Must be subjected to heavy post-processing (dot-matrix filters, 1-bit dithering) to degrade vector perfection and create textural juxtaposition against the clean sans-serifs.
 
 ## 4. Color System
 The color architecture is uncompromising. Gradients, soft drop shadows, and modern translucency are strictly prohibited. Colors simulate physical media or primitive emissive displays.
@@ -106,7 +106,7 @@ Standard web UI conventions are replaced with utilitarian, industrial graphic el
 ## 7. Textural and Post-Processing Effects
 To prevent the design from appearing purely digital, simulated analog degradation is engineered into the frontend via CSS and SVG filters.
 
-*   **Halftone and 1-Bit Dithering:** Transforming continuous-tone images or large serif typography into dot-matrix patterns. Achieved via pre-processing or CSS `mix-blend-mode: multiply` overlays combined with SVG radial dot patterns.
+*   **Dot-Matrix and 1-Bit Dithering:** Transforming continuous-tone images or large serif typography into dot-matrix patterns. Achieved via pre-processing or CSS `mix-blend-mode: multiply` overlays combined with SVG radial dot patterns.
 *   **CRT Scanlines:** For terminal interfaces, applying a `repeating-linear-gradient` to the background to simulate horizontal electron beam sweeps (e.g., `repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.1) 2px, rgba(0,0,0,0.1) 4px)`).
 *   **Mechanical Noise:** A global, low-opacity SVG static/noise filter applied to the DOM root to introduce a unified physical grain across both dark and light modes.
 

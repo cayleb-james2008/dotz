@@ -223,10 +223,9 @@ fn readiness_findings(dir: &FsPath) -> Vec<ReadinessFinding> {
                 ("complete", rest)
             } else if let Some(rest) = trimmed.strip_prefix("- [X]") {
                 ("complete", rest)
-            } else if let Some(rest) = trimmed.strip_prefix("- [ ]") {
-                ("pending", rest)
             } else {
-                return None;
+                let rest = trimmed.strip_prefix("- [ ]")?;
+                ("pending", rest)
             };
             let title = rest.trim().trim_start_matches('-').trim().to_string();
             if title.is_empty() {
