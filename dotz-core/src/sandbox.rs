@@ -2224,12 +2224,10 @@ mod tests {
                 .spawn()
                 .expect("sleep should be available")
         };
-        // On Windows `std::process::Child::id()` returns `u32` directly; on Unix it returns
-        // `Option<u32>`. Normalize to a plain u32.
-        #[cfg(windows)]
+        // `std::process::Child::id()` returns `u32` on every platform (`Option<u32>` is the
+        // *tokio* Child API — not used here). The old cfg branches had it backwards and did not
+        // compile on non-Windows.
         let pid = child.id();
-        #[cfg(not(windows))]
-        let pid = child.id().expect("child should have a pid");
 
         // kill_pid must kill the target. With .status() it also blocks until the kill/taskkill
         // subprocess exits and is reaped, so by the time kill_pid returns no zombie lingers.
@@ -2493,10 +2491,8 @@ mod tests {
                 .spawn()
                 .expect("sleep should be available")
         };
-        #[cfg(windows)]
+        // `std::process::Child::id()` returns `u32` on every platform (see note above).
         let pid = child.id();
-        #[cfg(not(windows))]
-        let pid = child.id().expect("child should have a pid");
 
         // Dispatch through the trait. Each impl reaps its own kill subprocess.
         backend().kill_tree(pid);

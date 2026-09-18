@@ -6,12 +6,17 @@
 
 **The in-process multi-agent coding dashboard — one prompt becomes a team of AI coding agents.**
 
-[![CI](https://github.com/cayleb-james2008/dotz/actions/workflows/ci.yml/badge.svg)](https://github.com/cayleb-james2008/dotz/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Download](https://img.shields.io/github/v/release/cayleb-james2008/dotz?label=download&color=b4befe)](https://github.com/cayleb-james2008/dotz/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/cayleb-james2008/dotz/total?color=a6e3a1)](https://github.com/cayleb-james2008/dotz/releases/latest)
-[![Platform](https://img.shields.io/badge/platform-Windows-89b4fa)](https://github.com/cayleb-james2008/dotz/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-Windows-first-89b4fa)](#what-works-today)
 [![Built with](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri-cba6f7)](https://tauri.app)
+[![Rust](https://img.shields.io/badge/rust-edition%202021-orange.svg)](dotz-core/Cargo.toml)
+
+> No live-fact badges here on purpose: the release-feed URLs returned HTTP 404
+> from an unauthenticated check on 2026-09-18 (see [What works today](#what-works-today)),
+> so CI-status / download-count / release-version badges would render as error badges.
+> Releases are cut by [`.github/workflows/release.yml`](.github/workflows/release.yml),
+> which builds the signed NSIS installer + the minisign-signed `latest.json` updater feed
+> on every `v*` tag.
 
 </div>
 
@@ -47,6 +52,7 @@ HTML/PDF export).
 - [Build and Test](#build-and-test)
 - [Development and Gates](#development--gates)
 - [Cross-device Auto-update](#cross-device-auto-update)
+- [What works today](#what-works-today)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -60,9 +66,12 @@ HTML/PDF export).
   The entire agent runtime (chat loop, tools, subagents, providers) lives inside `dotz-core`.
 - **Sessions over WebSocket** — the UI is a plain web app (`fetch` + WS streaming), identical in a
   browser against the headless `serve` bin and inside the Tauri window.
-- **Deterministic tool sandbox** — `terminal` mode streams stdout/stderr back into chat; `web` mode
+- **Managed tool sandbox** — `terminal` mode streams stdout/stderr back into chat; `web` mode
   renders an inline preview iframe the agent drives with an on-screen cursor you both can see.
-  Bash tools use an **allowlist-only** execution model.
+  Profiles gate which tools are available (the PLAN profile uses a fixed tool allowlist),
+  the in-app browser enforces an origin allowlist, and the loopback API rejects
+  disallowed `Origin`/`Host` with `403`. The `bash` tool itself runs the given command
+  in the session cwd with a wall-clock timeout — review commands in `terminal` mode.
 - **On-device memory** — automatic capture/recall/consolidation via `rusqlite` + local ONNX
   embeddings (all-MiniLM-L6-v2, in-process — no embeddings API), mirrored to a committable `MEMORY.md`.
 - **Model-agnostic providers** — multi-provider auth with per-provider UI modes (free-form model-id
@@ -192,8 +201,12 @@ in real time:
 
 ### 1. Deterministic Tool Sandbox
 
-The tool sandbox enforces an **allowlist-only** execution model. Bash tools only run commands that
-match the configured allowlist — no arbitrary shell execution. The sandbox runs in two modes:
+The tool sandbox is a managed run store (run lifecycle `pending → running → done|error|killed`,
+`dotz-core/src/sandbox.rs`). Allowlists apply at the boundaries: profiles gate which tools an
+agent may call (see `PLAN_TOOLS` in `dotz-core/src/agent/tools.rs`), the in-app browser enforces
+an origin allowlist (`dotz-core/src/browser.rs`), and the loopback API rejects disallowed
+`Origin`/`Host` with `403` (`dotz-core/src/server/guard.rs`). The `bash` tool itself runs the
+given command in the session cwd with a wall-clock timeout — no command allowlist. The sandbox runs in two modes:
 
 - **`terminal`** mode — streams stdout/stderr back into the chat panel.
 - **`web`** mode — starts a long-lived process bound to a local HTTP port; the UI renders an inline
@@ -349,6 +362,11 @@ npm install        # ships the agent-browser binary + the @huggingface/transform
 npm run fetch-model    # downloads the all-MiniLM-L6-v2 ONNX model into assets/models/ (bundled by Tauri)
 ```
 
+> Linux note (verified 2026-09-18, Node v26.7.0): plain `npm install` fails building
+> `sharp` from source (`npm error sharp: Please add node-addon-api to your dependencies`).
+> `npm install --ignore-scripts` works and is enough for the model fetch. Without the
+> fetch, the `embed::*` / `memory::*` tests fail — run it before `cargo test`, as CI does.
+
 ### Provider configuration
 
 dotz resolves provider auth from `~/.pi/agent/auth.json` → env vars. Set keys for the providers you
@@ -416,10 +434,66 @@ installer and cuts a draft GitHub Release with the signed `latest.json` updater 
 
 ## Cross-device Auto-update
 
-The installed app self-updates via `tauri-plugin-updater`: it checks this repo's
-[latest release](https://github.com/cayleb-james2008/dotz/releases/latest) for a minisign-signed
-`latest.json`, verifies it against the bundled pubkey, and installs + relaunches in place. Full
-topology and the release commands are in [src-tauri/DEPLOY.md](src-tauri/DEPLOY.md).
+The installed app self-updates via `tauri-plugin-updater` (wired in `src-tauri/src/main.rs`,
+endpoint + pubkey in `src-tauri/tauri.conf.json`): it checks this repo's releases for a
+minisign-signed `latest.json`, verifies it against the bundled pubkey, and installs + relaunches
+in place. Note: the release-feed URL returned HTTP 404 from an unauthenticated check on
+2026-09-18, so no updater feed could be verified yet — the mechanism is implemented and the feed
+goes live with the first `v*` release. Full topology and the release commands are in
+[src-tauri/DEPLOY.md](src-tauri/DEPLOY.md).
+
+## What works today
+
+Status as verified on this Linux host on 2026-09-18. Anything not listed here is untested.
+
+**Verified in code (file proves the claim):**
+
+- Own agent runtime, no third-party agent SDK — `dotz-core/src/agent/mod.rs` ("the Rust
+  replacement for the third-party pi SDK"); subagents are isolated in-process LLM runs
+  (`dotz-core/src/agent/subagent.rs`), not child processes.
+- Local ONNX embeddings via `ort` — `dotz-core/src/embed.rs` (all-MiniLM-L6-v2, 384-dim,
+  in-process); `ort` is deliberately exact-pinned (`=2.0.0-rc.12`), guarded by
+  `dotz-core/tests/ort_pin_guard.rs`.
+- Persistent projects + memory store — `dotz-core/src/projects.rs`, `dotz-core/src/memory.rs`
+  (`rusqlite` vector index + git-committable `MEMORY.md` mirror).
+- 150+ design systems and 150+ design skills — `.pi/design-systems/` (154 dirs, 150 with
+  `DESIGN.md`) and `.pi/design-skills/` (160 dirs, 156 with `SKILL.md`), served by
+  `dotz-core/src/design.rs` and `dotz-core/src/skills.rs` via `<cwd>/.pi` (override: `DOTZ_PI`).
+  Keep those paths — the app reads them at runtime.
+- Multi-provider auth — `dotz-core/src/agent/provider.rs` (`provider_endpoint`: ollama,
+  openrouter, openai, groq, mistral, xai, deepseek, cohere, nvidia-nim, local, plus native
+  anthropic/google adapters); keys resolve env var → `~/.pi/agent/auth.json`.
+- Origin-guarded loopback API — `dotz-core/src/server/guard.rs` rejects disallowed
+  `Origin`/`Host` with `403`.
+- Signed self-update wiring — `tauri-plugin-updater` in `src-tauri/Cargo.toml` +
+  endpoint/pubkey in `src-tauri/tauri.conf.json`; releases cut by
+  `.github/workflows/release.yml` on `v*` tags.
+- CI is valid YAML and its referenced paths exist: `scripts/fetch-embed-model.mjs`,
+  `docs/perf-baseline.json` (`cold_start_ms: 526`, measured 2026-07-20), the `cold_start`
+  bench (`dotz-core/benches/cold_start.rs`, `cargo bench --bench cold_start`).
+
+**Verified by running (exact commands + results):**
+
+- `cargo fmt --all -- --check` — passes (exit 0).
+- `cargo test -p dotz-core` after a two-line test-compile fix: 796 passed / 17 failed
+  with default parallelism, 803 passed / 10 failed with `-- --test-threads=1` (see
+  POLISH-NOTES.md for the per-cause breakdown; remaining failures are environment:
+  missing `minisign` CLI, filesystem walk order, process-group/pid capture).
+- `npm install --ignore-scripts && npm run fetch-model` — works (exit 0; plain
+  `npm install` fails building `sharp` from source on this host, the fetcher does not
+  need it). Without the model fetch, the `embed::*` / `memory::*` tests fail — a fresh
+  clone must run the fetch first, exactly as CI does.
+
+**Not run / needs something else:**
+
+- Desktop shell + installer (`cargo tauri dev` / `cargo tauri build`, NSIS target) — needs
+  Windows; not run on this Linux host.
+- GPU acceleration (DirectML execution provider for `ort`) — needs Windows; CPU path only here.
+- Live-provider tests (`e2e_live_prompt`, `DOTZ_E2E_LIVE=1`) — need provider API keys; not run.
+- The GitHub release feed (`.../releases/latest`, updater `latest.json`) — the URLs returned
+  HTTP 404 from an unauthenticated `curl` check on 2026-09-18, so no release artifact or badge
+  could be verified. The feed goes live with the first `v*` release.
+- `cargo bench --bench cold_start` — Windows-only CI gate; not run here.
 
 ## Contributing
 

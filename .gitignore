@@ -8,6 +8,9 @@ assets/models/
 .env.local
 data/
 *.log
+# Test artifact: a hooks test command redirects to `> nul` (the Windows null device),
+# which creates a real zero-byte file named `nul` when the suite runs on Linux.
+**/nul
 .DS_Store
 .ai-agents/
 
