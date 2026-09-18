@@ -1342,3 +1342,8 @@ button:not(:disabled):active, .qchip:active, .knob-btn:active,
 ::-webkit-scrollbar-thumb { background: rgba(140,157,255,0.22); border: 2px solid transparent; background-clip: padding-box; border-radius: 6px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(140,157,255,0.42); background-clip: padding-box; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+
+/* Keyboard accessibility: focus-revealed skip link (Catppuccin-ish tokens). */
+.skip-link{position:absolute;left:-9999px;top:0;z-index:500;padding:8px 14px;background:var(--surface-2);color:var(--text);border:1px solid var(--border-bright);border-radius:0 0 6px 0;font:inherit}
+.skip-link:focus,.skip-link:focus-visible{left:0;outline:2px solid var(--prim);outline-offset:2px}

@@ -10,6 +10,7 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <a class="skip-link" href="#stage">Skip to main content</a>
     <div id="app">
       <!-- TOP BAR: brand + project selector + the four knobs -->
       <header class="topbar">
@@ -31,15 +32,15 @@
                 <button id="project-new-btn" class="btn-mini btn-go">+ NEW PROJECT</button>
               </div>
               <div id="project-form" class="project-form hidden">
-                <input id="pf-name" class="pf-input" placeholder="project name" />
+                <input aria-label="project name" id="pf-name" class="pf-input" placeholder="project name" />
                 <div class="pf-row">
-                  <input id="pf-cwd" class="pf-input" placeholder="cwd (absolute path)" />
+                  <input aria-label="cwd (absolute path)" id="pf-cwd" class="pf-input" placeholder="cwd (absolute path)" />
                   <button id="pf-browse" class="btn-mini" type="button" title="Pick a folder in File Explorer">Browse…</button>
                 </div>
-                <select id="pf-profile" class="pf-select"></select>
-                <input id="pf-model" class="pf-input" placeholder="model id" />
-                <input id="pf-appurl" class="pf-input" placeholder="app url (optional, e.g. http://127.0.0.1:5173)" />
-                <input id="pf-gate" class="pf-input" placeholder="gate/test cmd (optional, e.g. .venv\Scripts\python -m pytest)" />
+                <select aria-label="project profile" id="pf-profile" class="pf-select"></select>
+                <input aria-label="model id" id="pf-model" class="pf-input" placeholder="model id" />
+                <input aria-label="app url (optional, e.g. http://127.0.0.1:5173)" id="pf-appurl" class="pf-input" placeholder="app url (optional, e.g. http://127.0.0.1:5173)" />
+                <input aria-label="gate/test cmd (optional, e.g. .venv\Scripts\python -m pytest)" id="pf-gate" class="pf-input" placeholder="gate/test cmd (optional, e.g. .venv\Scripts\python -m pytest)" />
                 <div class="pf-actions">
                   <button id="pf-create" class="btn-mini btn-go">CREATE &amp; OPEN</button>
                   <button id="pf-cancel" class="btn-mini">CANCEL</button>
@@ -55,18 +56,18 @@
 
           <div class="knob-group">
             <label class="knob-label">PROVIDER</label>
-            <select id="provider-select" class="knob-select" title="provider"></select>
+            <select aria-label="provider" id="provider-select" class="knob-select" title="provider"></select>
           </div>
           <div class="knob-group">
             <label class="knob-label">MODEL</label>
-            <input id="model-input" class="knob-input" list="model-suggestions" spellcheck="false" placeholder="executive model id" title="executive (lead) model" />
+            <input aria-label="executive model id" id="model-input" class="knob-input" list="model-suggestions" spellcheck="false" placeholder="executive model id" title="executive (lead) model" />
             <datalist id="model-suggestions"></datalist>
-            <select id="model-select" class="knob-select hidden"></select>
+            <select aria-label="executive model (select)" id="model-select" class="knob-select hidden"></select>
             <span id="model-badge" class="model-badge hidden">—</span>
           </div>
           <div class="knob-group">
             <label class="knob-label">SUBAGENT</label>
-            <input id="subagent-input" class="knob-input" list="subagent-suggestions" spellcheck="false" placeholder="subagent model id" title="model every dispersed subagent runs on" />
+            <input aria-label="subagent model id" id="subagent-input" class="knob-input" list="subagent-suggestions" spellcheck="false" placeholder="subagent model id" title="model every dispersed subagent runs on" />
             <datalist id="subagent-suggestions"></datalist>
           </div>
           <div class="knob-group">
@@ -94,7 +95,7 @@
             <p class="cc-sub">ultra-code agent dashboard</p>
             <div class="cc-composer-wrap">
               <div id="quick-chips" class="quick-chips"></div>
-              <textarea id="composer-input" class="composer-input" rows="1" placeholder="tell dotz what to build…   / slash commands · @ skills · # files"></textarea>
+              <textarea aria-label="tell dotz what to build…   / slash commands · @ skills · # files" id="composer-input" class="composer-input" rows="1" placeholder="tell dotz what to build…   / slash commands · @ skills · # files"></textarea>
               <div class="cc-actions">
                 <span class="cc-hint mono dim">↵ send · ⇧↵ newline</span>
                 <div class="cc-actions-btns">
@@ -135,7 +136,7 @@
     <!-- OVERLAYS -->
     <div id="cmd-palette" class="cmd-palette hidden">
       <div class="cmd-palette-card">
-        <input id="cmd-palette-input" class="cmd-palette-input" placeholder="type to filter…" />
+        <input aria-label="type to filter…" id="cmd-palette-input" class="cmd-palette-input" placeholder="type to filter…" />
         <div id="cmd-palette-list" class="cmd-palette-list"></div>
       </div>
     </div>
@@ -144,7 +145,7 @@
       <div class="gate-card-inner">
         <div id="gate-head" class="gate-head">◆ HUMAN GATE</div>
         <div id="gate-plan" class="gate-plan"></div>
-        <textarea id="gate-feedback" class="gate-feedback" placeholder="optional feedback (sent back to agent)"></textarea>
+        <textarea aria-label="optional feedback (sent back to agent)" id="gate-feedback" class="gate-feedback" placeholder="optional feedback (sent back to agent)"></textarea>
         <div class="gate-actions">
           <button id="gate-approve" class="btn-go">APPROVE ✓</button>
           <button id="gate-reject" class="btn-stop">REJECT ✕</button>
@@ -259,7 +260,7 @@
           <div class="composer">
             <div class="quick-chips" data-role="quick-chips"></div>
             <div class="composer-row">
-              <textarea class="composer-input" data-role="composer-input" rows="1" placeholder="message dotz…   / slash · @ skills · # files"></textarea>
+              <textarea aria-label="message dotz…   / slash · @ skills · # files" class="composer-input" data-role="composer-input" rows="1" placeholder="message dotz…   / slash · @ skills · # files"></textarea>
               <button class="btn-send" data-role="send-btn">SEND ▹</button>
               <button class="btn-stop hidden" data-role="stop-btn">STOP ■</button>
             </div>
@@ -318,14 +319,14 @@
             <button id="br-back" class="btn-mini" title="back" aria-label="Back"><span aria-hidden="true">◀</span></button>
             <button id="br-forward" class="btn-mini" title="forward" aria-label="Forward"><span aria-hidden="true">▶</span></button>
             <button id="br-reload" class="btn-mini" title="reload" aria-label="Reload"><span aria-hidden="true">↻</span></button>
-            <input id="br-url" class="br-url" placeholder="https://…" />
+            <input aria-label="https://…" id="br-url" class="br-url" placeholder="https://…" />
             <button id="br-navigate" class="btn-mini btn-go">GO</button>
             <button id="br-shot-btn" class="btn-mini" title="refresh frame" aria-label="Refresh frame">◫</button>
             <button id="br-stop" class="btn-mini btn-stop" title="stop browser">■</button>
           </div>
           <div class="browser-interact-row">
             <span class="browser-focus-hint">CLICK FRAME → TYPE</span>
-            <input id="br-type-text" class="br-type-text" placeholder="type into the focused page control…" />
+            <input aria-label="type into the focused page control…" id="br-type-text" class="br-type-text" placeholder="type into the focused page control…" />
             <button id="br-type-send" class="btn-mini btn-go">TYPE</button>
             <button id="br-scroll-up" class="btn-mini" title="scroll up" aria-label="Scroll up">↑</button>
             <button id="br-scroll-down" class="btn-mini" title="scroll down" aria-label="Scroll down">↓</button>
@@ -350,9 +351,9 @@
             <button id="mem-consolidate" class="btn-mini">CONSOLIDATE</button>
           </div>
           <div id="mem-form" class="mem-form hidden">
-            <textarea id="mem-text" class="pf-input" placeholder="a durable fact to remember"></textarea>
-            <input id="mem-category" class="pf-input" placeholder="category (convention, command, gotcha…)" />
-            <select id="mem-scope" class="pf-select">
+            <textarea aria-label="a durable fact to remember" id="mem-text" class="pf-input" placeholder="a durable fact to remember"></textarea>
+            <input aria-label="category (convention, command, gotcha…)" id="mem-category" class="pf-input" placeholder="category (convention, command, gotcha…)" />
+            <select aria-label="memory scope" id="mem-scope" class="pf-select">
               <option value="project">project</option>
               <option value="global">global</option>
             </select>
@@ -381,8 +382,8 @@
         <div class="panel-head" draggable="true"><span class="panel-icon">▩</span> SANDBOX <button class="panel-close">×</button></div>
         <div class="panel-body sandbox-body">
           <div class="sandbox-toolbar">
-            <select id="sb-lang" class="sb-select" title="language"></select>
-            <select id="sb-mode" class="sb-select" title="mode">
+            <select aria-label="language" id="sb-lang" class="sb-select" title="language"></select>
+            <select aria-label="mode" id="sb-mode" class="sb-select" title="mode">
               <option value="terminal">terminal</option>
               <option value="web">web</option>
             </select>
@@ -393,7 +394,7 @@
           <div class="sandbox-content">
             <div class="sandbox-editor">
               <div class="sb-pane-head">CODE</div>
-              <textarea id="sb-code" class="sb-code" spellcheck="false" placeholder="// print('hello dotz sandbox')"></textarea>
+              <textarea aria-label="// print('hello dotz sandbox')" id="sb-code" class="sb-code" spellcheck="false" placeholder="// print('hello dotz sandbox')"></textarea>
             </div>
             <div id="sb-output-wrap" class="sandbox-output-wrap">
               <div class="sb-pane-head">OUTPUT <span id="sb-runid" class="dim mono"></span></div>
@@ -419,7 +420,7 @@
       <div class="panel" data-panel="skills" role="region" aria-label="Skills">
         <div class="panel-head" draggable="true"><span class="panel-icon">✦</span> SKILLS <button class="panel-close">×</button></div>
         <div class="panel-body skills-body">
-          <input id="skills-search" class="pf-input" placeholder="search skills…" />
+          <input aria-label="search skills…" id="skills-search" class="pf-input" placeholder="search skills…" />
           <div id="skills-count" class="skills-count dim mono">loading…</div>
           <div id="skills-list" class="skills-list"></div>
           <div id="skills-detail" class="skills-detail hidden"></div>
@@ -443,7 +444,7 @@
             <div id="conn-keys-status" class="conn-keys-status"><div class="dim mono">loading key status…</div></div>
             <div class="conn-key-form">
               <select id="conn-key-provider" class="pf-select" aria-label="provider"></select>
-              <input id="conn-key-input" class="pf-input" type="password" placeholder="paste provider api key…" autocomplete="off" spellcheck="false" />
+              <input aria-label="paste provider api key…" id="conn-key-input" class="pf-input" type="password" placeholder="paste provider api key…" autocomplete="off" spellcheck="false" />
               <button id="conn-key-toggle" class="btn-mini" type="button" title="show or hide the key as you type" aria-label="Show or hide key">show</button>
               <button id="conn-key-save" class="btn-mini btn-go">SAVE</button>
               <button id="conn-key-clear" class="btn-mini btn-stop">CLEAR</button>
@@ -459,7 +460,7 @@
         <div class="panel-head" draggable="true"><span class="panel-icon">❖</span> DESIGN <button class="panel-close">×</button></div>
         <div class="panel-body design-body">
           <div class="design-toolbar">
-            <input id="design-search" class="pf-input" placeholder="search 150+ design systems…" />
+            <input aria-label="search 150+ design systems…" id="design-search" class="pf-input" placeholder="search 150+ design systems…" />
             <button id="design-export-html" class="btn-mini" title="download preview as HTML">⭳ HTML</button>
             <button id="design-export-pdf" class="btn-mini" title="print preview to PDF">⭳ PDF</button>
           </div>
@@ -480,7 +481,7 @@
         <div class="panel-head" draggable="true"><span class="panel-icon">⬡</span> TEMPLATES <button class="panel-close">×</button></div>
         <div class="panel-body templates-body">
           <div class="templates-toolbar">
-            <input id="templates-search" class="pf-input" placeholder="search templates…" />
+            <input aria-label="search templates…" id="templates-search" class="pf-input" placeholder="search templates…" />
             <button id="templates-new" class="btn-mini btn-go">+ NEW</button>
           </div>
           <div id="templates-count" class="skills-count dim mono">loading…</div>
@@ -492,10 +493,10 @@
                 <span id="templates-detail-source" class="skill-source"></span>
               </div>
               <div class="templates-detail-meta">
-                <input id="templates-detail-title" class="pf-input" placeholder="name" />
-                <input id="templates-detail-desc" class="pf-input" placeholder="description" />
+                <input aria-label="name" id="templates-detail-title" class="pf-input" placeholder="name" />
+                <input aria-label="description" id="templates-detail-desc" class="pf-input" placeholder="description" />
               </div>
-              <textarea id="templates-detail-body" class="templates-editor" spellcheck="false" placeholder="template body… use $@ for user arguments"></textarea>
+              <textarea aria-label="template body… use $@ for user arguments" id="templates-detail-body" class="templates-editor" spellcheck="false" placeholder="template body… use $@ for user arguments"></textarea>
               <div class="templates-detail-actions">
                 <button id="templates-run" class="btn-mini btn-go">▶ RUN</button>
                 <button id="templates-fork" class="btn-mini">FORK</button>
@@ -504,7 +505,7 @@
                 <button id="templates-cancel" class="btn-mini">CLOSE</button>
               </div>
               <div id="templates-run-args" class="templates-run-args hidden">
-                <input id="templates-args-input" class="pf-input" placeholder="arguments for $@…" />
+                <input aria-label="arguments for $@…" id="templates-args-input" class="pf-input" placeholder="arguments for $@…" />
                 <button id="templates-args-run" class="btn-mini btn-go">▶ RUN</button>
               </div>
             </div>
@@ -518,7 +519,7 @@
         <div class="panel-head" draggable="true"><span class="panel-icon">◇</span> SPEC <button class="panel-close">×</button></div>
         <div class="panel-body ops-body">
           <div class="ops-toolbar">
-            <input id="spec-title" class="pf-input" placeholder="new change title" />
+            <input aria-label="new change title" id="spec-title" class="pf-input" placeholder="new change title" />
             <button id="spec-create" class="btn-mini btn-go">+ PROPOSE</button>
             <button id="spec-refresh" class="btn-mini">REFRESH</button>
           </div>
@@ -538,11 +539,11 @@
         <div class="panel-head" draggable="true"><span class="panel-icon">◧</span> LIVING DOCS <button class="panel-close">×</button></div>
         <div class="panel-body ops-body">
           <div class="ops-toolbar">
-            <select id="ld-scope" class="pf-select">
+            <select aria-label="living-docs scope" id="ld-scope" class="pf-select">
               <option value="project">project</option>
               <option value="global">global</option>
             </select>
-            <select id="ld-kind" class="pf-select">
+            <select aria-label="living-docs kind" id="ld-kind" class="pf-select">
               <option value="anti_patterns">anti-patterns</option>
               <option value="non_inferables">non-inferables</option>
               <option value="context_scope">context scope</option>
@@ -553,7 +554,7 @@
           </div>
           <div id="ld-status" class="skills-count dim mono">loading…</div>
           <div class="ops-split">
-            <textarea id="ld-editor" class="ops-editor" spellcheck="false"></textarea>
+            <textarea aria-label="Ld editor" id="ld-editor" class="ops-editor" spellcheck="false"></textarea>
             <div class="ops-detail">
               <div class="sb-pane-head">SUGGESTIONS</div>
               <div id="ld-suggestions" class="ops-list"></div>
@@ -575,27 +576,27 @@
           <div class="ops-section">
             <div class="sb-pane-head">BRANCH</div>
             <div class="ops-row">
-              <input id="vcs-branch-name" class="pf-input" placeholder="spec slug or branch name" />
+              <input aria-label="spec slug or branch name" id="vcs-branch-name" class="pf-input" placeholder="spec slug or branch name" />
               <button id="vcs-branch" class="btn-mini btn-go">CREATE / SWITCH</button>
             </div>
           </div>
           <div class="ops-section">
             <div class="sb-pane-head">COMMIT</div>
-            <input id="vcs-commit-msg" class="pf-input" placeholder="atomic commit message" />
+            <input aria-label="atomic commit message" id="vcs-commit-msg" class="pf-input" placeholder="atomic commit message" />
             <button id="vcs-commit" class="btn-mini btn-go">COMMIT STAGED / ALL</button>
           </div>
           <div class="ops-section">
             <div class="sb-pane-head">PR / ROLLBACK</div>
             <div class="ops-row">
               <button id="vcs-pr" class="btn-mini">OPEN PR</button>
-              <select id="vcs-rollback-mode" class="pf-select">
+              <select aria-label="rollback mode" id="vcs-rollback-mode" class="pf-select">
                 <option value="revert">revert</option>
                 <option value="checkpoint">checkpoint</option>
                 <option value="reset">reset</option>
               </select>
             </div>
             <div class="ops-row">
-              <input id="vcs-rollback-target" class="pf-input" placeholder="commit sha or checkpoint run id" />
+              <input aria-label="commit sha or checkpoint run id" id="vcs-rollback-target" class="pf-input" placeholder="commit sha or checkpoint run id" />
               <label class="ops-check"><input id="vcs-rollback-confirm" type="checkbox" /> confirm reset</label>
               <button id="vcs-rollback" class="btn-mini btn-stop">ROLLBACK</button>
             </div>
@@ -616,7 +617,8 @@
           <div class="doctrine-split">
             <div class="doctrine-pane">
               <div class="sb-pane-head">EDIT (AGENTS.md)</div>
-              <textarea id="doctrine-editor" class="doctrine-editor" spellcheck="false" placeholder="# AGENTS.md
+              <textarea aria-label="# AGENTS.md
+Project doctrine — conventions, architecture, standing instructions. Edits take effect on the next session context reload." id="doctrine-editor" class="doctrine-editor" spellcheck="false" placeholder="# AGENTS.md
 Project doctrine — conventions, architecture, standing instructions. Edits take effect on the next session context reload."></textarea>
             </div>
             <div class="doctrine-pane">
@@ -633,7 +635,7 @@ Project doctrine — conventions, architecture, standing instructions. Edits tak
         <div class="panel-head" draggable="true"><span class="panel-icon">⚑</span> MARKETPLACE <button class="panel-close">×</button></div>
         <div class="panel-body skills-body">
           <div class="templates-toolbar">
-            <input id="marketplace-search" class="pf-input" placeholder="search presets…" />
+            <input aria-label="search presets…" id="marketplace-search" class="pf-input" placeholder="search presets…" />
             <select id="marketplace-kind-filter" class="pf-select" aria-label="filter by kind"></select>
             <button id="marketplace-refresh" class="btn-mini" title="re-fetch the catalog">↻</button>
           </div>
