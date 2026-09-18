@@ -347,11 +347,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-config-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         let result = f(&dir);
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         drop(guard);
@@ -415,7 +418,8 @@ mod tests {
             // Make the "config dir" path exist as a file so create_dir_all fails.
             let fake_dir = dir.join("fake-config-dir");
             std::fs::write(&fake_dir, "not a directory").unwrap();
-            std::env::set_var("DOTZ_CONFIG_DIR", &fake_dir);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &fake_dir) };
             assert!(fake_dir.is_file(), "fake_dir must be a file for this test");
 
             let base = DotzConfig::default();
@@ -427,8 +431,7 @@ mod tests {
             let result = update(&base, &patch);
             assert!(
                 result.is_err(),
-                "update must fail when config dir is a file, got: {:?}",
-                result
+                "update must fail when config dir is a file, got: {result:?}"
             );
 
             // DOTZ_SUBAGENT_MODEL must NOT change when persistence failed.

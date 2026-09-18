@@ -199,10 +199,12 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("dotz-auth-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
-        std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string()) };
         let result = f(&dir);
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("DOTZ_PI_AGENT_DIR");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_PI_AGENT_DIR") };
         drop(guard);
         result
     }
@@ -277,7 +279,8 @@ mod tests {
         with_tmp_auth_dir(|dir| {
             // Point DOTZ_PI_AGENT_DIR at a not-yet-existing nested dir.
             let nested = dir.join("nested").join("deep");
-            std::env::set_var("DOTZ_PI_AGENT_DIR", nested.to_string_lossy().to_string());
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_PI_AGENT_DIR", nested.to_string_lossy().to_string()) };
             write_auth_json(&json!({"OLLAMA_API_KEY": "sk-x"}))
                 .expect("write should create parent dirs");
             assert!(nested.join("auth.json").exists());

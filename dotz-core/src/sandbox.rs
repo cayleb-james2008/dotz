@@ -183,8 +183,14 @@ pub trait SandboxBackend: Send + Sync + 'static {
 /// Windows backend: `CREATE_NO_WINDOW` on spawn, `taskkill /T /F` for tree-kill. Verbatim from
 /// the former inline `#[cfg(windows)]` blocks; reuses `crate::util::no_window_tokio` /
 /// `crate::util::no_window` so the `CREATE_NO_WINDOW` constant lives in one place.
+///
+/// `#[cfg(windows)]`-gated because it is only ever constructed in `platform_backend()`'s
+/// `#[cfg(windows)]` arm; off Windows the type is unreachable, and leaving it ungated tripped
+/// `-D dead-code` under `clippy --all-targets -- -D warnings` on Linux.
+#[cfg(windows)]
 struct WindowsSandbox;
 
+#[cfg(windows)]
 impl SandboxBackend for WindowsSandbox {
     fn prepare_command(&self, command: &mut tokio::process::Command) {
         crate::util::no_window_tokio(command);
@@ -2456,7 +2462,7 @@ mod tests {
         // Read the child's pgid via libc::getpgid. If process_group(0) was applied, pgid == pid
         // (own group). We use a tiny extern-C shim to avoid adding the `nix` crate (ponytail:
         // stdlib + libc FFI, no new heavy deps).
-        extern "C" {
+        unsafe extern "C" {
             fn getpgid(pid: i32) -> i32;
         }
         // SAFETY: getpgid is a thread-safe POSIX syscall that reads a fixed process attribute;
@@ -2561,19 +2567,18 @@ mod tests {
         let mut grandchild_pid: Option<u32> = None;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while grandchild_pid.is_none() && tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
-                Ok(Ok(frame)) => {
-                    if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_output") {
-                        if let Some(line) = frame.get("line").and_then(|l| l.as_str()) {
-                            if let Some(rest) = line.strip_prefix("GRANDCHILD_PID=") {
-                                if let Ok(pid) = rest.trim().parse::<u32>() {
-                                    grandchild_pid = Some(pid);
-                                }
+            if let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+            {
+                if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_output") {
+                    if let Some(line) = frame.get("line").and_then(|l| l.as_str()) {
+                        if let Some(rest) = line.strip_prefix("GRANDCHILD_PID=") {
+                            if let Ok(pid) = rest.trim().parse::<u32>() {
+                                grandchild_pid = Some(pid);
                             }
                         }
                     }
                 }
-                _ => {}
             }
         }
         let grandchild_pid = grandchild_pid

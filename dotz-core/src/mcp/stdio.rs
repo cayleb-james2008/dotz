@@ -228,9 +228,7 @@ impl Transport for StdioTransport {
         match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
             Ok(Ok(resp)) => {
                 if let Some(err) = resp.get("error") {
-                    return Err(McpError::Server(format!(
-                        "{method} returned error: {err}"
-                    )));
+                    return Err(McpError::Server(format!("{method} returned error: {err}")));
                 }
                 Ok(resp.get("result").cloned().unwrap_or(Value::Null))
             }

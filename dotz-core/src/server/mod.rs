@@ -790,7 +790,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let prev_dir = std::env::var("DOTZ_CONFIG_DIR").ok();
         let prev_subagent = std::env::var("DOTZ_SUBAGENT_MODEL").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
 
         let state = Arc::new(AppState {
             config: Mutex::new(config::load()),
@@ -833,12 +834,16 @@ mod tests {
         assert_eq!(r2.0["config"]["thinkingLevel"], "xhigh");
 
         match prev_dir {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         match prev_subagent {
-            Some(p) => std::env::set_var("DOTZ_SUBAGENT_MODEL", p),
-            None => std::env::remove_var("DOTZ_SUBAGENT_MODEL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_SUBAGENT_MODEL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_SUBAGENT_MODEL") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         drop(guard);
@@ -913,7 +918,8 @@ mod tests {
             std::env::temp_dir().join(format!("dotz-server-models-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let prev_dir = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
 
         let state = Arc::new(AppState {
             config: Mutex::new(config::load()),
@@ -1002,8 +1008,10 @@ mod tests {
         assert!(!levels.is_empty(), "thinkingLevels must not be empty");
 
         match prev_dir {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2190,7 +2198,8 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("dotz-provider-key-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
-        std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string()) };
         crate::auth::refresh_cache();
         AuthDirGuard {
             dir,
@@ -2201,7 +2210,8 @@ mod tests {
     impl Drop for AuthDirGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
-            std::env::remove_var("DOTZ_PI_AGENT_DIR");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_PI_AGENT_DIR") };
             crate::auth::refresh_cache();
         }
     }
@@ -2369,13 +2379,15 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("dotz-server-gateway-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
-        std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string()) };
         GatewayConfigDirGuard { dir, _guard: g }
     }
 
     impl Drop for GatewayConfigDirGuard {
         fn drop(&mut self) {
-            std::env::remove_var("DOTZ_CONFIG_DIR");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") };
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -2692,7 +2704,8 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let _ = std::fs::create_dir_all(&dir);
-        std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string()) };
         FirstRunDirGuard { dir, _guard: g }
     }
 
@@ -2705,7 +2718,8 @@ mod tests {
     impl Drop for FirstRunDirGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(self.marker());
-            std::env::remove_var("DOTZ_CONFIG_DIR");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") };
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -2883,7 +2897,8 @@ mod tests {
         std::fs::create_dir_all(model_dir.join("onnx")).unwrap();
         std::fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
         std::fs::write(model_dir.join("onnx").join("model.onnx"), "fake-onnx").unwrap();
-        std::env::set_var("DOTZ_MODELS", models_dir.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_MODELS", models_dir.to_string_lossy().to_string()) };
 
         // Sanity: the embed check must now pass — if it doesn't, the test setup is wrong.
         assert!(
@@ -2915,7 +2930,8 @@ mod tests {
             "alreadyPresent must be true when the model is on disk"
         );
 
-        std::env::remove_var("DOTZ_MODELS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_MODELS") };
         let _ = tx.send(());
         let _ = handle.await;
         drop(guard);
@@ -2941,7 +2957,8 @@ mod tests {
         // Force model_files_present() to false by pointing DOTZ_MODELS at an empty dir.
         let empty_models = guard.dir.join("empty-models");
         std::fs::create_dir_all(&empty_models).unwrap();
-        std::env::set_var("DOTZ_MODELS", empty_models.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_MODELS", empty_models.to_string_lossy().to_string()) };
         assert!(
             !crate::embed::model_files_present(),
             "precondition: model_files_present must be false for an empty DOTZ_MODELS dir"
@@ -2991,7 +3008,8 @@ mod tests {
             );
         }
 
-        std::env::remove_var("DOTZ_MODELS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_MODELS") };
         let _ = tx.send(());
         let _ = handle.await;
         drop(guard);

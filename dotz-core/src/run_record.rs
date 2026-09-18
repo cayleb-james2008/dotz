@@ -411,14 +411,16 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let d = std::env::temp_dir().join(format!("dotz-runrec-{}", Uuid::new_v4()));
-            std::env::set_var("DOTZ_RUN_RECORD_DIR", d.to_string_lossy().to_string());
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_RUN_RECORD_DIR", d.to_string_lossy().to_string()) };
             Self(d, g)
         }
     }
     impl Drop for TmpDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
-            std::env::remove_var("DOTZ_RUN_RECORD_DIR");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_RUN_RECORD_DIR") };
         }
     }
 
@@ -427,7 +429,8 @@ mod tests {
         // workflow_executor suite (which mutates DOTZ_WORKFLOWS_FILE under its
         // own ENV_LOCK).
         let f = std::env::temp_dir().join(format!("dotz-runrec-wf-{}.json", Uuid::new_v4()));
-        std::env::set_var("DOTZ_WORKFLOWS_FILE", f.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WORKFLOWS_FILE", f.to_string_lossy().to_string()) };
         f
     }
 

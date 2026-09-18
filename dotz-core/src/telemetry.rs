@@ -913,11 +913,14 @@ mod tests {
             std::env::temp_dir().join(format!("dotz-telemetry-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         let result = f(&dir);
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         drop(guard);
@@ -1563,7 +1566,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-perf-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         clear();
         set_perf_recording(true);
         // Force the init flag to re-read so the new persisted value is picked up.
@@ -1574,8 +1578,10 @@ mod tests {
         let result = f();
         let _ = std::fs::remove_dir_all(&dir);
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         drop(PerfGuard { _cfg_guard: g });
         result
@@ -1591,7 +1597,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-perf-off-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         clear();
         // Also ensure remote telemetry is OFF (the OR branch of the gate).
         set_enabled(false);
@@ -1604,8 +1611,10 @@ mod tests {
         // Cleanup.
         clear();
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         drop(g);
@@ -1719,7 +1728,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-perf-summary-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         clear();
         set_perf_recording(true);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1751,8 +1761,10 @@ mod tests {
         set_perf_recording(false);
         clear();
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         drop(g);
@@ -1768,7 +1780,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-perf-samples-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         clear();
         set_perf_recording(true);
         record(PerfMetric::EmbedLatency, 1.0, None);
@@ -1791,8 +1804,10 @@ mod tests {
         set_perf_recording(false);
         clear();
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         drop(g);
@@ -1808,7 +1823,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-perf-record-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         clear();
         set_perf_recording(true);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1838,8 +1854,10 @@ mod tests {
         set_perf_recording(false);
         clear();
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         drop(g);
@@ -1855,7 +1873,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-perf-clear-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         clear();
         set_perf_recording(true);
         record(PerfMetric::TurnLatency, 1.0, None);
@@ -1887,8 +1906,10 @@ mod tests {
         // Cleanup.
         set_perf_recording(false);
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         drop(g);
@@ -1906,7 +1927,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-perf-toggle-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         clear();
         set_perf_recording(false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1936,8 +1958,10 @@ mod tests {
         set_perf_recording(false);
         clear();
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         drop(g);
@@ -1952,7 +1976,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-perf-default-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         // No config.json written + remote telemetry OFF → perf_recording_enabled
         // must be false. We also force the static atomics to false to mirror a
         // truly fresh process (a prior test may have toggled it ON).
@@ -1963,8 +1988,10 @@ mod tests {
             "fresh install must have perf recording OFF"
         );
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         drop(g);

@@ -1942,28 +1942,32 @@ mod tests {
         let _guard = crate::agent::session::SSE_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS").ok();
 
-        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS") };
         assert_eq!(
             subagent_timeout().as_secs(),
             300,
             "default subagent timeout is 5 minutes"
         );
 
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "5000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "5000") };
         assert_eq!(
             subagent_timeout().as_millis(),
             5000,
             "valid override is preserved"
         );
 
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "50");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "50") };
         assert_eq!(
             subagent_timeout().as_millis(),
             1000,
             "below-minimum value clamps to 1 second"
         );
 
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "100000000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "100000000") };
         assert_eq!(
             subagent_timeout().as_millis(),
             3_600_000,
@@ -1971,8 +1975,10 @@ mod tests {
         );
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS") },
         }
     }
 
@@ -2016,8 +2022,10 @@ mod tests {
 
         let prev_url = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
         let prev_timeout = std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "500");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1")) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "500") };
 
         let agent = AgentConfig {
             name: "test".into(),
@@ -2057,12 +2065,16 @@ mod tests {
             .unwrap();
 
         match prev_url {
-            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
-            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_LOCAL_BASE_URL") },
         }
         match prev_timeout {
-            Some(p) => std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS") },
         }
         let _ = server_tx.send(()).await;
 
@@ -2154,8 +2166,10 @@ mod tests {
 
         let prev_url = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
         let prev_timeout = std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "500");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1")) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "500") };
 
         let agent = AgentConfig {
             name: "test".into(),
@@ -2195,12 +2209,16 @@ mod tests {
         assert_eq!(result.stop_reason.as_deref(), Some("timeout"));
 
         match prev_url {
-            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
-            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_LOCAL_BASE_URL") },
         }
         match prev_timeout {
-            Some(p) => std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS") },
         }
 
         assert_eq!(

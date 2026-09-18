@@ -280,14 +280,17 @@ mod tests {
 
         let prev = std::env::var("DOTZ_MODELS").ok();
         let tmp = std::env::temp_dir().join(format!("dotz-embed-missing-{}", uuid::Uuid::new_v4()));
-        std::env::set_var("DOTZ_MODELS", &tmp);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_MODELS", &tmp) };
         assert!(
             !model_files_present(),
             "bogus DOTZ_MODELS dir should report embedder not ready"
         );
         match prev {
-            Some(p) => std::env::set_var("DOTZ_MODELS", p),
-            None => std::env::remove_var("DOTZ_MODELS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_MODELS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_MODELS") },
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -306,15 +309,18 @@ mod tests {
             "dotz-embed-warmup-missing-{}",
             uuid::Uuid::new_v4()
         ));
-        std::env::set_var("DOTZ_MODELS", &tmp);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_MODELS", &tmp) };
         assert!(!model_files_present(), "precondition: model files absent");
 
         // Must return cleanly — no panic, no Result to unwrap.
         warm();
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_MODELS", p),
-            None => std::env::remove_var("DOTZ_MODELS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_MODELS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_MODELS") },
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -331,7 +337,8 @@ mod tests {
         let prev = std::env::var("DOTZ_MODELS").ok();
         let tmp =
             std::env::temp_dir().join(format!("dotz-embed-warmup-fast-{}", uuid::Uuid::new_v4()));
-        std::env::set_var("DOTZ_MODELS", &tmp);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_MODELS", &tmp) };
 
         let start = std::time::Instant::now();
         warm();
@@ -343,8 +350,10 @@ mod tests {
         );
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_MODELS", p),
-            None => std::env::remove_var("DOTZ_MODELS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_MODELS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_MODELS") },
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }

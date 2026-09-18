@@ -1106,20 +1106,24 @@ mod tests {
         let _guard = BASH_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_BASH_TIMEOUT_MS").ok();
 
-        std::env::remove_var("DOTZ_BASH_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_BASH_TIMEOUT_MS") };
         assert_eq!(bash_timeout().as_secs(), 300, "default is 5 minutes");
 
-        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "5000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "5000") };
         assert_eq!(bash_timeout().as_millis(), 5000, "valid override preserved");
 
-        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "50");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "50") };
         assert_eq!(
             bash_timeout().as_millis(),
             1000,
             "too-small value clamped to minimum"
         );
 
-        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "100000000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "100000000") };
         assert_eq!(
             bash_timeout().as_millis(),
             3_600_000,
@@ -1127,8 +1131,10 @@ mod tests {
         );
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_BASH_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_BASH_TIMEOUT_MS") },
         }
     }
 
@@ -1138,7 +1144,8 @@ mod tests {
     async fn run_bash_times_out_on_long_command() {
         let _guard = BASH_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_BASH_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "1000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "1000") };
 
         let mut registry = ToolRegistry::new();
         registry.set_active(&["bash".to_string()]);
@@ -1162,8 +1169,10 @@ mod tests {
         let elapsed = start.elapsed();
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_BASH_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_BASH_TIMEOUT_MS") },
         }
 
         assert!(
@@ -1186,7 +1195,8 @@ mod tests {
     async fn run_bash_reaps_child_after_timeout() {
         let _guard = BASH_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_BASH_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "500");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "500") };
 
         let base =
             std::env::temp_dir().join(format!("dotz-bash-reap-test-{}", uuid::Uuid::new_v4()));
@@ -1215,8 +1225,10 @@ mod tests {
             .unwrap_err();
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_BASH_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_BASH_TIMEOUT_MS") },
         }
         let _ = std::fs::remove_dir_all(&base);
 
@@ -1258,7 +1270,8 @@ mod tests {
     async fn run_bash_timeout_reaps_kill_subprocess_no_zombie() {
         let _guard = BASH_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_BASH_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "500");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BASH_TIMEOUT_MS", "500") };
 
         let mut registry = ToolRegistry::new();
         registry.set_active(&["bash".to_string()]);
@@ -1274,8 +1287,10 @@ mod tests {
             .unwrap_err();
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_BASH_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_BASH_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_BASH_TIMEOUT_MS") },
         }
 
         assert!(
@@ -1623,21 +1638,27 @@ mod tests {
 
         let prev = std::env::var("DOTZ_GREP_FILE_BUDGET").ok();
 
-        std::env::remove_var("DOTZ_GREP_FILE_BUDGET");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_GREP_FILE_BUDGET") };
         assert_eq!(grep_file_budget(), 5000, "default budget should be 5000");
 
-        std::env::set_var("DOTZ_GREP_FILE_BUDGET", "100");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", "100") };
         assert_eq!(grep_file_budget(), 100, "valid override preserved");
 
-        std::env::set_var("DOTZ_GREP_FILE_BUDGET", "0");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", "0") };
         assert_eq!(grep_file_budget(), 1, "zero clamped to minimum");
 
-        std::env::set_var("DOTZ_GREP_FILE_BUDGET", "999999");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", "999999") };
         assert_eq!(grep_file_budget(), 100_000, "too-large clamped to maximum");
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_GREP_FILE_BUDGET", p),
-            None => std::env::remove_var("DOTZ_GREP_FILE_BUDGET"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_GREP_FILE_BUDGET") },
         }
     }
 
@@ -1669,7 +1690,8 @@ mod tests {
         let prev_budget = std::env::var("DOTZ_GREP_FILE_BUDGET").ok();
 
         // budget=1: only the first file (`a_decoy.txt`) is read; the needle must NOT be found.
-        std::env::set_var("DOTZ_GREP_FILE_BUDGET", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", "1") };
         let mut registry = ToolRegistry::new();
         registry.set_active(&["grep".to_string()]);
         let ctx = ToolCtx {
@@ -1687,7 +1709,8 @@ mod tests {
         );
 
         // budget=10: both files are read; the needle MUST be found.
-        std::env::set_var("DOTZ_GREP_FILE_BUDGET", "10");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", "10") };
         let found = registry
             .run("grep", &json!({"pattern": "unique-needle-here"}), &ctx)
             .await
@@ -1698,8 +1721,10 @@ mod tests {
         );
 
         match prev_budget {
-            Some(p) => std::env::set_var("DOTZ_GREP_FILE_BUDGET", p),
-            None => std::env::remove_var("DOTZ_GREP_FILE_BUDGET"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_GREP_FILE_BUDGET") },
         }
         let _ = std::fs::remove_dir_all(&base);
     }

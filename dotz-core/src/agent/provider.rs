@@ -718,7 +718,7 @@ mod tests {
             .await
             .expect("stream task timed out")
             .unwrap();
-        assert!(result.is_ok(), "stream ended with error: {:?}", result);
+        assert!(result.is_ok(), "stream ended with error: {result:?}");
 
         assert_eq!(
             starts, 1,
@@ -817,7 +817,7 @@ mod tests {
             .await
             .expect("stream task timed out")
             .unwrap();
-        assert!(result.is_ok(), "stream ended with error: {:?}", result);
+        assert!(result.is_ok(), "stream ended with error: {result:?}");
 
         match start {
             Some(StreamDelta::ToolCallStart { id, name, .. }) => {
@@ -827,10 +827,9 @@ mod tests {
                 );
                 assert_eq!(name, "bash");
             }
-            other => panic!(
-                "expected exactly one ToolCallStart with id 'call_real', got {:?}",
-                other
-            ),
+            other => {
+                panic!("expected exactly one ToolCallStart with id 'call_real', got {other:?}")
+            }
         }
     }
 
@@ -865,7 +864,8 @@ mod tests {
         });
 
         let prev = std::env::var("DOTZ_PROVIDER_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_PROVIDER_TIMEOUT_MS", "750");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_PROVIDER_TIMEOUT_MS", "750") };
 
         let client = OpenAiChat::new();
         let model = ResolvedModel {
@@ -892,8 +892,10 @@ mod tests {
         let elapsed = start.elapsed();
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_PROVIDER_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_PROVIDER_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_PROVIDER_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_PROVIDER_TIMEOUT_MS") },
         }
         server.abort();
 
@@ -1021,14 +1023,16 @@ mod tests {
 
         // Ensure the env var is unset (save + restore prior value if any).
         let prev = std::env::var(&var).ok();
-        std::env::remove_var(&var);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(&var) };
 
         // Point auth.json at a temp dir + write the key under our test var.
         let dir =
             std::env::temp_dir().join(format!("dotz-resolve-fallback-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev_auth_dir = std::env::var("DOTZ_PI_AGENT_DIR").ok();
-        std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string()) };
         let auth = serde_json::json!({ var.clone(): key_val });
         std::fs::write(dir.join("auth.json"), auth.to_string()).unwrap();
         crate::auth::refresh_cache();
@@ -1049,12 +1053,16 @@ mod tests {
 
         // Cleanup: restore env + remove temp dir.
         match prev {
-            Some(p) => std::env::set_var(&var, p),
-            None => std::env::remove_var(&var),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var(&var, p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var(&var) },
         }
         match prev_auth_dir {
-            Some(p) => std::env::set_var("DOTZ_PI_AGENT_DIR", p),
-            None => std::env::remove_var("DOTZ_PI_AGENT_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_PI_AGENT_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_PI_AGENT_DIR") },
         }
         crate::auth::refresh_cache();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1074,13 +1082,15 @@ mod tests {
         let auth_val = format!("sk-from-auth-{}", uuid::Uuid::new_v4());
 
         let prev = std::env::var(&var).ok();
-        std::env::set_var(&var, &env_val);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(&var, &env_val) };
 
         let dir =
             std::env::temp_dir().join(format!("dotz-resolve-precedence-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev_auth_dir = std::env::var("DOTZ_PI_AGENT_DIR").ok();
-        std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string()) };
         std::fs::write(
             dir.join("auth.json"),
             serde_json::json!({ var.clone(): auth_val }).to_string(),
@@ -1096,12 +1106,16 @@ mod tests {
         );
 
         match prev {
-            Some(p) => std::env::set_var(&var, p),
-            None => std::env::remove_var(&var),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var(&var, p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var(&var) },
         }
         match prev_auth_dir {
-            Some(p) => std::env::set_var("DOTZ_PI_AGENT_DIR", p),
-            None => std::env::remove_var("DOTZ_PI_AGENT_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_PI_AGENT_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_PI_AGENT_DIR") },
         }
         crate::auth::refresh_cache();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1130,14 +1144,16 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let _ = std::fs::create_dir_all(&dir);
-        std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string()) };
         ConfigDirGuard { dir, _guard: g }
     }
 
     impl Drop for ConfigDirGuard {
         fn drop(&mut self) {
             // The setup set it; restore is handled by the test below. Defensive: clear it.
-            std::env::remove_var("DOTZ_CONFIG_DIR");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") };
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -1175,8 +1191,10 @@ mod tests {
         );
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         drop(guard);
     }
@@ -1227,8 +1245,10 @@ mod tests {
         );
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         drop(guard);
     }
@@ -1266,8 +1286,10 @@ mod tests {
         let _adapter = adapter_for("gateway"); // must not panic; type is opaque Box<dyn Provider>.
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         drop(guard);
     }
@@ -1280,8 +1302,10 @@ mod tests {
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
         assert!(resolve("gateway", "gpt-5.6").is_none());
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         drop(guard);
     }

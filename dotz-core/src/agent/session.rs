@@ -353,13 +353,14 @@ pub fn count() -> usize {
 }
 
 pub fn dispose(id: &str) -> bool {
-    if let Some(s) = store_guard().remove(id) {
-        let g = session_guard(&s);
-        g.disposed.store(true, Ordering::SeqCst);
-        g.cancel.cancel();
-        true
-    } else {
-        false
+    match store_guard().remove(id) {
+        Some(s) => {
+            let g = session_guard(&s);
+            g.disposed.store(true, Ordering::SeqCst);
+            g.cancel.cancel();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1458,18 +1459,19 @@ fn finish_error(
 /// If no turn is currently active, arm `abort_pending` so a turn that is about to start bails
 /// out instead of running against a stale cancellation token.
 pub fn abort(id: &str) -> bool {
-    if let Some(s) = get(id) {
-        let g = session_guard(&s);
-        g.cancel.cancel();
-        if !g.turn_active.load(Ordering::SeqCst) {
-            // No turn is active: the cancellation token may be replaced before the next turn
-            // observes it, so mark the session as pending-abort. run_turn checks this flag while
-            // still holding the lock and cancels the new turn immediately.
-            g.abort_pending.store(true, Ordering::SeqCst);
+    match get(id) {
+        Some(s) => {
+            let g = session_guard(&s);
+            g.cancel.cancel();
+            if !g.turn_active.load(Ordering::SeqCst) {
+                // No turn is active: the cancellation token may be replaced before the next turn
+                // observes it, so mark the session as pending-abort. run_turn checks this flag while
+                // still holding the lock and cancels the new turn immediately.
+                g.abort_pending.store(true, Ordering::SeqCst);
+            }
+            true
         }
-        true
-    } else {
-        false
+        _ => false,
     }
 }
 
@@ -2296,7 +2298,8 @@ mod tests {
         });
 
         let prev = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
-        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1")) };
 
         // Guard restores the test-only pause knob even if the test panics.
         struct PauseGuard(u64);
@@ -2358,8 +2361,10 @@ mod tests {
         dispose(&sid);
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
-            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_LOCAL_BASE_URL") },
         }
     }
 
@@ -2637,8 +2642,10 @@ mod tests {
 
         let prev_url = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
         let prev_timeout = std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "10000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1")) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "10000") };
 
         // Point DOTZ_PI at a temp dir with a real agent definition so discovery finds it.
         let pi_dir =
@@ -2650,7 +2657,8 @@ mod tests {
         )
         .unwrap();
         let prev_pi = std::env::var("DOTZ_PI").ok();
-        std::env::set_var("DOTZ_PI", &pi_dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_PI", &pi_dir) };
 
         let summary = create(CreateOpts::default()).unwrap();
         let sid = summary["sessionId"].as_str().unwrap().to_string();
@@ -2724,16 +2732,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&pi_dir);
 
         match prev_url {
-            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
-            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_LOCAL_BASE_URL") },
         }
         match prev_timeout {
-            Some(p) => std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS") },
         }
         match prev_pi {
-            Some(p) => std::env::set_var("DOTZ_PI", p),
-            None => std::env::remove_var("DOTZ_PI"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_PI", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_PI") },
         }
 
         // The dispatch must have materialized a live run for this session (graph populates)…
@@ -2963,7 +2977,8 @@ mod tests {
         });
 
         let prev = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
-        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1")) };
 
         let opts = CreateOpts {
             model: Some(types::ModelRef {
@@ -3006,8 +3021,10 @@ mod tests {
         dispose(&sid);
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
-            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_LOCAL_BASE_URL") },
         }
         let _ = server_tx.send(()).await;
     }
@@ -3052,7 +3069,8 @@ mod tests {
         });
 
         let prev = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
-        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1")) };
 
         let opts = CreateOpts {
             model: Some(types::ModelRef {
@@ -3138,8 +3156,10 @@ mod tests {
         dispose(&sid);
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
-            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_LOCAL_BASE_URL") },
         }
         let _ = server_tx.send(()).await;
     }
@@ -3177,7 +3197,8 @@ mod tests {
         });
 
         let prev = std::env::var("DOTZ_LOCAL_BASE_URL").ok();
-        std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", format!("http://127.0.0.1:{port}/v1")) };
 
         let opts = CreateOpts {
             model: Some(types::ModelRef {
@@ -3225,8 +3246,10 @@ mod tests {
         dispose(&sid);
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_LOCAL_BASE_URL", p),
-            None => std::env::remove_var("DOTZ_LOCAL_BASE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_LOCAL_BASE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_LOCAL_BASE_URL") },
         }
         let _ = server_tx.send(()).await;
     }

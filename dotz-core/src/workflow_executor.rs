@@ -720,7 +720,8 @@ mod tests {
 
     fn set_tmp_workflows_file() -> std::path::PathBuf {
         let file = std::env::temp_dir().join(format!("dotz-wf-exec-test-{}.json", Uuid::new_v4()));
-        std::env::set_var("DOTZ_WORKFLOWS_FILE", file.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WORKFLOWS_FILE", file.to_string_lossy().to_string()) };
         file
     }
 
@@ -729,7 +730,8 @@ mod tests {
     #[test]
     fn concurrency_clamps_to_sane_bounds() {
         // Default when unset.
-        std::env::remove_var("DOTZ_WF_CONCURRENCY");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WF_CONCURRENCY") };
         let c = concurrency();
         assert!(
             (1..=MAX_CONCURRENCY).contains(&c),
@@ -737,23 +739,28 @@ mod tests {
         );
 
         // Valid override is preserved.
-        std::env::set_var("DOTZ_WF_CONCURRENCY", "2");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_CONCURRENCY", "2") };
         assert_eq!(concurrency(), 2);
 
         // Below-min clamps to 1.
-        std::env::set_var("DOTZ_WF_CONCURRENCY", "0");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_CONCURRENCY", "0") };
         assert_eq!(concurrency(), 1);
 
         // Above-max clamps to MAX_CONCURRENCY.
-        std::env::set_var("DOTZ_WF_CONCURRENCY", "99999");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_CONCURRENCY", "99999") };
         assert_eq!(concurrency(), MAX_CONCURRENCY);
 
         // Invalid string falls back to default.
-        std::env::set_var("DOTZ_WF_CONCURRENCY", "not-a-number");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_CONCURRENCY", "not-a-number") };
         let c = concurrency();
         assert!((1..=MAX_CONCURRENCY).contains(&c));
 
-        std::env::remove_var("DOTZ_WF_CONCURRENCY");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WF_CONCURRENCY") };
     }
 
     /// The step timeout must clamp to sane bounds. A zero value would time out before
@@ -767,24 +774,29 @@ mod tests {
     #[test]
     fn step_timeout_clamps_to_sane_bounds() {
         let _guard = ENV_LOCK.blocking_lock();
-        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS") };
         let t = step_timeout();
         assert_eq!(t.as_secs(), 300, "default step timeout is 5 minutes");
 
-        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
         assert_eq!(step_timeout().as_millis(), 5000);
 
-        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "50");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "50") };
         assert_eq!(step_timeout().as_millis(), 1000, "below-min clamps to 1s");
 
-        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "100000000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "100000000") };
         assert_eq!(
             step_timeout().as_millis(),
             3_600_000,
             "above-max clamps to 1h"
         );
 
-        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS") };
     }
 
     /// run_workflow must return None for an unknown run id.
@@ -825,8 +837,10 @@ mod tests {
         let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
         // Keep the timeout short so the test doesn't wait 5 minutes.
-        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000") };
 
         let run = workflows::create(
             None,
@@ -858,8 +872,10 @@ mod tests {
             run.steps[0].error
         );
 
-        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
-        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS") };
     }
 
     /// A two-step DAG where the first step fails must skip the second step (failure-rerouting).
@@ -867,8 +883,10 @@ mod tests {
     async fn run_workflow_skips_children_of_failed_step() {
         let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
-        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000") };
 
         let run = workflows::create(
             None,
@@ -892,8 +910,10 @@ mod tests {
         assert_eq!(run.steps[0].status, "error");
         assert_eq!(run.steps[1].status, "skipped");
 
-        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
-        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS") };
     }
 
     /// The context bus must auto-populate `step:<id>:output` and `step:<id>:summary`
@@ -903,8 +923,10 @@ mod tests {
     async fn context_bus_auto_populates_from_completed_steps() {
         let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
-        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000") };
 
         // Two-step chain: step 0 is an unknown agent (errors), step 1 depends on step 0.
         // The bus should contain step 0's output after the run completes.
@@ -957,8 +979,10 @@ mod tests {
 
         // Clean up.
         ContextBus::destroy(&run.id);
-        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
-        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS") };
     }
 
     /// The context bus must survive run completion so callers can inspect it. The
@@ -967,8 +991,10 @@ mod tests {
     async fn context_bus_persists_after_run_completion() {
         let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
-        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000") };
 
         let run = workflows::create(
             None,
@@ -999,8 +1025,10 @@ mod tests {
             "after destroy, bus should be empty"
         );
 
-        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
-        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS") };
     }
 
     /// On resume, the executor must pre-populate the fresh context bus from
@@ -1012,8 +1040,10 @@ mod tests {
     async fn run_workflow_preloads_context_bus_on_resume() {
         let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
-        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000") };
 
         // Two-step chain: step 0 (unknown agent) will error, step 1 depends on step 0.
         // After step 0 errors, step 1 is skipped. The bus should contain step 0's
@@ -1127,7 +1157,7 @@ mod tests {
         let bus = ContextBus {
             run_id: run2_id.clone(),
         };
-        let output_key = format!("step:{}:output", run2_step0_id);
+        let output_key = format!("step:{run2_step0_id}:output");
         let loaded = bus.read(&output_key);
         assert!(
             loaded.is_some(),
@@ -1140,7 +1170,7 @@ mod tests {
         );
 
         // The summary key must also be present.
-        let summary_key = format!("step:{}:summary", run2_step0_id);
+        let summary_key = format!("step:{run2_step0_id}:summary");
         let summary = bus.read(&summary_key);
         assert!(
             summary.is_some(),
@@ -1156,7 +1186,7 @@ mod tests {
         // output IS on the bus now (from the executor's auto-population).
         // The key assertion is that step 0's preloaded output (from BEFORE
         // shutdown) is present — that's what the resume scenario needs.
-        let step1_key = format!("step:{}:output", run2_step1_id);
+        let step1_key = format!("step:{run2_step1_id}:output");
         assert!(
             bus.read(&step1_key).is_some(),
             "step 1 was re-executed and auto-populated by the executor"
@@ -1165,8 +1195,10 @@ mod tests {
         // Clean up.
         ContextBus::destroy(&run_id);
         ContextBus::destroy(&run2_id);
-        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
-        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS") };
     }
 
     // ---- Budget enforcement tests ----
@@ -1182,8 +1214,10 @@ mod tests {
     async fn run_budget_exceeded_skips_remaining_steps() {
         let _guard = ENV_LOCK.lock().await;
         let _file = set_tmp_workflows_file();
-        std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000");
-        std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SUBAGENT_TIMEOUT_MS", "4000") };
 
         // Two independent steps (no parent-child). Step 0 will complete with
         // usage exceeding the tiny budget; step 1 should then be skipped.
@@ -1237,8 +1271,7 @@ mod tests {
         let step1 = run.steps.iter().find(|s| s.id == step1_id).unwrap();
         assert_eq!(
             step1.status, "skipped",
-            "step 1 should be skipped when run budget is exceeded: {:?}",
-            step1
+            "step 1 should be skipped when run budget is exceeded: {step1:?}"
         );
         assert!(
             step1.error.as_ref().is_some_and(|e| e.contains("budget")),
@@ -1246,8 +1279,10 @@ mod tests {
             step1.error
         );
 
-        std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS");
-        std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_SUBAGENT_TIMEOUT_MS") };
     }
 
     /// A run with no budget set must NOT skip steps even when cumulative spend is high.

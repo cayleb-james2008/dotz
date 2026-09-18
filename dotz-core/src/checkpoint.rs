@@ -719,8 +719,7 @@ mod tests {
         let result = restore_checkpoint("run-a", cwd);
         assert!(
             matches!(result, Err(CheckpointError::RollbackOrder { ref current, ref expected }) if current == "run-b" && expected == "run-a"),
-            "expected RollbackOrder error, got {:?}",
-            result
+            "expected RollbackOrder error, got {result:?}"
         );
     }
 

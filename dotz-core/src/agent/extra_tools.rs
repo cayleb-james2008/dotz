@@ -11,6 +11,9 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 
+// (RESOURCE_NAME kept as documentation of the regex valid_name enforces; the `const _` alias
+// below did not satisfy rustc's dead-code analysis, so the attribute is explicit.)
+#[allow(dead_code)]
 const RESOURCE_NAME: &str = r"^[a-z][a-z0-9-]{1,63}$";
 fn valid_name(name: &str) -> bool {
     let n = name.trim();
@@ -24,9 +27,6 @@ fn valid_name(name: &str) -> bool {
     n.chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
-// (RESOURCE_NAME kept as documentation of the regex valid_name enforces.)
-const _: &str = RESOURCE_NAME;
-
 // ---- agents_md: read/write the project AGENTS.md doctrine ----
 struct AgentsMdTool;
 #[async_trait]
@@ -2197,24 +2197,28 @@ mod tests {
         let _guard = GATE_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_GATE_TIMEOUT_MS").ok();
 
-        std::env::remove_var("DOTZ_GATE_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_GATE_TIMEOUT_MS") };
         assert_eq!(
             gate_timeout().as_secs(),
             600,
             "default gate timeout is 10 minutes"
         );
 
-        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "500");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "500") };
         assert_eq!(
             gate_timeout().as_millis(),
             1_000,
             "below-minimum value clamps to 1s"
         );
 
-        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "30000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "30000") };
         assert_eq!(gate_timeout().as_millis(), 30_000, "valid value preserved");
 
-        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "100000000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "100000000") };
         assert_eq!(
             gate_timeout().as_millis(),
             3_600_000,
@@ -2222,8 +2226,10 @@ mod tests {
         );
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_GATE_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_GATE_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_GATE_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_GATE_TIMEOUT_MS") },
         }
     }
 
@@ -2233,7 +2239,8 @@ mod tests {
     async fn run_gate_times_out_on_hung_command() {
         let _guard = GATE_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_GATE_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "1000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "1000") };
 
         let dir = tmp_dir();
         // ~2s of wall-clock time; the 1s timeout must fire first and kill the child.
@@ -2248,8 +2255,10 @@ mod tests {
         let elapsed = start.elapsed();
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_GATE_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_GATE_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_GATE_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_GATE_TIMEOUT_MS") },
         }
         let _ = fs::remove_dir_all(&dir);
 
@@ -2336,7 +2345,8 @@ mod tests {
     async fn run_gate_reaps_child_after_timeout() {
         let _guard = GATE_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_GATE_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "1000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GATE_TIMEOUT_MS", "1000") };
 
         let dir = tmp_dir();
         let pidfile = dir.join("pid");
@@ -2356,8 +2366,10 @@ mod tests {
         let result = run_gate(&dir, Some(&command)).await;
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_GATE_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_GATE_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_GATE_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_GATE_TIMEOUT_MS") },
         }
 
         assert_eq!(
@@ -2528,8 +2540,7 @@ mod tests {
             .await;
         assert!(
             write_result.is_ok(),
-            "agents_md write should succeed: {:?}",
-            write_result
+            "agents_md write should succeed: {write_result:?}"
         );
         assert!(
             dir.join("AGENTS.md").exists(),
@@ -2556,7 +2567,8 @@ mod tests {
             .ok()
             .map(std::path::PathBuf::from);
         let tmp = tmp_dir();
-        std::env::set_var("DOTZ_CONFIG_DIR", &tmp);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &tmp) };
 
         let tool = CreateSkillTool;
         let ctx = ToolCtx {
@@ -2584,7 +2596,7 @@ mod tests {
             .join("skills")
             .join(&name)
             .join("SKILL.md");
-        assert!(result.is_ok(), "create_skill should succeed: {:?}", result);
+        assert!(result.is_ok(), "create_skill should succeed: {result:?}");
         assert!(
             file.exists(),
             "create_skill should write the skill file at {}",
@@ -2595,8 +2607,10 @@ mod tests {
         // Restore DOTZ_CONFIG_DIR before rebuilding the index so other tests are not exposed
         // to the deleted temp directory, then clear the test skill from the global index.
         match &prev_config {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         crate::skills::reload_index();
     }

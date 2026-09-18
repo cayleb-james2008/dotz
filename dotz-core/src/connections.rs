@@ -590,7 +590,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-conn-none-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
 
         let (code, _body) = login(Path("github".to_string()), None).await;
         assert_eq!(
@@ -600,8 +601,10 @@ mod tests {
         );
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -640,7 +643,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-conn-gw-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         std::fs::write(
             dir.join("connectors.json"),
             format!(
@@ -668,8 +672,10 @@ mod tests {
         assert_eq!(put_body["values"]["api_key"], "k");
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         server.abort();

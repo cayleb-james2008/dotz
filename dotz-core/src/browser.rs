@@ -83,9 +83,7 @@ fn now_iso() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{ms:03}Z"
-    )
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{ms:03}Z")
 }
 
 // ---- origin normalization: lowercase scheme://host[:port], http(s) only ----
@@ -1935,23 +1933,31 @@ mod tests {
         let prev_timeout = std::env::var("DOTZ_BROWSER_TIMEOUT_MS").ok();
         // Use a huge command timeout so the only thing ending the close call is stop()'s own
         // CLOSE_TIMEOUT — if stop() relied on command_timeout() this test would take 75s.
-        std::env::set_var(
-            "DOTZ_BROWSER_BIN",
-            script_path.to_string_lossy().to_string(),
-        );
-        std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "300000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe {
+            std::env::set_var(
+                "DOTZ_BROWSER_BIN",
+                script_path.to_string_lossy().to_string(),
+            )
+        };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "300000") };
 
         let start = std::time::Instant::now();
         let result = stop(&sid).await;
         let elapsed = start.elapsed();
 
         match prev_bin {
-            Some(p) => std::env::set_var("DOTZ_BROWSER_BIN", p),
-            None => std::env::remove_var("DOTZ_BROWSER_BIN"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_BROWSER_BIN", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_BROWSER_BIN") },
         }
         match prev_timeout {
-            Some(p) => std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS") },
         }
 
         // stop() must complete well before the 5m command_timeout, bounded by CLOSE_TIMEOUT.
@@ -2149,23 +2155,31 @@ mod tests {
 
         let prev_bin = std::env::var("DOTZ_BROWSER_BIN").ok();
         let prev_timeout = std::env::var("DOTZ_BROWSER_TIMEOUT_MS").ok();
-        std::env::set_var(
-            "DOTZ_BROWSER_BIN",
-            script_path.to_string_lossy().to_string(),
-        );
-        std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "500");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe {
+            std::env::set_var(
+                "DOTZ_BROWSER_BIN",
+                script_path.to_string_lossy().to_string(),
+            )
+        };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "500") };
 
         let start = std::time::Instant::now();
         let result = run(&sid, &profile_dir, &allowed, &["get", "url"]).await;
         let elapsed = start.elapsed();
 
         match prev_bin {
-            Some(p) => std::env::set_var("DOTZ_BROWSER_BIN", p),
-            None => std::env::remove_var("DOTZ_BROWSER_BIN"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_BROWSER_BIN", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_BROWSER_BIN") },
         }
         match prev_timeout {
-            Some(p) => std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS") },
         }
 
         assert!(
@@ -2213,28 +2227,32 @@ mod tests {
         let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_BROWSER_TIMEOUT_MS").ok();
 
-        std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS") };
         assert_eq!(
             command_timeout().as_secs(),
             75,
             "default browser command timeout is 75 seconds"
         );
 
-        std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "2000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "2000") };
         assert_eq!(
             command_timeout().as_millis(),
             2000,
             "valid override is preserved"
         );
 
-        std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "50");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "50") };
         assert_eq!(
             command_timeout().as_millis(),
             1000,
             "below-minimum value clamps to 1 second"
         );
 
-        std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "100000000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "100000000") };
         assert_eq!(
             command_timeout().as_millis(),
             300_000,
@@ -2242,8 +2260,10 @@ mod tests {
         );
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_BROWSER_TIMEOUT_MS") },
         }
     }
 
@@ -2288,24 +2308,30 @@ mod tests {
         std::fs::write(&bin_path, "exit 0\n").unwrap();
 
         let prev = std::env::var("DOTZ_BROWSER_BIN").ok();
-        std::env::set_var("DOTZ_BROWSER_BIN", bin_path.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_BROWSER_BIN", bin_path.to_string_lossy().to_string()) };
         assert!(
             binary_present(),
             "binary_present must be true when DOTZ_BROWSER_BIN points at an existing file"
         );
 
-        std::env::set_var(
-            "DOTZ_BROWSER_BIN",
-            dir.join("does-not-exist").to_string_lossy().to_string(),
-        );
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe {
+            std::env::set_var(
+                "DOTZ_BROWSER_BIN",
+                dir.join("does-not-exist").to_string_lossy().to_string(),
+            )
+        };
         assert!(
             !binary_present(),
             "binary_present must be false when DOTZ_BROWSER_BIN points at a missing file"
         );
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_BROWSER_BIN", p),
-            None => std::env::remove_var("DOTZ_BROWSER_BIN"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_BROWSER_BIN", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_BROWSER_BIN") },
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

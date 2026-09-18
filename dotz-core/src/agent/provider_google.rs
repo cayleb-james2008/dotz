@@ -375,28 +375,36 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
 
         // Neither set → empty.
-        std::env::remove_var("GEMINI_API_KEY");
-        std::env::remove_var("GOOGLE_API_KEY");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("GEMINI_API_KEY") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("GOOGLE_API_KEY") };
         assert!(resolve_google_key("$GEMINI_API_KEY").is_empty());
 
         // GEMINI_API_KEY wins when present.
-        std::env::set_var("GEMINI_API_KEY", "gemini-key");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("GEMINI_API_KEY", "gemini-key") };
         assert_eq!(resolve_google_key("$GEMINI_API_KEY"), "gemini-key");
 
         // Fallback to GOOGLE_API_KEY when GEMINI_API_KEY is absent.
-        std::env::remove_var("GEMINI_API_KEY");
-        std::env::set_var("GOOGLE_API_KEY", "google-key");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("GEMINI_API_KEY") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("GOOGLE_API_KEY", "google-key") };
         assert_eq!(resolve_google_key("$GEMINI_API_KEY"), "google-key");
 
         // Cleanup.
-        std::env::remove_var("GOOGLE_API_KEY");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("GOOGLE_API_KEY") };
     }
 
     #[test]
     fn resolve_google_key_returns_bare_literal_untouched() {
         let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("GEMINI_API_KEY");
-        std::env::remove_var("GOOGLE_API_KEY");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("GEMINI_API_KEY") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("GOOGLE_API_KEY") };
 
         // A bare literal key is passed through (matches the shared resolve_api_key rule).
         assert_eq!(resolve_google_key("literal-key"), "literal-key");

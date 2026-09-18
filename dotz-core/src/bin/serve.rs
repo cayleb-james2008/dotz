@@ -59,7 +59,7 @@ fn spawn_embedder_warmup() {
 /// the headless `serve` bin is as helpful as the Tauri shell's `bind_listener`.
 fn format_startup_error(e: &std::io::Error, addr: &SocketAddr) -> String {
     let kind = e.kind();
-    
+
     match kind {
         std::io::ErrorKind::AddrInUse => {
             format!(
@@ -108,18 +108,23 @@ mod tests {
         let guard = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("DOTZ_WEB_DIR").ok();
 
-        std::env::set_var("DOTZ_WEB_DIR", "custom-web");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WEB_DIR", "custom-web") };
         assert_eq!(web_dir(), "custom-web");
 
-        std::env::set_var("DOTZ_WEB_DIR", "");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WEB_DIR", "") };
         assert_eq!(web_dir(), "web");
 
-        std::env::remove_var("DOTZ_WEB_DIR");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WEB_DIR") };
         assert_eq!(web_dir(), "web");
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_WEB_DIR", p),
-            None => std::env::remove_var("DOTZ_WEB_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_WEB_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_WEB_DIR") },
         }
         drop(guard);
     }
@@ -131,18 +136,24 @@ mod tests {
         let guard = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("DOTZ_TOKEN").ok();
 
-        std::env::set_var("DOTZ_TOKEN", "  abc123  ");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_TOKEN", "  abc123  ") };
         assert_eq!(session_token().as_deref(), Some("abc123"));
-        std::env::set_var("DOTZ_TOKEN", "   ");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_TOKEN", "   ") };
         assert_eq!(session_token(), None);
-        std::env::set_var("DOTZ_TOKEN", "");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_TOKEN", "") };
         assert_eq!(session_token(), None);
-        std::env::remove_var("DOTZ_TOKEN");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_TOKEN") };
         assert_eq!(session_token(), None);
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_TOKEN", p),
-            None => std::env::remove_var("DOTZ_TOKEN"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_TOKEN", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_TOKEN") },
         }
         drop(guard);
     }

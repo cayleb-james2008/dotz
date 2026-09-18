@@ -701,8 +701,10 @@ mod tests {
 
         let prev_pi = std::env::var("DOTZ_PI").ok();
         let prev_paths = std::env::var("DOTZ_SKILLS_PATHS").ok();
-        std::env::set_var("DOTZ_PI", &pi);
-        std::env::set_var("DOTZ_SKILLS_PATHS", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_PI", &pi) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SKILLS_PATHS", &dir) };
 
         // Create the first skill and prime the cache.
         let alpha = dir.join("alpha");
@@ -743,12 +745,16 @@ mod tests {
 
         // Cleanup.
         match prev_pi {
-            Some(p) => std::env::set_var("DOTZ_PI", p),
-            None => std::env::remove_var("DOTZ_PI"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_PI", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_PI") },
         }
         match prev_paths {
-            Some(p) => std::env::set_var("DOTZ_SKILLS_PATHS", p),
-            None => std::env::remove_var("DOTZ_SKILLS_PATHS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_SKILLS_PATHS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_SKILLS_PATHS") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&pi);

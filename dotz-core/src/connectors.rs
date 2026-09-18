@@ -401,11 +401,14 @@ mod tests {
             std::env::temp_dir().join(format!("dotz-connectors-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         let result = f(&dir);
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         drop(guard);
@@ -486,13 +489,15 @@ mod tests {
                 enabled: true,
                 label: None,
             };
-            std::env::set_var("DOTZ_TEST_OC_TOKEN", "secret-value-123");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_TEST_OC_TOKEN", "secret-value-123") };
             assert_eq!(
                 resolve_token(&c).unwrap(),
                 Some("secret-value-123".to_string())
             );
 
-            std::env::remove_var("DOTZ_TEST_OC_TOKEN");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_TEST_OC_TOKEN") };
             let err = resolve_token(&c).unwrap_err();
             assert!(
                 err.contains("DOTZ_TEST_OC_TOKEN"),
@@ -555,7 +560,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        std::env::set_var("DOTZ_TEST_INVOKE_TOKEN", "tkn-abc");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_TEST_INVOKE_TOKEN", "tkn-abc") };
         let c = Connector {
             id: "gw".into(),
             gateway_base_url: format!("http://127.0.0.1:{}", addr.port()),
@@ -581,7 +587,8 @@ mod tests {
             "payload must be wrapped as {{input}}"
         );
 
-        std::env::remove_var("DOTZ_TEST_INVOKE_TOKEN");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_TEST_INVOKE_TOKEN") };
         server.abort();
     }
 }

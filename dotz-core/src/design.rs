@@ -200,8 +200,10 @@ mod tests {
     impl Drop for PiDirGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(p) => std::env::set_var("DOTZ_PI", p),
-                None => std::env::remove_var("DOTZ_PI"),
+                // TODO: Audit that the environment access only happens in single-threaded code.
+                Some(p) => unsafe { std::env::set_var("DOTZ_PI", p) },
+                // TODO: Audit that the environment access only happens in single-threaded code.
+                None => unsafe { std::env::remove_var("DOTZ_PI") },
             }
             let _ = std::fs::remove_dir_all(&self.pi);
         }
@@ -214,7 +216,8 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let pi = std::env::temp_dir().join(format!("dotz-design-test-{}", uuid::Uuid::new_v4()));
         let prev = std::env::var("DOTZ_PI").ok();
-        std::env::set_var("DOTZ_PI", &pi);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_PI", &pi) };
         let guard = PiDirGuard {
             _lock: guard,
             pi: pi.clone(),

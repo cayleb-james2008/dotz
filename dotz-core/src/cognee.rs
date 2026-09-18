@@ -275,14 +275,16 @@ mod tests {
     fn disabled_by_default() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("DOTZ_COGNEE_URL").ok();
-        std::env::remove_var("DOTZ_COGNEE_URL");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_COGNEE_URL") };
         assert!(
             !enabled(),
             "Cognee must be disabled when DOTZ_COGNEE_URL is unset"
         );
         assert!(CogneeConfig::from_env().is_none());
         if let Some(p) = prev {
-            std::env::set_var("DOTZ_COGNEE_URL", p);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_COGNEE_URL", p) };
         }
     }
 
@@ -321,11 +323,13 @@ mod tests {
     fn from_env_strips_trailing_slash() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("DOTZ_COGNEE_URL").ok();
-        std::env::set_var("DOTZ_COGNEE_URL", "http://localhost:8000/");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_COGNEE_URL", "http://localhost:8000/") };
         let cfg = CogneeConfig::from_env().expect("should parse");
         assert_eq!(cfg.base_url, "http://localhost:8000");
         if let Some(p) = prev {
-            std::env::set_var("DOTZ_COGNEE_URL", p);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_COGNEE_URL", p) };
         }
     }
 
@@ -335,20 +339,27 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_url = std::env::var("DOTZ_COGNEE_URL").ok();
         let prev_ds = std::env::var("DOTZ_COGNEE_DATASET").ok();
-        std::env::set_var("DOTZ_COGNEE_URL", "http://localhost:8000");
-        std::env::remove_var("DOTZ_COGNEE_DATASET");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_COGNEE_URL", "http://localhost:8000") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_COGNEE_DATASET") };
         let cfg = CogneeConfig::from_env().expect("should parse");
         assert_eq!(cfg.dataset, "dotz");
-        std::env::set_var("DOTZ_COGNEE_DATASET", "my-project");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_COGNEE_DATASET", "my-project") };
         let cfg = CogneeConfig::from_env().expect("should parse");
         assert_eq!(cfg.dataset, "my-project");
         match prev_url {
-            Some(p) => std::env::set_var("DOTZ_COGNEE_URL", p),
-            None => std::env::remove_var("DOTZ_COGNEE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_COGNEE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_COGNEE_URL") },
         }
         match prev_ds {
-            Some(p) => std::env::set_var("DOTZ_COGNEE_DATASET", p),
-            None => std::env::remove_var("DOTZ_COGNEE_DATASET"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_COGNEE_DATASET", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_COGNEE_DATASET") },
         }
     }
 
@@ -372,10 +383,12 @@ mod tests {
     async fn recall_returns_none_when_disabled() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("DOTZ_COGNEE_URL").ok();
-        std::env::remove_var("DOTZ_COGNEE_URL");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_COGNEE_URL") };
         assert!(recall("test", None, 5).await.is_none());
         if let Some(p) = prev {
-            std::env::set_var("DOTZ_COGNEE_URL", p);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_COGNEE_URL", p) };
         }
     }
 
@@ -385,10 +398,12 @@ mod tests {
     async fn remember_returns_none_when_disabled() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("DOTZ_COGNEE_URL").ok();
-        std::env::remove_var("DOTZ_COGNEE_URL");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_COGNEE_URL") };
         assert!(remember("test fact", None).await.is_none());
         if let Some(p) = prev {
-            std::env::set_var("DOTZ_COGNEE_URL", p);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_COGNEE_URL", p) };
         }
     }
 
@@ -398,10 +413,12 @@ mod tests {
     async fn health_returns_none_when_disabled() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("DOTZ_COGNEE_URL").ok();
-        std::env::remove_var("DOTZ_COGNEE_URL");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_COGNEE_URL") };
         assert!(health().await.is_none());
         if let Some(p) = prev {
-            std::env::set_var("DOTZ_COGNEE_URL", p);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_COGNEE_URL", p) };
         }
     }
 
@@ -455,23 +472,30 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_url = std::env::var("DOTZ_COGNEE_URL").ok();
         let prev_key = std::env::var("DOTZ_COGNEE_API_KEY").ok();
-        std::env::set_var("DOTZ_COGNEE_URL", "http://localhost:8000");
-        std::env::remove_var("DOTZ_COGNEE_API_KEY");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_COGNEE_URL", "http://localhost:8000") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_COGNEE_API_KEY") };
         let cfg = CogneeConfig::from_env().expect("should parse");
         assert!(
             cfg.api_key.is_none(),
             "api_key should be None when env unset"
         );
-        std::env::set_var("DOTZ_COGNEE_API_KEY", "ck_test_key_123");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_COGNEE_API_KEY", "ck_test_key_123") };
         let cfg = CogneeConfig::from_env().expect("should parse");
         assert_eq!(cfg.api_key.as_deref(), Some("ck_test_key_123"));
         match prev_url {
-            Some(p) => std::env::set_var("DOTZ_COGNEE_URL", p),
-            None => std::env::remove_var("DOTZ_COGNEE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_COGNEE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_COGNEE_URL") },
         }
         match prev_key {
-            Some(p) => std::env::set_var("DOTZ_COGNEE_API_KEY", p),
-            None => std::env::remove_var("DOTZ_COGNEE_API_KEY"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_COGNEE_API_KEY", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_COGNEE_API_KEY") },
         }
     }
 
@@ -481,15 +505,18 @@ mod tests {
     fn from_env_disables_on_invalid_url() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("DOTZ_COGNEE_URL").ok();
-        std::env::set_var("DOTZ_COGNEE_URL", "ftp://bad");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_COGNEE_URL", "ftp://bad") };
         assert!(
             CogneeConfig::from_env().is_none(),
             "invalid URL should disable Cognee"
         );
         assert!(!enabled());
         match prev {
-            Some(p) => std::env::set_var("DOTZ_COGNEE_URL", p),
-            None => std::env::remove_var("DOTZ_COGNEE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_COGNEE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_COGNEE_URL") },
         }
     }
 
@@ -499,29 +526,37 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_url = std::env::var("DOTZ_COGNEE_URL").ok();
         let prev_to = std::env::var("DOTZ_COGNEE_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_COGNEE_URL", "http://localhost:8000");
-        std::env::set_var("DOTZ_COGNEE_TIMEOUT_MS", "100");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_COGNEE_URL", "http://localhost:8000") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_COGNEE_TIMEOUT_MS", "100") };
         let cfg = CogneeConfig::from_env().expect("should parse");
         assert_eq!(
             cfg.timeout_ms, DEFAULT_TIMEOUT_MS,
             "too-small timeout should fall back"
         );
-        std::env::set_var("DOTZ_COGNEE_TIMEOUT_MS", "999999");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_COGNEE_TIMEOUT_MS", "999999") };
         let cfg = CogneeConfig::from_env().expect("should parse");
         assert_eq!(
             cfg.timeout_ms, DEFAULT_TIMEOUT_MS,
             "too-large timeout should fall back"
         );
-        std::env::set_var("DOTZ_COGNEE_TIMEOUT_MS", "5000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_COGNEE_TIMEOUT_MS", "5000") };
         let cfg = CogneeConfig::from_env().expect("should parse");
         assert_eq!(cfg.timeout_ms, 5000, "in-range timeout should be honored");
         match prev_url {
-            Some(p) => std::env::set_var("DOTZ_COGNEE_URL", p),
-            None => std::env::remove_var("DOTZ_COGNEE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_COGNEE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_COGNEE_URL") },
         }
         match prev_to {
-            Some(p) => std::env::set_var("DOTZ_COGNEE_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_COGNEE_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_COGNEE_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_COGNEE_TIMEOUT_MS") },
         }
     }
 

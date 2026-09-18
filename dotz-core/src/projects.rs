@@ -706,8 +706,10 @@ struct TmpFileGuard {
 impl Drop for TmpFileGuard {
     fn drop(&mut self) {
         match &self.prev {
-            Some(p) => std::env::set_var("DOTZ_PROJECTS_FILE", p),
-            None => std::env::remove_var("DOTZ_PROJECTS_FILE"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_PROJECTS_FILE", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_PROJECTS_FILE") },
         }
         let _ = std::fs::remove_file(&self.file);
     }
@@ -721,7 +723,8 @@ fn with_tmp_projects_file() -> TmpFileGuard {
     let file =
         std::env::temp_dir().join(format!("dotz-projects-test-{}.json", uuid::Uuid::new_v4()));
     let prev = std::env::var("DOTZ_PROJECTS_FILE").ok();
-    std::env::set_var("DOTZ_PROJECTS_FILE", &file);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("DOTZ_PROJECTS_FILE", &file) };
     {
         let mut store_guard = store_guard();
         *store_guard = Vec::new();

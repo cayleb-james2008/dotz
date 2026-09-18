@@ -1501,7 +1501,8 @@ mod tests {
     fn add_rejects_invalid_scope() {
         with_tmp_dir(|dir| {
             let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-            std::env::set_var("DOTZ_CONFIG_DIR", dir);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir) };
             // Force DB init in the isolated dir.
             // Recovering lock: db_guard_recovers_from_poisoned_mutex intentionally leaves the
             // process-global DB mutex poisoned, and test order is arbitrary.
@@ -1516,8 +1517,10 @@ mod tests {
             );
 
             match prev {
-                Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-                None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+                // TODO: Audit that the environment access only happens in single-threaded code.
+                Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+                // TODO: Audit that the environment access only happens in single-threaded code.
+                None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
             }
         });
     }
@@ -1569,7 +1572,8 @@ mod tests {
     fn db_guard_recovers_from_poisoned_mutex() {
         with_tmp_dir(|dir| {
             let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-            std::env::set_var("DOTZ_CONFIG_DIR", dir);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir) };
             // Force initialization if not already done, so this test runs in an isolated
             // location when it is the first caller.
             // Recovering lock: db_guard_recovers_from_poisoned_mutex intentionally leaves the
@@ -1592,8 +1596,10 @@ mod tests {
                 .unwrap();
 
             match prev {
-                Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-                None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+                // TODO: Audit that the environment access only happens in single-threaded code.
+                Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+                // TODO: Audit that the environment access only happens in single-threaded code.
+                None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
             }
         });
     }
@@ -1651,9 +1657,12 @@ mod tests {
         let prev_base = std::env::var("DOTZ_MEMORY_BASE_URL").ok();
         let prev_key = std::env::var("DOTZ_MEMORY_API_KEY").ok();
         let prev_timeout = std::env::var("DOTZ_MEMORY_TIMEOUT_MS").ok();
-        std::env::set_var("DOTZ_MEMORY_BASE_URL", format!("http://{}", addr));
-        std::env::set_var("DOTZ_MEMORY_API_KEY", "test-key");
-        std::env::set_var("DOTZ_MEMORY_TIMEOUT_MS", "250");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_MEMORY_BASE_URL", format!("http://{addr}")) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_MEMORY_API_KEY", "test-key") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_MEMORY_TIMEOUT_MS", "250") };
 
         // Wait until the fake server has accepted the TCP connection so the timeout measures the
         // response wait, not the connection handshake.
@@ -1671,16 +1680,22 @@ mod tests {
         let elapsed = start.elapsed();
 
         match prev_base {
-            Some(p) => std::env::set_var("DOTZ_MEMORY_BASE_URL", p),
-            None => std::env::remove_var("DOTZ_MEMORY_BASE_URL"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_MEMORY_BASE_URL", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_MEMORY_BASE_URL") },
         }
         match prev_key {
-            Some(p) => std::env::set_var("DOTZ_MEMORY_API_KEY", p),
-            None => std::env::remove_var("DOTZ_MEMORY_API_KEY"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_MEMORY_API_KEY", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_MEMORY_API_KEY") },
         }
         match prev_timeout {
-            Some(p) => std::env::set_var("DOTZ_MEMORY_TIMEOUT_MS", p),
-            None => std::env::remove_var("DOTZ_MEMORY_TIMEOUT_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_MEMORY_TIMEOUT_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_MEMORY_TIMEOUT_MS") },
         }
 
         assert!(
@@ -1701,7 +1716,8 @@ mod tests {
     fn auto_consolidation_counter_is_per_scope() {
         with_tmp_dir(|dir| {
             let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-            std::env::set_var("DOTZ_CONFIG_DIR", dir);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir) };
             // Recovering lock: db_guard_recovers_from_poisoned_mutex intentionally leaves the
             // process-global DB mutex poisoned, and test order is arbitrary.
             drop(db().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
@@ -1745,8 +1761,10 @@ mod tests {
             );
 
             match prev {
-                Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-                None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+                // TODO: Audit that the environment access only happens in single-threaded code.
+                Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+                // TODO: Audit that the environment access only happens in single-threaded code.
+                None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
             }
         });
     }
@@ -1773,7 +1791,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-memory-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         // Force DB init in the isolated dir (no-op if another test already initialized it).
         drop(db().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
 
@@ -1811,8 +1830,10 @@ mod tests {
         );
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1836,7 +1857,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dotz-memory-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", &dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
         // Force DB init in the isolated dir (no-op if another test already initialized it).
         drop(db().lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
 
@@ -1889,8 +1911,10 @@ mod tests {
         // Clean up the stored fact so this test leaves no residue in the shared store.
         assert!(remove(&added.id, None), "cleanup remove should succeed");
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1922,7 +1946,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("DOTZ_MODELS").ok();
         let tmp = std::env::temp_dir().join(format!("dotz-warm-missing-{}", uuid::Uuid::new_v4()));
-        std::env::set_var("DOTZ_MODELS", &tmp);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_MODELS", &tmp) };
         assert!(
             !crate::embed::model_files_present(),
             "precondition: model files absent"
@@ -1932,8 +1957,10 @@ mod tests {
         warm_embedder();
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_MODELS", p),
-            None => std::env::remove_var("DOTZ_MODELS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_MODELS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_MODELS") },
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }

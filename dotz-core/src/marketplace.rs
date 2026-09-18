@@ -202,9 +202,7 @@ fn marketplace_base_url() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
-            format!(
-                "https://raw.githubusercontent.com/{MARKETPLACE_REPO}/{MARKETPLACE_BRANCH}/"
-            )
+            format!("https://raw.githubusercontent.com/{MARKETPLACE_REPO}/{MARKETPLACE_BRANCH}/")
         })
 }
 
@@ -215,11 +213,7 @@ fn marketplace_api_url() -> String {
     std::env::var("DOTZ_MARKETPLACE_API_URL")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            format!(
-                "https://api.github.com/repos/{MARKETPLACE_REPO}/contents/"
-            )
-        })
+        .unwrap_or_else(|| format!("https://api.github.com/repos/{MARKETPLACE_REPO}/contents/"))
 }
 
 /// `~/.dotz/presets/` — the install root. Honors `DOTZ_CONFIG_DIR` via [`config::dotz_dir`] so
@@ -1516,15 +1510,19 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("dotz-marketplace-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
-        std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string()) };
         PresetsDirGuard { dir, _lock: g }
     }
 
     impl Drop for PresetsDirGuard {
         fn drop(&mut self) {
-            std::env::remove_var("DOTZ_CONFIG_DIR");
-            std::env::remove_var("DOTZ_MARKETPLACE_URL");
-            std::env::remove_var("DOTZ_MARKETPLACE_API_URL");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") };
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_MARKETPLACE_URL") };
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_MARKETPLACE_API_URL") };
             invalidate_cache();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -1539,16 +1537,20 @@ mod tests {
 
     fn setup_market_url(base: &str, api_base: &str) -> MarketUrlGuard {
         let g = test_lock();
-        std::env::set_var("DOTZ_MARKETPLACE_URL", base);
-        std::env::set_var("DOTZ_MARKETPLACE_API_URL", api_base);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_MARKETPLACE_URL", base) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_MARKETPLACE_API_URL", api_base) };
         invalidate_cache();
         MarketUrlGuard { _lock: g }
     }
 
     impl Drop for MarketUrlGuard {
         fn drop(&mut self) {
-            std::env::remove_var("DOTZ_MARKETPLACE_URL");
-            std::env::remove_var("DOTZ_MARKETPLACE_API_URL");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_MARKETPLACE_URL") };
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_MARKETPLACE_API_URL") };
             invalidate_cache();
         }
     }
@@ -1597,13 +1599,15 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&path, perms).unwrap();
         }
-        std::env::set_var(env_var, path.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(env_var, path.to_string_lossy().to_string()) };
         FakeBinGuard { env_var, path }
     }
 
     impl Drop for FakeBinGuard {
         fn drop(&mut self) {
-            std::env::remove_var(self.env_var);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var(self.env_var) };
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::remove_dir_all(parent);
             }
@@ -2353,7 +2357,8 @@ exit 0
             std::env::temp_dir().join(format!("dotz-skills-presets-root-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
-        std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string()) };
         let roots = crate::skills::scan_roots_public();
         let expected = dir.join("presets");
         assert!(
@@ -2374,8 +2379,10 @@ exit 0
         );
         // Restore the env (don't just remove — a prior test may have set it).
         match prev {
-            Some(p) => std::env::set_var("DOTZ_CONFIG_DIR", p),
-            None => std::env::remove_var("DOTZ_CONFIG_DIR"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

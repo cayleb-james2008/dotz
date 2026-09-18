@@ -345,7 +345,6 @@ pub async fn resolve_effective_model(
     // primary to test whether it recovered. The caller must record the outcome so a success
     // clears the degraded flag.
     let probe = if degraded {
-        
         {
             let m = health_map().read().await;
             m.get(primary_provider)
@@ -705,7 +704,8 @@ mod tests {
         // Save/restore the env var; HEALTH_TEST_LOCK serializes these tests so no other test
         // sees the override.
         let prev = std::env::var("DOTZ_RECOVERY_COOLDOWN_MS").ok();
-        std::env::set_var("DOTZ_RECOVERY_COOLDOWN_MS", "400");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_RECOVERY_COOLDOWN_MS", "400") };
 
         let primary_provider = "test-failed-probe-provider";
         let primary_model = "nex-agi/nex-n2-pro:free";
@@ -756,8 +756,10 @@ mod tests {
 
         // Restore env + state.
         match prev {
-            Some(p) => std::env::set_var("DOTZ_RECOVERY_COOLDOWN_MS", p),
-            None => std::env::remove_var("DOTZ_RECOVERY_COOLDOWN_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_RECOVERY_COOLDOWN_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_RECOVERY_COOLDOWN_MS") },
         }
         reset().await;
     }

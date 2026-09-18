@@ -2565,7 +2565,8 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let file =
             std::env::temp_dir().join(format!("dotz-workflows-test-{}.json", Uuid::new_v4()));
-        std::env::set_var("DOTZ_WORKFLOWS_FILE", file.to_string_lossy().to_string());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WORKFLOWS_FILE", file.to_string_lossy().to_string()) };
         let result = f();
         let _ = std::fs::remove_file(&file);
         drop(guard);
@@ -2708,8 +2709,7 @@ mod tests {
                     assert_eq!(s.status, "skipped", "child of errored step must be skipped");
                     assert!(
                         s.ended_at.is_some(),
-                        "auto-skipped step must have endedAt: {:?}",
-                        s
+                        "auto-skipped step must have endedAt: {s:?}"
                     );
                 }
             }
@@ -2729,8 +2729,7 @@ mod tests {
                 assert_eq!(s.status, "skipped");
                 assert!(
                     s.ended_at.is_some(),
-                    "aborted step must have endedAt: {:?}",
-                    s
+                    "aborted step must have endedAt: {s:?}"
                 );
             }
         });
@@ -2805,8 +2804,7 @@ mod tests {
             for s in &updated.steps {
                 assert!(
                     s.ended_at.is_some(),
-                    "every skipped step must have endedAt: {:?}",
-                    s
+                    "every skipped step must have endedAt: {s:?}"
                 );
             }
         });

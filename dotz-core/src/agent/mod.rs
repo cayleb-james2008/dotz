@@ -1515,7 +1515,8 @@ mod tests {
 
         // Use a very short ping interval so the test finishes quickly.
         let prev_interval = std::env::var("DOTZ_WS_PING_INTERVAL_MS").ok();
-        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "100");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "100") };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1564,8 +1565,10 @@ mod tests {
         }
 
         match prev_interval {
-            Some(p) => std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p),
-            None => std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS") },
         }
 
         // The server should also still be healthy after the ping exchange.
@@ -1594,7 +1597,8 @@ mod tests {
 
         // Disable server-side pings so the only frame after the ready is our pong echo.
         let prev_interval = std::env::var("DOTZ_WS_PING_INTERVAL_MS").ok();
-        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "3600000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "3600000") };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1646,8 +1650,10 @@ mod tests {
         }
 
         match prev_interval {
-            Some(p) => std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p),
-            None => std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS") },
         }
 
         let _ = tx.send(());
@@ -1671,7 +1677,8 @@ mod tests {
 
         // Disable pings so the only frame we see after the ready is the close echo.
         let prev_interval = std::env::var("DOTZ_WS_PING_INTERVAL_MS").ok();
-        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "3600000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "3600000") };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1720,8 +1727,10 @@ mod tests {
         );
 
         match prev_interval {
-            Some(p) => std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p),
-            None => std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS") },
         }
 
         let _ = tx.send(());
@@ -1738,31 +1747,36 @@ mod tests {
         let _guard = WS_TEST_LOCK.lock().await;
         let prev = std::env::var("DOTZ_WS_PING_INTERVAL_MS").ok();
 
-        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "0");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "0") };
         assert_eq!(
             ws_ping_interval().as_millis(),
             100,
             "zero must clamp to min"
         );
 
-        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "50");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "50") };
         assert_eq!(
             ws_ping_interval().as_millis(),
             100,
             "below-minimum must clamp to min"
         );
 
-        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "250");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "250") };
         assert_eq!(ws_ping_interval().as_millis(), 250, "valid value preserved");
 
-        std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "10000000");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", "10000000") };
         assert_eq!(
             ws_ping_interval().as_millis(),
             3_600_000,
             "above-maximum must clamp to max"
         );
 
-        std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS") };
         assert_eq!(
             ws_ping_interval().as_secs(),
             30,
@@ -1770,8 +1784,10 @@ mod tests {
         );
 
         match prev {
-            Some(p) => std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p),
-            None => std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_WS_PING_INTERVAL_MS", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_WS_PING_INTERVAL_MS") },
         }
     }
 
@@ -2226,10 +2242,13 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let prev_workflows_file = std::env::var("DOTZ_WORKFLOWS_FILE").ok();
-        std::env::set_var(
-            "DOTZ_WORKFLOWS_FILE",
-            workflows_file.to_string_lossy().to_string(),
-        );
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe {
+            std::env::set_var(
+                "DOTZ_WORKFLOWS_FILE",
+                workflows_file.to_string_lossy().to_string(),
+            )
+        };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2357,8 +2376,10 @@ mod tests {
 
         session::dispose(&sid);
         match prev_workflows_file {
-            Some(p) => std::env::set_var("DOTZ_WORKFLOWS_FILE", p),
-            None => std::env::remove_var("DOTZ_WORKFLOWS_FILE"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(p) => unsafe { std::env::set_var("DOTZ_WORKFLOWS_FILE", p) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("DOTZ_WORKFLOWS_FILE") },
         }
         let _ = std::fs::remove_file(&workflows_file);
         let _ = tx.send(());

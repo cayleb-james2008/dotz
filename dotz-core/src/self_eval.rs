@@ -726,14 +726,16 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let d = std::env::temp_dir().join(format!("dotz-selfeval-{}", Uuid::new_v4()));
-            std::env::set_var("DOTZ_SELF_EVAL_DIR", d.to_string_lossy().to_string());
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("DOTZ_SELF_EVAL_DIR", d.to_string_lossy().to_string()) };
             Self(d, g)
         }
     }
     impl Drop for TmpDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
-            std::env::remove_var("DOTZ_SELF_EVAL_DIR");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("DOTZ_SELF_EVAL_DIR") };
         }
     }
 
@@ -1186,17 +1188,22 @@ mod tests {
     #[test]
     fn min_pass_rate_clamps_and_defaults_to_one() {
         // Default is 1.0 (every task must pass — a single regression fails the release).
-        std::env::remove_var("DOTZ_SELF_EVAL_MIN_PASS_RATE");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_SELF_EVAL_MIN_PASS_RATE") };
         assert!((min_pass_rate() - 1.0).abs() < 1e-9);
 
         // Out-of-range values clamp to [0.0, 1.0].
-        std::env::set_var("DOTZ_SELF_EVAL_MIN_PASS_RATE", "1.5");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SELF_EVAL_MIN_PASS_RATE", "1.5") };
         assert!((min_pass_rate() - 1.0).abs() < 1e-9);
-        std::env::set_var("DOTZ_SELF_EVAL_MIN_PASS_RATE", "-0.2");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SELF_EVAL_MIN_PASS_RATE", "-0.2") };
         assert!((min_pass_rate() - 0.0).abs() < 1e-9);
-        std::env::set_var("DOTZ_SELF_EVAL_MIN_PASS_RATE", "0.75");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SELF_EVAL_MIN_PASS_RATE", "0.75") };
         assert!((min_pass_rate() - 0.75).abs() < 1e-9);
-        std::env::remove_var("DOTZ_SELF_EVAL_MIN_PASS_RATE");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_SELF_EVAL_MIN_PASS_RATE") };
     }
 
     #[test]
@@ -1224,11 +1231,14 @@ mod tests {
     #[test]
     fn self_eval_dir_honors_env_and_falls_back_to_dotz_dir() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::set_var("DOTZ_SELF_EVAL_DIR", "/tmp/dotz-eval-xyz");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SELF_EVAL_DIR", "/tmp/dotz-eval-xyz") };
         assert_eq!(self_eval_dir(), PathBuf::from("/tmp/dotz-eval-xyz"));
-        std::env::set_var("DOTZ_SELF_EVAL_DIR", "");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_SELF_EVAL_DIR", "") };
         // Empty-but-set is treated as unset (don't point at cwd).
         assert_ne!(self_eval_dir(), PathBuf::from(""));
-        std::env::remove_var("DOTZ_SELF_EVAL_DIR");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("DOTZ_SELF_EVAL_DIR") };
     }
 }
