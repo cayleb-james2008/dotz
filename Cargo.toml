@@ -7,7 +7,7 @@ members = ["dotz-core", "src-tauri"]
 
 [workspace.package]
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 
 # ── Recommended Rust AI Desktop Tech Stack deps (workspace-level) ──────────────
 # These are the forward-looking dependencies for the Rust AI desktop stack.

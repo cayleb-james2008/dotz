@@ -4,7 +4,7 @@
 //! repo because release assets are public). Single-instance + native folder picker.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 use tauri::Manager;
 
@@ -211,10 +211,14 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| res.join("web"));
             if std::env::var("DOTZ_PI").is_err() {
-                std::env::set_var("DOTZ_PI", res.join(".pi"));
+                unsafe {
+                    std::env::set_var("DOTZ_PI", res.join(".pi"));
+                }
             }
             if std::env::var("DOTZ_ASSETS").is_err() {
-                std::env::set_var("DOTZ_ASSETS", res.join("assets"));
+                unsafe {
+                    std::env::set_var("DOTZ_ASSETS", res.join("assets"));
+                }
             }
             // In-app browser binary (bundled as a resource under agent-browser/bin/<name>).
             // Uses binary_name() so the Tauri shell resolves the right per-platform binary
@@ -222,10 +226,12 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // bundles the whole agent-browser/bin/ directory.
             if std::env::var("DOTZ_BROWSER_BIN").is_err() {
                 let name = dotz_core::browser::binary_name();
-                std::env::set_var(
-                    "DOTZ_BROWSER_BIN",
-                    res.join("agent-browser").join("bin").join(name),
-                );
+                unsafe {
+                    std::env::set_var(
+                        "DOTZ_BROWSER_BIN",
+                        res.join("agent-browser").join("bin").join(name),
+                    );
+                };
             }
 
             // Graceful shutdown: notify the server task when the Tauri event loop exits so axum

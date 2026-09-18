@@ -1,7 +1,7 @@
 [package]
 name = "dotz-tauri"
 version = "0.2.8"
-edition = "2021"
+edition = "2024"
 description = "dotz — ultra code (Rust/Tauri shell)"
 default-run = "dotz"
 

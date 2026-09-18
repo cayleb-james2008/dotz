@@ -571,7 +571,7 @@ async fn execute_run(
     };
 
     // Fresh temp dir per run, mirroring fs.mkdtemp(os.tmpdir(), "dotz-sandbox-").
-    let temp_dir = std::env::temp_dir().join(format!("dotz-sandbox-{}", id));
+    let temp_dir = std::env::temp_dir().join(format!("dotz-sandbox-{id}"));
     if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
         finish(&id, "error", None, &format!("[spawn error] {e}\n"));
         return;

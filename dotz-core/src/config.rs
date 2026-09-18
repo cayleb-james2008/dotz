@@ -121,7 +121,9 @@ pub fn apply_env(c: &DotzConfig) {
     } else {
         model
     };
-    std::env::set_var("DOTZ_SUBAGENT_MODEL", format!("{}/{}", c.provider, model));
+    unsafe {
+        std::env::set_var("DOTZ_SUBAGENT_MODEL", format!("{}/{}", c.provider, model));
+    }
 }
 
 /// Strip any leading "<provider>/" prefix from a model string. This prevents stale prefixes from
