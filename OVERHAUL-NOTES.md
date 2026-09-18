@@ -114,3 +114,39 @@ downloadable CRT provides; the same symbols resolve fine with real Visual Studio
 This is a cross-compilation toolchain gap, not a code defect — recorded, not worked around.
 
 **Runtime Windows testing remains NOT RUN.**
+
+## Windows runtime test — COMPLETED (2026-09-18); the link gap is closed
+
+The earlier entry recorded dotz's Windows **link** as blocked. That gap is now **resolved**, and
+dotz has been **run on real Windows**.
+
+**What was wrong.** The Windows link failed with 20 undefined C++ symbols
+(`__std_find_trivial_8`, `__std_search_1`, `__std_last_of_trivial_pos_1`, …) referenced by the
+pinned `ort` / ONNX Runtime prebuilt. Root cause, established with a clean-room test:
+cargo-xwin's **default CRT is older than the MSVC C++ STL the ONNX prebuilt was compiled
+against**, so those internal `__std_*` helpers were defined by nothing on the link line.
+
+**Two fixes, both verified:**
+1. `--xwin-crt-version 14.44.17.14`. That CRT's `libcpmt.lib` **does** define the missing
+   symbols (confirmed: 4 hits for `__std_find_trivial_8`, vs 0 in the default CRT). Subtlety:
+   xwin silently reuses an already-populated cache, so the newer CRT only takes effect when
+   fetched into a **clean** cache directory — that was the key discovery.
+2. The Windows SDK import libs are extracted lowercase on Linux but MSVC asks for
+   `PathCch.lib` / `DirectML.lib`; correctly-cased symlinks resolve that.
+
+**Result:** `dotz.exe` builds (`PE32+ executable for MS Windows (GUI), x86-64`, ~47 MB) and,
+delivered to a **real Windows 10 Enterprise LTSC** VM together with four CRT DLLs, it launched
+and stayed running: **`[dotz] RESULT=RUNNING_AFTER_15s pid=4180`** (report uploaded from inside
+the guest; evidence in `_verify/windows-vm/dotz-*`).
+
+**Reproducible:** `bash scripts/windows-build.sh` (documented in `WINDOWS-BUILD.md`).
+
+**Packaging note:** dotz cannot use `+crt-static` (unlike the other four apps) because ONNX
+Runtime is compiled `/MD` and the linker rejects the mismatch. Its installer must ship
+`msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll`, `vcruntime140_1.dll` from the MSVC 14.44
+redistributable. Without them a clean Windows install fails with "VCRUNTIME140.dll was not
+found" — measured; with them, dotz runs.
+
+**Linux bar unchanged:** `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0,
+`cargo test -- --test-threads=2` 803 passed / 10 failed (the same environment-limited failures
+documented above: `minisign` absent, pid/pgid privileges).
