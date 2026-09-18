@@ -83,3 +83,18 @@ pass.
 - Per the repo's own AGENTS.md the CI gate runs `cargo clippy -p dotz-core --all-targets --
   -D warnings`; that now exits 0 on Linux as well. `.cargo/config.toml` pins `build.jobs = 2` to
   avoid LLVM OOM on a loaded host; tests were run with `--test-threads=2` for the same reason.
+
+## Dashboard modernization (`web/index.html` + `styles.css`)
+
+- **Accessible names for 40 form fields.** The dashboard's inputs/selects/textareas relied on
+  `placeholder` text only, which is not an accessible name. Each now carries an `aria-label`. Most
+  reuse the field's own visible placeholder text (e.g. `aria-label="project name"`); a handful that
+  had no placeholder were given a human label derived from their id (e.g. "project profile",
+  "memory scope", "sandbox language"). 9 fields already had a name via `title`/`<label for>`/wrapping
+  and were left alone.
+- **Keyboard skip-link** added, focus-revealed by CSS, targeting `<main id="stage">`.
+- The stylesheet already supported `prefers-reduced-motion` and had focus styling.
+
+Verified: audit reports 0 failures across lang/viewport/img-alt/button-names/field-labels/link
+integrity; the 4 root-absolute refs (`/fonts.css`, `/styles.css`, `/main.js`, `/wizard.js`) resolve
+against `frontendDist: "../web"` and were confirmed present. No JS changed.
