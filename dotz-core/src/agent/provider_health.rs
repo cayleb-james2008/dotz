@@ -15,7 +15,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 /// Classify a provider error string into a `FailKind`. Only the kinds we know how to recover from
 /// by switching providers count toward the degradation threshold — a model-not-found or a bad
@@ -345,7 +345,8 @@ pub async fn resolve_effective_model(
     // primary to test whether it recovered. The caller must record the outcome so a success
     // clears the degraded flag.
     let probe = if degraded {
-        let cooldown_elapsed = {
+        
+        {
             let m = health_map().read().await;
             m.get(primary_provider)
                 .and_then(|h| h.degraded_at)
@@ -354,8 +355,7 @@ pub async fn resolve_effective_model(
                     elapsed >= recovery_cooldown()
                 })
                 .unwrap_or(false)
-        };
-        cooldown_elapsed
+        }
     } else {
         false
     };
@@ -513,7 +513,9 @@ mod tests {
         // The 500 itself is now failover-worthy (StreamInterrupted), but the point of this
         // assertion is that the "429" substring inside the body must NOT classify as RateLimit.
         assert_eq!(
-            classify_error("openrouter returned 500: {\"request_id\":\"req_14293abc\",\"error\":\"internal\"}"),
+            classify_error(
+                "openrouter returned 500: {\"request_id\":\"req_14293abc\",\"error\":\"internal\"}"
+            ),
             FailKind::StreamInterrupted,
             "a 429 substring inside the body must not classify as RateLimit; the 500 status is the real signal"
         );

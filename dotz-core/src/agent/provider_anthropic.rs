@@ -18,11 +18,11 @@
 //! (clamped to Anthropic's low|medium|high|max set) per the claude-api skill. Auth resolves the
 //! `$ANTHROPIC_API_KEY` reference via the shared `resolve_api_key`.
 use super::event::{Cost, Usage};
-use super::provider::{request_timeout, resolve_api_key, ChatRequest, Provider, StreamDelta};
+use super::provider::{ChatRequest, Provider, StreamDelta, request_timeout, resolve_api_key};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";

@@ -4,8 +4,8 @@
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::PathBuf;
-use tokenizers::utils::truncation::TruncationParams;
 use tokenizers::Tokenizer;
+use tokenizers::utils::truncation::TruncationParams;
 
 pub const EMBED_DIM: usize = 384;
 /// all-MiniLM-L6-v2 max position embeddings. Truncate at the tokenizer so the ONNX session never
@@ -185,11 +185,7 @@ mod tests {
             nb += b[i] as f64 * b[i] as f64;
         }
         let den = na.sqrt() * nb.sqrt();
-        if den == 0.0 {
-            d
-        } else {
-            d / den
-        }
+        if den == 0.0 { d } else { d / den }
     }
 
     fn l2_norm(v: &[f32]) -> f64 {

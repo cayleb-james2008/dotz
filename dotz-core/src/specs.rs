@@ -5,13 +5,13 @@
 //! `tasks.md`, `specs/`) and adds `readiness.md` as the production gate artifact.
 use crate::types::{ReadinessFinding, SpecArtifact, SpecChange, SpecStatus};
 use axum::{
+    Json, Router,
     extract::{Path, Query},
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -708,9 +708,11 @@ mod tests {
         assert!(root.join("tasks.md").exists());
         assert!(root.join("readiness.md").exists());
         assert!(root.join("specs").join("spec-driven-flow.md").exists());
-        assert!(std::fs::read_to_string(root.join("readiness.md"))
-            .unwrap()
-            .contains("Observability"));
+        assert!(
+            std::fs::read_to_string(root.join("readiness.md"))
+                .unwrap()
+                .contains("Observability")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -762,11 +764,12 @@ mod tests {
         .unwrap();
         let result = sync_change(&dir, &change.id).unwrap();
         assert_eq!(result["ok"], true);
-        assert!(dir
-            .join("openspec")
-            .join("specs")
-            .join("sync-specs.md")
-            .exists());
+        assert!(
+            dir.join("openspec")
+                .join("specs")
+                .join("sync-specs.md")
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -785,11 +788,12 @@ mod tests {
         .unwrap();
         let result = archive_change(&dir, &change.id).unwrap();
         assert_eq!(result["ok"], true);
-        assert!(!dir
-            .join("openspec")
-            .join("changes")
-            .join("archive-me")
-            .exists());
+        assert!(
+            !dir.join("openspec")
+                .join("changes")
+                .join("archive-me")
+                .exists()
+        );
         assert_eq!(
             list_changes(&dir)
                 .iter()

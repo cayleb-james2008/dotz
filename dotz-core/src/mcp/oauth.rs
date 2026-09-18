@@ -33,7 +33,7 @@
 //!   those to authorize the device).
 //! - Token storage is per-server in `~/.dotz/mcp-auth.json`. The file is created with
 //!   0600 permissions on Unix; on Windows it inherits the user's `.dotz` ACL.
-use super::{OauthConfig, CLIENT_NAME};
+use super::{CLIENT_NAME, OauthConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -282,7 +282,7 @@ fn urlencode(s: &str) -> String {
                 out.push(*b as char);
             }
             b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{:02X}", b)),
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out

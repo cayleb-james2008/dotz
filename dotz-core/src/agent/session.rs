@@ -9,7 +9,7 @@ use super::event::*;
 use super::provider::{self, ChatRequest, StreamDelta};
 use super::tools::{ToolCtx, ToolRegistry};
 use crate::{config, living_docs, memory, profiles, projects, skills, types};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 #[cfg(test)]
@@ -1323,7 +1323,7 @@ fn finish_turn(
             .iter()
             .rev()
             .find(|m| m.role == "user")
-            .map(&join_text)
+            .map(join_text)
             .unwrap_or_default();
         let assistant_text = join_text(&final_msg);
         emit(

@@ -40,14 +40,14 @@
 //! the graceful-degradation contract every other dotz config file follows.
 use crate::util;
 use axum::{
+    Json, Router,
     extract::Query,
     http::HeaderMap,
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -959,7 +959,7 @@ mod tests {
     // the runtime inside the closure keeps the LOCK + env override held for the whole body.
     #[test]
     fn test_record_event_when_enabled_posts() {
-        use axum::{routing::post, Router};
+        use axum::{Router, routing::post};
 
         with_tmp_dir(|_| {
             let rt = tokio::runtime::Builder::new_multi_thread()

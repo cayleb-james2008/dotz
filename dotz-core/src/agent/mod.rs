@@ -18,18 +18,18 @@ pub mod subagent;
 pub mod tools;
 
 use axum::{
+    Json, Router,
     body::Bytes,
     extract::{
-        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
         Path, Query,
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -1277,7 +1277,7 @@ mod tests {
         }));
         let err = create_session(Some(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        let msg = err.1 .0["error"].as_str().unwrap_or("");
+        let msg = err.1.0["error"].as_str().unwrap_or("");
         assert!(
             msg.contains("provider must be one of"),
             "unexpected error: {msg}"
@@ -1405,7 +1405,7 @@ mod tests {
         let body = Json(json!({ "profileId": "not-a-profile" }));
         let err = create_session(Some(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        let msg = err.1 .0["error"].as_str().unwrap_or("");
+        let msg = err.1.0["error"].as_str().unwrap_or("");
         assert!(
             msg.contains("profileId must be one of"),
             "unexpected error: {msg}"
@@ -1431,7 +1431,7 @@ mod tests {
         let body = Json(json!({ "projectId": id }));
         let err = create_session(Some(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        let msg = err.1 .0["error"].as_str().unwrap_or("");
+        let msg = err.1.0["error"].as_str().unwrap_or("");
         assert!(msg.contains("no such project"), "unexpected error: {msg}");
     }
 

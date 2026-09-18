@@ -14,8 +14,8 @@
 //! function returning a `Vec<Command>`, which makes the palette's contract unit-testable without
 //! spinning up axum. The handler below just wraps it in JSON.
 
-use axum::{http::StatusCode, routing::get, Json, Router};
-use serde_json::{json, Value};
+use axum::{Json, Router, http::StatusCode, routing::get};
+use serde_json::{Value, json};
 
 /// A single palette entry. The UI dispatches on `action` (optionally with `arg`); `key` is an
 /// accelerator hint rendered in the row (not enforced server-side — the UI owns keybindings).
@@ -228,7 +228,7 @@ pub fn validate(cmds: &[Command]) -> Result<(), String> {
     }
     for cat in CATEGORIES {
         if !cmds.iter().any(|c| c.category == cat) {
-            return Err(format!("category '{}' has no commands", cat));
+            return Err(format!("category '{cat}' has no commands"));
         }
     }
     Ok(())

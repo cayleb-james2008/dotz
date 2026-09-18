@@ -14,7 +14,7 @@
 //! JSON-RPC responses keyed by method name, so the client's handshake + list/call paths can
 //! be exercised without spawning a real subprocess or HTTP server.
 use super::{
-    OauthConfig, ServerConfig, TransportType, CLIENT_NAME, CLIENT_VERSION, PROTOCOL_VERSION,
+    CLIENT_NAME, CLIENT_VERSION, OauthConfig, PROTOCOL_VERSION, ServerConfig, TransportType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

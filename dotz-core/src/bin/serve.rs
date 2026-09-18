@@ -59,7 +59,8 @@ fn spawn_embedder_warmup() {
 /// the headless `serve` bin is as helpful as the Tauri shell's `bind_listener`.
 fn format_startup_error(e: &std::io::Error, addr: &SocketAddr) -> String {
     let kind = e.kind();
-    let hint = match kind {
+    
+    match kind {
         std::io::ErrorKind::AddrInUse => {
             format!(
                 "dotz-core could not bind to {addr}: port already in use. \
@@ -73,8 +74,7 @@ fn format_startup_error(e: &std::io::Error, addr: &SocketAddr) -> String {
             format!("dotz-core could not bind to {addr}: address not available ({e}).")
         }
         _ => format!("dotz-core server error on {addr}: {e}"),
-    };
-    hint
+    }
 }
 
 /// Resolve the opt-in session token from `DOTZ_TOKEN` (plan-015 follow-up). Whitespace is

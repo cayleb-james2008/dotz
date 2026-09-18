@@ -21,7 +21,7 @@
 //!     `context_read`/`context_write` tools active for that subagent.
 //!   - The workflow executor creates the bus before the loop and passes it to every
 //!     `run_single_agent_public` call.
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 

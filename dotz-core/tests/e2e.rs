@@ -7,7 +7,7 @@
 //! - `e2e_offline` always runs and NEVER sends a WS prompt (no tokens spent).
 //! - `e2e_live_prompt` only runs when DOTZ_E2E_LIVE=1 (spends real Ollama Cloud tokens).
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -87,7 +87,9 @@ impl ServeGuard {
                 let stderr = std::fs::read_to_string(&guard.stderr_path).unwrap_or_default();
                 let _ = guard.child.kill();
                 let _ = guard.child.wait();
-                panic!("serve did not become healthy on port {port} within 30s.\n--- serve stderr ---\n{stderr}");
+                panic!(
+                    "serve did not become healthy on port {port} within 30s.\n--- serve stderr ---\n{stderr}"
+                );
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }

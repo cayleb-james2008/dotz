@@ -22,11 +22,11 @@ use super::provider::{self, ChatRequest, StreamDelta};
 use super::tools::{ToolCtx, ToolRegistry};
 use crate::context_bus::ContextBus;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 
 const MAX_PARALLEL_TASKS: usize = 8;
 const MAX_CHAIN_STEPS: usize = 16;
@@ -1336,7 +1336,7 @@ pub async fn dispatch_via_executor(
                 text: "subagent dispatch formed a dependency cycle".into(),
                 is_error: true,
                 details: details(mode, Vec::new()),
-            }
+            };
         }
     };
     let run = crate::workflow_executor::run_workflow(&run.id)

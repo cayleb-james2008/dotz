@@ -1,7 +1,7 @@
 //! dotz agent profile summaries — port of profiles.ts `profileSummary` (for /api/profiles) +
 //! the full operating doctrines (appendSystemPrompt) ported verbatim for the agent runtime's
 //! system-prompt assembly (Phase 3).
-use crate::types::{default_model, ModelRef};
+use crate::types::{ModelRef, default_model};
 use serde::Serialize;
 
 // ---- operating doctrines (ported from profiles.ts with the local Ultra Code override) ----

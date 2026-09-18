@@ -6,7 +6,7 @@
 //! thin stubs so the tool LIST matches the pi surface — they return a clear "not yet implemented"
 //! (Phase 4). `setActiveToolsByName` filters which tools the model actually sees.
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -724,11 +724,7 @@ impl Tool for SubagentTool {
     async fn execute(&self, args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         let cwd = ctx.cwd.to_string_lossy().to_string();
         let d = crate::agent::subagent::dispatch(args, &cwd).await;
-        if d.is_error {
-            Err(d.text)
-        } else {
-            Ok(d.text)
-        }
+        if d.is_error { Err(d.text) } else { Ok(d.text) }
     }
 }
 
@@ -1347,9 +1343,10 @@ mod tests {
         // `..` traversal and absolute paths outside the cwd are rejected.
         assert!(ctx.resolve_in_cwd("../secret.txt").is_err());
         assert!(ctx.resolve_in_cwd("sub/../../secret.txt").is_err());
-        assert!(ctx
-            .resolve_in_cwd(sibling.join("file.txt").to_str().unwrap())
-            .is_err());
+        assert!(
+            ctx.resolve_in_cwd(sibling.join("file.txt").to_str().unwrap())
+                .is_err()
+        );
         assert!(ctx.resolve_in_cwd("/etc/passwd").is_err());
 
         let _ = std::fs::remove_dir_all(&base);

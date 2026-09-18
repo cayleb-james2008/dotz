@@ -7,14 +7,14 @@
 //! (mirrors the Node module-singleton `memoryStore`). No AppState, stateless Router<()>.
 use crate::embed::Embedder;
 use axum::{
+    Json, Router,
     extract::{Path, Query},
     http::StatusCode,
     routing::{get, patch, post},
-    Json, Router,
 };
 use rusqlite::Connection;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -76,11 +76,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
         nb += b[i] as f64 * b[i] as f64;
     }
     let den = na.sqrt() * nb.sqrt();
-    if den == 0.0 {
-        d
-    } else {
-        d / den
-    }
+    if den == 0.0 { d } else { d / den }
 }
 
 fn norm_folder(p: &str) -> String {

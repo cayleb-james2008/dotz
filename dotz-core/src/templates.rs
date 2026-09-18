@@ -6,13 +6,13 @@
 //! resulting prompt to a live session, mirroring typing the slash command in the composer.
 use crate::{agent::session, config, skills};
 use axum::{
+    Json, Router,
     extract::Path,
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Mutex, OnceLock};

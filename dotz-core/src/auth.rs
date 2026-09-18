@@ -16,7 +16,7 @@
 //! so `resolve_api_key` doesn't re-read + re-parse the file on every provider call (every chat
 //! turn hits it). The POST/DELETE routes call [`refresh_cache`] after writing, so a newly-set
 //! key is visible to `resolve_api_key` immediately — no restart required.
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 

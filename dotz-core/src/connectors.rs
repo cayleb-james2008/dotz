@@ -14,7 +14,7 @@
 //! byte-identical to a dotz build without this module. Nothing is probed, no tool does anything,
 //! and `GET /api/connections` returns exactly the three CLI providers it always did.
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -520,7 +520,7 @@ mod tests {
     /// resolved token as `Authorization: Bearer <token>`.
     #[tokio::test]
     async fn invoke_action_shapes_request_and_sends_bearer_token() {
-        use axum::{routing::post, Router};
+        use axum::{Router, routing::post};
         use std::sync::{Arc, Mutex as AMutex};
 
         // Captured request facts from the stub gateway: (dotted-action-path, auth-header, body).

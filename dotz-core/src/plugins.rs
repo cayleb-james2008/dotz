@@ -390,7 +390,7 @@ fn parse_manifest(text: &str) -> Result<PluginManifest, String> {
                     return Err(format!(
                         "line {}: unknown array-of-tables header: {other}",
                         line_no + 1
-                    ))
+                    ));
                 }
             };
             continue;

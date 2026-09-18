@@ -1100,27 +1100,33 @@ mod tests {
     #[test]
     fn gateway_config_is_empty_when_both_fields_blank() {
         assert!(GatewayConfig::default().is_empty());
-        assert!(GatewayConfig {
-            base_url: "   ".into(),
-            api_key_ref: "".into(),
-            presets: vec![],
-            model_allowlist: vec![],
-        }
-        .is_empty());
-        assert!(!GatewayConfig {
-            base_url: "https://api.omniroute.ai/v1".into(),
-            api_key_ref: "".into(),
-            presets: vec![],
-            model_allowlist: vec![],
-        }
-        .is_empty());
-        assert!(!GatewayConfig {
-            base_url: "".into(),
-            api_key_ref: "OMNIROUTE_API_KEY".into(),
-            presets: vec![],
-            model_allowlist: vec![],
-        }
-        .is_empty());
+        assert!(
+            GatewayConfig {
+                base_url: "   ".into(),
+                api_key_ref: "".into(),
+                presets: vec![],
+                model_allowlist: vec![],
+            }
+            .is_empty()
+        );
+        assert!(
+            !GatewayConfig {
+                base_url: "https://api.omniroute.ai/v1".into(),
+                api_key_ref: "".into(),
+                presets: vec![],
+                model_allowlist: vec![],
+            }
+            .is_empty()
+        );
+        assert!(
+            !GatewayConfig {
+                base_url: "".into(),
+                api_key_ref: "OMNIROUTE_API_KEY".into(),
+                presets: vec![],
+                model_allowlist: vec![],
+            }
+            .is_empty()
+        );
     }
 
     /// C6: a config with a gateway section must still serialize the other fields unchanged, and

@@ -26,7 +26,7 @@ use crate::config::dotz_dir;
 use crate::types::Budget;
 use crate::workflows::{self, CreateStepInput, WorkflowRun, WorkflowStep};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 

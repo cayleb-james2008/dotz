@@ -10,13 +10,13 @@
 //! `sandbox_output` events and web-mode listener banners emit `sandbox_port` as soon as the port
 //! is reachable, so the UI preview iframe can load before the run terminates.
 use axum::{
+    Json, Router,
     extract::Path,
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
@@ -2044,7 +2044,9 @@ mod tests {
         let (language, code) = if cfg!(windows) {
             (
                 "powershell",
-                &format!("Write-Output 'ready'; Write-Output 'http://localhost:{port}/'; Start-Sleep -Seconds 1"),
+                &format!(
+                    "Write-Output 'ready'; Write-Output 'http://localhost:{port}/'; Start-Sleep -Seconds 1"
+                ),
             )
         } else {
             (

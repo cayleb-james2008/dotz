@@ -19,19 +19,19 @@
 use crate::config::dotz_dir;
 use crate::types::Budget;
 use axum::{
+    Json, Router,
     extract::{Path, Query},
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
     },
 };
 use tokio::sync::broadcast;
@@ -901,8 +901,7 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
                 // The reviewer's task includes the original findings so the worker can fix them.
                 let findings = step.output.clone().unwrap_or_default();
                 let repair_task = format!(
-                    "[Auto-repair round {next_round}] The review step '{}' found the following issues that must be fixed. Apply the minimal correct fix; do NOT rewrite unrelated code; do NOT introduce new features. Review findings:\n\n{findings}",
-                    review_step_id
+                    "[Auto-repair round {next_round}] The review step '{review_step_id}' found the following issues that must be fixed. Apply the minimal correct fix; do NOT rewrite unrelated code; do NOT introduce new features. Review findings:\n\n{findings}"
                 );
                 let re_review_task = format!(
                     "[Re-review round {next_round}] Re-audit the implementation after the repair step applied fixes for the original review findings. Verify the Critical and Warnings issues are resolved and no regressions were introduced. Output the standard review report.\n\nOriginal findings for reference:\n{findings}"
@@ -1548,7 +1547,7 @@ async fn execute_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": e.message() })),
-            ))
+            ));
         }
     };
 

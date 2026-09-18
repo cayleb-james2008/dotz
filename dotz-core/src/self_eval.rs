@@ -31,7 +31,7 @@ use crate::agent::subagent::{self, SingleResult};
 use crate::config::dotz_dir;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};

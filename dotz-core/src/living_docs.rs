@@ -5,13 +5,13 @@
 //! into the agent prompt beside memory recall.
 use crate::types::LivingDocKind;
 use axum::{
+    Json, Router,
     extract::{Path, Query},
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -451,10 +451,10 @@ mod tests {
         .unwrap();
         assert!(doc.path.contains(".ai-agents"));
         let docs = list_docs("project", Some(&dir));
-        assert!(docs
-            .iter()
-            .any(|d| d.kind == LivingDocKind::AntiPatterns
-                && d.content.contains("generated indexes")));
+        assert!(
+            docs.iter().any(|d| d.kind == LivingDocKind::AntiPatterns
+                && d.content.contains("generated indexes"))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

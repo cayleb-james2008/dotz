@@ -8,9 +8,9 @@
 //! op also writes the full array back to disk. No AppState fields, no axum State.
 use crate::profiles;
 use crate::types::{self, ModelRef};
-use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
+use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     path::Path as FsPath,
     sync::{Mutex, OnceLock},
@@ -278,7 +278,7 @@ async fn create_project(
                 return Err(bad(format!(
                     "model must be a known provider and non-empty modelId (providers: {})",
                     types::provider_ids().join(", ")
-                )))
+                )));
             }
         },
         None => None,
@@ -441,7 +441,7 @@ async fn patch_project(
                 return Err(bad(format!(
                     "model must be a known provider and non-empty modelId (providers: {})",
                     types::provider_ids().join(", ")
-                )))
+                )));
             }
         }
     }
@@ -574,8 +574,8 @@ pub fn router() -> Router<()> {
 /// `PATCH /api/agents_md?projectId=<id>` overwrites it.
 mod agents_md {
     use super::{bad, cwd_for_project, not_found};
-    use axum::{extract::Query, http::StatusCode, routing::get, Json, Router};
-    use serde_json::{json, Value};
+    use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -833,12 +833,12 @@ mod tests {
             let err = create_project(Some(body)).await.unwrap_err();
             assert_eq!(err.0, StatusCode::BAD_REQUEST);
             assert!(
-                err.1 .0["error"]
+                err.1.0["error"]
                     .as_str()
                     .unwrap()
                     .contains("profileId must be one of:"),
                 "error should list valid profileIds, got: {:?}",
-                err.1 .0
+                err.1.0
             );
         });
     }
@@ -861,12 +861,12 @@ mod tests {
             let err = patch_project(Path(id), Some(patch_body)).await.unwrap_err();
             assert_eq!(err.0, StatusCode::BAD_REQUEST);
             assert!(
-                err.1 .0["error"]
+                err.1.0["error"]
                     .as_str()
                     .unwrap()
                     .contains("profileId must be one of:"),
                 "error should list valid profileIds, got: {:?}",
-                err.1 .0
+                err.1.0
             );
         });
     }
@@ -889,7 +889,7 @@ mod tests {
         }));
         let err = create_project(Some(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        let msg = err.1 .0["error"].as_str().unwrap_or("");
+        let msg = err.1.0["error"].as_str().unwrap_or("");
         assert!(
             msg.contains("model must be a known provider"),
             "unexpected error: {msg}"
@@ -923,7 +923,7 @@ mod tests {
         }));
         let err = patch_project(Path(id), Some(patch_body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        let msg = err.1 .0["error"].as_str().unwrap_or("");
+        let msg = err.1.0["error"].as_str().unwrap_or("");
         assert!(
             msg.contains("model must be a known provider"),
             "unexpected error: {msg}"

@@ -17,11 +17,11 @@
 //! one-shot. The `.pi` location is resolved the same way `design.rs` does (a `DOTZ_PI` override,
 //! else `<cwd>/.pi`).
 use axum::{
+    Json, Router,
     extract::Path,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
 use serde::Serialize;
 use serde_json::json;

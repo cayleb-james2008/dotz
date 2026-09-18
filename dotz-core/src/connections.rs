@@ -8,9 +8,9 @@
 //!   - vercel: `vercel whoami` (read-only; exit 0 + non-empty output => logged in, account = last line)
 //!   - neon:   READ ~/.config/neonctl/credentials.json (present & non-empty => logged in). Never calls
 //!     neonctl — it has no on-PATH CLI / no logout command here, so status keys off the file.
-use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
+use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::process::Command;
 use std::time::Duration;
 
@@ -78,7 +78,7 @@ fn run_command(program: &str, args: &[&str], timeout: Duration) -> CmdResult {
                 code: Some(127),
                 stdout: String::new(),
                 stderr: err.to_string(),
-            }
+            };
         }
     };
 
@@ -611,7 +611,7 @@ mod tests {
     /// gateway, never stored in dotz.
     #[tokio::test]
     async fn login_gateway_connector_api_key_puts_to_gateway() {
-        use axum::{routing::put, Router as AxRouter};
+        use axum::{Router as AxRouter, routing::put};
         use std::sync::{Arc, Mutex as SMutex};
 
         let _g = GW_LOCK.lock().await;

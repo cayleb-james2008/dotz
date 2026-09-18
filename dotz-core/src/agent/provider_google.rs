@@ -17,11 +17,11 @@
 //! Auth resolves `$GEMINI_API_KEY` first, falling back to `$GOOGLE_API_KEY`, and sends the key
 //! as the `key` query parameter.
 use super::event::{Cost, Usage};
-use super::provider::{request_timeout, resolve_api_key, ChatRequest, Provider, StreamDelta};
+use super::provider::{ChatRequest, Provider, StreamDelta, request_timeout, resolve_api_key};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 

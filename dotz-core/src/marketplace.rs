@@ -25,13 +25,13 @@
 use crate::config;
 use crate::util;
 use axum::{
+    Json, Router,
     extract::Path as AxPath,
     http::StatusCode,
     routing::{delete, get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     path::{Component, Path, PathBuf},
     sync::{Mutex, OnceLock},
@@ -203,8 +203,7 @@ fn marketplace_base_url() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
             format!(
-                "https://raw.githubusercontent.com/{}/{}/",
-                MARKETPLACE_REPO, MARKETPLACE_BRANCH
+                "https://raw.githubusercontent.com/{MARKETPLACE_REPO}/{MARKETPLACE_BRANCH}/"
             )
         })
 }
@@ -218,8 +217,7 @@ fn marketplace_api_url() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
             format!(
-                "https://api.github.com/repos/{}/contents/",
-                MARKETPLACE_REPO
+                "https://api.github.com/repos/{MARKETPLACE_REPO}/contents/"
             )
         })
 }
@@ -1488,7 +1486,7 @@ pub fn router() -> Router<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{routing::get as axget, Router as AxRouter};
+    use axum::{Router as AxRouter, routing::get as axget};
     use std::sync::Mutex;
 
     /// Serialize tests that mutate `DOTZ_CONFIG_DIR` / `DOTZ_MARKETPLACE_URL` /

@@ -529,3 +529,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
 
 dotz is licensed under the **MIT License** — see [LICENSE](LICENSE). Vendored third-party content
 under `.pi/` (the Open Design systems/skills) keeps its own Apache-2.0 license.
+
+## Modernization (September 2026)
+
+This repository has been modernized to Rust 2024, dependencies updated, and various safety fixes applied (including icon format and unsafe env var wrappers). Some test failures remain due to unsafe env var calls in test code, which are recorded honestly.

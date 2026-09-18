@@ -7,11 +7,11 @@
 //! Self-contained: no AppState, no axum State. The `.pi` location is resolved exactly like the Node
 //! code (relative to the running process, with a DOTZ_PI env override) — see `design_systems_dir`.
 use axum::{
+    Json, Router,
     extract::Path,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
 use serde::Serialize;
 use serde_json::json;

@@ -18,10 +18,10 @@
 //! - The transport reuses one `reqwest::Client` for all requests (connection pooling).
 use super::client::{McpError, Transport};
 use super::oauth::{self, ClientCredentials, OauthHttp, ReqwestOauthHttp, TokenSet};
-use super::{validate_http_url, OauthConfig, ServerConfig};
+use super::{OauthConfig, ServerConfig, validate_http_url};
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 /// HTTP MCP transport. POSTs JSON-RPC to `url`; OAuth-aware (401 triggers DCR + device flow).
@@ -277,8 +277,7 @@ impl Transport for HttpTransport {
         // Surface server-returned JSON-RPC errors.
         if let Some(err) = resp.get("error") {
             return Err(McpError::Server(format!(
-                "{} returned error: {}",
-                method, err
+                "{method} returned error: {err}"
             )));
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))

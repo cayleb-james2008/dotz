@@ -13,16 +13,16 @@
 //! - The command runs with the user's privileges (same as the `bash` tool). The command being
 //!   spawned is logged; env vars (which may carry secrets) are NOT logged.
 //! - The subprocess is killed on `close()` so a leaked client doesn't leave orphans.
-use super::client::{McpError, Transport};
 use super::ServerConfig;
+use super::client::{McpError, Transport};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 /// A JSON-RPC 2.0 message. The transport frames each message as one NDJSON line.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -229,8 +229,7 @@ impl Transport for StdioTransport {
             Ok(Ok(resp)) => {
                 if let Some(err) = resp.get("error") {
                     return Err(McpError::Server(format!(
-                        "{} returned error: {}",
-                        method, err
+                        "{method} returned error: {err}"
                     )));
                 }
                 Ok(resp.get("result").cloned().unwrap_or(Value::Null))

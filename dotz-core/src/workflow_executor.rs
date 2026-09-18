@@ -17,7 +17,7 @@
 //!
 //! Bounded concurrency: a tokio Semaphore (default 4, configurable via DOTZ_WF_CONCURRENCY)
 //! gates how many steps execute in parallel, matching the subagent fan-out pool.
-use crate::agent::subagent::{run_single_agent_with_bus, SingleResult};
+use crate::agent::subagent::{SingleResult, run_single_agent_with_bus};
 use crate::checkpoint::git_diff_artifact;
 use crate::context_bus::ContextBus;
 use crate::run_record;
@@ -190,11 +190,7 @@ fn thinking_from_messages(messages: &[serde_json::Value]) -> Option<String> {
         }
         out.push_str(&text_parts.join("\n\n"));
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Drive a workflow run to completion.
@@ -593,7 +589,7 @@ mod tests {
     use super::*;
     use crate::types::Budget;
     use crate::workflows::{self, CreateStepInput};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use uuid::Uuid;
 
     // tokio Mutex (not std): several tests below intentionally hold this guard across `.await`

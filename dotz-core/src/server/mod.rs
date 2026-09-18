@@ -11,12 +11,12 @@ use crate::{
     profiles, types,
 };
 use axum::{
+    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     net::SocketAddr,

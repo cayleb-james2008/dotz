@@ -15,14 +15,14 @@
 //! a best-effort `reap_stray_browsers` backstop on app shutdown (the Tauri shell calls `dispose_all`
 //! and `reap_stray_browsers` on `RunEvent::Exit` so headless Chrome instances do not outlive the app).
 use axum::{
+    Json, Router,
     extract::Query,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -84,8 +84,7 @@ fn now_iso() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        y, m, d, hh, mm, ss, ms
+        "{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{ms:03}Z"
     )
 }
 

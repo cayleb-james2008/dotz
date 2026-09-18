@@ -43,12 +43,12 @@
 use crate::workflows;
 use axum::http::StatusCode;
 use axum::{
+    Json, Router,
     extract::Path,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     sync::{Mutex, OnceLock},
@@ -94,14 +94,15 @@ impl CheckpointError {
     /// Human-readable error message for the HTTP response body.
     pub fn message(&self) -> String {
         match self {
-            Self::NotAGitRepo => "project is not inside a git repository — checkpoint unavailable".into(),
+            Self::NotAGitRepo => {
+                "project is not inside a git repository — checkpoint unavailable".into()
+            }
             Self::SnapFailed(e) => format!("failed to snapshot working tree: {e}"),
             Self::StashFailed(e) => format!("git stash failed: {e}"),
             Self::RestoreFailed(e) => format!("failed to restore checkpoint: {e}"),
             Self::DiscardFailed(e) => format!("failed to discard checkpoint: {e}"),
             Self::RollbackOrder { current, expected } => format!(
-                "rollback order violation: '{}' is the most-recent checkpoint (LIFO); restore '{}' first",
-                current, expected
+                "rollback order violation: '{current}' is the most-recent checkpoint (LIFO); restore '{expected}' first"
             ),
             Self::UnknownCheckpoint => "no checkpoint for that run id".into(),
         }
@@ -336,7 +337,7 @@ pub fn save_checkpoint(run_id: &str, cwd: &str) -> Result<String, CheckpointErro
         return Err(CheckpointError::NotAGitRepo);
     }
     let snapshot_sha = git_head_sha(cwd).ok_or_else(|| {
-        CheckpointError::SnapFailed(format!("{} has no git history (no HEAD)", cwd))
+        CheckpointError::SnapFailed(format!("{cwd} has no git history (no HEAD)"))
     })?;
 
     // Record the checkpoint metadata.

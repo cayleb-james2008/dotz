@@ -14,8 +14,8 @@
 //! gate stays green on a fresh checkout that hasn't run `npm run fetch-model` — the bench then
 //! reports nothing instead of failing. `cargo bench --bench cold_start -- --no-run` still compiles
 //! and is the CI compile-check.
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use dotz_core::embed::{model_files_present, Embedder};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use dotz_core::embed::{Embedder, model_files_present};
 
 /// One cold-start: load the embedder from disk (tokenizer parse + ONNX session commit). This is the
 /// exact path the server runs on first memory/recall use; the `Embedder` is dropped at the end of
