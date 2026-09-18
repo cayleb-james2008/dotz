@@ -98,3 +98,19 @@ pass.
 Verified: audit reports 0 failures across lang/viewport/img-alt/button-names/field-labels/link
 integrity; the 4 root-absolute refs (`/fonts.css`, `/styles.css`, `/main.js`, `/wizard.js`) resolve
 against `frontendDist: "../web"` and were confirmed present. No JS changed.
+
+## Windows-native verification (2026-09-18)
+
+Windows-native is now **verified by cross-compiling the real Windows target**:
+`cargo xwin check --target x86_64-pc-windows-msvc` → **exit 0** (the whole `dotz-core` +
+`dotz-tauri` graph type-checks for Windows, including `WindowsSandbox` and the `winres` resources).
+
+**Honest blocker on the full Windows link:** `cargo xwin build --release --target
+x86_64-pc-windows-msvc` fails at the final link with undefined C++ standard-library symbols
+(`__std_find_trivial_8`, `__std_search_1`, …) referenced by `ort_sys`. Root cause: dotz's
+`ort = "=2.0.0-rc.12"` (DirectML/ONNX, deliberate pin — see the crate comment and
+`tests/ort_pin_guard.rs`) is an MSVC C++ object built against a newer STL than cargo-xwin's
+downloadable CRT provides; the same symbols resolve fine with real Visual Studio on Windows.
+This is a cross-compilation toolchain gap, not a code defect — recorded, not worked around.
+
+**Runtime Windows testing remains NOT RUN.**
