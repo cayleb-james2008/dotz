@@ -932,6 +932,11 @@ pub async fn fetch_pubkey(client: &reqwest::Client) -> Result<String, Marketplac
 ///
 /// Returns a `Command` with the program + (on Windows, for `.cmd`/`.bat`) the `/c <path>` args
 /// set. The caller adds the rest of the args.
+///
+/// `util::no_window_tokio` is applied here (not only at the call sites) so every command that
+/// leaves this constructor is windowless on Windows — this is what the
+/// `every_spawn_site_is_windowless` guard checks, and it also means a future caller cannot
+/// forget it.
 fn prep_command(bin: &str) -> tokio::process::Command {
     #[cfg(windows)]
     {
@@ -939,14 +944,19 @@ fn prep_command(bin: &str) -> tokio::process::Command {
         if lower.ends_with(".cmd") || lower.ends_with(".bat") {
             let mut cmd = tokio::process::Command::new("cmd");
             cmd.arg("/c").arg(bin);
+            // Windowless on Windows even for the cmd.exe shim (see the fn doc).
+            util::no_window_tokio(&mut cmd);
             return cmd;
         }
     }
-    tokio::process::Command::new(bin)
+    let mut cmd = tokio::process::Command::new(bin);
+    util::no_window_tokio(&mut cmd);
+    cmd
 }
 
 /// Prepare a `std::process::Command` for a binary path (the sync counterpart of
 /// [`prep_command`], used by the presence checks in [`minisign_bin`] / [`gh_bin`]).
+/// Applies `util::no_window` for the same reason as [`prep_command`].
 fn prep_command_sync(bin: &str) -> std::process::Command {
     #[cfg(windows)]
     {
@@ -954,10 +964,13 @@ fn prep_command_sync(bin: &str) -> std::process::Command {
         if lower.ends_with(".cmd") || lower.ends_with(".bat") {
             let mut cmd = std::process::Command::new("cmd");
             cmd.arg("/c").arg(bin);
+            util::no_window(&mut cmd);
             return cmd;
         }
     }
-    std::process::Command::new(bin)
+    let mut cmd = std::process::Command::new(bin);
+    util::no_window(&mut cmd);
+    cmd
 }
 
 /// Resolve the minisign binary path. Honors the `DOTZ_MINISIGN_BIN` env override (tests inject a
@@ -1616,8 +1629,17 @@ mod tests {
 
     /// A fake `minisign` verify binary that exits 0 (signature OK). The body echoes nothing +
     /// exits 0 on every invocation (both the `--version` presence check and the `-V` verify).
+    ///
+    /// The body MUST be platform-aware: `install_fake_bin` prepends `#!/bin/sh` on Unix, so a
+    /// Windows `@echo off\nexit /b 0` body is not a valid script there and the presence check
+    /// (`<bin> --version`) fails — which is why these tests failed on Linux.
     fn install_fake_minisign_verify_ok() -> FakeBinGuard {
-        install_fake_bin("DOTZ_MINISIGN_BIN", "@echo off\nexit /b 0\n")
+        let body = if cfg!(windows) {
+            "@echo off\nexit /b 0\n"
+        } else {
+            "exit 0\n"
+        };
+        install_fake_bin("DOTZ_MINISIGN_BIN", body)
     }
 
     /// A fake `minisign` verify binary that exits 1 (signature BAD). Used to test the
@@ -2527,7 +2549,16 @@ exit 0
         // `minisign` is on PATH (the presence check would fall back to it — we can't easily
         // hide PATH from a std::process::Command). On hosts without minisign installed (the
         // common dev case), the env override alone is enough to force None.
-        let _fake = install_fake_bin("DOTZ_MINISIGN_BIN", "@echo off\nexit /b 127\n");
+        // Point DOTZ_MINISIGN_BIN at a fake binary that exits 127 on `--version` (its
+        // presence check), so `minisign_bin()` returns None. Platform-aware body, same
+        // reason as install_fake_minisign_verify_ok: `install_fake_bin` prepends `#!/bin/sh`
+        // on Unix, where a Windows batch body is not a runnable script.
+        let body = if cfg!(windows) {
+            "@echo off\nexit /b 127\n"
+        } else {
+            "exit 127\n"
+        };
+        let _fake = install_fake_bin("DOTZ_MINISIGN_BIN", body);
         // The fake binary exits 127 on --version (not found) → presence check fails → None.
         // But we also need to ensure the real `minisign` isn't picked up via PATH fallback —
         // the env override IS set (non-empty), so minisign_bin uses it directly (no PATH

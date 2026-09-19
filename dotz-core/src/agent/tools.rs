@@ -1230,7 +1230,6 @@ mod tests {
             // TODO: Audit that the environment access only happens in single-threaded code.
             None => unsafe { std::env::remove_var("DOTZ_BASH_TIMEOUT_MS") },
         }
-        let _ = std::fs::remove_dir_all(&base);
 
         assert!(
             err.contains("[timeout]"),
@@ -1243,10 +1242,18 @@ mod tests {
             // shell). The old `start_kill` only killed the shell, leaving this child
             // running as an orphan; the process-group tree-kill must reach it too.
             // Give the tree-kill a moment to propagate before checking.
+            //
+            // NOTE: read the pidfile BEFORE removing the temp dir — the previous version of
+            // this test called `remove_dir_all(&base)` first, which deleted the pidfile and
+            // made the pid parse fail ("test should have captured a valid child pid") on every
+            // run. Cleanup now happens last.
             std::thread::sleep(std::time::Duration::from_millis(200));
             let pid_text = std::fs::read_to_string(&pidfile).unwrap_or_default();
             let pid: i32 = pid_text.trim().parse().unwrap_or(-1);
-            assert!(pid > 0, "test should have captured a valid child pid");
+            assert!(
+                pid > 0,
+                "test should have captured a valid child pid (pidfile: {pid_text:?})"
+            );
             let gone = std::process::Command::new("kill")
                 .args(["-0", &pid.to_string()])
                 .output()
@@ -1257,6 +1264,8 @@ mod tests {
                 "timed-out bash child (pid {pid}) should have been killed and reaped, not still running"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The timeout-kill path must use `.status()` (not `.spawn()`) for the `kill`/`taskkill`
@@ -1662,11 +1671,14 @@ mod tests {
         }
     }
 
-    /// The `grep` tool must respect the file-scan budget: when `DOTZ_GREP_FILE_BUDGET` is set
-    /// low enough that the matching file is never reached, the tool returns "(no matches)"
-    /// instead of reading past the budget. This also verifies the budget-exhaustion `return`
-    /// (which replaced the old inner-loop-only `break` that left the outer loop traversing
-    /// directories uselessly) terminates the scan cleanly.
+    /// The `grep` tool must respect the file-scan budget: with `DOTZ_GREP_FILE_BUDGET` set low,
+    /// fewer files may be read, and once exhausted the scan must stop entirely (this verifies
+    /// the budget-exhaustion `return`, which replaced the old inner-loop-only `break` that left
+    /// the outer loop traversing directories uselessly) and terminate cleanly.
+    ///
+    /// Hits are counted rather than matched against specific filenames, because
+    /// `std::fs::read_dir` gives no ordering guarantee — so which files the budget admits is
+    /// filesystem-dependent, but *how many* is not.
     #[tokio::test]
     async fn grep_respects_file_budget_and_terminates_cleanly() {
         // tokio Mutex (not std): the guard is intentionally held across the `.await` calls below
@@ -1678,20 +1690,17 @@ mod tests {
         let base = std::env::temp_dir().join(format!("dotz-grep-budget-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
 
-        // Create a single directory with files. The first file is a decoy (consumes the
-        // budget), and the second file contains the needle. With budget=1, only the first
-        // file is read — the needle in the second file must NOT be found. This is
-        // deterministic because both files are in the same directory and `read_dir` returns
-        // them in a stable per-filesystem order; we name them so `decoy.txt` sorts before
-        // `match.txt` to ensure the decoy is scanned first on all platforms.
-        std::fs::write(base.join("a_decoy.txt"), "nothing interesting").unwrap();
-        std::fs::write(base.join("z_match.txt"), "unique-needle-here").unwrap();
+        // Four files in one directory, EACH containing the same needle. That makes the
+        // assertions independent of directory iteration order: `std::fs::read_dir` gives no
+        // ordering guarantee (the previous version of this test assumed `a_decoy.txt` sorts
+        // before `z_match.txt`, which is false on ext4/tmpfs — the entry order is hash-based).
+        // Counting hits is the order-independent way to prove the budget is enforced.
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            std::fs::write(base.join(name), "unique-needle-here\n").unwrap();
+        }
 
         let prev_budget = std::env::var("DOTZ_GREP_FILE_BUDGET").ok();
 
-        // budget=1: only the first file (`a_decoy.txt`) is read; the needle must NOT be found.
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", "1") };
         let mut registry = ToolRegistry::new();
         registry.set_active(&["grep".to_string()]);
         let ctx = ToolCtx {
@@ -1699,25 +1708,58 @@ mod tests {
             tx: None,
             run_id: None,
         };
+
+        // budget=2: exactly two files may be read, so at most two hits can be returned —
+        // regardless of which two the filesystem hands back first.
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", "2") };
         let result = registry
             .run("grep", &json!({"pattern": "unique-needle-here"}), &ctx)
             .await
             .unwrap();
-        assert_eq!(
-            result, "(no matches)",
-            "with budget=1 the needle in the second file must not be found, got: {result}"
+        let hits = if result == "(no matches)" {
+            0
+        } else {
+            result.lines().count()
+        };
+        assert!(
+            hits <= 2,
+            "with budget=2 at most two files may be read, got {hits} hits: {result}"
+        );
+        assert!(
+            hits >= 1,
+            "with budget=2 at least one file must have been read, got: {result}"
         );
 
-        // budget=10: both files are read; the needle MUST be found.
+        // budget=1 must read strictly fewer files than budget=2 (proves the cap scales with
+        // the env var rather than being ignored).
         // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", "10") };
-        let found = registry
+        unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", "1") };
+        let one = registry
             .run("grep", &json!({"pattern": "unique-needle-here"}), &ctx)
             .await
             .unwrap();
+        let one_hits = if one == "(no matches)" {
+            0
+        } else {
+            one.lines().count()
+        };
         assert!(
-            found.contains("unique-needle-here"),
-            "with a generous budget the needle must be found, got: {found}"
+            one_hits <= 1,
+            "with budget=1 at most one file may be read, got {one_hits} hits: {one}"
+        );
+
+        // budget=10 reaches every file: all four hits must be returned.
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("DOTZ_GREP_FILE_BUDGET", "10") };
+        let all = registry
+            .run("grep", &json!({"pattern": "unique-needle-here"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.lines().count(),
+            4,
+            "with a generous budget every file must be read, got: {all}"
         );
 
         match prev_budget {

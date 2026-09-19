@@ -252,9 +252,11 @@ async fn e2e_offline() {
     let (status, body) = get_raw(&client, &base, "/").await;
     assert_eq!(status, 200, "2: GET / must be 200");
     let html = String::from_utf8_lossy(&body).to_string();
+    // The UI entry point is `main.js` (the file was renamed from `app.js` on 2026-07-20, after
+    // this assertion was written on 2026-07-01 — the test had been asserting a stale filename).
     assert!(
-        html.contains("app.js"),
-        "2: index.html must reference app.js"
+        html.contains("main.js"),
+        "2: index.html must reference main.js"
     );
     assert!(
         html.contains("data-panel=\"chat\""),

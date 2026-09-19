@@ -62,15 +62,33 @@ fn is_fn_item(line: &str) -> bool {
             && t.contains("fn "))
 }
 
-/// Net brace tracking, line by line. Good enough for this repo's formatted (rustfmt-shaped)
-/// source: `{`/`}` inside string literals appear as balanced `{}` format pairs and cancel out.
+/// Net brace tracking, line by line. Rustfmt-shaped source is assumed, BUT braces inside string
+/// literals and comments MUST be ignored: a bare `"}"` literal (e.g. `line.trim() == "}"`) is
+/// unbalanced, and counting it made the exempt-block walker stop early — it ended the
+/// `#[cfg(test)] mod tests` at an inner function's closing brace instead of the module's, so test
+/// code was scanned as production and flagged. Both `//` line comments and `"…"` / `r"…"` string
+/// literals are therefore skipped below.
 fn brace_delta(line: &str) -> (i64, bool) {
     let mut delta = 0i64;
     let mut opened = false;
-    // Ignore trailing line comments so a `// ... {` doc note cannot skew the count.
-    let code = line.split("//").next().unwrap_or(line);
-    for ch in code.chars() {
+    let mut chars = line.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match ch {
+            // Line comment: the rest of the line cannot close a block.
+            '/' if chars.peek() == Some(&'/') => break,
+            '"' => in_string = true,
             '{' => {
                 delta += 1;
                 opened = true;

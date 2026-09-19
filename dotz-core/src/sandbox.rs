@@ -221,12 +221,12 @@ impl MacSandbox {
     /// Best-effort detect: `seatbelt` is true only if `sandbox-exec` is on PATH. No failure if
     /// absent — the posix fallback still runs without it.
     fn detect() -> Self {
-        let seatbelt = std::process::Command::new("sandbox-exec")
-            .arg("-h")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok();
+        // Route through util::no_window per the windowless-subprocess convention (no-op off
+        // Windows); keeps `every_spawn_site_is_windowless` green and cannot flash a console.
+        let mut cmd = std::process::Command::new("sandbox-exec");
+        cmd.arg("-h").stdout(Stdio::null()).stderr(Stdio::null());
+        crate::util::no_window(&mut cmd);
+        let seatbelt = cmd.status().is_ok();
         Self { seatbelt }
     }
 }
@@ -258,12 +258,13 @@ struct LinuxSandbox {
 impl LinuxSandbox {
     /// Best-effort detect: `bwrap` is true only if `bwrap` is on PATH. No failure if absent.
     fn detect() -> Self {
-        let bwrap = std::process::Command::new("bwrap")
-            .arg("--version")
+        // Same windowless convention as the macOS detect above (no-op on Linux).
+        let mut cmd = std::process::Command::new("bwrap");
+        cmd.arg("--version")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok();
+            .stderr(Stdio::null());
+        crate::util::no_window(&mut cmd);
+        let bwrap = cmd.status().is_ok();
         Self { bwrap }
     }
 }
@@ -2435,48 +2436,46 @@ mod tests {
     #[tokio::test]
     async fn sandbox_backend_posix_impl_sets_process_group() {
         use std::ffi::c_void;
-        // libc::getpgid via std::process — call the backend's prepare_command on a real spawn,
-        // then read the child's pgid and assert it equals the child's pid (its own group), not
-        // this test process's pgid. We can't use `tokio::process::Child::id` + a pgid read
-        // without a raw libc call; instead use std::process::Command with a pipe that lets us
-        // read the child pid, then check getpgid via a small nix-free helper.
-        let backend = crate::sandbox::platform_backend();
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg("echo $$")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        backend.prepare_command(&mut cmd);
-        let child = cmd.spawn().expect("posix spawn should succeed");
-        let pid = child.id().expect("child has a pid");
-        let output = child.wait_with_output().await.expect("child reaps");
-        let printed_pid: u32 = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .expect("child should print its pid");
-
-        // The child printed its own pid; that must equal the Child::id we observed.
-        assert_eq!(printed_pid, pid, "child should print its own pid");
-
-        // Read the child's pgid via libc::getpgid. If process_group(0) was applied, pgid == pid
-        // (own group). We use a tiny extern-C shim to avoid adding the `nix` crate (ponytail:
-        // stdlib + libc FFI, no new heavy deps).
+        // libc::getpgid via a tiny extern-C shim (ponytail: no `nix` dep). The child stays
+        // alive (it reads stdin) so `getpgid` can be called while the pid still exists —
+        // calling it after the child was reaped returns -1/ESRCH, which the previous version
+        // of this test did and therefore failed on every host.
         unsafe extern "C" {
             fn getpgid(pid: i32) -> i32;
         }
-        // SAFETY: getpgid is a thread-safe POSIX syscall that reads a fixed process attribute;
-        // no aliasing, no mutation. pid is a positive integer from a reaped child, so there's a
-        // brief window where the pid may already be recycled, but a -1 return (ESRCH) only
-        // makes the assertion loose, not unsound.
+
+        let backend = crate::sandbox::platform_backend();
+        let mut cmd = tokio::process::Command::new("sh");
+        // Read one line from stdin, so the child blocks and remains alive until we release it.
+        cmd.arg("-c")
+            .arg("read _line; exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        backend.prepare_command(&mut cmd);
+        let mut child = cmd.spawn().expect("posix spawn should succeed");
+        let pid = child.id().expect("child has a pid");
+
+        // SAFETY: getpgid is a thread-safe POSIX syscall reading a fixed process attribute; no
+        // aliasing or mutation. The child is still running, so the pid is valid.
         let pgid = unsafe { getpgid(pid as i32) };
         assert_eq!(
             pgid, pid as i32,
             "child must be in its own process group (pgid == pid) after prepare_command; \
              got pgid {pgid} for pid {pid}"
         );
-        // Suppress an unused-variable warning on the c_void import path if the compiler
-        // didn't already absorb it.
+
+        // It must also differ from this test process's group (a genuinely separate group).
+        // SAFETY: same call, on our own pid.
+        let our_pgid = unsafe { getpgid(0) };
+        assert_ne!(
+            pgid, our_pgid,
+            "child group must differ from the test process group"
+        );
+
+        // Release the child and reap it so no process is left behind.
+        drop(child.stdin.take());
+        let _ = child.wait().await;
         let _: *const c_void = std::ptr::null();
     }
 
