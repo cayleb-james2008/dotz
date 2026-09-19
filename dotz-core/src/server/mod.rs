@@ -2362,8 +2362,13 @@ mod tests {
     // These tests point DOTZ_CONFIG_DIR at a temp dir + serialize on the shared config-dir lock
     // so they never touch the operator's real ~/.dotz/config.json. The server loads the config
     // at start_server() time, so DOTZ_CONFIG_DIR must be set BEFORE start_server().
-
-    static GATEWAY_CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+    //
+    // NOTE: the guard below uses `util::dotz_config_dir_test_lock()` — the SAME process-global
+    // mutex every other config-dir test uses. It previously had its own private
+    // `GATEWAY_CONFIG_ENV_LOCK`, which did not exclude the other tests: a parallel
+    // `setup_first_run_dir` could overwrite DOTZ_CONFIG_DIR mid-test, so reading
+    // `<guard.dir>/config.json` intermittently failed with NotFound (observed flake in the
+    // full-suite sweep). One env var ⇒ one lock.
 
     /// RAII guard: point DOTZ_CONFIG_DIR at a fresh temp dir + serialize on the shared lock, so
     /// gateway-config tests never race with config::tests or touch the operator's real config.
@@ -2373,7 +2378,7 @@ mod tests {
     }
 
     fn setup_gateway_config_dir() -> GatewayConfigDirGuard {
-        let g = GATEWAY_CONFIG_ENV_LOCK
+        let g = crate::util::dotz_config_dir_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir =
