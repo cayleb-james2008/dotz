@@ -22,7 +22,14 @@ jobs:
       # (assets/models/ is gitignored, so a fresh checkout has no model). The script is
       # cross-platform Node, so it runs on every OS.
       - run: npm install && npm run fetch-model
-      - run: cargo test -p dotz-core
+      # Bound test parallelism: the suite spawns sandbox children + a websocket server per test
+      # and the default unbounded fan-out has been observed driving the GitHub-hosted runner into
+      # resource starvation ("the hosted runner lost communication with the server" on
+      # ubuntu-latest, 2026-09-21 — the same failure class the repo's own OOM doctrine describes;
+      # AGENTS.md "Verification commands" documents `--test-threads=2` as the matching remedy).
+      # The suite still runs fully in parallel mode locally (813/0 confirmed); this only bounds
+      # the CI runner's concurrency.
+      - run: cargo test -p dotz-core -- --test-threads=2
       # Cold-start perf bench (Windows-only): measures Embedder::load() and records the number.
       # The bench is non-gating by design (see dotz-core/benches/cold_start.rs doc header): it
       # skips when the bundled ONNX model is absent, and it does not fail on a regression — a
