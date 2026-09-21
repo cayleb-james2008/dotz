@@ -1139,20 +1139,22 @@ mod tests {
         // `detect_port_in_window` task has time to be scheduled + complete its
         // TCP probe even under full-suite runtime contention (the original
         // 10s/20s budget raced the scheduler when 500+ tests saturated tokio).
-        // Platform-correct shell + keep-alive: `bash`/`sleep` do not exist on Windows runners,
-        // so a Windows child uses cmd + ping-as-delay (same 45s hold, same banner line).
+        // Platform-correct language + keep-alive: `bash` does not exist on Windows runners, so a
+        // Windows child uses the sandbox's PowerShell language with Start-Sleep as the hold.
         #[cfg(windows)]
-        let (shell, code) = (
-            "cmd",
-            format!("echo listening on 127.0.0.1:{port}\r\nping -n 46 127.0.0.1 >NUL\r\n"),
+        let (language, code) = (
+            "powershell",
+            format!(
+                "Write-Output \"listening on 127.0.0.1:{port}\"\r\nStart-Sleep -Seconds 45\r\n"
+            ),
         );
         #[cfg(not(windows))]
-        let (shell, code) = (
+        let (language, code) = (
             "bash",
             format!("echo \"listening on 127.0.0.1:{port}\"\nsleep 45\n"),
         );
 
-        let run = start_run(shell, &code, "web", None, 60_000, None, None)
+        let run = start_run(language, &code, "web", None, 60_000, None, None)
             .await
             .expect("start_run should succeed");
 
@@ -1190,8 +1192,12 @@ mod tests {
     async fn web_start_supersedes_prior_running_web_run_for_same_project() {
         let project = format!("proj-{}", uuid::Uuid::new_v4());
         let first = start_run(
-            "bash",
-            "sleep 45\n",
+            if cfg!(windows) { "powershell" } else { "bash" },
+            if cfg!(windows) {
+                "Start-Sleep -Seconds 45\r\n"
+            } else {
+                "sleep 45\n"
+            },
             "web",
             Some(&project),
             60_000,
@@ -1213,8 +1219,12 @@ mod tests {
         assert!(pid.is_some(), "first web run's child should spawn");
 
         let second = start_run(
-            "bash",
-            "sleep 45\n",
+            if cfg!(windows) { "powershell" } else { "bash" },
+            if cfg!(windows) {
+                "Start-Sleep -Seconds 45\r\n"
+            } else {
+                "sleep 45\n"
+            },
             "web",
             Some(&project),
             60_000,

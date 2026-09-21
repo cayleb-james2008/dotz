@@ -1,0 +1,1 @@
+Introducing dotz: a native-Rust multi-agent coding dashboard where one prompt becomes a team of agents on a live workflow graph — 813 tests passing, on Windows + Linux.
