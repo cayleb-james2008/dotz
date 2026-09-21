@@ -187,14 +187,12 @@ pub fn provider_key_var(provider: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // Serialize tests that mutate the process-global `DOTZ_PI_AGENT_DIR` env var + the shared
-    // `AUTH_CACHE` so they do not race with each other or with the provider fallback tests.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
+    // Serialize on the process-wide env lock: `DOTZ_PI_AGENT_DIR` is also flipped by the
+    // provider fallback tests and the server provider-key tests, and per-module locks do not
+    // exclude each other. The shared `AUTH_CACHE` is refreshed under the same guard.
     fn with_tmp_auth_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let guard = ENV_LOCK
+        let guard = crate::util::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("dotz-auth-test-{}", uuid::Uuid::new_v4()));

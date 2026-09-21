@@ -388,26 +388,18 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
-    /// Serializes these tests on the process-global env vars they mutate
-    /// (`DOTZ_RUN_RECORD_DIR`, `DOTZ_WORKFLOWS_FILE`). Mirrors the `ENV_LOCK`
-    /// pattern used by the `workflows` and `workflow_executor` test suites —
-    /// without it, parallel tests clobber each other's env mid-run and a
-    /// `capture_step`/`load` round-trip races against a sibling test that reset
-    /// the dir (observed as a flaky `load().unwrap()` on `None`).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     /// Point recording at a unique temp dir for the duration of the test, AND
-    /// hold the env-var lock for the whole test body (released on drop). Without
+    /// hold the process-wide env lock for the whole test body (released on drop). Without
     /// the lock, parallel tests clobber each other's `DOTZ_RUN_RECORD_DIR` /
     /// `DOTZ_WORKFLOWS_FILE` mid-run — observed as a flaky `load().unwrap()` on
     /// `None` when a sibling test reset the dir between a `capture_step` and the
-    /// asserting `load`. Mirrors the `ENV_LOCK` pattern in the `workflows` and
-    /// `workflow_executor` suites.
+    /// asserting `load`. Takes the same lock as the `workflows` and
+    /// `workflow_executor` suites (a module-local lock would not exclude them).
     #[allow(dead_code)] // the guard field is held only for its Drop (lock release)
     struct TmpDir(PathBuf, std::sync::MutexGuard<'static, ()>);
     impl TmpDir {
         fn new() -> Self {
-            let g = ENV_LOCK
+            let g = crate::util::env_test_lock()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let d = std::env::temp_dir().join(format!("dotz-runrec-{}", Uuid::new_v4()));
@@ -425,9 +417,9 @@ mod tests {
     }
 
     fn wf_file() -> std::path::PathBuf {
-        // Use a unique workflows file so these tests don't collide with the
-        // workflow_executor suite (which mutates DOTZ_WORKFLOWS_FILE under its
-        // own ENV_LOCK).
+        // Use a unique workflows file (the caller holds the process-wide env lock via TmpDir,
+        // the same lock the workflow_executor suite takes, so no sibling can reset the var
+        // between set and use).
         let f = std::env::temp_dir().join(format!("dotz-runrec-wf-{}.json", Uuid::new_v4()));
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("DOTZ_WORKFLOWS_FILE", f.to_string_lossy().to_string()) };

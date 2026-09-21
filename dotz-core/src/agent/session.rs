@@ -1564,11 +1564,6 @@ pub fn models(id: &str) -> Option<Value> {
 }
 
 #[cfg(test)]
-/// Lock shared by any test that mutates the process-global `DOTZ_LOCAL_BASE_URL` env var so
-/// concurrent fake-provider tests do not race each other.
-pub(crate) static SSE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::provider::StreamDelta;
@@ -1576,10 +1571,11 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    /// Serializes the hung-SSE tests below so they don't race on the
-    /// process-global `DOTZ_LOCAL_BASE_URL` env var.
-    use super::SSE_TEST_LOCK;
-
+    // NOTE: tests below that mutate process-global env vars (`DOTZ_LOCAL_BASE_URL`,
+    // `DOTZ_SUBAGENT_TIMEOUT_MS`, `DOTZ_PI`) hold the process-wide
+    // `crate::util::env_test_lock()` instead of a module-local lock, so they serialize
+    // against every other module's env-mutating tests. There is no module-local env
+    // lock here by design.
     /// `panel_for_tool` binds each capability tool to its graph-node panel. The design + sandbox
     /// tools (new first-class panels) must map, and plain file/shell tools must not.
     #[test]
@@ -2279,9 +2275,14 @@ mod tests {
     /// acquisition, so an abort() that arrived after `turn_active` was set but before that reset
     /// cancelled the stale token and was ignored. With the fresh token installed in the first
     /// critical section, the abort is observed and the turn stops with stopReason "aborted".
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn abort_during_turn_setup_is_observed() {
-        let _guard = SSE_TEST_LOCK.lock().await;
+        // Process-wide env lock, deliberately held across the awaits below (the awaited
+        // provider tasks never acquire the env lock; each test runs on its own runtime).
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // A fake local endpoint is enough: the provider task is spawned and immediately aborted,
         // so it never actually streams.
@@ -2605,12 +2606,17 @@ mod tests {
     /// bubbles. This test wires a fake local provider, dispatches one subagent, and asserts a
     /// `workflow_start` for this session's run plus a terminal `step_state` land on the global
     /// workflow channel — and the tool-result JSON keeps its shape.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn execute_tool_subagent_dispatch_drives_workflow_graph() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let _guard = SSE_TEST_LOCK.lock().await;
+        // Process-wide env lock, deliberately held across the awaits below (the awaited
+        // provider tasks never acquire the env lock; each test runs on its own runtime).
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // A fake SSE server that streams a handful of text deltas then ends.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2945,9 +2951,14 @@ mod tests {
     /// A hung provider stream must not keep run_turn alive after session::abort. Before the
     /// abort-task fix, the loop would leave the provider task running and await it, stalling until
     /// the network stack gave up.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_turn_aborts_hung_stream_promptly() {
-        let _guard = SSE_TEST_LOCK.lock().await;
+        // Process-wide env lock, deliberately held across the awaits below (the awaited
+        // provider tasks never acquire the env lock; each test runs on its own runtime).
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
@@ -3033,9 +3044,14 @@ mod tests {
     /// not leave that partial, unexecuted tool_call in the conversation history. Before the
     /// sanitization fix, the aborted message_end retained the ToolCall block, which the next turn
     /// then saw as a completed call.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn aborted_turn_strips_partial_tool_calls_from_history() {
-        let _guard = SSE_TEST_LOCK.lock().await;
+        // Process-wide env lock, deliberately held across the awaits below (the awaited
+        // provider tasks never acquire the env lock; each test runs on its own runtime).
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
@@ -3167,9 +3183,14 @@ mod tests {
     /// The UI renders the recalled-memory list from a `{kind:"memory_recall"}` WS frame.
     /// run_turn must emit it after building the effective system prompt so the operator sees what
     /// memories informed the turn, even while the model stream is still in progress.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_turn_emits_memory_recall_before_streaming() {
-        let _guard = SSE_TEST_LOCK.lock().await;
+        // Process-wide env lock, deliberately held across the awaits below (the awaited
+        // provider tasks never acquire the env lock; each test runs on its own runtime).
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let port = addr.port();

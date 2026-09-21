@@ -782,8 +782,11 @@ mod tests {
     #[test]
     fn post_config_serializes_concurrent_updates() {
         use std::sync::Barrier;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let guard = LOCK.lock().unwrap();
+        // Process-wide env lock (not a function-local static): DOTZ_CONFIG_DIR is flipped by
+        // tests across many modules, and a lock only excludes holders of the SAME lock.
+        let guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let dir =
             std::env::temp_dir().join(format!("dotz-server-config-test-{}", uuid::Uuid::new_v4()));
@@ -851,6 +854,10 @@ mod tests {
 
     #[tokio::test]
     async fn health_endpoint_ok_and_graceful_shutdown_works() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -912,8 +919,18 @@ mod tests {
     /// non-empty `available` catalog with model ids, provider metadata, provider-aware defaults,
     /// and the currently configured `current` provider/model derived from the loaded config. This
     /// is what the UI's model picker binds to instead of a hardcoded list.
+    ///
+    /// The process-wide env lock is deliberately held across the awaits: the awaited handler
+    /// never acquires the env lock, and each test runs on its own runtime, so the deadlock the
+    /// lint guards against cannot occur.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn get_models_returns_backend_driven_catalog() {
+        // Process-wide env lock: this test flips DOTZ_CONFIG_DIR, which races with every
+        // other module's config-dir tests unless all of them hold the same lock.
+        let _env_guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir =
             std::env::temp_dir().join(format!("dotz-server-models-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1020,6 +1037,10 @@ mod tests {
     /// catalog JSON with the expected shape — proving the route is wired into `app()`.
     #[tokio::test]
     async fn get_models_endpoint_reachable_over_http() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = dummy.local_addr().unwrap();
         drop(dummy);
@@ -1100,6 +1121,10 @@ mod tests {
     /// list route (which spawns nothing) so the test never executes sandbox code.
     #[tokio::test]
     async fn origin_guard_blocks_foreign_origin_on_sandbox_route() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = dummy.local_addr().unwrap();
         drop(dummy);
@@ -1168,6 +1193,10 @@ mod tests {
     /// `/api/health` and the static shell stay unauthenticated.
     #[tokio::test]
     async fn token_guard_enforces_token_on_api_and_ws() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         use futures_util::StreamExt;
         use tokio_tungstenite::connect_async;
 
@@ -1339,6 +1368,10 @@ mod tests {
     /// both the headless `serve` bin and any future caller (e.g. the Tauri shell) can use.
     #[tokio::test]
     async fn serve_with_shutdown_addr_binds_and_serves() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         // Bind a dummy listener on port 0, read the assigned port, then immediately drop it so
         // `serve_with_shutdown_addr` can reuse the same port deterministically.
         let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1385,6 +1418,10 @@ mod tests {
     /// `tokio::sync::watch` channel — the exact pattern the Tauri shell uses for graceful shutdown.
     #[tokio::test]
     async fn serve_with_shutdown_addr_drain_on_watch_shutdown() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = dummy.local_addr().unwrap();
         drop(dummy);
@@ -1424,6 +1461,10 @@ mod tests {
     /// surfacing the bind error to the caller instead of panicking or swallowing it.
     #[tokio::test]
     async fn serve_with_shutdown_addr_fails_when_port_in_use() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = dummy.local_addr().unwrap();
         let result =
@@ -1585,6 +1626,10 @@ mod tests {
     /// HTTP exactly the way the WebView2 shell loads it — not just present on disk.
     #[tokio::test]
     async fn server_serves_bundled_fonts_locally() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         // Pick a real woff2 file from the bundle to request over HTTP.
         let fonts_dir = web_dir().join("fonts");
         let a_woff2 = std::fs::read_dir(&fonts_dir)
@@ -1708,6 +1753,10 @@ mod tests {
     /// not panic or hang. This is the core "shutdown under load" scenario.
     #[tokio::test]
     async fn shutdown_drains_under_concurrent_http_load() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         let (port, tx, handle) = start_server().await;
         let client = reqwest::Client::new();
         let base = format!("http://127.0.0.1:{port}");
@@ -1767,6 +1816,10 @@ mod tests {
     /// the server stays responsive under load right up to the shutdown signal.
     #[tokio::test]
     async fn server_responsive_under_burst_load_then_clean_shutdown() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         let (port, tx, handle) = start_server().await;
         let client = reqwest::Client::new();
         let base = format!("http://127.0.0.1:{port}");
@@ -1814,6 +1867,10 @@ mod tests {
     /// to the shutdown signal and closes its socket so the server can exit.
     #[tokio::test]
     async fn shutdown_closes_active_websocket_connections() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         use futures_util::StreamExt;
         use tokio_tungstenite::connect_async;
 
@@ -1871,6 +1928,10 @@ mod tests {
     /// disposed during shutdown, but the server must not deadlock or panic.
     #[tokio::test]
     async fn shutdown_with_active_agent_sessions_exits_cleanly() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         let (port, tx, handle) = start_server().await;
         let client = reqwest::Client::new();
         let base = format!("http://127.0.0.1:{port}");
@@ -1921,6 +1982,10 @@ mod tests {
     /// (TIME_WAIT or similar) that would block a rapid restart.
     #[tokio::test]
     async fn rapid_restart_on_same_port_after_shutdown() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         // Start first instance.
         let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = dummy.local_addr().unwrap();
@@ -1989,6 +2054,10 @@ mod tests {
     /// endpoints when the process receives SIGINT.
     #[tokio::test]
     async fn shutdown_under_mixed_rest_and_ws_load() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         use futures_util::StreamExt;
         use tokio_tungstenite::connect_async;
 
@@ -2074,6 +2143,10 @@ mod tests {
     /// simultaneously; the server must handle this gracefully.
     #[tokio::test]
     async fn multiple_shutdown_triggers_are_safe() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         let dummy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = dummy.local_addr().unwrap();
         drop(dummy);
@@ -2110,6 +2183,10 @@ mod tests {
     /// independently; if any handler misses the signal, the server would hang.
     #[tokio::test]
     async fn shutdown_closes_multiple_websocket_connections() {
+        // Boot isolation: hold the process-wide env lock + boot the server against fresh
+        // temp dirs so `startup_resume()` cannot scan a sibling's workflows file (resuming
+        // foreign runs into the shared store + spawning executors for them).
+        let _boot = crate::util::server_boot_guard();
         use futures_util::StreamExt;
         use tokio_tungstenite::connect_async;
 
@@ -2176,23 +2253,25 @@ mod tests {
     // ---- Q4: provider key routes (POST/GET/DELETE /api/provider/key → ~/.pi/agent/auth.json) ----
     //
     // These tests point `DOTZ_PI_AGENT_DIR` at a temp dir so they NEVER touch the operator's real
-    // `~/.pi/agent/auth.json`. They serialize on a shared ENV_LOCK so concurrent provider-key tests
-    // don't race on the env var or the in-memory auth cache.
-
-    static PROVIDER_KEY_ENV_LOCK: Mutex<()> = Mutex::new(());
+    // `~/.pi/agent/auth.json`. They serialize on the process-wide env lock so concurrent
+    // provider-key tests — and the auth.rs / provider.rs tests that flip the same var under
+    // their own previous locks — don't race on the env var or the in-memory auth cache.
 
     /// RAII guard: points `DOTZ_PI_AGENT_DIR` at a fresh temp dir for the lifetime of the guard,
     /// refreshes the auth cache to the empty dir, and on drop removes the dir + env var +
-    /// refreshes the cache back. Using a guard (instead of a closure) lets async test bodies
-    /// `.await` freely between setup and teardown — a sync `FnOnce` would fight the async borrow
-    /// checker.
+    /// refreshes the cache back. Also pins `DOTZ_WORKFLOWS_FILE` at a fresh temp file: these
+    /// tests boot the server, whose `startup_resume()` scans the LIVE workflows file and would
+    /// otherwise resume foreign runs into the shared store + spawn executors for them. Using a
+    /// guard (instead of a closure) lets async test bodies `.await` freely between setup and
+    /// teardown — a sync `FnOnce` would fight the async borrow checker.
     struct AuthDirGuard {
         dir: std::path::PathBuf,
+        _wf_pin: crate::util::WorkflowsFilePin,
         _env_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     fn setup_auth_dir() -> AuthDirGuard {
-        let env_lock = PROVIDER_KEY_ENV_LOCK
+        let env_lock = crate::util::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir =
@@ -2201,8 +2280,11 @@ mod tests {
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("DOTZ_PI_AGENT_DIR", dir.to_string_lossy().to_string()) };
         crate::auth::refresh_cache();
+        // Lock held: pin the workflows file so booted servers scan an isolated file.
+        let wf_pin = crate::util::pin_workflows_file();
         AuthDirGuard {
             dir,
+            _wf_pin: wf_pin,
             _env_lock: env_lock,
         }
     }
@@ -2372,8 +2454,13 @@ mod tests {
 
     /// RAII guard: point DOTZ_CONFIG_DIR at a fresh temp dir + serialize on the shared lock, so
     /// gateway-config tests never race with config::tests or touch the operator's real config.
+    /// Also pins DOTZ_WORKFLOWS_FILE at a fresh temp file: several of these tests boot the
+    /// server, whose `startup_resume()` scans the LIVE workflows file and would otherwise
+    /// resume foreign runs (from a sibling's temp file or the operator's real one) into the
+    /// shared store + spawn executors for them.
     struct GatewayConfigDirGuard {
         dir: std::path::PathBuf,
+        _wf_pin: crate::util::WorkflowsFilePin,
         _guard: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -2386,7 +2473,13 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string()) };
-        GatewayConfigDirGuard { dir, _guard: g }
+        // Lock held: pin the workflows file so booted servers scan an isolated file.
+        let wf_pin = crate::util::pin_workflows_file();
+        GatewayConfigDirGuard {
+            dir,
+            _wf_pin: wf_pin,
+            _guard: g,
+        }
     }
 
     impl Drop for GatewayConfigDirGuard {
@@ -2694,9 +2787,12 @@ mod tests {
 
     /// RAII guard: point `DOTZ_CONFIG_DIR` at a fresh temp dir + hold the shared config-dir lock
     /// for the test's lifetime. The marker file is created/cleared per-test via
-    /// `remove_marker()` on drop.
+    /// `remove_marker()` on drop. Also pins `DOTZ_WORKFLOWS_FILE` at a fresh temp file: several
+    /// of these tests boot the server, whose `startup_resume()` scans the LIVE workflows file
+    /// and would otherwise resume foreign runs into the shared store + spawn executors for them.
     struct FirstRunDirGuard {
         dir: std::path::PathBuf,
+        _wf_pin: crate::util::WorkflowsFilePin,
         _guard: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -2711,7 +2807,13 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir.to_string_lossy().to_string()) };
-        FirstRunDirGuard { dir, _guard: g }
+        // Lock held: pin the workflows file so booted servers scan an isolated file.
+        let wf_pin = crate::util::pin_workflows_file();
+        FirstRunDirGuard {
+            dir,
+            _wf_pin: wf_pin,
+            _guard: g,
+        }
     }
 
     impl FirstRunDirGuard {

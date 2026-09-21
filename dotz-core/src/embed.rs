@@ -157,9 +157,9 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
-    // Serialize tests that mutate the process-global `DOTZ_MODELS` env var so they do not race
-    // with the shared embedder initialization or with each other.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Serialize on the process-wide env lock: `DOTZ_MODELS` is also flipped by memory.rs tests
+    // and server tests under different locks, and per-module locks do not exclude each other.
+    // Recover from poison so one panicking sibling cannot brick the group with PoisonErrors.
 
     // The ONNX Session + Tokenizer are not cheap to create; share one instance across tests and
     // serialize on it so parallel test runners do not load the model multiple times.
@@ -270,7 +270,9 @@ mod tests {
     /// intentionally bogus DOTZ_MODELS override it is false.
     #[test]
     fn model_files_present_matches_disk_state() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Normal workspace/crate layout: the bundled model should be discoverable.
         assert!(
@@ -298,12 +300,14 @@ mod tests {
     /// `warm()` must NOT panic when the bundled model files are missing — that's the expected
     /// state on a fresh install before `npm run fetch-model` runs. It logs a warning and
     /// returns, so the first chat turn after launch degrades to a lazy load instead of
-    /// crashing the server task. Uses the same `ENV_LOCK` serialization as
+    /// crashing the server task. Uses the same process-wide env-lock serialization as
     /// `model_files_present_matches_disk_state` so the bogus `DOTZ_MODELS` override does not
     /// race with other tests sharing the process env.
     #[test]
     fn embed_warmup_with_missing_model_does_not_panic() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev = std::env::var("DOTZ_MODELS").ok();
         let tmp = std::env::temp_dir().join(format!(
             "dotz-embed-warmup-missing-{}",
@@ -333,7 +337,9 @@ mod tests {
     /// that accidentally moves the load before the present-check is caught.
     #[test]
     fn embed_warmup_missing_model_fast_path_returns_quickly() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev = std::env::var("DOTZ_MODELS").ok();
         let tmp =
             std::env::temp_dir().join(format!("dotz-embed-warmup-fast-{}", uuid::Uuid::new_v4()));

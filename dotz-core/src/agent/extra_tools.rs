@@ -2515,10 +2515,10 @@ mod tests {
         assert_eq!(result, (false, Some("needs work".to_string())));
     }
 
-    /// Serialize tests that mutate process-global env vars used by the file-persisting tools
-    /// (`DOTZ_CONFIG_DIR`). An async-aware mutex is required because the tests hold the lock
-    /// across `.await` points.
-    static TOOL_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // NOTE: tests below that mutate DOTZ_CONFIG_DIR take the process-wide
+    // `crate::util::env_test_lock()` (not a module-local static) so they serialize against
+    // every other module's config-dir tests. The std guard is deliberately held across
+    // `.await` points where noted (the awaited tasks never acquire the env lock).
 
     /// `agents_md` must read and write the project AGENTS.md asynchronously without blocking the
     /// tokio runtime. This covers the conversion from `std::fs` to `tokio::fs` in the doctrine tool.
@@ -2560,9 +2560,16 @@ mod tests {
     /// `create_skill` must persist a user skill file asynchronously and rebuild the skill index
     /// on the blocking pool. This covers the `tokio::fs` conversion and the `spawn_blocking`
     /// reload in the skill-creation tool.
+    ///
+    /// Holds the process-wide env lock across the awaits (deliberate: the awaited tool +
+    /// blocking-pool tasks never acquire the env lock; each test runs on its own runtime).
+    /// DOTZ_CONFIG_DIR is flipped by many modules' tests, which all take the same lock.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn create_skill_tool_persists_async_and_reloads_index() {
-        let _guard = TOOL_ENV_TEST_LOCK.lock().await;
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev_config = std::env::var("DOTZ_CONFIG_DIR")
             .ok()
             .map(std::path::PathBuf::from);

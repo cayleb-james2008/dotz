@@ -1936,10 +1936,16 @@ mod tests {
     /// The configurable subagent timeout must clamp to sane bounds. A zero or extremely small
     /// value would time out before the provider stream starts; an enormous value defeats the
     /// purpose of the wall-clock cap.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn subagent_timeout_is_configurable_and_clamped() {
-        // Serialize with other subagent tests that mutate this process-global env var.
-        let _guard = crate::agent::session::SSE_TEST_LOCK.lock().await;
+        // Process-wide env lock, deliberately held across the awaits below (the awaited
+        // provider tasks never acquire the env lock; each test runs on its own runtime).
+        // DOTZ_SUBAGENT_TIMEOUT_MS is also flipped by workflow_executor tests, which take
+        // the same lock, so the clamp assertions cannot see a foreign value mid-test.
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev = std::env::var("DOTZ_SUBAGENT_TIMEOUT_MS").ok();
 
         // TODO: Audit that the environment access only happens in single-threaded code.
@@ -1986,13 +1992,17 @@ mod tests {
     /// provider stream task must be aborted so the underlying connection is released. Before the
     /// timeout fix, `run_single_agent` would await the stream indefinitely; before the abort fix,
     /// the timed-out task detached and kept the connection open.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_single_agent_times_out_on_hung_provider() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        // Serialize with other tests that mutate the process-global local-provider URL.
-        let _guard = crate::agent::session::SSE_TEST_LOCK.lock().await;
+        // Process-wide env lock, deliberately held across the awaits below (same idiom as
+        // subagent_timeout_is_configurable_and_clamped above).
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2101,12 +2111,16 @@ mod tests {
 
     /// A timed-out subagent must abort the provider stream task, releasing the underlying TCP
     /// connection. We verify this by having the fake server detect EOF after the client aborts.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_single_agent_aborts_provider_stream_task_on_timeout() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let _guard = crate::agent::session::SSE_TEST_LOCK.lock().await;
+        // Process-wide env lock, deliberately held across the awaits below (same idiom).
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

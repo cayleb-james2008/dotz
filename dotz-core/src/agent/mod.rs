@@ -1445,6 +1445,10 @@ mod tests {
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::protocol::Message;
 
+        // Boot isolation first (process-wide env lock + fresh temp dirs so the booted
+        // server's `startup_resume()` cannot scan a sibling's workflows file), then the
+        // WS lock. No path acquires them in the opposite order, so this cannot deadlock.
+        let _boot = crate::util::server_boot_guard();
         let _guard = WS_TEST_LOCK.lock().await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1511,6 +1515,10 @@ mod tests {
         use std::time::Duration;
         use tokio_tungstenite::connect_async;
 
+        // Boot isolation first (process-wide env lock + fresh temp dirs so the booted
+        // server's `startup_resume()` cannot scan a sibling's workflows file), then the
+        // WS lock. No path acquires them in the opposite order, so this cannot deadlock.
+        let _boot = crate::util::server_boot_guard();
         let _guard = WS_TEST_LOCK.lock().await;
 
         // Use a very short ping interval so the test finishes quickly.
@@ -1593,6 +1601,10 @@ mod tests {
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::protocol::Message;
 
+        // Boot isolation first (process-wide env lock + fresh temp dirs so the booted
+        // server's `startup_resume()` cannot scan a sibling's workflows file), then the
+        // WS lock. No path acquires them in the opposite order, so this cannot deadlock.
+        let _boot = crate::util::server_boot_guard();
         let _guard = WS_TEST_LOCK.lock().await;
 
         // Disable server-side pings so the only frame after the ready is our pong echo.
@@ -1673,6 +1685,10 @@ mod tests {
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::protocol::Message;
 
+        // Boot isolation first (process-wide env lock + fresh temp dirs so the booted
+        // server's `startup_resume()` cannot scan a sibling's workflows file), then the
+        // WS lock. No path acquires them in the opposite order, so this cannot deadlock.
+        let _boot = crate::util::server_boot_guard();
         let _guard = WS_TEST_LOCK.lock().await;
 
         // Disable pings so the only frame we see after the ready is the close echo.
@@ -1845,6 +1861,10 @@ mod tests {
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::protocol::Message;
 
+        // Boot isolation first (process-wide env lock + fresh temp dirs so the booted
+        // server's `startup_resume()` cannot scan a sibling's workflows file), then the
+        // WS lock. No path acquires them in the opposite order, so this cannot deadlock.
+        let _boot = crate::util::server_boot_guard();
         let _guard = WS_TEST_LOCK.lock().await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1972,6 +1992,10 @@ mod tests {
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::protocol::Message;
 
+        // Boot isolation first (process-wide env lock + fresh temp dirs so the booted
+        // server's `startup_resume()` cannot scan a sibling's workflows file), then the
+        // WS lock. No path acquires them in the opposite order, so this cannot deadlock.
+        let _boot = crate::util::server_boot_guard();
         let _guard = WS_TEST_LOCK.lock().await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2141,6 +2165,10 @@ mod tests {
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::protocol::Message;
 
+        // Boot isolation first (process-wide env lock + fresh temp dirs so the booted
+        // server's `startup_resume()` cannot scan a sibling's workflows file), then the
+        // WS lock. No path acquires them in the opposite order, so this cannot deadlock.
+        let _boot = crate::util::server_boot_guard();
         let _guard = WS_TEST_LOCK.lock().await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2227,6 +2255,10 @@ mod tests {
     /// Workflow events are broadcast globally to every WebSocket. Creating a workflow via REST
     /// must deliver a `workflow_start` frame, and a step update must deliver `step_state`, so the
     /// UI graph panel stays live without polling.
+    ///
+    /// Holds the process-wide env lock across the awaits (deliberate: the awaited server/client
+    /// tasks never acquire the env lock; each test runs on its own runtime).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn websocket_receives_global_workflow_events() {
         use futures_util::StreamExt;
@@ -2234,6 +2266,11 @@ mod tests {
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::protocol::Message;
 
+        // Boot isolation first (process-wide env lock + fresh temp dirs so the booted
+        // server's `startup_resume()` cannot scan a sibling's workflows file — this test
+        // also flips DOTZ_WORKFLOWS_FILE itself), then the WS lock. No path acquires
+        // them in the opposite order, so this cannot deadlock.
+        let _boot = crate::util::server_boot_guard();
         let _guard = WS_TEST_LOCK.lock().await;
 
         // Isolate the workflow history file so this test does not pollute the real store.

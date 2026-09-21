@@ -46,6 +46,27 @@ pub fn no_window_tokio(cmd: &mut tokio::process::Command) -> &mut tokio::process
     cmd
 }
 
+/// THE process-wide serialization lock for tests that mutate process-global environment
+/// variables (`DOTZ_CONFIG_DIR`, `DOTZ_PI_AGENT_DIR`, `DOTZ_MODELS`, `DOTZ_PI`,
+/// `DOTZ_WORKFLOWS_FILE`, `DOTZ_SUBAGENT_TIMEOUT_MS`, timeout overrides, ...).
+///
+/// Process env vars are process-global: two tests mutating the SAME var under DIFFERENT locks
+/// interleave (module A sets `DOTZ_CONFIG_DIR` to dir-a, module B sets it to dir-b, module A's
+/// `load_config()` reads dir-b and sees an empty/wrong config), and on this toolchain any
+/// concurrent `set_var` + `getenv` is unsafe even across different var names. Per-module locks
+/// only serialize within their own module, so every test that calls `set_var`/`remove_var`
+/// MUST hold this ONE lock for the whole test body. Async tests hold the std guard across
+/// `.await` deliberately (the awaited tasks never acquire this lock, and each test runs on its
+/// own runtime, so the deadlock the lint guards against cannot occur); mark those sites with
+/// `#[allow(clippy::await_holding_lock)]` plus a one-line justification, matching the existing
+/// `memory.rs` idiom. Always recover from poisoning with `unwrap_or_else(into_inner)` so one
+/// panicking sibling cannot brick the rest of the suite with cascading `PoisonError`s.
+#[cfg(test)]
+pub fn env_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 /// Shared lock for tests that mutate the `DOTZ_CONFIG_DIR` env var. Both `config::tests` and
 /// `telemetry::tests` (and any other module that flips `DOTZ_CONFIG_DIR` to a tmp dir) MUST hold
 /// this lock for the whole test body — otherwise two modules' `with_tmp_dir` helpers can race:
@@ -54,10 +75,104 @@ pub fn no_window_tokio(cmd: &mut tokio::process::Command) -> &mut tokio::process
 /// `telemetry::tests::test_set_enabled_false_clears_endpoint` when a `config::tests::*` test runs
 /// concurrently. A single process-wide mutex is the root-cause fix; per-module locks only
 /// serialize within their own module.
+///
+/// This is an alias for [`env_test_lock`]: `DOTZ_CONFIG_DIR` is one of several raced vars, and
+/// the tests that flip it also flip sibling vars (`DOTZ_SUBAGENT_MODEL`, `DOTZ_MODELS`, ...),
+/// so one shared lock covers the whole family. Existing callers are unchanged.
 #[cfg(test)]
 pub fn dotz_config_dir_test_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    &LOCK
+    env_test_lock()
+}
+
+/// RAII boot isolation for tests that start the dotz server (`serve_with_shutdown*`,
+/// `start_server`). Holds the process-wide [`env_test_lock`] for the whole test body AND
+/// points `DOTZ_CONFIG_DIR` + `DOTZ_WORKFLOWS_FILE` at fresh temp dirs (restored + removed
+/// on drop), so the boot sequence cannot observe a sibling test's temp files.
+///
+/// Without this, two boot-time behaviors race the rest of the suite, both reading the LIVE
+/// env: `config::load()` (bakes a foreign config into the test server's `AppState`) and
+/// `workflows::startup_resume()` (scans `workflows.json` for non-terminal runs, reinserts
+/// them into the shared in-memory store, marks steps interrupted, and spawns real executor
+/// tasks — observed as a sibling `run_record` test's just-written step status reverting to
+/// its pristine value mid-test). Booting with isolated temps also keeps tests from resuming
+/// the operator's real runs. Struct-held guard: safe across `.await` (the awaited server
+/// tasks never acquire the env lock), matching the existing `AuthDirGuard` idiom — no
+/// `clippy::await_holding_lock` allow needed.
+#[cfg(test)]
+pub struct ServerBootGuard {
+    _env: std::sync::MutexGuard<'static, ()>,
+    prev_config_dir: Option<String>,
+    prev_workflows_file: Option<String>,
+    tmp: std::path::PathBuf,
+}
+
+/// Acquire boot isolation for a server-booting test. See [`ServerBootGuard`] for why.
+#[cfg(test)]
+pub fn server_boot_guard() -> ServerBootGuard {
+    let env = env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tmp = std::env::temp_dir().join(format!("dotz-server-boot-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let prev_config_dir = std::env::var("DOTZ_CONFIG_DIR").ok();
+    let prev_workflows_file = std::env::var("DOTZ_WORKFLOWS_FILE").ok();
+    // SAFETY comments elsewhere in the suite apply: test-only, lock held.
+    unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &tmp) };
+    let wf = tmp.join("workflows.json");
+    unsafe { std::env::set_var("DOTZ_WORKFLOWS_FILE", &wf) };
+    ServerBootGuard {
+        _env: env,
+        prev_config_dir,
+        prev_workflows_file,
+        tmp,
+    }
+}
+
+#[cfg(test)]
+impl Drop for ServerBootGuard {
+    fn drop(&mut self) {
+        match &self.prev_config_dir {
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
+        }
+        match &self.prev_workflows_file {
+            Some(p) => unsafe { std::env::set_var("DOTZ_WORKFLOWS_FILE", p) },
+            None => unsafe { std::env::remove_var("DOTZ_WORKFLOWS_FILE") },
+        }
+        let _ = std::fs::remove_dir_all(&self.tmp);
+    }
+}
+
+/// RAII pin for `DOTZ_WORKFLOWS_FILE` at a fresh temp file (restored + removed on drop).
+/// Does NOT take any lock: the caller must already hold [`env_test_lock()`] (it is
+/// non-reentrant, so taking it again would deadlock). Used by server-test guards that
+/// already own the lock (`AuthDirGuard`, `GatewayConfigDirGuard`, `FirstRunDirGuard`) so
+/// every server boot scans an isolated file — never a sibling's temp file (whose foreign
+/// runs would be reinserted into the shared store + executed) nor the operator's real one.
+#[cfg(test)]
+pub struct WorkflowsFilePin {
+    prev: Option<String>,
+    file: std::path::PathBuf,
+}
+
+/// Pin `DOTZ_WORKFLOWS_FILE` at a fresh temp file. Caller must hold [`env_test_lock()`].
+#[cfg(test)]
+pub fn pin_workflows_file() -> WorkflowsFilePin {
+    let file = std::env::temp_dir().join(format!("dotz-wf-pin-{}.json", uuid::Uuid::new_v4()));
+    let prev = std::env::var("DOTZ_WORKFLOWS_FILE").ok();
+    unsafe { std::env::set_var("DOTZ_WORKFLOWS_FILE", &file) };
+    WorkflowsFilePin { prev, file }
+}
+
+#[cfg(test)]
+impl Drop for WorkflowsFilePin {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(p) => unsafe { std::env::set_var("DOTZ_WORKFLOWS_FILE", p) },
+            None => unsafe { std::env::remove_var("DOTZ_WORKFLOWS_FILE") },
+        }
+        let _ = std::fs::remove_file(&self.file);
+    }
 }
 
 #[cfg(test)]

@@ -592,11 +592,14 @@ mod tests {
     use serde_json::{Value, json};
     use uuid::Uuid;
 
-    // tokio Mutex (not std): several tests below intentionally hold this guard across `.await`
-    // (run_workflow reads the process-global env vars mid-execution), so the lock MUST serialize
-    // the whole async test body. An async-aware mutex is the correct type to hold across await;
-    // the sync `#[test]` cases use `blocking_lock()` since they run outside a runtime.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Process-wide env lock (not a module-local static): these tests flip DOTZ_WF_* /
+    // DOTZ_SUBAGENT_TIMEOUT_MS / DOTZ_WORKFLOWS_FILE, and DOTZ_SUBAGENT_TIMEOUT_MS is also
+    // flipped by session/subagent tests while DOTZ_WORKFLOWS_FILE is flipped by the workflows
+    // and run_record suites — per-module locks do not exclude each other. The std guard is
+    // deliberately held across `.await` points in the async tests below (the awaited
+    // run_workflow tasks never acquire the env lock; each test runs on its own runtime), so
+    // the deadlock the lint guards against cannot occur; the sync `#[test]` cases take the
+    // same lock directly since they run outside a runtime.
 
     fn step(agent: &str, task: &str, parents: Option<Vec<Value>>) -> CreateStepInput {
         CreateStepInput {
@@ -729,6 +732,10 @@ mod tests {
     /// deadlock the Semaphore; an enormous value would spawn unbounded LLM streams.
     #[test]
     fn concurrency_clamps_to_sane_bounds() {
+        // Process-wide env lock: this test flips DOTZ_WF_CONCURRENCY like its siblings.
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Default when unset.
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var("DOTZ_WF_CONCURRENCY") };
@@ -766,14 +773,16 @@ mod tests {
     /// The step timeout must clamp to sane bounds. A zero value would time out before
     /// the provider stream starts; an enormous value defeats the purpose of the cap.
     ///
-    /// Takes ENV_LOCK like every other DOTZ_WF_STEP_TIMEOUT_MS test in this file: this test
+    /// Takes the process-wide env lock like every other DOTZ_WF_STEP_TIMEOUT_MS test in this file: this test
     /// mutates the process-global env var, and without the lock it races under the parallel
     /// suite against the other tests below that set DOTZ_WF_STEP_TIMEOUT_MS=5000 — observed
     /// as a flaky `left: 5, right: 300` failure (read back another test's 5000ms instead of
     /// the unset default) when this test ran unlocked.
     #[test]
     fn step_timeout_clamps_to_sane_bounds() {
-        let _guard = ENV_LOCK.blocking_lock();
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var("DOTZ_WF_STEP_TIMEOUT_MS") };
         let t = step_timeout();
@@ -800,18 +809,24 @@ mod tests {
     }
 
     /// run_workflow must return None for an unknown run id.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_workflow_returns_none_for_unknown_run() {
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _file = set_tmp_workflows_file();
         let result = run_workflow("no-such-run-id").await;
         assert!(result.is_none());
     }
 
     /// run_workflow must return the run immediately if it is already terminal.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_workflow_returns_immediately_for_terminal_run() {
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _file = set_tmp_workflows_file();
         let run = workflows::create(
             None,
@@ -832,9 +847,12 @@ mod tests {
 
     /// A single-step run with an unknown agent must complete with error status (the
     /// subagent returns an error for unknown agents, and step_state records it).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_workflow_marks_unknown_agent_step_as_error() {
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _file = set_tmp_workflows_file();
         // Keep the timeout short so the test doesn't wait 5 minutes.
         // TODO: Audit that the environment access only happens in single-threaded code.
@@ -879,9 +897,12 @@ mod tests {
     }
 
     /// A two-step DAG where the first step fails must skip the second step (failure-rerouting).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_workflow_skips_children_of_failed_step() {
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _file = set_tmp_workflows_file();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
@@ -919,9 +940,12 @@ mod tests {
     /// The context bus must auto-populate `step:<id>:output` and `step:<id>:summary`
     /// entries for completed steps, so a downstream step can read prior results via
     /// context_read without parsing raw text.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn context_bus_auto_populates_from_completed_steps() {
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _file = set_tmp_workflows_file();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
@@ -987,9 +1011,12 @@ mod tests {
 
     /// The context bus must survive run completion so callers can inspect it. The
     /// caller is responsible for destroying it explicitly (bounded: one bus per run).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn context_bus_persists_after_run_completion() {
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _file = set_tmp_workflows_file();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
@@ -1036,9 +1063,12 @@ mod tests {
     /// (scout findings, planner plans, reviewer gap-lists) — the same data
     /// they would have seen without a restart. Without this, a resumed run's
     /// worker step reads an empty bus and starts from scratch.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_workflow_preloads_context_bus_on_resume() {
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _file = set_tmp_workflows_file();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
@@ -1210,9 +1240,12 @@ mod tests {
     // we test the budget-skip logic directly: create a run with a budget, manually
     /// simulate spend by completing one step with usage, then verify the next
     /// ready step is skipped.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_budget_exceeded_skips_remaining_steps() {
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _file = set_tmp_workflows_file();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("DOTZ_WF_STEP_TIMEOUT_MS", "5000") };
@@ -1287,9 +1320,12 @@ mod tests {
 
     /// A run with no budget set must NOT skip steps even when cumulative spend is high.
     /// This is the regression guard: the budget feature must be opt-in.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_without_budget_never_skips_on_cost() {
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _file = set_tmp_workflows_file();
 
         // No budget on the run. Agent name must NOT contain "budget" so we can
@@ -1347,7 +1383,9 @@ mod tests {
     /// the store and back).
     #[test]
     fn run_budget_round_trips_through_store() {
-        let _guard = ENV_LOCK.blocking_lock();
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _file = set_tmp_workflows_file();
         let budget = Budget {
             max_cost: Some(10.0),

@@ -2519,9 +2519,10 @@ pub fn router() -> Router<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Process-wide env lock (not a module-local static): DOTZ_WORKFLOWS_FILE is also flipped by
+    // the workflow_executor and run_record suites, and per-module locks do not exclude each
+    // other.
 
     fn step(agent: &str, task: &str, parents: Option<Vec<Value>>) -> CreateStepInput {
         CreateStepInput {
@@ -2560,7 +2561,7 @@ mod tests {
     }
 
     fn with_tmp_workflows_file<T>(f: impl FnOnce() -> T) -> T {
-        let guard = ENV_LOCK
+        let guard = crate::util::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let file =
@@ -4319,6 +4320,14 @@ mod tests {
     /// confirms `event_lag_count()` increased by the lagged amount.
     #[test]
     fn broadcast_lag_increments_counter_and_warns() {
+        // Process-wide env lock: this test floods the GLOBAL workflow event bus (1500 events)
+        // and bumps the global lag counter. Any bus-draining test running concurrently
+        // (broadcast event assertions, WS fan-out paths) would observe our flood frames or
+        // lag out and fail — observed as `left: "lag-test-run"` in
+        // `workflow_mutations_broadcast_live_events`. Sync test: no await, no allow needed.
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = event_lag_count();
 
         // Subscribe a receiver we will NOT drain — its per-receiver buffer (capacity 1024)

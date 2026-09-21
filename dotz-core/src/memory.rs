@@ -1207,13 +1207,12 @@ fn get_captures_since_consolidate(user_id: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tokio::io::AsyncReadExt;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     fn with_tmp_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let guard = ENV_LOCK
+        // Serialize on the process-wide env lock: several other modules flip DOTZ_CONFIG_DIR
+        // under their own locks, and per-module locks do not exclude each other.
+        let guard = crate::util::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("dotz-memory-test-{}", uuid::Uuid::new_v4()));
@@ -1224,6 +1223,52 @@ mod tests {
         result
     }
 
+    /// Backup for the invariant established by [`suite_db_preinit`] (which runs first, at
+    /// binary load): if the process-static DB is somehow still uninitialized, pin it now —
+    /// while holding the process-wide env lock and BEFORE rebinding `DOTZ_CONFIG_DIR` — so
+    /// init happens under the ambient env instead of this test's temp dir. (Without any
+    /// pinning, whichever temp-dir test initializes the DB first dooms every later writer:
+    /// its temp dir is deleted at test end, and subsequent writes fail with
+    /// `SQLITE_READONLY_ROLLBACK`.) Test-only.
+    fn ensure_db_init() {
+        if DB.get().is_none() {
+            drop(db_guard());
+        }
+    }
+
+    /// Suite-stable DB pre-init: force the process-static DB to initialize ONCE, at test-binary
+    /// load time (before any test thread exists, under the ambient env), into a pid-scoped temp
+    /// dir that no test ever deletes. This closes the last init-location hole that locks alone
+    /// cannot close: several tests reach the DB *transitively* without holding the env lock
+    /// (e.g. every `session::create` builds the system prompt, which seeds from
+    /// `memory::list_public`), so one of them could otherwise win the first-init race inside
+    /// another test's `DOTZ_CONFIG_DIR` temp window — pinning the DB to a dir that is deleted
+    /// moments later and failing every later write with `SQLITE_READONLY_ROLLBACK` (proven with
+    /// a `PRAGMA database_list` probe: the DB file sat in a `dotz-gate-test-*` dir owned by an
+    /// unrelated passing test).
+    ///
+    /// Runs before `main` via `ctor`, so no lock is needed (no other thread exists yet) and no
+    /// test can observe a half-pinned state. The dir is deliberately never removed: it is
+    /// pid-unique in the OS temp area (age-scavenged like any tmp), it keeps test rows OUT of
+    /// the operator's real `~/.dotz` in parallel runs, and reusing it after pid recycle is
+    /// harmless (all test rows live under unique uuid scopes and are cleaned up by their
+    /// tests). Test-only (`#[cfg(test)]`); production binds `DOTZ_CONFIG_DIR` once at startup.
+    #[ctor::ctor]
+    fn suite_db_preinit() {
+        let dir = std::env::temp_dir().join(format!("dotz-suite-db-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("ai-agents"));
+        let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
+        // SAFETY: runs at binary load before any test thread spawns; no concurrent env access.
+        unsafe { std::env::set_var("DOTZ_CONFIG_DIR", &dir) };
+        drop(db_guard());
+        match prev {
+            // SAFETY: same single-threaded load context as above.
+            Some(p) => unsafe { std::env::set_var("DOTZ_CONFIG_DIR", p) },
+            // SAFETY: same single-threaded load context as above.
+            None => unsafe { std::env::remove_var("DOTZ_CONFIG_DIR") },
+        }
+    }
+
     #[test]
     fn scope_user_global_ignores_cwd() {
         assert_eq!(scope_user("global", Some("/any/path")), "__global__");
@@ -1232,6 +1277,13 @@ mod tests {
 
     #[test]
     fn purge_project_deletes_only_that_scope() {
+        // Hold the process-wide env lock: this test shares the process-static DB with every
+        // other memory test, and several of them flip DOTZ_CONFIG_DIR (which feeds db() init
+        // and the MEMORY.md mirror path) mid-test. Unique cwds isolate the rows; the lock
+        // isolates the environment around the whole body.
+        let _env_guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Unique cwds so this is isolated from every other test sharing the process-static DB.
         let cwd_a = format!("C:/tmp/purge-a-{}", uuid::Uuid::new_v4());
         let cwd_b = format!("C:/tmp/purge-b-{}", uuid::Uuid::new_v4());
@@ -1500,6 +1552,8 @@ mod tests {
     #[test]
     fn add_rejects_invalid_scope() {
         with_tmp_dir(|dir| {
+            // Pin the process-static DB before rebinding DOTZ_CONFIG_DIR (see ensure_db_init).
+            ensure_db_init();
             let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
             // TODO: Audit that the environment access only happens in single-threaded code.
             unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir) };
@@ -1531,7 +1585,7 @@ mod tests {
         // std::sync::MutexGuard across an await point — that would block the tokio executor
         // and can deadlock other async tasks.
         let prev = {
-            let guard = ENV_LOCK
+            let guard = crate::util::env_test_lock()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let prev = AUTONOMY.load(Ordering::Relaxed);
@@ -1552,7 +1606,7 @@ mod tests {
 
         // Restore the previous autonomy flag so other tests see their expected state.
         {
-            let guard = ENV_LOCK
+            let guard = crate::util::env_test_lock()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             AUTONOMY.store(prev, Ordering::Relaxed);
@@ -1571,6 +1625,8 @@ mod tests {
     #[test]
     fn db_guard_recovers_from_poisoned_mutex() {
         with_tmp_dir(|dir| {
+            // Pin the process-static DB before rebinding DOTZ_CONFIG_DIR (see ensure_db_init).
+            ensure_db_init();
             let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
             // TODO: Audit that the environment access only happens in single-threaded code.
             unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir) };
@@ -1715,6 +1771,8 @@ mod tests {
     #[test]
     fn auto_consolidation_counter_is_per_scope() {
         with_tmp_dir(|dir| {
+            // Pin the process-static DB before rebinding DOTZ_CONFIG_DIR (see ensure_db_init).
+            ensure_db_init();
             let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
             // TODO: Audit that the environment access only happens in single-threaded code.
             unsafe { std::env::set_var("DOTZ_CONFIG_DIR", dir) };
@@ -1776,18 +1834,21 @@ mod tests {
     /// `memory::recall` call this test deadlocks until the holder's 10s bailout, then fails the
     /// elapsed assertion.
     ///
-    /// ENV_LOCK is deliberately held across the awaits: the recall must not race the other
-    /// memory tests' store mutations, and the awaited tasks never acquire ENV_LOCK, so the
-    /// deadlock the lint guards against cannot occur (each test runs on its own runtime).
+    /// The process-wide env lock is deliberately held across the awaits: the recall must not
+    /// race the other modules' env/store mutations, and the awaited tasks never acquire the
+    /// env lock, so the deadlock the lint guards against cannot occur (each test runs on its
+    /// own runtime).
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn recall_async_keeps_reactor_free_while_embedder_mutex_is_held() {
-        // Serialize against the other memory tests and point DOTZ_CONFIG_DIR at a scratch dir
-        // so a first-to-run store init lands in temp, never in the operator's real memory.db
-        // (same idiom as async_wrappers_match_sync_results).
-        let _guard = ENV_LOCK
+        // Serialize on the process-wide env lock and point DOTZ_CONFIG_DIR at a scratch dir
+        // (the DB itself is pinned to the suite-stable dir by `suite_db_preinit`, so this
+        // only isolates the mirror-file paths, never the operator's real memory.db).
+        let _guard = crate::util::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Pin the process-static DB before rebinding DOTZ_CONFIG_DIR (see ensure_db_init).
+        ensure_db_init();
         let dir = std::env::temp_dir().join(format!("dotz-memory-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
@@ -1842,18 +1903,21 @@ mod tests {
     /// exactly what the sync cores return (compare ids/text — rerank's recency term shifts
     /// scores by nanoseconds between calls).
     ///
-    /// ENV_LOCK is deliberately held across the awaits: the store must stay unmutated for the
-    /// sync/async comparisons, and the awaited blocking tasks never acquire ENV_LOCK, so the
-    /// deadlock the lint guards against cannot occur (each test runs on its own runtime).
+    /// The process-wide env lock is deliberately held across the awaits: the store must stay
+    /// unmutated for the sync/async comparisons, and the awaited blocking tasks never acquire
+    /// the env lock, so the deadlock the lint guards against cannot occur (each test runs on
+    /// its own runtime).
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn async_wrappers_match_sync_results() {
-        // Serialize against the other memory tests (they mutate the shared store under ENV_LOCK)
-        // and point DOTZ_CONFIG_DIR at a scratch dir so a first-to-run store init lands in temp,
-        // never in the operator's real memory.db (same idiom as add_rejects_invalid_scope).
-        let _guard = ENV_LOCK
+        // Serialize on the process-wide env lock and point DOTZ_CONFIG_DIR at a scratch dir
+        // (the DB itself is pinned to the suite-stable dir by `suite_db_preinit`, so this
+        // only isolates the mirror-file paths, never the operator's real memory.db).
+        let _guard = crate::util::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Pin the process-static DB before rebinding DOTZ_CONFIG_DIR (see ensure_db_init).
+        ensure_db_init();
         let dir = std::env::temp_dir().join(format!("dotz-memory-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
@@ -1943,7 +2007,13 @@ mod tests {
     /// the load itself and surface the error rather than crashing the server task.
     #[test]
     fn warm_embedder_with_missing_model_does_not_panic() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        // Process-wide env lock (recover from poison so one panicking sibling cannot brick
+        // this test with a cascading PoisonError) + point DOTZ_MODELS at a missing dir.
+        // DOTZ_MODELS is also flipped by embed.rs tests and server tests, which take the
+        // same lock, so the precondition below cannot be yanked mid-test.
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev = std::env::var("DOTZ_MODELS").ok();
         let tmp = std::env::temp_dir().join(format!("dotz-warm-missing-{}", uuid::Uuid::new_v4()));
         // TODO: Audit that the environment access only happens in single-threaded code.

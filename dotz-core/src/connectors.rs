@@ -390,13 +390,13 @@ fn merge_status(mut base: Value, installed: bool, logged_in: bool, hint: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // Serialize tests that mutate DOTZ_CONFIG_DIR / connector env vars.
-    static LOCK: Mutex<()> = Mutex::new(());
-
+    // Serialize on the process-wide env lock: these tests flip DOTZ_CONFIG_DIR, which is also
+    // flipped by config::tests and many other modules under different locks.
     fn with_tmp_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir =
             std::env::temp_dir().join(format!("dotz-connectors-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();

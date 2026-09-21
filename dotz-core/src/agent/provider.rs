@@ -1013,9 +1013,12 @@ mod tests {
     /// real keys or env. Serialized so the env var + cache state don't race with other tests.
     #[test]
     fn resolve_api_key_falls_back_to_auth_json() {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap();
+        // Process-wide env lock (not a private static): DOTZ_PI_AGENT_DIR is also flipped by
+        // auth.rs tests and the server provider-key tests, and two tests mutating the same var
+        // under different locks still race. A per-test private lock only excludes itself.
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Unique var name + key value so this test is isolated from real env + other tests.
         let var = format!("DOTZ_TEST_FALLBACK_KEY_{}", uuid::Uuid::new_v4());
@@ -1073,9 +1076,10 @@ mod tests {
     /// silently overridden by a stale auth.json entry. Same isolation as the fallback test.
     #[test]
     fn resolve_api_key_env_takes_precedence_over_auth_json() {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap();
+        // Same process-wide env lock as the fallback test above (see comment there).
+        let _guard = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let var = format!("DOTZ_TEST_PRECEDENCE_KEY_{}", uuid::Uuid::new_v4());
         let env_val = format!("sk-from-env-{}", uuid::Uuid::new_v4());

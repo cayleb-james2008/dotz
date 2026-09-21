@@ -187,9 +187,9 @@ pub fn router() -> Router<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Process-wide env lock (not a module-local static): DOTZ_PI is also flipped by skills.rs
+    // tests and session.rs tests, and per-module locks do not exclude each other.
 
     struct PiDirGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -211,7 +211,7 @@ mod tests {
 
     /// Create an isolated `.pi/design-systems/<slug>/components.html` tree and point DOTZ_PI at it.
     fn with_tmp_design_systems() -> (PiDirGuard, std::path::PathBuf) {
-        let guard = ENV_LOCK
+        let guard = crate::util::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let pi = std::env::temp_dir().join(format!("dotz-design-test-{}", uuid::Uuid::new_v4()));

@@ -407,7 +407,7 @@ fn build_index() -> BTreeMap<String, Skill> {
 /// Build the skill index from a pre-collected set of roots. Splitting this out of `build_index`
 /// lets the parallel-vs-sequential test compare both scans over the *same* root snapshot, so a
 /// concurrent `DOTZ_PI`/`DOTZ_SKILLS_PATHS` mutation by another test can't make the two diverge
-/// and poison the shared `TEST_LOCK`. Production `build_index()` still resolves roots itself.
+/// and poison the shared env lock. Production `build_index()` still resolves roots itself.
 fn build_index_from(roots: Vec<(PathBuf, &'static str)>) -> BTreeMap<String, Skill> {
     // 1. Collect candidate files in priority order (low→high). The walk is fast; parsing isn't.
     let mut files: Vec<(PathBuf, &'static str)> = Vec::new();
@@ -597,20 +597,17 @@ pub fn router() -> Router<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::time::Instant;
 
-    /// Serialize tests that mutate the process-global `DOTZ_PI` / `DOTZ_SKILLS_PATHS` env vars
-    /// so concurrent index builds don't see each other's isolated directories. Recover from
-    /// poison (matching `index_guard`) so a single panicking sibling can't brick the group —
-    /// this is what kept the cascade going once `parallel_index_matches_sequential` panicked.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Acquire `TEST_LOCK`, surviving a poison left by a sibling test that panicked while holding
-    /// it. Poison is sticky on the mutex itself, so without recovery every later skills test
-    /// would fail with `PoisonError` even though they did nothing wrong.
+    /// Serialize on the process-wide env lock: these tests flip `DOTZ_PI` (also flipped by
+    /// design.rs and session.rs tests) and `DOTZ_SKILLS_PATHS`. Recover from poison (matching
+    /// `index_guard`) so a single panicking sibling can't brick the group — this is what kept
+    /// the cascade going once `parallel_index_matches_sequential` panicked.
+    ///
+    /// There is intentionally no module-local env lock: per-module locks do not exclude the
+    /// other modules flipping the same vars.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK
+        crate::util::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -653,7 +650,7 @@ mod tests {
         // Snapshot the env-controlled roots ONCE so the sequential reference and the parallel
         // build see the exact same root set. Without this, a concurrently-running test that
         // mutates DOTZ_PI/DOTZ_SKILLS_PATHS can flip the roots between the two scans, making them
-        // diverge and poisoning TEST_LOCK — flaking the whole skills test group in the full suite.
+        // diverge and poisoning the shared env lock — flaking the whole skills test group in the full suite.
         let roots = scan_roots();
         let t0 = Instant::now();
         let mut seq: BTreeMap<String, PathBuf> = BTreeMap::new();
@@ -765,9 +762,7 @@ mod tests {
     /// recovery, lookups, list, and reload keep working after a previous lock owner panicked.
     #[test]
     fn index_guard_recovers_from_poisoned_mutex() {
-        let _guard = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = test_lock();
         // Ensure the cache is initialized.
         drop(index().lock().unwrap());
 

@@ -577,16 +577,17 @@ mod tests {
         assert!(ids.contains(&"neon"), "neon missing: {ids:?}");
     }
 
-    // Serialize the DOTZ_CONFIG_DIR-mutating gateway tests. An async-aware mutex is used because
-    // the guard is held across `.await` points (a std MutexGuard across await can stall the
-    // executor and trips clippy::await_holding_lock under -D warnings).
-    static GW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// login for an UNKNOWN id (including the three CLI providers) must stay 501 — the safety
-    /// contract for github/vercel/neon is unchanged when no gateway connector is configured.
+    // Serialize the DOTZ_CONFIG_DIR-mutating gateway tests on the process-wide env lock:
+    // config::tests and several other modules flip the same var, and per-module locks do not
+    // exclude each other. The std guard is deliberately held across `.await` points (the
+    // awaited handlers never acquire the env lock; each test runs on its own runtime), so the
+    // deadlock the lint guards against cannot occur.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn login_unknown_provider_stays_501() {
-        let _g = GW_LOCK.lock().await;
+        let _g = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("dotz-conn-none-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let prev = std::env::var("DOTZ_CONFIG_DIR").ok();
@@ -612,12 +613,18 @@ mod tests {
     /// login for a configured GATEWAY connector with an api_key body must PUT the credentials to
     /// the gateway (`PUT /api/connections/<provider>`) and return 200 — credentials go to the
     /// gateway, never stored in dotz.
+    ///
+    /// Holds the process-wide env lock across the awaits (deliberate; same idiom as the test
+    /// above) because this test also flips DOTZ_CONFIG_DIR.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn login_gateway_connector_api_key_puts_to_gateway() {
         use axum::{Router as AxRouter, routing::put};
         use std::sync::{Arc, Mutex as SMutex};
 
-        let _g = GW_LOCK.lock().await;
+        let _g = crate::util::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Stub gateway capturing the PUT path + body.
         let captured: Arc<SMutex<(String, Value)>> =

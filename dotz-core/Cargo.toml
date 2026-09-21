@@ -52,6 +52,7 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 tokio-tungstenite = "0.29"
 criterion = { version = "0.5", features = ["html_reports"] }
+ctor = "0.8.0"
 
 # Cold-start benchmark: measures Embedder::load() (the dominant dotz cold-start cost — the ONNX
 # session + tokenizer bring-up that gates memory/recall). Black-box server-spawn was rejected as
