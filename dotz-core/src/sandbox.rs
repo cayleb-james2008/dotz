@@ -834,17 +834,17 @@ async fn detect_port_in_window(
     for port in scan_ports(&context) {
         if is_port_open(port).await {
             let mut store = runs_guard();
-            if let Some(e) = store.get_mut(id) {
-                if e.port.is_none() {
-                    e.port = Some(port);
-                    drop(store);
-                    let _ = tx.send(json!({
-                        "type": "sandbox_port",
-                        "runId": id,
-                        "port": port,
-                    }));
-                    return;
-                }
+            if let Some(e) = store.get_mut(id)
+                && e.port.is_none()
+            {
+                e.port = Some(port);
+                drop(store);
+                let _ = tx.send(json!({
+                    "type": "sandbox_port",
+                    "runId": id,
+                    "port": port,
+                }));
+                return;
             }
         }
     }
@@ -969,13 +969,13 @@ fn supersede_prior_web_runs(project_id: Option<&str>) -> Vec<String> {
             // No pid yet: mark it terminal + killed_by_us so the spawn path kills the
             // child as soon as it exists (mirrors kill_run_by_id's terminal bookkeeping).
             let mut store = runs_guard();
-            if let Some(e) = store.get_mut(id) {
-                if e.run.status == "running" {
-                    e.killed_by_us = true;
-                    e.run.status = "killed".to_string();
-                    e.run.ended_at = Some(crate::util::now_ms());
-                    e.run.output.push_str("\n[killed]\n");
-                }
+            if let Some(e) = store.get_mut(id)
+                && e.run.status == "running"
+            {
+                e.killed_by_us = true;
+                e.run.status = "killed".to_string();
+                e.run.ended_at = Some(crate::util::now_ms());
+                e.run.output.push_str("\n[killed]\n");
             }
         }
     }
@@ -1053,12 +1053,13 @@ fn scan_ports(text: &str) -> Vec<u16> {
             while let Some(pos) = search.find(pfx) {
                 let after = &search[pos + pfx.len()..];
                 let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(p) = digits.parse::<u32>() {
-                    if p > 1024 && p < 65536 {
-                        let p = p as u16;
-                        if !out.contains(&p) {
-                            out.push(p);
-                        }
+                if let Ok(p) = digits.parse::<u32>()
+                    && p > 1024
+                    && p < 65536
+                {
+                    let p = p as u16;
+                    if !out.contains(&p) {
+                        out.push(p);
                     }
                 }
                 search = &search[pos + pfx.len()..];
@@ -2568,16 +2569,12 @@ mod tests {
         while grandchild_pid.is_none() && tokio::time::Instant::now() < deadline {
             if let Ok(Ok(frame)) =
                 tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+                && frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_output")
+                && let Some(line) = frame.get("line").and_then(|l| l.as_str())
+                && let Some(rest) = line.strip_prefix("GRANDCHILD_PID=")
+                && let Ok(pid) = rest.trim().parse::<u32>()
             {
-                if frame.get("type").and_then(|t| t.as_str()) == Some("sandbox_output") {
-                    if let Some(line) = frame.get("line").and_then(|l| l.as_str()) {
-                        if let Some(rest) = line.strip_prefix("GRANDCHILD_PID=") {
-                            if let Ok(pid) = rest.trim().parse::<u32>() {
-                                grandchild_pid = Some(pid);
-                            }
-                        }
-                    }
-                }
+                grandchild_pid = Some(pid);
             }
         }
         let grandchild_pid = grandchild_pid

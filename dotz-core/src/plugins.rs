@@ -851,10 +851,10 @@ fn parse_json_scalar(v: &str) -> Option<Value> {
     if let Ok(n) = v.parse::<i64>() {
         return Some(Value::Number(n.into()));
     }
-    if let Ok(f) = v.parse::<f64>() {
-        if let Some(n) = serde_json::Number::from_f64(f) {
-            return Some(Value::Number(n));
-        }
+    if let Ok(f) = v.parse::<f64>()
+        && let Some(n) = serde_json::Number::from_f64(f)
+    {
+        return Some(Value::Number(n));
     }
     None
 }

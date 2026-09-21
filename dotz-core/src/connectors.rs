@@ -81,12 +81,11 @@ pub fn load_connectors() -> Vec<Connector> {
         return parse_registry(&raw, "connectors.json");
     }
     // Fallback: a `connectors` block inside config.json.
-    if let Ok(raw) = std::fs::read_to_string(crate::config::dotz_dir().join("config.json")) {
-        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-            if let Some(arr) = v.get("connectors") {
-                return from_array_value(arr.clone());
-            }
-        }
+    if let Ok(raw) = std::fs::read_to_string(crate::config::dotz_dir().join("config.json"))
+        && let Ok(v) = serde_json::from_str::<Value>(&raw)
+        && let Some(arr) = v.get("connectors")
+    {
+        return from_array_value(arr.clone());
     }
     Vec::new()
 }

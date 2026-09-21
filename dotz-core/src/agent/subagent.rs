@@ -322,17 +322,17 @@ impl SingleResult {
     /// The final assistant text output (last assistant message's text blocks).
     pub fn final_output(&self) -> String {
         for m in self.messages.iter().rev() {
-            if m.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                if let Some(blocks) = m.get("content").and_then(|c| c.as_array()) {
-                    let text: String = blocks
-                        .iter()
-                        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                        .collect::<Vec<_>>()
-                        .join("");
-                    if !text.is_empty() {
-                        return text;
-                    }
+            if m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                && let Some(blocks) = m.get("content").and_then(|c| c.as_array())
+            {
+                let text: String = blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !text.is_empty() {
+                    return text;
                 }
             }
         }
@@ -1007,11 +1007,10 @@ fn apply_delta(acc: &mut Acc, delta: StreamDelta, stop_reason: &mut String) {
         StreamDelta::ToolCallArgs { index, json: frag } => {
             if let Some(entry) = acc.tool_calls.get_mut(&index) {
                 entry.1.push_str(&frag);
-                if let Ok(parsed) = serde_json::from_str::<Value>(&entry.1) {
-                    if let ContentBlock::ToolCall { arguments, .. } = &mut acc.msg.content[entry.0]
-                    {
-                        *arguments = parsed;
-                    }
+                if let Ok(parsed) = serde_json::from_str::<Value>(&entry.1)
+                    && let ContentBlock::ToolCall { arguments, .. } = &mut acc.msg.content[entry.0]
+                {
+                    *arguments = parsed;
                 }
             }
         }

@@ -24,10 +24,10 @@ use std::sync::OnceLock;
 /// override (used by tests + the Tauri shell's `DOTZ_PI` resource resolution) so the test suite
 /// can point at a temp dir without touching the operator's real keys.
 fn auth_file() -> PathBuf {
-    if let Ok(d) = std::env::var("DOTZ_PI_AGENT_DIR") {
-        if !d.is_empty() {
-            return PathBuf::from(d).join("auth.json");
-        }
+    if let Ok(d) = std::env::var("DOTZ_PI_AGENT_DIR")
+        && !d.is_empty()
+    {
+        return PathBuf::from(d).join("auth.json");
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))

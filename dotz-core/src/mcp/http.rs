@@ -200,10 +200,10 @@ impl HttpTransport {
                         if data.is_empty() {
                             continue;
                         }
-                        if let Ok(v) = serde_json::from_str::<Value>(data) {
-                            if v.get("result").is_some() || v.get("error").is_some() {
-                                return Ok(v);
-                            }
+                        if let Ok(v) = serde_json::from_str::<Value>(data)
+                            && (v.get("result").is_some() || v.get("error").is_some())
+                        {
+                            return Ok(v);
                         }
                     }
                 }

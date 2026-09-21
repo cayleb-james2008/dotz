@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 /// Resolve `pantheon/leaderboard.html`. Override with `DOTZ_LEADERBOARD_HTML`; otherwise derive it
 /// from the build location: `<...>/projects/dotz/dotz-core` → `<...>/projects/pantheon/leaderboard.html`.
 fn leaderboard_path() -> PathBuf {
-    if let Ok(p) = std::env::var("DOTZ_LEADERBOARD_HTML") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
+    if let Ok(p) = std::env::var("DOTZ_LEADERBOARD_HTML")
+        && !p.trim().is_empty()
+    {
+        return PathBuf::from(p);
     }
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent() // .../projects/dotz

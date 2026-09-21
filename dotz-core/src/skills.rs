@@ -68,10 +68,10 @@ struct SkillView {
 /// (pointing at the `.pi` dir itself), else `<cwd>/.pi`, else the workspace root derived from
 /// this crate's manifest (used when tests run from the `dotz-core` package dir).
 pub fn pi_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("DOTZ_PI") {
-        if !d.is_empty() {
-            return PathBuf::from(d);
-        }
+    if let Ok(d) = std::env::var("DOTZ_PI")
+        && !d.is_empty()
+    {
+        return PathBuf::from(d);
     }
     let cwd_pi = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
@@ -430,10 +430,10 @@ fn build_index_from(roots: Vec<(PathBuf, &'static str)>) -> BTreeMap<String, Ski
             for (in_c, out_c) in files.chunks(chunk).zip(parsed.chunks_mut(chunk)) {
                 s.spawn(move || {
                     for (i, (file, source)) in in_c.iter().enumerate() {
-                        if let Some(skill) = parse_skill_file(file, source) {
-                            if platforms_ok(&skill) {
-                                out_c[i] = Some(skill);
-                            }
+                        if let Some(skill) = parse_skill_file(file, source)
+                            && platforms_ok(&skill)
+                        {
+                            out_c[i] = Some(skill);
                         }
                     }
                 });
@@ -656,10 +656,10 @@ mod tests {
         let mut seq: BTreeMap<String, PathBuf> = BTreeMap::new();
         for (dir, source) in &roots {
             for file in find_skill_files(dir) {
-                if let Some(s) = parse_skill_file(&file, source) {
-                    if platforms_ok(&s) {
-                        seq.insert(s.name.clone(), s.path.clone());
-                    }
+                if let Some(s) = parse_skill_file(&file, source)
+                    && platforms_ok(&s)
+                {
+                    seq.insert(s.name.clone(), s.path.clone());
                 }
             }
         }

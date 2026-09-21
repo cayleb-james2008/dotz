@@ -40,10 +40,10 @@ use std::time::{Duration, Instant};
 /// `DOTZ_SELF_EVAL_DIR`; defaults to `<dotz_dir>/ai-agents/self-eval`. An empty-but-set env
 /// var is treated as unset so a stray `DOTZ_SELF_EVAL_DIR=` doesn't point us at cwd.
 fn self_eval_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("DOTZ_SELF_EVAL_DIR") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
+    if let Ok(p) = std::env::var("DOTZ_SELF_EVAL_DIR")
+        && !p.trim().is_empty()
+    {
+        return PathBuf::from(p);
     }
     dotz_dir().join("ai-agents").join("self-eval")
 }
@@ -500,11 +500,11 @@ impl Harness {
         // Setup: seed starter files. A failed setup fails the task up front (the agent never
         // runs) — this surfaces a broken suite fixture instead of blaming the agent. Setup is
         // `Fn` so it can be invoked through the `&Task` we hold here.
-        if let Some(setup) = task.setup.as_ref() {
-            if let Err(e) = setup(&cwd_path) {
-                let _ = std::fs::remove_dir_all(&cwd);
-                return fail_case(task, format!("task setup failed: {e}"));
-            }
+        if let Some(setup) = task.setup.as_ref()
+            && let Err(e) = setup(&cwd_path)
+        {
+            let _ = std::fs::remove_dir_all(&cwd);
+            return fail_case(task, format!("task setup failed: {e}"));
         }
 
         // Drive the runner with a per-task timeout. A timeout is a failing case (not a panic).

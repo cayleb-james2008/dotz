@@ -243,20 +243,20 @@ pub fn git_diff_artifact(cwd: &str) -> Option<workflows::Artifact> {
     let mut content = String::new();
 
     // Unstaged changes (working tree vs index).
-    if let Ok((stdout, _, 0)) = git(cwd, &["diff"]) {
-        if !stdout.trim().is_empty() {
-            content.push_str(&stdout);
-        }
+    if let Ok((stdout, _, 0)) = git(cwd, &["diff"])
+        && !stdout.trim().is_empty()
+    {
+        content.push_str(&stdout);
     }
 
     // Staged changes (index vs HEAD).
-    if let Ok((stdout, _, 0)) = git(cwd, &["diff", "--cached"]) {
-        if !stdout.trim().is_empty() {
-            if !content.is_empty() {
-                content.push_str("\n--- staged changes ---\n");
-            }
-            content.push_str(&stdout);
+    if let Ok((stdout, _, 0)) = git(cwd, &["diff", "--cached"])
+        && !stdout.trim().is_empty()
+    {
+        if !content.is_empty() {
+            content.push_str("\n--- staged changes ---\n");
         }
+        content.push_str(&stdout);
     }
 
     if content.trim().is_empty() {
@@ -466,10 +466,10 @@ pub fn discard_checkpoint(run_id: &str) -> Result<(), CheckpointError> {
 /// cwd (if the run was created with a project_id); falls back to server cwd.
 fn cwd_for_run(run_id: &str) -> String {
     let project_id = crate::workflows::get_active(run_id).and_then(|r| r.project_id.clone());
-    if let Some(pid) = project_id {
-        if let Some(cwd) = crate::projects::cwd_for_project(Some(&pid)) {
-            return cwd;
-        }
+    if let Some(pid) = project_id
+        && let Some(cwd) = crate::projects::cwd_for_project(Some(&pid))
+    {
+        return cwd;
     }
     std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))

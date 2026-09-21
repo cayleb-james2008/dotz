@@ -52,10 +52,10 @@ impl Budget {
     pub fn fraction_used(&self, cost: f64, input_tokens: u64, output_tokens: u64) -> f64 {
         let total = input_tokens.saturating_add(output_tokens);
         let mut max_ratio = 0.0_f64;
-        if let Some(max_cost) = self.max_cost {
-            if max_cost > 0.0 {
-                max_ratio = max_ratio.max(cost / max_cost);
-            }
+        if let Some(max_cost) = self.max_cost
+            && max_cost > 0.0
+        {
+            max_ratio = max_ratio.max(cost / max_cost);
         }
         if let Some(max_tokens) = self.max_tokens {
             // Guard against the degenerate max_tokens == 0 config.
@@ -63,10 +63,10 @@ impl Budget {
                 max_ratio = max_ratio.max(total as f64 / max_tokens as f64);
             }
         }
-        if let Some(max_input_tokens) = self.max_input_tokens {
-            if max_input_tokens > 0 {
-                max_ratio = max_ratio.max(input_tokens as f64 / max_input_tokens as f64);
-            }
+        if let Some(max_input_tokens) = self.max_input_tokens
+            && max_input_tokens > 0
+        {
+            max_ratio = max_ratio.max(input_tokens as f64 / max_input_tokens as f64);
         }
         max_ratio
     }
@@ -367,10 +367,10 @@ pub fn render_low_cost_models() -> String {
 /// case-insensitively so "Ollama/glm-5.2" under provider "ollama" is normalized too.
 pub fn strip_matching_provider_prefix(provider: &str, model_id: &str) -> String {
     let trimmed = model_id.trim();
-    if let Some(slash) = trimmed.find('/') {
-        if trimmed[..slash].eq_ignore_ascii_case(provider) {
-            return trimmed[slash + 1..].to_string();
-        }
+    if let Some(slash) = trimmed.find('/')
+        && trimmed[..slash].eq_ignore_ascii_case(provider)
+    {
+        return trimmed[slash + 1..].to_string();
     }
     trimmed.to_string()
 }

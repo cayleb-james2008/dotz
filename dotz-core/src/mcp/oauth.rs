@@ -332,10 +332,10 @@ pub async fn dynamic_client_register(
 /// derive from `authorization_url` by replacing `/authorize` (case-insensitive) with
 /// `/device_authorization`. If no derivation is possible, return an error.
 fn derive_device_auth_url(oauth: &OauthConfig) -> Result<String, McpOauthError> {
-    if let Some(u) = oauth.device_authorization_url.as_deref() {
-        if !u.trim().is_empty() {
-            return Ok(u.to_string());
-        }
+    if let Some(u) = oauth.device_authorization_url.as_deref()
+        && !u.trim().is_empty()
+    {
+        return Ok(u.to_string());
     }
     let auth = oauth
         .authorization_url

@@ -192,7 +192,9 @@ fn enc_emb(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 fn dec_emb(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
+    b.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -1013,10 +1015,11 @@ async fn post_memory(
         _ => return Err(bad("text (or value) is required")),
     };
     for k in ["category", "folder"] {
-        if let Some(v) = b.get(k) {
-            if !v.is_null() && !v.is_string() {
-                return Err(bad(&format!("{k} must be a string")));
-            }
+        if let Some(v) = b.get(k)
+            && !v.is_null()
+            && !v.is_string()
+        {
+            return Err(bad(&format!("{k} must be a string")));
         }
     }
     if let Some(s) = b.get("scope") {
@@ -1102,10 +1105,11 @@ async fn search_memory(
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let b = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
-    if let Some(qv) = b.get("query") {
-        if !qv.is_null() && !qv.is_string() {
-            return Err(bad("query must be a string"));
-        }
+    if let Some(qv) = b.get("query")
+        && !qv.is_null()
+        && !qv.is_string()
+    {
+        return Err(bad("query must be a string"));
     }
     let num = |key: &str| -> Result<Option<f64>, ()> {
         match b.get(key) {

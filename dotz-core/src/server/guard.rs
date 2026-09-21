@@ -124,15 +124,15 @@ fn forbidden(reason: &str) -> Response {
 pub async fn origin_guard(req: Request, next: Next) -> Response {
     let headers = req.headers();
 
-    if let Some(host) = headers.get(HOST).and_then(|v| v.to_str().ok()) {
-        if !host_allowed(host) {
-            return forbidden("host not allowed");
-        }
+    if let Some(host) = headers.get(HOST).and_then(|v| v.to_str().ok())
+        && !host_allowed(host)
+    {
+        return forbidden("host not allowed");
     }
-    if let Some(origin) = headers.get(ORIGIN).and_then(|v| v.to_str().ok()) {
-        if !origin_allowed(origin) {
-            return forbidden("cross-origin request rejected");
-        }
+    if let Some(origin) = headers.get(ORIGIN).and_then(|v| v.to_str().ok())
+        && !origin_allowed(origin)
+    {
+        return forbidden("cross-origin request rejected");
     }
 
     next.run(req).await
@@ -215,18 +215,18 @@ fn unauthorized() -> Response {
 /// layers are distinguishable in logs and tests. With `required = None` this is a no-op
 /// pass-through, keeping the token-less `app()`/serve paths byte-identical in behavior.
 pub async fn token_guard(required: Option<String>, req: Request, next: Next) -> Response {
-    if let Some(required) = required.as_deref() {
-        if path_requires_token(req.uri().path()) {
-            let header = req
-                .headers()
-                .get(TOKEN_HEADER)
-                .and_then(|v| v.to_str().ok());
-            let query = req.uri().query().and_then(query_token);
-            // Accept EITHER carrier: a stale/wrong header must not veto a correct ?token=.
-            let ok = token_ok(Some(required), header) || token_ok(Some(required), query);
-            if !ok {
-                return unauthorized();
-            }
+    if let Some(required) = required.as_deref()
+        && path_requires_token(req.uri().path())
+    {
+        let header = req
+            .headers()
+            .get(TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let query = req.uri().query().and_then(query_token);
+        // Accept EITHER carrier: a stale/wrong header must not veto a correct ?token=.
+        let ok = token_ok(Some(required), header) || token_ok(Some(required), query);
+        if !ok {
+            return unauthorized();
         }
     }
     next.run(req).await

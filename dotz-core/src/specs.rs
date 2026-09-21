@@ -296,10 +296,10 @@ pub fn list_changes(cwd: &FsPath) -> Vec<SpecChange> {
     if let Ok(entries) = std::fs::read_dir(&root) {
         for ent in entries.flatten() {
             let path = ent.path();
-            if path.is_dir() {
-                if let Some(change) = materialize_change(cwd, &path, false) {
-                    out.push(change);
-                }
+            if path.is_dir()
+                && let Some(change) = materialize_change(cwd, &path, false)
+            {
+                out.push(change);
             }
         }
     }
@@ -307,10 +307,10 @@ pub fn list_changes(cwd: &FsPath) -> Vec<SpecChange> {
     if let Ok(entries) = std::fs::read_dir(&archive_root) {
         for ent in entries.flatten() {
             let path = ent.path();
-            if path.is_dir() {
-                if let Some(change) = materialize_change(cwd, &path, true) {
-                    out.push(change);
-                }
+            if path.is_dir()
+                && let Some(change) = materialize_change(cwd, &path, true)
+            {
+                out.push(change);
             }
         }
     }

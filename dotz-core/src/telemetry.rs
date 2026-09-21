@@ -80,10 +80,10 @@ impl Default for TelemetryConfig {
 fn dotz_dir() -> PathBuf {
     // Mirrors config::dotz_dir so telemetry honors the same DOTZ_CONFIG_DIR
     // override the rest of dotz uses for test isolation + portable installs.
-    if let Ok(d) = std::env::var("DOTZ_CONFIG_DIR") {
-        if !d.is_empty() {
-            return PathBuf::from(d);
-        }
+    if let Ok(d) = std::env::var("DOTZ_CONFIG_DIR")
+        && !d.is_empty()
+    {
+        return PathBuf::from(d);
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -216,14 +216,12 @@ pub async fn enable_with_working_endpoint(local_port: u16) -> TelemetryConfig {
 /// restarts (lets the ledger count distinct installs). Never panics; a corrupt
 /// id file is replaced with a fresh UUID.
 fn get_or_create_session_id() -> String {
-    if let Ok(raw) = std::fs::read_to_string(id_file()) {
-        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-            if let Some(id) = v.get("session_id").and_then(|x| x.as_str()) {
-                if !id.trim().is_empty() {
-                    return id.to_string();
-                }
-            }
-        }
+    if let Ok(raw) = std::fs::read_to_string(id_file())
+        && let Ok(v) = serde_json::from_str::<Value>(&raw)
+        && let Some(id) = v.get("session_id").and_then(|x| x.as_str())
+        && !id.trim().is_empty()
+    {
+        return id.to_string();
     }
     // First launch, corrupt id file, or empty id — mint a fresh one and
     // persist best-effort. A failure to persist is non-fatal: the id is still
@@ -1354,11 +1352,11 @@ mod tests {
                 let sink = dir.join("telemetry_sink.jsonl");
                 let mut got = String::new();
                 for _ in 0..40 {
-                    if let Ok(raw) = std::fs::read_to_string(&sink) {
-                        if !raw.trim().is_empty() {
-                            got = raw;
-                            break;
-                        }
+                    if let Ok(raw) = std::fs::read_to_string(&sink)
+                        && !raw.trim().is_empty()
+                    {
+                        got = raw;
+                        break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
@@ -1449,11 +1447,11 @@ mod tests {
                 record_daily_active().await;
                 let mut got = String::new();
                 for _ in 0..40 {
-                    if let Ok(raw) = std::fs::read_to_string(&sink) {
-                        if !raw.trim().is_empty() {
-                            got = raw;
-                            break;
-                        }
+                    if let Ok(raw) = std::fs::read_to_string(&sink)
+                        && !raw.trim().is_empty()
+                    {
+                        got = raw;
+                        break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }

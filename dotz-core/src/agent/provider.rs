@@ -84,10 +84,10 @@ pub trait Provider: Send + Sync {
 pub fn resolve_api_key(reference: &str) -> String {
     let r = reference.trim();
     if let Some(var) = r.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                return v;
-            }
+        if let Ok(v) = std::env::var(var)
+            && !v.is_empty()
+        {
+            return v;
         }
         // Env var missing/empty → fall back to auth.json (keyed by the same var name).
         if let Some(key) = crate::auth::lookup_key(var) {
@@ -96,10 +96,10 @@ pub fn resolve_api_key(reference: &str) -> String {
         return String::new();
     }
     if let Some(var) = r.strip_prefix('$') {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                return v;
-            }
+        if let Ok(v) = std::env::var(var)
+            && !v.is_empty()
+        {
+            return v;
         }
         if let Some(key) = crate::auth::lookup_key(var) {
             return key;
@@ -474,16 +474,16 @@ impl Provider for OpenAiChat {
                 if !r.is_empty() {
                     let _ = tx.send(StreamDelta::Thinking(r.to_string())).await;
                 }
-            } else if let Some(r) = delta.get("reasoning").and_then(|x| x.as_str()) {
-                if !r.is_empty() {
-                    let _ = tx.send(StreamDelta::Thinking(r.to_string())).await;
-                }
+            } else if let Some(r) = delta.get("reasoning").and_then(|x| x.as_str())
+                && !r.is_empty()
+            {
+                let _ = tx.send(StreamDelta::Thinking(r.to_string())).await;
             }
 
-            if let Some(c) = delta.get("content").and_then(|x| x.as_str()) {
-                if !c.is_empty() {
-                    let _ = tx.send(StreamDelta::Text(c.to_string())).await;
-                }
+            if let Some(c) = delta.get("content").and_then(|x| x.as_str())
+                && !c.is_empty()
+            {
+                let _ = tx.send(StreamDelta::Text(c.to_string())).await;
             }
 
             // Tool calls (function calling). Each chunk carries a partial arg-fragment per index.
@@ -502,36 +502,36 @@ impl Provider for OpenAiChat {
                     }
                     let func = tc.get("function");
                     let name = func.and_then(|f| f.get("name")).and_then(|n| n.as_str());
-                    if let Some(name) = name {
-                        if !name.is_empty() && tool_call_started.insert(index) {
-                            let id = tool_call_ids
-                                .get(&index)
-                                .cloned()
-                                .or_else(|| {
-                                    tc.get("id").and_then(|i| i.as_str()).map(|s| s.to_string())
-                                })
-                                .unwrap_or_else(|| format!("call_{index}"));
-                            let _ = tx
-                                .send(StreamDelta::ToolCallStart {
-                                    index,
-                                    id,
-                                    name: name.to_string(),
-                                })
-                                .await;
-                        }
+                    if let Some(name) = name
+                        && !name.is_empty()
+                        && tool_call_started.insert(index)
+                    {
+                        let id = tool_call_ids
+                            .get(&index)
+                            .cloned()
+                            .or_else(|| {
+                                tc.get("id").and_then(|i| i.as_str()).map(|s| s.to_string())
+                            })
+                            .unwrap_or_else(|| format!("call_{index}"));
+                        let _ = tx
+                            .send(StreamDelta::ToolCallStart {
+                                index,
+                                id,
+                                name: name.to_string(),
+                            })
+                            .await;
                     }
                     if let Some(args) = func
                         .and_then(|f| f.get("arguments"))
                         .and_then(|a| a.as_str())
+                        && !args.is_empty()
                     {
-                        if !args.is_empty() {
-                            let _ = tx
-                                .send(StreamDelta::ToolCallArgs {
-                                    index,
-                                    json: args.to_string(),
-                                })
-                                .await;
-                        }
+                        let _ = tx
+                            .send(StreamDelta::ToolCallArgs {
+                                index,
+                                json: args.to_string(),
+                            })
+                            .await;
                     }
                 }
             }

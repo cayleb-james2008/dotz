@@ -50,15 +50,15 @@ pub fn warm() {
 /// <workspace>/assets/models derived from the crate manifest dir. The manifest fallback makes
 /// tests and binaries runnable from the `dotz-core` crate dir as well as the workspace root.
 fn models_root() -> PathBuf {
-    if let Ok(d) = std::env::var("DOTZ_MODELS") {
-        if !d.is_empty() {
-            return PathBuf::from(d);
-        }
+    if let Ok(d) = std::env::var("DOTZ_MODELS")
+        && !d.is_empty()
+    {
+        return PathBuf::from(d);
     }
-    if let Ok(d) = std::env::var("DOTZ_ASSETS") {
-        if !d.is_empty() {
-            return PathBuf::from(d).join("models");
-        }
+    if let Ok(d) = std::env::var("DOTZ_ASSETS")
+        && !d.is_empty()
+    {
+        return PathBuf::from(d).join("models");
     }
     // Cargo sets CARGO_MANIFEST_DIR to the crate root (dotz-core). Fall back to the workspace
     // root (one level up) so tests/binaries work regardless of the current working directory.

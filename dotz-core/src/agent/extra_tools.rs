@@ -260,20 +260,19 @@ fn cargo_package_name(cargo_toml: &str) -> Option<String> {
             in_package = trimmed == "[package]";
             continue;
         }
-        if in_package {
-            if let Some((key, value)) = trimmed.split_once('=') {
-                if key.trim() == "name" {
-                    let mut v = value.trim();
-                    // Strip a trailing TOML comment so `name = "foo" # comment` does not leak
-                    // the comment into the gate command.
-                    if let Some(idx) = v.find('#') {
-                        v = &v[..idx];
-                    }
-                    let v = v.trim().trim_matches(|c| c == '\"' || c == '\'');
-                    if !v.is_empty() {
-                        return Some(v.to_string());
-                    }
-                }
+        if in_package
+            && let Some((key, value)) = trimmed.split_once('=')
+            && key.trim() == "name"
+        {
+            let mut v = value.trim();
+            // Strip a trailing TOML comment so `name = "foo" # comment` does not leak
+            // the comment into the gate command.
+            if let Some(idx) = v.find('#') {
+                v = &v[..idx];
+            }
+            let v = v.trim().trim_matches(|c| c == '\"' || c == '\'');
+            if !v.is_empty() {
+                return Some(v.to_string());
             }
         }
     }
@@ -508,10 +507,10 @@ fn parse_counts(text: &str) -> (i64, i64) {
                     while j > 0 && l.as_bytes()[j - 1].is_ascii_digit() {
                         j -= 1;
                     }
-                    if j < i {
-                        if let Ok(v) = l[j..i].parse::<i64>() {
-                            return v;
-                        }
+                    if j < i
+                        && let Ok(v) = l[j..i].parse::<i64>()
+                    {
+                        return v;
                     }
                     // Number immediately after the keyword (node:test "# pass N" / "# fail N").
                     let mut k = after_idx;
@@ -522,10 +521,10 @@ fn parse_counts(text: &str) -> (i64, i64) {
                     while m < l.len() && l.as_bytes()[m].is_ascii_digit() {
                         m += 1;
                     }
-                    if m > k {
-                        if let Ok(v) = l[k..m].parse::<i64>() {
-                            return v;
-                        }
+                    if m > k
+                        && let Ok(v) = l[k..m].parse::<i64>()
+                    {
+                        return v;
                     }
                 }
                 search_from = idx + 1;

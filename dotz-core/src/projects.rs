@@ -79,10 +79,10 @@ pub fn find(id: &str) -> Option<Project> {
 }
 
 fn projects_file() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("DOTZ_PROJECTS_FILE") {
-        if !p.trim().is_empty() {
-            return std::path::PathBuf::from(p);
-        }
+    if let Ok(p) = std::env::var("DOTZ_PROJECTS_FILE")
+        && !p.trim().is_empty()
+    {
+        return std::path::PathBuf::from(p);
     }
     crate::config::dotz_dir().join("projects.json")
 }
@@ -287,22 +287,22 @@ async fn create_project(
     // The remaining optional fields must be strings if present. A present-but-non-string value
     // (incl. null, which is `!== undefined` && `typeof !== "string"` in JS) 400s.
     for k in ["profileId", "thinkingLevel", "appUrl", "gateCommand"] {
-        if let Some(v) = body.get(k) {
-            if !v.is_string() {
-                return Err(bad(format!("{k} must be a string")));
-            }
+        if let Some(v) = body.get(k)
+            && !v.is_string()
+        {
+            return Err(bad(format!("{k} must be a string")));
         }
     }
 
     // thinkingLevel value check (after the string-type check, matching server.ts).
     let thinking_input = body.get("thinkingLevel").and_then(|v| v.as_str());
-    if let Some(t) = thinking_input {
-        if !types::is_valid_thinking(t) {
-            return Err(bad(format!(
-                "thinkingLevel must be one of: {}",
-                types::THINKING_LEVELS.join(", ")
-            )));
-        }
+    if let Some(t) = thinking_input
+        && !types::is_valid_thinking(t)
+    {
+        return Err(bad(format!(
+            "thinkingLevel must be one of: {}",
+            types::THINKING_LEVELS.join(", ")
+        )));
     }
 
     if let Some(err) = validate_cwd(&cwd) {
@@ -421,17 +421,17 @@ async fn patch_project(
                 t
             }
         });
-        if let Some(ref id) = new_profile_id {
-            if !profiles::is_valid(id) {
-                return Err(bad(format!(
-                    "profileId must be one of: {}",
-                    profiles::summaries()
-                        .iter()
-                        .map(|s| s.id)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
+        if let Some(ref id) = new_profile_id
+            && !profiles::is_valid(id)
+        {
+            return Err(bad(format!(
+                "profileId must be one of: {}",
+                profiles::summaries()
+                    .iter()
+                    .map(|s| s.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
     }
     if let Some(v) = raw.get("model") {

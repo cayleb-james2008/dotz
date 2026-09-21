@@ -222,10 +222,10 @@ fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
             }
             "assistant" => {
                 let mut parts: Vec<Value> = Vec::new();
-                if let Some(t) = m.get("content").and_then(|c| c.as_str()) {
-                    if !t.is_empty() {
-                        parts.push(json!({ "text": t }));
-                    }
+                if let Some(t) = m.get("content").and_then(|c| c.as_str())
+                    && !t.is_empty()
+                {
+                    parts.push(json!({ "text": t }));
                 }
                 if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
                     for tc in tcs {
@@ -282,13 +282,12 @@ fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
 /// otherwise produce N consecutive "user" turns, which Gemini rejects. This mirrors the
 /// consecutive-role merge the Anthropic adapter already does.
 fn merge_or_push(out: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
-    if let Some(last) = out.last_mut() {
-        if last.get("role").and_then(|r| r.as_str()) == Some(role) {
-            if let Some(existing) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
-                existing.extend(parts);
-                return;
-            }
-        }
+    if let Some(last) = out.last_mut()
+        && last.get("role").and_then(|r| r.as_str()) == Some(role)
+        && let Some(existing) = last.get_mut("parts").and_then(|p| p.as_array_mut())
+    {
+        existing.extend(parts);
+        return;
     }
     out.push(json!({ "role": role, "parts": parts }));
 }

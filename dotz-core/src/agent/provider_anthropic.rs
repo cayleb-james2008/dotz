@@ -162,20 +162,18 @@ impl Provider for AnthropicMessages {
                         "text" => {
                             if let Some(t) =
                                 block.and_then(|b| b.get("text")).and_then(|x| x.as_str())
+                                && !t.is_empty()
                             {
-                                if !t.is_empty() {
-                                    let _ = tx.send(StreamDelta::Text(t.to_string())).await;
-                                }
+                                let _ = tx.send(StreamDelta::Text(t.to_string())).await;
                             }
                         }
                         "thinking" => {
                             if let Some(t) = block
                                 .and_then(|b| b.get("thinking"))
                                 .and_then(|x| x.as_str())
+                                && !t.is_empty()
                             {
-                                if !t.is_empty() {
-                                    let _ = tx.send(StreamDelta::Thinking(t.to_string())).await;
-                                }
+                                let _ = tx.send(StreamDelta::Thinking(t.to_string())).await;
                             }
                         }
                         _ => {}
@@ -192,45 +190,42 @@ impl Provider for AnthropicMessages {
                         "text_delta" => {
                             if let Some(t) =
                                 delta.and_then(|d| d.get("text")).and_then(|x| x.as_str())
+                                && !t.is_empty()
                             {
-                                if !t.is_empty() {
-                                    let _ = tx.send(StreamDelta::Text(t.to_string())).await;
-                                }
+                                let _ = tx.send(StreamDelta::Text(t.to_string())).await;
                             }
                         }
                         "thinking_delta" => {
                             if let Some(t) = delta
                                 .and_then(|d| d.get("thinking"))
                                 .and_then(|x| x.as_str())
+                                && !t.is_empty()
                             {
-                                if !t.is_empty() {
-                                    let _ = tx.send(StreamDelta::Thinking(t.to_string())).await;
-                                }
+                                let _ = tx.send(StreamDelta::Thinking(t.to_string())).await;
                             }
                         }
                         "input_json_delta" => {
                             if let Some(j) = delta
                                 .and_then(|d| d.get("partial_json"))
                                 .and_then(|x| x.as_str())
+                                && !j.is_empty()
                             {
-                                if !j.is_empty() {
-                                    let _ = tx
-                                        .send(StreamDelta::ToolCallArgs {
-                                            index,
-                                            json: j.to_string(),
-                                        })
-                                        .await;
-                                }
+                                let _ = tx
+                                    .send(StreamDelta::ToolCallArgs {
+                                        index,
+                                        json: j.to_string(),
+                                    })
+                                    .await;
                             }
                         }
                         _ => {}
                     }
                 }
                 "message_delta" => {
-                    if let Some(u) = v.get("usage") {
-                        if let Some(o) = u.get("output_tokens").and_then(|x| x.as_u64()) {
-                            output_tokens = o;
-                        }
+                    if let Some(u) = v.get("usage")
+                        && let Some(o) = u.get("output_tokens").and_then(|x| x.as_u64())
+                    {
+                        output_tokens = o;
                     }
                     if let Some(sr) = v
                         .get("delta")
@@ -303,10 +298,10 @@ fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
                 blocks.push(json!({ "type": "text", "text": text }));
             }
             "assistant" => {
-                if let Some(t) = m.get("content").and_then(|c| c.as_str()) {
-                    if !t.is_empty() {
-                        blocks.push(json!({ "type": "text", "text": t }));
-                    }
+                if let Some(t) = m.get("content").and_then(|c| c.as_str())
+                    && !t.is_empty()
+                {
+                    blocks.push(json!({ "type": "text", "text": t }));
                 }
                 if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
                     for tc in tcs {
@@ -350,13 +345,12 @@ fn convert_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
         // Merge consecutive turns that map to the same Anthropic role. Without this, a single
         // assistant tool_calls turn followed by N tool results would produce N consecutive user
         // turns, which Anthropic rejects.
-        if let Some(last) = out.last_mut() {
-            if last.get("role").and_then(|r| r.as_str()) == Some(anthropic_role) {
-                if let Some(content) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
-                    content.extend(blocks);
-                    continue;
-                }
-            }
+        if let Some(last) = out.last_mut()
+            && last.get("role").and_then(|r| r.as_str()) == Some(anthropic_role)
+            && let Some(content) = last.get_mut("content").and_then(|c| c.as_array_mut())
+        {
+            content.extend(blocks);
+            continue;
         }
         out.push(json!({ "role": anthropic_role, "content": blocks }));
     }

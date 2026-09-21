@@ -83,22 +83,22 @@ fn tool_calls_from_messages(messages: &[serde_json::Value]) -> Vec<workflows::To
     // tool-call id → joined result text (from `{"role":"tool",...}` messages).
     let mut results: HashMap<String, String> = HashMap::new();
     for m in messages {
-        if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
-            if let Some(id) = m.get("toolCallId").and_then(|v| v.as_str()) {
-                if m.get("isError").and_then(|e| e.as_bool()) == Some(true) {
-                    errored.insert(id.to_string());
-                }
-                if let Some(content) = m.get("content").and_then(|c| c.as_array()) {
-                    let entry = results.entry(id.to_string()).or_default();
-                    for b in content {
-                        if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                                if !entry.is_empty() {
-                                    entry.push('\n');
-                                }
-                                entry.push_str(t);
-                            }
+        if m.get("role").and_then(|r| r.as_str()) == Some("tool")
+            && let Some(id) = m.get("toolCallId").and_then(|v| v.as_str())
+        {
+            if m.get("isError").and_then(|e| e.as_bool()) == Some(true) {
+                errored.insert(id.to_string());
+            }
+            if let Some(content) = m.get("content").and_then(|c| c.as_array()) {
+                let entry = results.entry(id.to_string()).or_default();
+                for b in content {
+                    if b.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(t) = b.get("text").and_then(|t| t.as_str())
+                    {
+                        if !entry.is_empty() {
+                            entry.push('\n');
                         }
+                        entry.push_str(t);
                     }
                 }
             }
@@ -163,17 +163,17 @@ fn thinking_from_messages(messages: &[serde_json::Value]) -> Option<String> {
         for b in content {
             match b.get("type").and_then(|t| t.as_str()) {
                 Some("thinking") => {
-                    if let Some(t) = b.get("thinking").and_then(|t| t.as_str()) {
-                        if !t.trim().is_empty() {
-                            thinking_parts.push(t.to_string());
-                        }
+                    if let Some(t) = b.get("thinking").and_then(|t| t.as_str())
+                        && !t.trim().is_empty()
+                    {
+                        thinking_parts.push(t.to_string());
                     }
                 }
                 Some("text") => {
-                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                        if !t.trim().is_empty() {
-                            text_parts.push(t.to_string());
-                        }
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str())
+                        && !t.trim().is_empty()
+                    {
+                        text_parts.push(t.to_string());
                     }
                 }
                 _ => {}
@@ -313,57 +313,57 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
 
         // Budget check: if cumulative spend exceeds the run budget, skip all ready
         // steps and abort the run.
-        if let Some(ref budget) = run.budget {
-            if !budget.is_unbounded() {
-                // Headroom signal: emit a near-limit warning once when cumulative
-                // spend crosses 80% of the most-consumed budget dimension. This is
-                // the prerequisite for the intended downgrade-before-abort behavior
-                // — the runtime can only hard-abort at 100%, so the operator (and a
-                // future auto-downgrade path) needs an earlier signal to act while
-                // there is still headroom. `fraction_used` returns 0.0 when
-                // unbounded, but we already gated on `!is_unbounded()` above.
-                let fraction = budget.fraction_used(
-                    cumulative_cost,
-                    cumulative_input_tokens,
-                    cumulative_output_tokens,
+        if let Some(ref budget) = run.budget
+            && !budget.is_unbounded()
+        {
+            // Headroom signal: emit a near-limit warning once when cumulative
+            // spend crosses 80% of the most-consumed budget dimension. This is
+            // the prerequisite for the intended downgrade-before-abort behavior
+            // — the runtime can only hard-abort at 100%, so the operator (and a
+            // future auto-downgrade path) needs an earlier signal to act while
+            // there is still headroom. `fraction_used` returns 0.0 when
+            // unbounded, but we already gated on `!is_unbounded()` above.
+            let fraction = budget.fraction_used(
+                cumulative_cost,
+                cumulative_input_tokens,
+                cumulative_output_tokens,
+            );
+            if !budget_near_limit_warned && fraction >= 0.8 {
+                budget_near_limit_warned = true;
+                workflows::emit_event(
+                    run_id,
+                    serde_json::json!({
+                        "type": "budget_near_limit",
+                        "fractionUsed": fraction,
+                        "cost": cumulative_cost,
+                        "inputTokens": cumulative_input_tokens,
+                        "outputTokens": cumulative_output_tokens,
+                        "budget": serde_json::to_value(budget)
+                            .unwrap_or(serde_json::Value::Null),
+                    }),
                 );
-                if !budget_near_limit_warned && fraction >= 0.8 {
-                    budget_near_limit_warned = true;
-                    workflows::emit_event(
+            }
+
+            if budget.is_exceeded(
+                cumulative_cost,
+                cumulative_input_tokens,
+                cumulative_output_tokens,
+            ) {
+                // Skip every ready step and abort the run.
+                for step in &ready_steps {
+                    let _ = workflows::step_state(
                         run_id,
-                        serde_json::json!({
-                            "type": "budget_near_limit",
-                            "fractionUsed": fraction,
-                            "cost": cumulative_cost,
-                            "inputTokens": cumulative_input_tokens,
-                            "outputTokens": cumulative_output_tokens,
-                            "budget": serde_json::to_value(budget)
-                                .unwrap_or(serde_json::Value::Null),
-                        }),
+                        &step.id,
+                        workflows::StepPatch {
+                            status: Some("skipped".into()),
+                            error: Some("run budget exceeded".into()),
+                            ..Default::default()
+                        },
                     );
                 }
-
-                if budget.is_exceeded(
-                    cumulative_cost,
-                    cumulative_input_tokens,
-                    cumulative_output_tokens,
-                ) {
-                    // Skip every ready step and abort the run.
-                    for step in &ready_steps {
-                        let _ = workflows::step_state(
-                            run_id,
-                            &step.id,
-                            workflows::StepPatch {
-                                status: Some("skipped".into()),
-                                error: Some("run budget exceeded".into()),
-                                ..Default::default()
-                            },
-                        );
-                    }
-                    // Mark the run aborted.
-                    workflows::abort(run_id);
-                    return workflows::get_active(run_id);
-                }
+                // Mark the run aborted.
+                workflows::abort(run_id);
+                return workflows::get_active(run_id);
             }
         }
 
@@ -562,18 +562,18 @@ pub async fn run_workflow(run_id: &str) -> Option<workflows::WorkflowRun> {
                 if terminal && !recorded.contains(&step.id) {
                     run_record::capture_step(run_id, &step.id, None);
                 }
-                if step.status == "done" || step.status == "error" {
-                    if let Some(ref out) = step.output {
-                        bus.write(
-                            &format!("step:{}:output", step.id),
-                            serde_json::Value::String(out.clone()),
-                        );
-                        let summary = out.lines().next().unwrap_or("").to_string();
-                        bus.write(
-                            &format!("step:{}:summary", step.id),
-                            serde_json::Value::String(summary),
-                        );
-                    }
+                if (step.status == "done" || step.status == "error")
+                    && let Some(ref out) = step.output
+                {
+                    bus.write(
+                        &format!("step:{}:output", step.id),
+                        serde_json::Value::String(out.clone()),
+                    );
+                    let summary = out.lines().next().unwrap_or("").to_string();
+                    bus.write(
+                        &format!("step:{}:summary", step.id),
+                        serde_json::Value::String(summary),
+                    );
                 }
             }
         }

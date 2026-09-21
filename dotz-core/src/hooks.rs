@@ -459,10 +459,10 @@ async fn run_agent_handler(hook: &HookConfig, payload: &Value) -> Result<HookOut
 /// payload (same `{{key}}` substitution as the `prompt` handler); otherwise the full payload
 /// JSON is the task (so the spawned agent sees the full context).
 fn render_agent_task(hook: &HookConfig, payload: &Value) -> String {
-    if let Some(tmpl) = hook.template.as_deref() {
-        if !tmpl.trim().is_empty() {
-            return substitute_template(tmpl, payload);
-        }
+    if let Some(tmpl) = hook.template.as_deref()
+        && !tmpl.trim().is_empty()
+    {
+        return substitute_template(tmpl, payload);
     }
     serde_json::to_string_pretty(payload).unwrap_or_else(|_| "{}".into())
 }
@@ -657,13 +657,15 @@ pub fn substitute_template(tmpl: &str, payload: &Value) -> String {
     let bytes = tmpl.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
-            if let Some(end_rel) = tmpl[i + 2..].find("}}") {
-                let key = tmpl[i + 2..i + 2 + end_rel].trim();
-                out.push_str(&lookup_key(payload, key));
-                i = i + 2 + end_rel + 2;
-                continue;
-            }
+        if i + 1 < bytes.len()
+            && bytes[i] == b'{'
+            && bytes[i + 1] == b'{'
+            && let Some(end_rel) = tmpl[i + 2..].find("}}")
+        {
+            let key = tmpl[i + 2..i + 2 + end_rel].trim();
+            out.push_str(&lookup_key(payload, key));
+            i = i + 2 + end_rel + 2;
+            continue;
         }
         out.push(bytes[i] as char);
         i += 1;

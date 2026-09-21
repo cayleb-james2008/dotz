@@ -33,10 +33,10 @@ use std::sync::{Mutex, OnceLock};
 /// Directory holding one `<run_id>.json` record per run. Override with
 /// `DOTZ_RUN_RECORD_DIR`; defaults to `<dotz_dir>/ai-agents/run-records`.
 fn record_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("DOTZ_RUN_RECORD_DIR") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
+    if let Ok(p) = std::env::var("DOTZ_RUN_RECORD_DIR")
+        && !p.trim().is_empty()
+    {
+        return PathBuf::from(p);
     }
     dotz_dir().join("ai-agents").join("run-records")
 }
@@ -817,10 +817,10 @@ mod tests {
         // Wait for the spawned executor to finish (poll the active store).
         let replay_id = replayed.id.clone();
         for _ in 0..200 {
-            if let Some(r) = workflows::get_active(&replay_id) {
-                if r.status == "done" || r.status == "error" || r.status == "aborted" {
-                    break;
-                }
+            if let Some(r) = workflows::get_active(&replay_id)
+                && (r.status == "done" || r.status == "error" || r.status == "aborted")
+            {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

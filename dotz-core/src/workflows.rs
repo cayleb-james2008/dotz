@@ -492,10 +492,10 @@ fn review_has_findings(output: Option<&str>) -> bool {
 // ---- disk history (<dotz_dir>/ai-agents/workflows.json) ----
 
 fn workflows_file() -> PathBuf {
-    if let Ok(p) = std::env::var("DOTZ_WORKFLOWS_FILE") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
+    if let Ok(p) = std::env::var("DOTZ_WORKFLOWS_FILE")
+        && !p.trim().is_empty()
+    {
+        return PathBuf::from(p);
     }
     dotz_dir().join("ai-agents").join("workflows.json")
 }
@@ -814,11 +814,11 @@ pub fn step_state(run_id: &str, step_id: &str, patch: StepPatch) -> Option<Workf
         let step_idx = run.steps.iter().position(|s| s.id == step_id)?;
         {
             let step = &mut run.steps[step_idx];
-            if let Some(s) = &patch.status {
-                if step.status != *s {
-                    changed.insert(step.id.clone());
-                    step.status = s.clone();
-                }
+            if let Some(s) = &patch.status
+                && step.status != *s
+            {
+                changed.insert(step.id.clone());
+                step.status = s.clone();
             }
             if patch.output.is_some() && step.output != patch.output {
                 step.output = patch.output.clone();
@@ -1505,15 +1505,15 @@ async fn resume_handler(Path(id): Path<String>) -> Result<Json<Value>, (StatusCo
     // Reject the resume if the run is already terminal. `resume()` returns the
     // run as-is in that case, but the UI should see a 409 so it doesn't render a
     // "running" badge on a run that hasn't actually restarted.
-    if let Some(run) = get_active(&id) {
-        if run.status == "done" || run.status == "error" || run.status == "aborted" {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": format!("run is {} — cannot resume", run.status)
-                })),
-            ));
-        }
+    if let Some(run) = get_active(&id)
+        && (run.status == "done" || run.status == "error" || run.status == "aborted")
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("run is {} — cannot resume", run.status)
+            })),
+        ));
     }
     match resume(&id) {
         Some(run) => Ok(Json(run_with_summary(&run))),
@@ -1794,10 +1794,10 @@ async fn patch_step_handler(
         // Re-add children based on new parents.
         let new_parents = proposed_parents.clone();
         for pid in &new_parents {
-            if let Some(p) = test_run.steps.iter_mut().find(|s| &s.id == pid) {
-                if !p.children.contains(&step_id_c) {
-                    p.children.push(step_id_c.clone());
-                }
+            if let Some(p) = test_run.steps.iter_mut().find(|s| &s.id == pid)
+                && !p.children.contains(&step_id_c)
+            {
+                p.children.push(step_id_c.clone());
             }
         }
         // Kahn's algorithm.
@@ -1879,10 +1879,10 @@ async fn patch_step_handler(
         }
         // Re-add children for new parents.
         for pid in &proposed_parents {
-            if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid) {
-                if !p.children.contains(&step_id_c) {
-                    p.children.push(step_id_c.clone());
-                }
+            if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid)
+                && !p.children.contains(&step_id_c)
+            {
+                p.children.push(step_id_c.clone());
             }
         }
         run.updated_at = now;
@@ -2051,10 +2051,10 @@ async fn insert_steps_handler(
             .collect();
         for (child_id, parents) in &parent_pairs {
             for pid in parents {
-                if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid) {
-                    if !p.children.contains(child_id) {
-                        p.children.push(child_id.clone());
-                    }
+                if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid)
+                    && !p.children.contains(child_id)
+                {
+                    p.children.push(child_id.clone());
                 }
             }
         }
@@ -2224,10 +2224,10 @@ pub fn patch_parents(
             }
         }
         for pid in &resolved {
-            if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid) {
-                if !p.children.contains(&step_id_c) {
-                    p.children.push(step_id_c.clone());
-                }
+            if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid)
+                && !p.children.contains(&step_id_c)
+            {
+                p.children.push(step_id_c.clone());
             }
         }
         if run.status == "error" {
@@ -2344,10 +2344,10 @@ pub fn insert_steps(run_id: &str, inputs: &[CreateStepInput]) -> Result<Workflow
             .collect();
         for (child_id, parents) in &parent_pairs {
             for pid in parents {
-                if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid) {
-                    if !p.children.contains(child_id) {
-                        p.children.push(child_id.clone());
-                    }
+                if let Some(p) = run.steps.iter_mut().find(|s| &s.id == pid)
+                    && !p.children.contains(child_id)
+                {
+                    p.children.push(child_id.clone());
                 }
             }
         }

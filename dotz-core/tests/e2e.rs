@@ -78,10 +78,10 @@ impl ServeGuard {
         let health = format!("http://127.0.0.1:{port}/api/health");
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            if let Ok(resp) = client.get(&health).send().await {
-                if resp.status().is_success() {
-                    return guard;
-                }
+            if let Ok(resp) = client.get(&health).send().await
+                && resp.status().is_success()
+            {
+                return guard;
             }
             if std::time::Instant::now() >= deadline {
                 let stderr = std::fs::read_to_string(&guard.stderr_path).unwrap_or_default();

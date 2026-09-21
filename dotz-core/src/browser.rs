@@ -142,13 +142,13 @@ fn normalize_origin(value: &str) -> Result<String, String> {
     }
 
     // Hostname/IPv4 with optional port.
-    if let Some((host, port)) = authority.rsplit_once(':') {
-        if let Ok(p) = port.parse::<u16>() {
-            if p == default_port {
-                return Ok(format!("{scheme}://{host}"));
-            }
-            return Ok(format!("{scheme}://{host}:{p}"));
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && let Ok(p) = port.parse::<u16>()
+    {
+        if p == default_port {
+            return Ok(format!("{scheme}://{host}"));
         }
+        return Ok(format!("{scheme}://{host}:{p}"));
     }
     Ok(format!("{scheme}://{authority}"))
 }
@@ -321,10 +321,10 @@ pub fn binary_name() -> &'static str {
 /// Resolve the agent-browser executable. DOTZ_BROWSER_BIN wins; else
 /// `<DOTZ_RESOURCES or cwd>/node_modules/agent-browser/bin/<name>`; else the PATH fallback name.
 fn resolve_executable() -> Result<PathBuf, String> {
-    if let Ok(p) = std::env::var("DOTZ_BROWSER_BIN") {
-        if !p.trim().is_empty() {
-            return Ok(PathBuf::from(p));
-        }
+    if let Ok(p) = std::env::var("DOTZ_BROWSER_BIN")
+        && !p.trim().is_empty()
+    {
+        return Ok(PathBuf::from(p));
     }
     let name = binary_name();
     let base = std::env::var("DOTZ_RESOURCES")
@@ -559,12 +559,12 @@ fn strip_ref_tail(s: &str) -> &str {
 /// Split a descriptor `role "name"` (or `role 'name'`) into (role, name).
 fn split_role_name(descriptor: &str) -> (String, String) {
     for q in ['"', '\''] {
-        if let Some(start) = descriptor.find(q) {
-            if let Some(end_rel) = descriptor[start + 1..].find(q) {
-                let role = descriptor[..start].trim().to_string();
-                let name = descriptor[start + 1..start + 1 + end_rel].to_string();
-                return (role, name);
-            }
+        if let Some(start) = descriptor.find(q)
+            && let Some(end_rel) = descriptor[start + 1..].find(q)
+        {
+            let role = descriptor[..start].trim().to_string();
+            let name = descriptor[start + 1..start + 1 + end_rel].to_string();
+            return (role, name);
         }
     }
     (descriptor.trim().to_string(), String::new())
@@ -1086,30 +1086,30 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
             let by = bv.get("y").and_then(|v| v.as_f64());
             let bw = bv.get("width").and_then(|v| v.as_f64());
             let bh = bv.get("height").and_then(|v| v.as_f64());
-            if let (Some(bx), Some(by), Some(bw), Some(bh)) = (bx, by, bw, bh) {
-                if [bx, by, bw, bh].iter().all(|f| f.is_finite()) {
-                    let mut store = sessions_guard();
-                    if let Some(r) = store.get_mut(&session_id) {
-                        r.observation.cursor = Some(Cursor {
-                            x: bx + bw / 2.0,
-                            y: by + bh / 2.0,
-                            kind: action.clone(),
-                        });
-                    }
+            if let (Some(bx), Some(by), Some(bw), Some(bh)) = (bx, by, bw, bh)
+                && [bx, by, bw, bh].iter().all(|f| f.is_finite())
+            {
+                let mut store = sessions_guard();
+                if let Some(r) = store.get_mut(&session_id) {
+                    r.observation.cursor = Some(Cursor {
+                        x: bx + bw / 2.0,
+                        y: by + bh / 2.0,
+                        kind: action.clone(),
+                    });
                 }
             }
-        } else if action == "clickAt" {
-            if let (Some(x), Some(y)) = (x, y) {
-                if x.is_finite() && y.is_finite() {
-                    let mut store = sessions_guard();
-                    if let Some(r) = store.get_mut(&session_id) {
-                        r.observation.cursor = Some(Cursor {
-                            x,
-                            y,
-                            kind: action.clone(),
-                        });
-                    }
-                }
+        } else if action == "clickAt"
+            && let (Some(x), Some(y)) = (x, y)
+            && x.is_finite()
+            && y.is_finite()
+        {
+            let mut store = sessions_guard();
+            if let Some(r) = store.get_mut(&session_id) {
+                r.observation.cursor = Some(Cursor {
+                    x,
+                    y,
+                    kind: action.clone(),
+                });
             }
         }
 

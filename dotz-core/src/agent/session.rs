@@ -254,15 +254,15 @@ pub fn create(opts: CreateOpts) -> Result<Value, String> {
     let mut app_url: Option<String> = None;
 
     // A bound project supplies cwd/profile and the default model/thinking (explicit opts still win).
-    if let Some(pid) = &opts.project_id {
-        if let Some(p) = projects::find(pid) {
-            project_id = Some(p.id.clone());
-            cwd = p.cwd.clone();
-            profile_id = p.profile_id.clone();
-            model = model.or(Some(p.model.clone()));
-            thinking = thinking.or(Some(p.thinking_level.clone()));
-            app_url = p.app_url.clone();
-        }
+    if let Some(pid) = &opts.project_id
+        && let Some(p) = projects::find(pid)
+    {
+        project_id = Some(p.id.clone());
+        cwd = p.cwd.clone();
+        profile_id = p.profile_id.clone();
+        model = model.or(Some(p.model.clone()));
+        thinking = thinking.or(Some(p.thinking_level.clone()));
+        app_url = p.app_url.clone();
     }
 
     let profile = profiles::get(Some(&profile_id));
@@ -1137,11 +1137,10 @@ fn apply_delta(
             if let Some(entry) = acc.tool_calls.get_mut(&index) {
                 entry.3.push_str(&frag);
                 // Try to parse the accumulated buffer; update the block's arguments when valid.
-                if let Ok(parsed) = serde_json::from_str::<Value>(&entry.3) {
-                    if let ContentBlock::ToolCall { arguments, .. } = &mut acc.msg.content[entry.0]
-                    {
-                        *arguments = parsed;
-                    }
+                if let Ok(parsed) = serde_json::from_str::<Value>(&entry.3)
+                    && let ContentBlock::ToolCall { arguments, .. } = &mut acc.msg.content[entry.0]
+                {
+                    *arguments = parsed;
                 }
                 ame_kind = Some("toolcall_delta");
                 content_index = entry.0;
@@ -1260,20 +1259,20 @@ fn apply_subagent_delta(msg: &mut super::event::Message, delta: StreamDelta) {
                 .get(index)
                 .copied()
                 .or_else(|| tc_indices.last().copied());
-            if let Some(bi) = block_idx {
-                if let ContentBlock::ToolCall { arguments, .. } = &mut msg.content[bi] {
-                    let buf = match arguments {
-                        Value::String(s) => {
-                            s.push_str(&frag);
-                            s.clone()
-                        }
-                        _ => frag.clone(),
-                    };
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
-                        *arguments = parsed;
-                    } else {
-                        *arguments = Value::String(buf);
+            if let Some(bi) = block_idx
+                && let ContentBlock::ToolCall { arguments, .. } = &mut msg.content[bi]
+            {
+                let buf = match arguments {
+                    Value::String(s) => {
+                        s.push_str(&frag);
+                        s.clone()
                     }
+                    _ => frag.clone(),
+                };
+                if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
+                    *arguments = parsed;
+                } else {
+                    *arguments = Value::String(buf);
                 }
             }
         }
@@ -3115,22 +3114,17 @@ mod tests {
         while tokio::time::Instant::now() < deadline && !saw_toolcall {
             if let Ok(Ok(frame)) =
                 tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
-            {
-                if frame
+                && frame
                     .get("event")
                     .and_then(|e| e.get("type"))
                     .and_then(|t| t.as_str())
                     == Some("message_update")
-                {
-                    if let Some(ame) = frame
-                        .get("event")
-                        .and_then(|e| e.get("assistantMessageEvent"))
-                    {
-                        if ame.get("type").and_then(|t| t.as_str()) == Some("toolcall_start") {
-                            saw_toolcall = true;
-                        }
-                    }
-                }
+                && let Some(ame) = frame
+                    .get("event")
+                    .and_then(|e| e.get("assistantMessageEvent"))
+                && ame.get("type").and_then(|t| t.as_str()) == Some("toolcall_start")
+            {
+                saw_toolcall = true;
             }
         }
         assert!(

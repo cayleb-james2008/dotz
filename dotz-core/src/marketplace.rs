@@ -268,20 +268,19 @@ pub fn validate_preset_name(name: &str) -> Result<(), MarketplaceError> {
 /// follow-up could surface the last error in the `GET /api/presets` response body.
 pub async fn list_presets() -> Result<Vec<Preset>, MarketplaceError> {
     // Cache hit?
-    if let Ok(guard) = catalog_cache().lock() {
-        if let Some((fetched_at, cached)) = guard.as_ref() {
-            if fetched_at.elapsed() < CACHE_TTL {
-                // Re-stamp `installed` + `update_available` against the current disk state — a
-                // preset may have been installed/uninstalled/upgraded since the catalog was
-                // cached, and the UI's badges must reflect the live disk state, not the state at
-                // cache time.
-                let installed = list_installed();
-                return Ok(cached
-                    .iter()
-                    .map(|p| stamp_preset(p.clone(), &installed))
-                    .collect());
-            }
-        }
+    if let Ok(guard) = catalog_cache().lock()
+        && let Some((fetched_at, cached)) = guard.as_ref()
+        && fetched_at.elapsed() < CACHE_TTL
+    {
+        // Re-stamp `installed` + `update_available` against the current disk state — a
+        // preset may have been installed/uninstalled/upgraded since the catalog was
+        // cached, and the UI's badges must reflect the live disk state, not the state at
+        // cache time.
+        let installed = list_installed();
+        return Ok(cached
+            .iter()
+            .map(|p| stamp_preset(p.clone(), &installed))
+            .collect());
     }
 
     let url = format!("{}catalog.json", marketplace_base_url());
@@ -788,10 +787,10 @@ pub fn list_installed() -> Vec<String> {
     };
     let mut out = Vec::new();
     for ent in entries.flatten() {
-        if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            if let Some(name) = ent.file_name().to_str() {
-                out.push(name.to_string());
-            }
+        if ent.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            && let Some(name) = ent.file_name().to_str()
+        {
+            out.push(name.to_string());
         }
     }
     out.sort();
@@ -846,24 +845,23 @@ pub fn invalidate_pubkey_cache() {
 /// build a second client per call.
 pub async fn fetch_pubkey(client: &reqwest::Client) -> Result<String, MarketplaceError> {
     // In-memory cache.
-    if let Ok(g) = pubkey_cache().lock() {
-        if let Some(s) = g.as_ref() {
-            if !s.is_empty() {
-                return Ok(s.clone());
-            }
-        }
+    if let Ok(g) = pubkey_cache().lock()
+        && let Some(s) = g.as_ref()
+        && !s.is_empty()
+    {
+        return Ok(s.clone());
     }
     // On-disk cache.
     let cache_path = pubkey_cache_path();
-    if cache_path.exists() {
-        if let Ok(s) = std::fs::read_to_string(&cache_path) {
-            let trimmed = s.trim().to_string();
-            if !trimmed.is_empty() {
-                if let Ok(mut g) = pubkey_cache().lock() {
-                    *g = Some(trimmed.clone());
-                }
-                return Ok(trimmed);
+    if cache_path.exists()
+        && let Ok(s) = std::fs::read_to_string(&cache_path)
+    {
+        let trimmed = s.trim().to_string();
+        if !trimmed.is_empty() {
+            if let Ok(mut g) = pubkey_cache().lock() {
+                *g = Some(trimmed.clone());
             }
+            return Ok(trimmed);
         }
     }
     // Fetch from the repo root.

@@ -82,10 +82,10 @@ impl Default for DotzConfig {
 }
 
 pub fn dotz_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("DOTZ_CONFIG_DIR") {
-        if !d.is_empty() {
-            return PathBuf::from(d);
-        }
+    if let Ok(d) = std::env::var("DOTZ_CONFIG_DIR")
+        && !d.is_empty()
+    {
+        return PathBuf::from(d);
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -205,37 +205,37 @@ pub fn load() -> DotzConfig {
                     provider_invalid = true;
                 }
             }
-            if let Some(m) = v.get("executiveModel").and_then(|x| x.as_str()) {
-                if !m.trim().is_empty() {
-                    cfg.executive_model = m.to_string();
-                    explicit_executive = true;
-                }
+            if let Some(m) = v.get("executiveModel").and_then(|x| x.as_str())
+                && !m.trim().is_empty()
+            {
+                cfg.executive_model = m.to_string();
+                explicit_executive = true;
             }
-            if let Some(m) = v.get("subagentModel").and_then(|x| x.as_str()) {
-                if !m.trim().is_empty() {
-                    cfg.subagent_model = m.to_string();
-                    explicit_subagent = true;
-                }
+            if let Some(m) = v.get("subagentModel").and_then(|x| x.as_str())
+                && !m.trim().is_empty()
+            {
+                cfg.subagent_model = m.to_string();
+                explicit_subagent = true;
             }
-            if let Some(t) = v.get("thinkingLevel").and_then(|x| x.as_str()) {
-                if types::is_valid_thinking(t) {
-                    cfg.thinking_level = t.to_string();
-                }
+            if let Some(t) = v.get("thinkingLevel").and_then(|x| x.as_str())
+                && types::is_valid_thinking(t)
+            {
+                cfg.thinking_level = t.to_string();
             }
             // C6: parse the optional gateway section leniently. A malformed `gateway` object is
             // dropped to None (with a stderr warning) rather than failing the whole config load —
             // a bad gateway block must not brick provider/model/thinking. `gateway: null` and a
             // missing field both leave `cfg.gateway = None`.
-            if let Some(gw_v) = v.get("gateway") {
-                if !gw_v.is_null() {
-                    match serde_json::from_value::<GatewayConfig>(gw_v.clone()) {
-                        Ok(gw) => cfg.gateway = Some(gw),
-                        Err(e) => eprintln!(
-                            "config: {} has a malformed 'gateway' section ({e}); \
+            if let Some(gw_v) = v.get("gateway")
+                && !gw_v.is_null()
+            {
+                match serde_json::from_value::<GatewayConfig>(gw_v.clone()) {
+                    Ok(gw) => cfg.gateway = Some(gw),
+                    Err(e) => eprintln!(
+                        "config: {} has a malformed 'gateway' section ({e}); \
                              ignoring it. Fix or remove the gateway block to restore it.",
-                            config_file().display()
-                        ),
-                    }
+                        config_file().display()
+                    ),
                 }
             }
             // B3: parse the optional perfRecording flag (default false). Any non-bool value is

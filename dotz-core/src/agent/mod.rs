@@ -568,20 +568,20 @@ fn spawn_sandbox_end_poller(
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_millis(sandbox_poll_deadline_ms(timeout_ms));
         while tokio::time::Instant::now() < deadline {
-            if let Some(run) = crate::sandbox::lookup(&run_id) {
-                if run.status != "running" {
-                    // Dedup against the sandbox.kill handler: only the first caller to claim
-                    // the end emission should emit, so a killed run delivers exactly one
-                    // sandbox_end to the UI instead of two.
-                    if crate::sandbox::try_mark_end_emitted(&run_id) {
-                        emit_sandbox_event(
-                            &tx,
-                            &session_id,
-                            json!({ "type": "sandbox_end", "runId": run_id, "run": run }),
-                        );
-                    }
-                    return;
+            if let Some(run) = crate::sandbox::lookup(&run_id)
+                && run.status != "running"
+            {
+                // Dedup against the sandbox.kill handler: only the first caller to claim
+                // the end emission should emit, so a killed run delivers exactly one
+                // sandbox_end to the UI instead of two.
+                if crate::sandbox::try_mark_end_emitted(&run_id) {
+                    emit_sandbox_event(
+                        &tx,
+                        &session_id,
+                        json!({ "type": "sandbox_end", "runId": run_id, "run": run }),
+                    );
                 }
+                return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
@@ -918,8 +918,7 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                             .map(|s| s.to_string());
                         if !run_id.is_empty()
                             && ["move", "click", "type"].contains(&action.as_str())
-                        {
-                            if let Some(tx) = session::tx(&session_id) {
+                            && let Some(tx) = session::tx(&session_id) {
                                 emit_sandbox_event(
                                     &tx,
                                     &session_id,
@@ -933,7 +932,6 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                                     }),
                                 );
                             }
-                        }
                     }
                     // Resolve a pending human_gate (app.js sends {kind:"gate.approve"|"gate.reject", gateId, feedback?}).
                     "gate.approve" | "gate.reject" => {
@@ -973,8 +971,8 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                         let run_id = v.get("runId").and_then(|x| x.as_str()).map(|s| s.to_string());
                         let step_id = v.get("stepId").and_then(|x| x.as_str()).map(|s| s.to_string());
                         let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
-                        if action == "reject" {
-                            if let (Some(rid), Some(sid)) = (run_id, step_id) {
+                        if action == "reject"
+                            && let (Some(rid), Some(sid)) = (run_id, step_id) {
                                 let feedback = v
                                     .get("feedback")
                                     .and_then(|x| x.as_str())
@@ -985,7 +983,6 @@ async fn ws_loop(socket: WebSocket, session_id: String) {
                                         .await;
                                 });
                             }
-                        }
                     }
                     // Live-editable workflow steering: patch a step's model.
                     "workflow.patchModel" => {
