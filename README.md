@@ -56,6 +56,12 @@ HTML/PDF export).
 - [Contributing](#contributing)
 - [License](#license)
 
+## Launch video
+
+[![dotz launch video](brag-output/brag.jpg)](brag-output/brag.mp4)
+
+*20-second launch video rendered with `/brag` + Hyperframes — click the still to watch.*
+
 ## Highlights
 
 - **Live workflow graph** — every subagent materializes as a node, every tool it reaches for
