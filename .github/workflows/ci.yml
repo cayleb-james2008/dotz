@@ -23,10 +23,14 @@ jobs:
       # cross-platform Node, so it runs on every OS.
       - run: npm install && npm run fetch-model
       - run: cargo test -p dotz-core
-      # Cold-start perf gate (Windows-only): runs the Embedder::load() bench against the
-      # committed baseline (docs/perf-baseline.json, 526ms on 2026-07-20). A regression beyond
-      # 15% fails the gate. The model is already fetched above.
-      - run: cargo bench --bench cold_start -- --bench
+      # Cold-start perf bench (Windows-only): measures Embedder::load() and records the number.
+      # The bench is non-gating by design (see dotz-core/benches/cold_start.rs doc header): it
+      # skips when the bundled ONNX model is absent, and it does not fail on a regression — a
+      # comparison gate will be wired up once docs/perf-baseline.json's comparison is enacted.
+      # NOTE (2026-09-21): the previous invocation passed `-- --bench`, which criterion rejects
+      # ("an argument cannot be used with one or more of the other specified arguments", exit 2);
+      # `cargo bench --bench cold_start` is the form the bench's own doc header documents.
+      - run: cargo bench --bench cold_start
         if: matrix.os == 'windows-latest'
 
 # ponytail: src-tauri/icons/icon.icns is a placeholder (byte-copy of icon.png). Generate a real
