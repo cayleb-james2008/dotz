@@ -1139,8 +1139,20 @@ mod tests {
         // `detect_port_in_window` task has time to be scheduled + complete its
         // TCP probe even under full-suite runtime contention (the original
         // 10s/20s budget raced the scheduler when 500+ tests saturated tokio).
-        let code = format!("echo \"listening on 127.0.0.1:{port}\"\nsleep 45\n");
-        let run = start_run("bash", &code, "web", None, 60_000, None, None)
+        // Platform-correct shell + keep-alive: `bash`/`sleep` do not exist on Windows runners,
+        // so a Windows child uses cmd + ping-as-delay (same 45s hold, same banner line).
+        #[cfg(windows)]
+        let (shell, code) = (
+            "cmd",
+            format!("echo listening on 127.0.0.1:{port}\r\nping -n 46 127.0.0.1 >NUL\r\n"),
+        );
+        #[cfg(not(windows))]
+        let (shell, code) = (
+            "bash",
+            format!("echo \"listening on 127.0.0.1:{port}\"\nsleep 45\n"),
+        );
+
+        let run = start_run(shell, &code, "web", None, 60_000, None, None)
             .await
             .expect("start_run should succeed");
 
