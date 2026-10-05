@@ -43,7 +43,10 @@ def agent_browser_argv(
         if node_executable and package_entry.is_file():
             return [node_executable, str(package_entry)]
         return []
-    return [str(selected)]
+    # Return a caller-supplied native override verbatim. Windows Path normalizes
+    # separators, but direct executable overrides are argv tokens, not paths to
+    # rewrite.
+    return [executable] if executable else [str(selected)]
 
 
 def agent_browser_target(argv_prefix: list[str], fallback: Path) -> Path:

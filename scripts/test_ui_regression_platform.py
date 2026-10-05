@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest import mock
 
 from ui_regression_platform import agent_browser_argv, serve_binary_path
@@ -36,13 +36,17 @@ class UiRegressionPlatformTests(unittest.TestCase):
             self.assertEqual(command, ["node.exe", str(entry)])
 
     def test_windows_native_override_remains_direct(self) -> None:
-        command = agent_browser_argv(
-            Path("/repo"),
-            node_executable="node.exe",
-            executable="C:/tools/agent-browser.exe",
-            platform_name="win32",
-        )
-        self.assertEqual(command, ["C:/tools/agent-browser.exe"])
+        executable = "C:/tools/agent-browser.exe"
+        with mock.patch(
+            "ui_regression_platform.Path", side_effect=PureWindowsPath
+        ):
+            command = agent_browser_argv(
+                Path("/repo"),
+                node_executable="node.exe",
+                executable=executable,
+                platform_name="win32",
+            )
+        self.assertEqual(command, [executable])
 
     def test_js_entrypoint_requires_node(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
