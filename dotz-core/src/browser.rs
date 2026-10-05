@@ -349,7 +349,8 @@ fn resolve_executable() -> Result<PathBuf, String> {
 
 /// True when the resolved `agent-browser` binary is actually present on disk. Used by the
 /// first-run wizard (`GET /api/first-run/state`) so the UI can tell the operator whether the
-/// browser panel will work out of the box or whether they need to run `npm install` first.
+/// browser panel will work out of the box or whether they need to run
+/// `npm run install:deps` first.
 /// Mirrors [`resolve_executable`] exactly: `DOTZ_BROWSER_BIN` wins (must exist), then the
 /// bundled `node_modules/agent-browser/bin/<name>` path, then a PATH lookup for the bare
 /// `agent-browser[.exe]` name (so a system install is recognized).
@@ -2291,9 +2292,9 @@ mod tests {
     /// `binary_present` must reflect whether the resolved `agent-browser` binary is on disk.
     /// With `DOTZ_BROWSER_BIN` pointed at a temp file that exists, it returns true; pointed at a
     /// missing path, it returns false. With the env var cleared, it falls back to the bundled /
-    /// PATH lookup, which on a dev host without `npm install` returns false (and on a packaged
-    /// install with the bundled binary returns true) — so we only assert the explicit-DOTZ_BROWSER_BIN
-    /// branch here to keep the test host-independent.
+    /// PATH lookup, which on a dev host without `npm run install:deps` returns false (and on a
+    /// packaged install with the bundled binary returns true). We assert only the
+    /// explicit-DOTZ_BROWSER_BIN branch here to keep the test host-independent.
     #[test]
     fn binary_present_matches_disk_state_for_explicit_bin() {
         let _guard = BROWSER_TIMEOUT_TEST_LOCK.blocking_lock();

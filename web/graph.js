@@ -1,12 +1,13 @@
 /* dotz — workflow graph: SVG DAG render + node-detail drawer + live-editing + run record.
  * Split from app.js (C7). No behavior change — pure mechanical split.
  * Preserves: Q2 render-signature guard + rAF debounce (computeWfRenderSignature / refreshWorkflowGraph),
- * Q3 PANEL_REGISTRY-derived PANEL_COLOR + panelForToolJS, C5 viewport culling (nodeIntersectsViewport
+ * Q3 PANEL_DEFINITIONS-derived PANEL_COLOR + panelForToolJS, C5 viewport culling (nodeIntersectsViewport
  * inside renderWorkflowDag, driven by applyViewBoxAndCull on pan/zoom/fit/reset).
  */
 import { $, el, api, post, esc, truncate } from './api.js';
 import { state } from './state.js';
-import { openPanel, PANEL_REGISTRY } from './panels.js';
+import { openPanel } from './panels.js';
+import { PANEL_DEFINITIONS } from './panel-registry.js';
 import { pushError, pushInfo } from './chat.js';
 import { logBrain } from './panels/brain.js';
 import { focusSandboxRun } from './handlers.js';
@@ -194,20 +195,20 @@ function _refreshWorkflowGraphInner(panel) {
   renderWorkflowDag(run, panel);
 }
 
-// Panel accent colors for tool sub-node chips — derived from PANEL_REGISTRY (only entries that
+// Panel accent colors for tool sub-node chips — derived from PANEL_DEFINITIONS (only entries that
 // declare a `color` appear here; panels without one fall back to var(--surface-2) at call sites).
 const PANEL_COLOR = Object.fromEntries(
-  PANEL_REGISTRY.filter((e) => e.color).map((e) => [e.name, e.color])
+  PANEL_DEFINITIONS.filter((e) => e.color).map((e) => [e.name, e.color])
 );
 
 // JS mirror of the backend `panel_for_tool` — maps a tool name to its bento panel (for chip color
-// + click-to-open). Derived from PANEL_REGISTRY.toolMap. Kept in sync with
+// + click-to-open). Derived from PANEL_DEFINITIONS.toolMap. Kept in sync with
 // dotz-core/src/agent/session.rs::panel_for_tool. The matcher set is disjoint (no tool name
 // matches two panels' toolMaps), so registry-order traversal yields the same result as the
 // original if/else chain for every input.
 function panelForToolJS(name) {
   if (!name) return null;
-  for (const entry of PANEL_REGISTRY) {
+  for (const entry of PANEL_DEFINITIONS) {
     if (!entry.toolMap) continue;
     for (const m of entry.toolMap) {
       if (m.prefix != null) { if (name.startsWith(m.prefix)) return entry.name; }

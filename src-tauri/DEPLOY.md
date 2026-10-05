@@ -22,7 +22,7 @@ old private-source + separate `dotz-releases` split was retired.)
 # 2. build the signed installer (from a clean checkout):
 export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.claude/dotz-rust/dotz-updater-v2.key)"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$(sed 's/^PASSWORD=//' ~/.claude/dotz-rust/dotz-updater-v2.key.password)"
-npm install && npm run fetch-model       # agent-browser binary + ONNX model into assets/models/
+npm run install:deps && npm run fetch-model  # agent-browser binary + ONNX model into assets/models/
 cargo tauri build
 # 3. build latest.json + publish to the dotz repo:
 VER=<ver> NSIS_DIR="$(pwd)/target/release/bundle/nsis" node ~/.claude/dotz-rust/build-latest-json.mjs
