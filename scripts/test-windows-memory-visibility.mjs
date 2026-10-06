@@ -10,6 +10,11 @@ assert.match(
   /overflow-x:\s*auto\s*;/,
   "the bento must provide a user-scrollable horizontal path when a persisted panel is outside the native viewport",
 );
+assert.match(
+  bento,
+  /grid-template-columns:\s*repeat\(12,\s*minmax\(0,\s*1fr\)\)\s*;/,
+  "intrinsic content must not widen the bento grid past the native viewport and clip later panels",
+);
 
 // These are the captured native geometry dimensions/coordinates from the verified
 // 2026-10-06 restart screenshot: the old harness saw the saved text outside the window.
