@@ -3,8 +3,13 @@ import { readFileSync } from "node:fs";
 import { createDriverCallError, projectFrameToWindowScreenshot, sendGuardedScroll } from "./windows-installer-runtime.mjs";
 
 const css = readFileSync(new URL("../web/styles.css", import.meta.url), "utf8");
+const app = css.match(/#app\s*\{([\s\S]*?)\n\}/)?.[1];
+assert.ok(app, "native app root grid must remain defined");
+assert.match(app, /grid-template-columns:\s*minmax\(0,\s*1fr\)\s*;/, "constrain the app's single grid track to the native viewport instead of allowing topbar min-content to widen and clip the full dashboard");
 const bento = css.match(/\.bento\s*\{([\s\S]*?)\n\}/)?.[1];
 assert.ok(bento, "bento panel grid must remain defined");
+assert.match(bento, /min-width:\s*0\s*;/, "the nested bento scroller must shrink to its parent's constrained viewport");
+assert.match(bento, /grid-template-columns:\s*repeat\(12,\s*minmax\(0,\s*1fr\)\)\s*;/, "grid tracks must not expand beyond the bento scroller due to panel intrinsic widths");
 assert.match(
   bento,
   /overflow-x:\s*auto\s*;/,
