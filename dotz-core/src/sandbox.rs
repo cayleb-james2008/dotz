@@ -277,6 +277,28 @@ impl SandboxBackend for LinuxSandbox {
             // ponytail: TODO — wrap argv in `bwrap --unshare-...` for the B2 Linux hardening
             // pass. Requires a Linux host to validate the bubblewrap argv; deferred.
         }
+        // Owner-crash safety for the containment wrapper (see the process-ownership
+        // containment section below): if the owning dotz process dies, SIGKILL this child
+        // immediately so `unshare --kill-child=KILL` fires and the kernel tears down the run's
+        // PID namespace — an owner crash cannot leak the run tree. The signal fires when the
+        // spawning *thread* dies (PR_SET_PDEATHSIG semantics); both spawn sites run on
+        // long-lived runtime worker threads, so the only realistic trigger is owner death.
+        let parent_pid = std::process::id();
+        unsafe {
+            command.pre_exec(move || {
+                if prctl_set_pdeathsig_sigkill() != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // If the owner died between fork and this point the death signal would never
+                // fire and the child would be orphaned; refuse to exec in that race.
+                if getppid() as u32 != parent_pid {
+                    return Err(std::io::Error::other(
+                        "owner exited before the parent-death signal was armed",
+                    ));
+                }
+                Ok(())
+            });
+        }
     }
 
     fn kill_tree(&self, pid: u32) {
@@ -286,24 +308,161 @@ impl SandboxBackend for LinuxSandbox {
 
 /// Posix tree-kill: signal the child's process group (pgid == child pid when spawned with
 /// `process_group(0)`), falling back to a direct signal if the group doesn't exist (e.g. a
-/// caller that spawned the child without its own process group, as some unit tests do). Uses
-/// `.status()` so the kill subprocess is reaped. Verbatim from the former inline
-/// `#[cfg(not(windows))]` block in `kill_pid`.
+/// caller that spawned the child without its own process group, as some unit tests do).
+///
+/// The signals go through the `kill(2)` SYSCALL directly — never the `kill(1)` utility.
+/// Strace evidence on Ubuntu (procps `/bin/kill`): `kill -9 -<pgid>` WITHOUT `--` executes
+/// `kill(0, SIGKILL)`, i.e. it SIGKILLs THE CALLER'S OWN PROCESS GROUP — in CI that wiped the
+/// runner's job process group (the "hosted runner lost communication" failures that an older
+/// commit blamed on "infra, not code"), and in tests it killed the harness itself. The
+/// `kill -9 -- -<pgid>` form parses correctly, but the syscall has no parser to get it wrong
+/// and needs no subprocess to reap. Guards: pids 0 and 1 are refused — signalling either
+/// reaches far beyond the owned tree (pid 0 = caller's group, pid 1 = init).
 #[cfg(unix)]
 fn posix_kill_tree(pid: u32) {
-    let group = std::process::Command::new("kill")
-        .args(["-9", &format!("-{pid}")])
+    let Ok(p) = i32::try_from(pid) else { return };
+    if p <= 1 {
+        return;
+    }
+    // SAFETY: kill(2) touches no memory — it only delivers a signal. Negative `p` targets the
+    // process group whose pgid equals `p`; `p` comes from our own spawn record.
+    let group_ok = unsafe { kill(-p, SIGKILL_AS_C_INT) == 0 };
+    if !group_ok {
+        // SAFETY: as above; positive `p` targets exactly that process.
+        let _ = unsafe { kill(p, SIGKILL_AS_C_INT) };
+    }
+}
+
+// ---- process-ownership containment (Linux PID namespace) ----
+//
+// Bounded cleanup must not rely on enumerating descendants: a `setsid`-style child escapes
+// both the process group and any parent-pid walk, so process-group kills (`posix_kill_tree`)
+// cannot reach it — the regression in the next-session handoff (an escaped descendant
+// survived cleanup in a contained regression). On Linux the sandbox therefore runs every
+// workload inside its own PID namespace via the util-linux `unshare` wrapper:
+//
+//   unshare --user --map-root-user --pid --fork --mount-proc --kill-child=KILL -- <argv...>
+//
+// Containment invariants (kernel-enforced, no descendant enumeration):
+//   * the workload root is PID 1 of the namespace; when it terminates for ANY reason the
+//     kernel SIGKILLs every remaining process in that namespace, including `setsid` escapees;
+//   * killing the tracked wrapper (`posix_kill_tree`) fires `--kill-child=KILL`, which kills
+//     the namespace init and therefore tears down the whole namespace;
+//   * `PR_SET_PDEATHSIG` on the wrapper (LinuxSandbox::prepare_command) means an owner crash
+//     (dotz dying) also kills the wrapper and tears the namespace down.
+// Cleanup is bounded and complete without process-group breadth or numeric-pid descendant
+// hunting, and none of these paths can reach processes outside the namespace (unrelated-
+// process isolation). As a side effect the kernel also tears down background children the
+// moment the workload root exits, so escaped pipes cannot wedge a run's output collection.
+//
+// Fail closed: when the containment probe fails (no `unshare`, restricted user namespaces,
+// or an old util-linux without `--kill-child`), `wrap_sandbox_argv` returns Err and
+// `execute_run` refuses to start the workload instead of falling back to uncontained
+// execution.
+//
+// Platform boundaries (unchanged, and no containment claim is made there): Windows keeps
+// `taskkill /T` and macOS keeps the process-group kill. The agent-browser path (`browser.rs`)
+// is intentionally NOT wrapped: its controller keeps a persistent Chrome daemon alive across
+// one-shot commands by design, and a PID namespace would kill that daemon when the one-shot
+// root exits — browser escaped-descendant cleanup remains open, not claimed by this change.
+
+#[cfg(target_os = "linux")]
+const UNSHARE_WRAPPER_FLAGS: &[&str] = &[
+    "--user",
+    "--map-root-user",
+    "--pid",
+    "--fork",
+    "--mount-proc",
+    "--kill-child=KILL",
+];
+
+/// Containment wrapper binary. `DOTZ_UNSHARE_BIN` is a test seam used only by the fail-closed
+/// helper-process test; product code never sets it.
+#[cfg(target_os = "linux")]
+fn unshare_bin() -> String {
+    std::env::var("DOTZ_UNSHARE_BIN").unwrap_or_else(|_| "unshare".to_string())
+}
+
+/// Probe that PID-namespace containment can actually be created on this host before any
+/// workload is spawned. The probe runs the real wrapper with a no-op command, so it fails
+/// when `unshare` is missing, when unprivileged user namespaces are restricted, or when
+/// util-linux is too old for `--kill-child`.
+#[cfg(target_os = "linux")]
+fn probe_containment() -> Result<(), String> {
+    let bin = unshare_bin();
+    let status = std::process::Command::new(&bin)
+        .args(UNSHARE_WRAPPER_FLAGS)
+        .args(["--", "true"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
-    let group_ok = matches!(group, Ok(s) if s.success());
-    if !group_ok {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        .status()
+        .map_err(|e| format!("containment wrapper `{bin}` unavailable: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "PID-namespace containment probe failed (`{bin}` exited {status})"
+        ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn containment_available() -> Result<(), String> {
+    if std::env::var_os("DOTZ_UNSHARE_BIN").is_some() {
+        // Test seam: re-probe on every call so the fail-closed helper process can force
+        // failure without poisoning a process-wide cache used by concurrent tests.
+        return probe_containment();
+    }
+    static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
+    PROBE.get_or_init(probe_containment).clone()
+}
+
+/// Wrap the sandbox argv for process-ownership containment before spawn. Returns Err when
+/// containment cannot be established — callers must fail closed and NOT spawn the workload.
+/// Non-Linux platforms return the argv unchanged (documented boundary above).
+pub(crate) fn wrap_sandbox_argv(argv: Vec<String>) -> Result<Vec<String>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        containment_available()?;
+        let mut wrapped = Vec::with_capacity(argv.len() + UNSHARE_WRAPPER_FLAGS.len() + 2);
+        wrapped.push(unshare_bin());
+        wrapped.extend(UNSHARE_WRAPPER_FLAGS.iter().map(|s| (*s).to_string()));
+        wrapped.push("--".to_string());
+        wrapped.extend(argv);
+        Ok(wrapped)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(argv)
+    }
+}
+
+// PR_SET_PDEATHSIG / SIGKILL constants and the two libc entry points used by the Linux
+// parent-death arm above. Declared locally (instead of a `libc` dependency) against the C
+// runtime Rust already links; both calls are async-signal-safe, which pre_exec requires.
+#[cfg(target_os = "linux")]
+const PR_SET_PDEATHSIG: std::os::raw::c_int = 1;
+#[cfg(target_os = "linux")]
+const SIGKILL_AS_C_ULONG: std::os::raw::c_ulong = 9;
+#[cfg(unix)]
+const SIGKILL_AS_C_INT: std::os::raw::c_int = 9;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn prctl(option: std::os::raw::c_int, ...) -> std::os::raw::c_int;
+    fn getppid() -> std::os::raw::c_int;
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+#[cfg(target_os = "linux")]
+fn prctl_set_pdeathsig_sigkill() -> std::os::raw::c_int {
+    // SAFETY: PR_SET_PDEATHSIG takes a signal number; SIGKILL cannot be caught or ignored and
+    // the call only mutates the calling process's own signal-disposition state.
+    unsafe { prctl(PR_SET_PDEATHSIG, SIGKILL_AS_C_ULONG) }
 }
 
 /// Select the platform's sandbox backend. The cfg ladder is exhaustive; an unsupported target
@@ -609,9 +768,28 @@ async fn execute_run(
     } else {
         cmd[1..].iter().map(|a| a.to_string()).collect()
     };
-    let mut command = tokio::process::Command::new(cmd[0]);
+    // Process-ownership containment (Linux): run the whole tree inside a PID namespace so
+    // cleanup is kernel-bounded even for `setsid` escapees. Fail closed — when containment
+    // cannot be created the run errors out and the workload never starts.
+    let mut argv: Vec<String> = Vec::with_capacity(args.len() + 1);
+    argv.push(cmd[0].to_string());
+    argv.extend(args.iter().cloned());
+    let argv = match wrap_sandbox_argv(argv) {
+        Ok(v) => v,
+        Err(e) => {
+            finish(
+                &id,
+                "error",
+                None,
+                &format!("[containment unavailable] {e}\n"),
+            );
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            return;
+        }
+    };
+    let mut command = tokio::process::Command::new(&argv[0]);
     command
-        .args(&args)
+        .args(&argv[1..])
         .current_dir(work_dir.as_deref().unwrap_or(&temp_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1095,6 +1273,28 @@ fn not_found(msg: &str) -> (StatusCode, Json<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Host-visible liveness probe for a run's backgrounded grandchild. On Linux the script's
+    /// `$!` is a PID-namespace-local pid under containment, so probe by cmdline marker; on
+    /// other unix platforms `$!` is a real host pid and `kill -0` applies directly.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn grandchild_alive(pid: Option<u32>, _marker: &str) -> bool {
+        pid.map(|p| {
+            std::process::Command::new("kill")
+                .args(["-0", &p.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn grandchild_alive(_pid: Option<u32>, marker: &str) -> bool {
+        !pids_with_marker(marker).is_empty()
+    }
 
     /// Regression: web-mode previews were killed by the 30 s terminal default because the UI
     /// never sends `timeoutMs`. The mode-aware resolver must give `mode:"web"` runs the long
@@ -2566,15 +2766,22 @@ mod tests {
     /// child. A sandboxed script that backgrounds a long-lived grandchild (e.g. `sleep 30 &`)
     /// would otherwise leak that grandchild as an orphan when the sandbox run is killed or times
     /// out. This test starts a bash run that backgrounds `sleep 30` and prints the grandchild's
-    /// pid, kills the run, and asserts the grandchild is also dead — proving the process-group
-    /// signal reaches descendants.
+    /// pid, kills the run, and asserts the grandchild is also dead — proving cleanup reaches
+    /// descendants (process-group signal on macOS; PID-namespace teardown on Linux).
     #[cfg(unix)]
     #[tokio::test]
     async fn kill_pid_tree_kills_grandchild_on_posix() {
+        // Track the grandchild by a cmdline marker as well as `$!`: under Linux PID-namespace
+        // containment the script's `$!` is a namespace-LOCAL pid that cannot be probed from
+        // the host, so the Linux liveness probe scans /proc for the marker (see
+        // `grandchild_alive`). The behavioral assertion is unchanged — the backgrounded
+        // grandchild must not survive the run's cleanup. The grandchild sleep is minutes long
+        // so natural exit can never race the post-kill assertion.
+        let marker = unique_duration();
         let (tx, mut rx) = broadcast::channel::<Value>(64);
         let run = start_run(
             "bash",
-            "sleep 30 & echo \"GRANDCHILD_PID=$!\"; sleep 30",
+            &format!("sleep {marker} & echo \"GRANDCHILD_PID=$!\"; sleep 600"),
             "terminal",
             None,
             60_000,
@@ -2602,14 +2809,8 @@ mod tests {
         let grandchild_pid = grandchild_pid
             .expect("should have received the grandchild pid from sandbox output within 10s");
 
-        // Sanity: the grandchild should be alive right now (it is sleeping for 30s).
-        let alive = std::process::Command::new("kill")
-            .args(["-0", &grandchild_pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        // Sanity: the grandchild should be alive right now (it is sleeping for minutes).
+        let alive = grandchild_alive(Some(grandchild_pid), &marker);
         assert!(alive, "grandchild should be alive before the sandbox kill");
 
         // Kill the sandbox run — this must tree-kill the process group, including the grandchild.
@@ -2634,14 +2835,7 @@ mod tests {
         // since the OS may take a moment to reap after SIGKILL.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let alive = std::process::Command::new("kill")
-                .args(["-0", &grandchild_pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !alive {
+            if !grandchild_alive(Some(grandchild_pid), &marker) {
                 break;
             }
             if std::time::Instant::now() >= deadline {
@@ -2651,5 +2845,426 @@ mod tests {
         }
 
         remove_test_run(&id);
+    }
+}
+
+// ---- test-only process helpers (shared by `tests` and `containment_tests`) ----
+
+/// Unique fractional `sleep` duration used as a process marker. `bash -c 'single command'`
+/// and `setsid cmd` exec the command directly, so an argv marker like `$0` is REPLACED at
+/// exec — the marker must be an argument of the FINAL exec'd process (`sleep <duration>`).
+/// Verified empirically via /proc: a `$0` marker vanished from the escapee's cmdline when the
+/// chain exec'd into bare `sleep`.
+#[cfg(test)]
+fn unique_duration() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    format!("300.{n}{nanos:09}")
+}
+
+/// Poll `/proc` for processes whose cmdline contains `marker` (Linux only). Test hygiene:
+/// scanning + killing leaked processes at test end is cleanup, never a product claim.
+#[cfg(all(test, target_os = "linux"))]
+fn pids_with_marker(marker: &str) -> Vec<u32> {
+    let mut hits = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid == std::process::id() {
+                continue;
+            }
+            if let Ok(cmdline) = std::fs::read_to_string(entry.path().join("cmdline"))
+                && cmdline.contains(marker)
+            {
+                hits.push(pid);
+            }
+        }
+    }
+    hits
+}
+
+/// Containment regression tests for the next-session handoff's unresolved safety problem:
+/// a `setsid`-style descendant escaping the run's process group must not survive cleanup.
+/// These tests exercise the normal packaging/lifecycle route (`start_run` → `execute_run` →
+/// `kill_run_by_id` / watchdog), not a private kill helper. They compile against the
+/// pre-containment code too, so they are demonstrably RED there (the escapee survives the
+/// group kill) and GREEN only with PID-namespace containment. Failures and platform skips
+/// stay visible by design.
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+
+    /// Explicit platform boundary marker (kept visible per the evidence rules): escaped-
+    /// descendant containment requires Linux PID namespaces. Windows/macOS keep their
+    /// best-effort tree-kill paths and make no containment claim here.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn escaped_setsid_containment_skipped_non_linux() {
+        eprintln!(
+            "SKIP (explicit platform boundary): escaped-descendant containment tests require Linux PID namespaces"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_until(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if pred() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A run script that detaches a `setsid` descendant (own session, escapes the process
+    /// group) whose exec'd `sleep` carries the unique marker in its cmdline, then keeps the
+    /// run root alive with a separate long sleep.
+    #[cfg(target_os = "linux")]
+    fn escapee_script(escape_marker: &str) -> String {
+        format!("setsid sleep {escape_marker} </dev/null >/dev/null 2>&1 &\nsleep 600\n")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kill_leaked(marker: &str) {
+        for pid in pids_with_marker(marker) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    /// Regression: a `setsid` descendant must not survive the NORMAL cleanup route
+    /// (`kill_run_by_id`). RED before containment (the escapee leaves the process group, so
+    /// `posix_kill_tree`'s group kill misses it); GREEN after (kernel namespace teardown).
+    /// Also asserts unrelated-process isolation: a process the test owns must survive.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn escaped_setsid_descendant_does_not_survive_normal_cleanup() {
+        let escape_marker = unique_duration();
+        let other_marker = unique_duration();
+        // Unrelated process, NOT part of the run tree: must survive run cleanup untouched.
+        // (Direct `sleep <marker>`: the marker must survive exec into the final process.)
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg(&other_marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn unrelated process");
+
+        let run = start_run(
+            "bash",
+            &escapee_script(&escape_marker),
+            "terminal",
+            None,
+            600_000,
+            None,
+            None,
+        )
+        .await
+        .expect("start_run");
+        let id = run.id.clone();
+
+        // Precondition: the escaped descendant must actually be alive first, otherwise the
+        // cleanup assertion would pass vacuously.
+        let started = wait_until(
+            || !pids_with_marker(&escape_marker).is_empty(),
+            Duration::from_secs(15),
+        )
+        .await;
+        if !started {
+            let state = lookup(&id)
+                .map(|r| format!("status={} output={:?}", r.status, r.output))
+                .unwrap_or_else(|| "<no run record>".to_string());
+            kill_leaked(&escape_marker);
+            let _ = unrelated.kill();
+            panic!("escaped setsid descendant never started — precondition failed ({state})");
+        }
+
+        assert!(
+            kill_run_by_id(&id),
+            "kill_run_by_id must claim the running run"
+        );
+
+        // Bounded cleanup: the escapee must die even though it left the process group.
+        let cleaned = wait_until(
+            || pids_with_marker(&escape_marker).is_empty(),
+            Duration::from_secs(15),
+        )
+        .await;
+        let survivors = pids_with_marker(&escape_marker);
+        // Unrelated-process isolation: the test's own process must be untouched.
+        let other_alive = !pids_with_marker(&other_marker).is_empty();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+        if !cleaned {
+            kill_leaked(&escape_marker);
+        }
+        remove_test_run(&id);
+        assert!(
+            cleaned,
+            "escaped setsid descendant survived cleanup (survivors: {survivors:?})"
+        );
+        assert!(
+            other_alive,
+            "cleanup must not kill unrelated processes outside the run tree"
+        );
+    }
+
+    /// Same containment expectation for the timeout/watchdog route: when the watchdog
+    /// tree-kills a timed-out run, an escaped `setsid` descendant must not survive it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn escaped_setsid_descendant_does_not_survive_timeout_cleanup() {
+        let escape_marker = unique_duration();
+        let run = start_run(
+            "bash",
+            &escapee_script(&escape_marker),
+            "terminal",
+            None,
+            2_000,
+            None,
+            None,
+        )
+        .await
+        .expect("start_run");
+        let id = run.id.clone();
+
+        let started = wait_until(
+            || !pids_with_marker(&escape_marker).is_empty(),
+            Duration::from_secs(15),
+        )
+        .await;
+        if !started {
+            let state = lookup(&id)
+                .map(|r| format!("status={} output={:?}", r.status, r.output))
+                .unwrap_or_else(|| "<no run record>".to_string());
+            kill_leaked(&escape_marker);
+            panic!("escaped setsid descendant never started — precondition failed ({state})");
+        }
+
+        // The watchdog fires at 2 s; the run must reach a terminal state on its own.
+        let terminal = wait_until(
+            || lookup(&id).map(|r| r.status != "running").unwrap_or(true),
+            Duration::from_secs(20),
+        )
+        .await;
+        let cleaned = wait_until(
+            || pids_with_marker(&escape_marker).is_empty(),
+            Duration::from_secs(15),
+        )
+        .await;
+        let survivors = pids_with_marker(&escape_marker);
+        if !cleaned {
+            kill_leaked(&escape_marker);
+        }
+        remove_test_run(&id);
+        assert!(terminal, "timeout watchdog must finish the run");
+        assert!(
+            cleaned,
+            "escaped setsid descendant survived timeout cleanup (survivors: {survivors:?})"
+        );
+    }
+
+    /// Regression: an owner crash (the dotz process dying) must tear down the contained run
+    /// tree. Runs in a separate OS process — the "owner" — that the parent SIGKILLs. RED
+    /// before containment (the run tree leaks); GREEN after (PR_SET_PDEATHSIG on the wrapper
+    /// → `--kill-child=KILL` → kernel namespace teardown).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_crash_tears_down_contained_run_tree() {
+        let escape_marker = unique_duration();
+        let mut helper = spawn_helper(
+            "owner-crash",
+            &[("DOTZ_TEST_ESCAPE_MARKER", &escape_marker)],
+        );
+        let started = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if !pids_with_marker(&escape_marker).is_empty() {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        };
+        if !started {
+            let _ = helper.kill();
+            let _ = helper.wait();
+            kill_leaked(&escape_marker);
+            panic!("helper's escaped descendant never started — precondition failed");
+        }
+
+        // Owner crash: SIGKILL the whole helper process (all threads die).
+        let _ = helper.kill();
+        let _ = helper.wait();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if pids_with_marker(&escape_marker).is_empty() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let survivors = pids_with_marker(&escape_marker);
+                kill_leaked(&escape_marker);
+                panic!("run tree survived owner crash (survivors: {survivors:?})");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Fail-closed: when containment cannot be created, the run must error out WITHOUT ever
+    /// executing the workload — no silent fallback to uncontained execution. Runs in a helper
+    /// process because the test seam (`DOTZ_UNSHARE_BIN`) is process-local.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn containment_unavailable_fails_closed_without_running_workload() {
+        let dir = std::env::temp_dir().join(format!("dotz-failclosed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sentinel = dir.join("workload-ran");
+        let result_file = dir.join("result.txt");
+        let sentinel_s = sentinel.to_string_lossy().to_string();
+        let result_s = result_file.to_string_lossy().to_string();
+        let mut helper = spawn_helper(
+            "fail-closed",
+            &[
+                ("DOTZ_TEST_SENTINEL", &sentinel_s),
+                ("DOTZ_TEST_RESULT_FILE", &result_s),
+            ],
+        );
+        let status = helper.wait().expect("helper exit");
+        assert!(status.success(), "helper must complete normally");
+        let result = std::fs::read_to_string(&result_file).expect("helper result file");
+        let workload_ran = sentinel.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            result.contains("containment unavailable"),
+            "run must fail closed with a containment error, got: {result}"
+        );
+        assert!(
+            !workload_ran,
+            "workload must NOT execute when containment is unavailable"
+        );
+    }
+
+    /// Helper-process entrypoint for the two tests that must run in a separate OS process
+    /// (owner crash = SIGKILL of the owning process; fail-closed = a process-local env
+    /// override). Runs as a no-op pass in the parent harness.
+    #[test]
+    fn containment_helper_entrypoint() {
+        #[cfg(target_os = "linux")]
+        match std::env::var("DOTZ_TEST_CONTAINMENT_HELPER").as_deref() {
+            Ok("owner-crash") => helper_owner_crash(),
+            Ok("fail-closed") => helper_fail_closed(),
+            _ => {}
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_helper(mode: &str, extra_env: &[(&str, &str)]) -> std::process::Child {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut cmd = std::process::Command::new(exe);
+        // libtest's `--exact` matches the FULL test path, so spell it out — otherwise the
+        // helper runs zero tests and exits "successfully" without doing anything.
+        cmd.arg("sandbox::containment_tests::containment_helper_entrypoint")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("DOTZ_TEST_CONTAINMENT_HELPER", mode)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd.spawn().expect("spawn helper process")
+    }
+
+    /// Helper mode `owner-crash`: start a contained run with an escaped descendant, then park
+    /// forever. This process is the "owner" the parent SIGKILLs; returning would drop the
+    /// runtime and tear the run down through the parent-death path, which would make the
+    /// owner-crash assertion pass for the wrong reason.
+    #[cfg(target_os = "linux")]
+    fn helper_owner_crash() {
+        let marker = std::env::var("DOTZ_TEST_ESCAPE_MARKER").expect("escape marker");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let run = start_run(
+                "bash",
+                &escapee_script(&marker),
+                "terminal",
+                None,
+                600_000,
+                None,
+                None,
+            )
+            .await
+            .expect("start_run");
+            assert_eq!(run.status, "running");
+        });
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    /// Helper mode `fail-closed`: force containment failure via the process-local test seam
+    /// and record the run's terminal state so the parent can assert on it.
+    #[cfg(target_os = "linux")]
+    fn helper_fail_closed() {
+        let sentinel = std::env::var("DOTZ_TEST_SENTINEL").expect("sentinel");
+        let result_file = std::env::var("DOTZ_TEST_RESULT_FILE").expect("result file");
+        // SAFETY: single-threaded helper process; no other threads are running that could
+        // observe the environment mid-mutation (the runtime is built after this line).
+        unsafe {
+            std::env::set_var("DOTZ_UNSHARE_BIN", "/nonexistent/dotz-no-unshare");
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let final_run = rt.block_on(async {
+            let run = start_run(
+                "bash",
+                &format!("touch {sentinel}\n"),
+                "terminal",
+                None,
+                60_000,
+                None,
+                None,
+            )
+            .await
+            .expect("start_run");
+            let id = run.id.clone();
+            for _ in 0..600 {
+                if let Some(r) = lookup(&id)
+                    && r.status != "running"
+                {
+                    return r;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            lookup(&id).expect("run record")
+        });
+        std::fs::write(
+            result_file,
+            format!("{}\n{}", final_run.status, final_run.output),
+        )
+        .expect("write result file");
     }
 }
