@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { isSupportedSetupPe, isX64ApplicationPe, readPeInfo } from "./windows-pe-validation.mjs";
+import { parseDriverOutput, sleep } from "./windows-installer-runtime.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -364,16 +365,6 @@ function saveUiSnapshot(name, state) {
   fs.writeFileSync(path.join(outputDir, `uia-${name}.json`), `${JSON.stringify(sanitized, null, 2)}\n`, "utf8");
 }
 
-function parseDriverOutput(tool, stdout) {
-  const text = String(stdout || "").trim();
-  if (!text) throw new Error(`cua-driver call ${tool} returned empty output`);
-  let parsed;
-  try { parsed = JSON.parse(text); }
-  catch { throw new Error(`cua-driver call ${tool} returned non-JSON output: ${text}`); }
-  if (parsed?.isError) throw new Error(`cua-driver call ${tool} failed: ${parsed.error || JSON.stringify(parsed)}`);
-  return parsed;
-}
-
 function invokeDriver(tool, payload = {}, timeoutMs = 120_000) {
   const withSession = { ...payload, session: payload.session || driverSession };
   const completed = runSync(driverBin, ["call", tool], { input: JSON.stringify(withSession), timeoutMs });
@@ -675,7 +666,11 @@ async function launchNativeApp(appExe) {
 async function stopApp() {
   if (!activeAppPid) return;
   const pid = activeAppPid;
-  call("kill_app", { pid });
+  const killResponse = call("kill_app", { pid });
+  result.cleanup.app_stop_response = killResponse;
+  if (Number.isInteger(killResponse?.pid) && killResponse.pid !== pid) {
+    throw new Error(`cua-driver kill_app targeted pid ${killResponse.pid}, expected ${pid}`);
+  }
   const start = Date.now();
   let exited = false;
   while (Date.now() - start < 15_000) {

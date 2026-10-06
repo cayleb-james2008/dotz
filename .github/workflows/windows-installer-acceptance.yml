@@ -50,6 +50,10 @@ jobs:
         run: |
           node --check scripts/windows-installer-acceptance.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check scripts/windows-installer-runtime.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/test-windows-installer-runtime.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/test-windows-installer-architecture.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/test-verify-windows-memory-embedding.py
@@ -221,6 +225,10 @@ jobs:
         shell: pwsh
         run: |
           node --check scripts/windows-installer-acceptance.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check scripts/windows-installer-runtime.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/test-windows-installer-runtime.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/test-windows-installer-architecture.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
