@@ -955,6 +955,12 @@ async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
     let Some(reader) = reader else { return };
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        // Push to `out` BEFORE broadcasting so that a kill triggered by the broadcast
+        // (e.g. a test that waits for a marker then kills) cannot race the push —
+        // the marker is already in the collected output when the observer sees it.
+        out.push_str(&line);
+        out.push('\n');
+        cap_in_place(out);
         let _ = tx.send(json!({
             "type": "sandbox_output",
             "runId": id,
@@ -970,9 +976,6 @@ async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
                 detect_port_in_window(&id2, &line2, &window, &tx2).await;
             });
         }
-        out.push_str(&line);
-        out.push('\n');
-        cap_in_place(out);
         recent.push_back(line);
         if recent.len() > 3 {
             recent.pop_front();
@@ -2855,7 +2858,7 @@ mod tests {
 /// exec — the marker must be an argument of the FINAL exec'd process (`sleep <duration>`).
 /// Verified empirically via /proc: a `$0` marker vanished from the escapee's cmdline when the
 /// chain exec'd into bare `sleep`.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn unique_duration() -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
