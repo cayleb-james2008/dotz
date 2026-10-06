@@ -209,6 +209,8 @@ assert.match(acceptanceSource, /Select-Object ProcessId,ParentProcessId,Name,Exe
 assert.match(acceptanceSource, /list_windows", \{ pid \}\)/, "the exact target window association must be re-read before close input");
 assert.match(acceptanceSource, /requireVerifiedCloseForRelaunch\(closeOutcome, exitResult\)/, "relaunch requires both a successful input action and observed process exit");
 assert.match(acceptanceSource, /if \(activeAppPid && !activeStopAttempted\) await stopApp\(\)/, "cleanup must not repeat a previously attempted Alt+F4 action");
-const restartBoundary = acceptanceSource.indexOf("await stopApp();\n  await sleep(1_200);\n  state = await launchNativeApp(appExe);");
-assert.ok(restartBoundary >= 0, "native relaunch and persistence reads remain strictly after stopApp succeeds");
+const restartBoundaryPattern = /await stopApp\(\);\r?\n\s*await sleep\(1_200\);\r?\n\s*state = await launchNativeApp\(appExe\);/;
+assert.match("await stopApp();\r\n  await sleep(1_200);\r\n  state = await launchNativeApp(appExe);", restartBoundaryPattern, "restart-order assertion accepts Windows CRLF source files");
+const restartBoundary = acceptanceSource.match(restartBoundaryPattern);
+assert.ok(restartBoundary, "native relaunch and persistence reads remain strictly after stopApp succeeds");
 console.log("windows installer guarded native-close tests passed (all assertions)");
