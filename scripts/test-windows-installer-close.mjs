@@ -72,10 +72,32 @@ const target = (processInfo = identity, windowList = windows, processState = liv
   assert.equal(close.verifications.length, 2, "target identity is revalidated before both input actions");
 }
 
+// A successful response body containing the refusal code is data, not a driver failure.
+// It must never turn a completed input action into a second foreground input.
+{
+  const calls = [];
+  const close = runtime.sendGuardedClose({
+    pid: 1234,
+    windowId: 5678,
+    keys: ["alt", "f4"],
+    verifyTarget: () => target(),
+    sendInput: (request) => {
+      calls.push(request);
+      return refusalPayload;
+    },
+  });
+  assert.equal(close.ok, true, "a successful driver call completes without retrying based on its response data");
+  assert.equal(calls.length, 1, "only structured non-zero-exit driver errors can authorize escalation");
+  assert.equal(calls[0].delivery_mode, undefined);
+}
+
 // Other structured errors and malformed JSON are preserved but never escalated.
 for (const [label, completed] of [
   ["different code", { status: 1, stdout: "", stderr: JSON.stringify({ code: "stale_element_token", escalation: { recommended: "foreground" } }) }],
   ["malformed JSON", { status: 1, stdout: "", stderr: '{"code":"background_unavailable"' }],
+  ["unknown process exit status", { status: null, stdout: "", stderr: JSON.stringify(refusalPayload) }],
+  ["zero process exit status", { status: 0, stdout: "", stderr: JSON.stringify(refusalPayload) }],
+  ["nonnumeric process exit status", { status: "1", stdout: "", stderr: JSON.stringify(refusalPayload) }],
   ["unrecommended refusal", { status: 1, stdout: "", stderr: JSON.stringify({ code: "background_unavailable", escalation: { recommended: "px" } }) }],
 ]) {
   const calls = [];
@@ -208,6 +230,7 @@ assert.match(acceptanceSource, /sendGuardedClose\(\{[\s\S]*?verifyTarget:\s*veri
 assert.match(acceptanceSource, /Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,SessionId,CreationDate/, "the native process probe must capture launch identity against PID reuse");
 assert.match(acceptanceSource, /list_windows", \{ pid \}\)/, "the exact target window association must be re-read before close input");
 assert.match(acceptanceSource, /requireVerifiedCloseForRelaunch\(closeOutcome, exitResult\)/, "relaunch requires both a successful input action and observed process exit");
+assert.match(acceptanceSource, /const processExitObserved = exitResult\.exited;\s*const closeAndExitVerified = closeOutcome\.ok && processExitObserved;[\s\S]*?addCheck\("installed app process exited after guarded native Alt\+F4", closeAndExitVerified,/, "the native-exit acceptance check cannot pass unless both close delivery and process absence are verified");
 assert.match(acceptanceSource, /if \(activeAppPid && !activeStopAttempted\) await stopApp\(\)/, "cleanup must not repeat a previously attempted Alt+F4 action");
 const restartBoundaryPattern = /await stopApp\(\);\r?\n\s*await sleep\(1_200\);\r?\n\s*state = await launchNativeApp\(appExe\);/;
 assert.match("await stopApp();\r\n  await sleep(1_200);\r\n  state = await launchNativeApp(appExe);", restartBoundaryPattern, "restart-order assertion accepts Windows CRLF source files");

@@ -864,16 +864,20 @@ async function stopApp() {
     return { exited: false, latest };
   };
   const exitResult = await waitForExit(15_000);
-  const exited = exitResult.exited;
+  const processExitObserved = exitResult.exited;
+  const closeAndExitVerified = closeOutcome.ok && processExitObserved;
   stopRecord.after_close_process_state = exitResult.latest;
   stopRecord.stop_method = "cua-driver hotkey alt+f4; identity-guarded foreground retry only after structured background_unavailable; no forced PID termination";
-  stopRecord.exited = exited;
-  result.cleanup.cua_alt_f4_exit_observed = closeOutcome.ok && exited;
+  stopRecord.process_exit_observed = processExitObserved;
+  stopRecord.exited = closeAndExitVerified;
+  result.cleanup.cua_alt_f4_exit_observed = closeAndExitVerified;
   result.cleanup.stop_method = stopRecord.stop_method;
-  addCheck("installed app process exited after guarded native Alt+F4", exited, {
+  addCheck("installed app process exited after guarded native Alt+F4", closeAndExitVerified, {
     pid,
     timeout_ms: 15_000,
     method: stopRecord.stop_method,
+    close_request_succeeded: closeOutcome.ok,
+    process_exit_observed: processExitObserved,
     close_request_error: closeOutcome.reason,
     final_process_state: exitResult.latest,
     forced_termination: null,

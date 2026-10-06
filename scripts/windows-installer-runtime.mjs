@@ -194,7 +194,9 @@ function serializeCloseError(error) {
 }
 
 function structuredCloseSignal(attempt) {
-  const payload = attempt.error?.driver_failure?.parsed_error || attempt.response;
+  const driverFailure = attempt.error?.driver_failure;
+  if (!Number.isSafeInteger(driverFailure?.exit_code) || driverFailure.exit_code <= 0) return null;
+  const payload = driverFailure.parsed_error;
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
   return {
     code: typeof payload.code === "string" ? payload.code : null,
