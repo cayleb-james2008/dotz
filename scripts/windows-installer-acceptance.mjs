@@ -975,7 +975,7 @@ async function ensureMemoryVisibleAfterRestart() {
   let state = getState(true);
   if (!labels(state).includes(memoryText)) throw new Error("post-restart native UIA no longer contains the exact persisted synthetic memory text");
   const before = memoryVisibilityReadback(state);
-  result.memory.visibility = { status: "NAVIGATION_REQUIRED", before_scroll: before, native_scroll: null, after_scroll: null };
+  result.memory.visibility = { status: "NAVIGATION_REQUIRED", before_scroll: before, native_scroll: null, uia_scroll: null, after_scroll: null };
   await captureScreenshot("reuse-memory-before-native-scroll-after-restart", state);
 
   let after = before;
@@ -989,7 +989,7 @@ async function ensureMemoryVisibleAfterRestart() {
     if (scrollPoint.x < 0 || scrollPoint.y < 0 || scrollPoint.x >= width || scrollPoint.y >= height) {
       throw new Error(`horizontal scroll point is outside the exact native screenshot: ${JSON.stringify(scrollPoint)} in ${width}x${height}`);
     }
-    const scrollOutcome = sendGuardedScroll({
+    const wheelOutcome = sendGuardedScroll({
       pid: activeAppPid,
       windowId: activeWindowId,
       payload: { direction: "right", by: "page", amount: 8, ...scrollPoint },
@@ -997,25 +997,74 @@ async function ensureMemoryVisibleAfterRestart() {
       sendScroll: (request) => call("scroll", request),
     });
     result.memory.visibility.native_scroll = {
-      method: "cua-driver scroll direction=right by=page amount=8 over visible native chat area",
+      method: "cua-driver scroll direction=right by=page amount=8 over the visible native chat panel",
       point_window_local_pixels: scrollPoint,
       exact_target: { pid: activeAppPid, window_id: activeWindowId, launch_identity: activeLaunchIdentity },
-      outcome: scrollOutcome,
+      outcome: wheelOutcome,
     };
-    log(`MEMORY_HORIZONTAL_SCROLL ${JSON.stringify(result.memory.visibility.native_scroll)}`);
-    addCheck("guarded native horizontal scroll input is accepted by the exact installed window", scrollOutcome.ok, {
+    log(`MEMORY_HORIZONTAL_WHEEL ${JSON.stringify(result.memory.visibility.native_scroll)}`);
+    addCheck("guarded native horizontal wheel is accepted by the exact installed window", wheelOutcome.ok, {
       direction: "right",
       point_window_local_pixels: scrollPoint,
       pid: activeAppPid,
       window_id: activeWindowId,
-      delivery_attempts: scrollOutcome.attempts,
-      exact_target_verifications: scrollOutcome.verifications,
-      error: scrollOutcome.reason,
+      delivery_attempts: wheelOutcome.attempts,
+      exact_target_verifications: wheelOutcome.verifications,
+      error: wheelOutcome.reason,
     });
-    if (!scrollOutcome.ok) throw new Error(`native horizontal scroll could not be delivered to the verified dotz window: ${scrollOutcome.reason}`);
-    verifyActiveNativeInputTarget("after-horizontal-memory-scroll");
+    if (!wheelOutcome.ok) throw new Error(`native horizontal wheel could not be delivered to the verified dotz window: ${wheelOutcome.reason}`);
+    verifyActiveNativeInputTarget("after-horizontal-memory-wheel");
     state = getState(true);
     after = memoryVisibilityReadback(state);
+    result.memory.visibility.after_wheel = after;
+    await captureScreenshot("reuse-memory-after-native-wheel-before-uia-scroll-after-restart", state);
+
+    if (!memoryIsFullyReachable(after)) {
+      // Screenshot capture asks CUA for a new window snapshot and invalidates UIA tokens.
+      // Refresh after the preserved wheel screenshot so the ScrollPattern token below is current.
+      state = getState(true);
+      after = memoryVisibilityReadback(state);
+      result.memory.visibility.after_wheel = after;
+      if (!memoryIsFullyReachable(after)) {
+        const scrollSurface = findElement(state, { text: "dotz · ultra code · pi.dev", role: "Document" });
+        if (!scrollSurface?.element_token) {
+          throw new Error("fresh native UIA snapshot has no scrollable Document element token for horizontal Memory navigation");
+        }
+        const uiaOutcome = sendGuardedScroll({
+          pid: activeAppPid,
+          windowId: activeWindowId,
+          payload: {
+            direction: "right",
+            by: "page",
+            amount: 8,
+            element_token: scrollSurface.element_token,
+          },
+          verifyTarget: verifyActiveNativeInputTarget,
+          sendScroll: (request) => call("scroll", request),
+        });
+        result.memory.visibility.uia_scroll = {
+          method: "cua-driver UIA ScrollPattern right-pages on the fresh exact-window Document element",
+          target_role: scrollSurface.role,
+          target_label: scrollSurface.label,
+          exact_target: { pid: activeAppPid, window_id: activeWindowId, launch_identity: activeLaunchIdentity },
+          outcome: uiaOutcome,
+        };
+        log(`MEMORY_UIA_SCROLL ${JSON.stringify(result.memory.visibility.uia_scroll)}`);
+        addCheck("guarded native UIA ScrollPattern input is accepted by the exact installed window", uiaOutcome.ok, {
+          target_role: scrollSurface.role,
+          target_label: scrollSurface.label,
+          pid: activeAppPid,
+          window_id: activeWindowId,
+          delivery_attempts: uiaOutcome.attempts,
+          exact_target_verifications: uiaOutcome.verifications,
+          error: uiaOutcome.reason,
+        });
+        if (!uiaOutcome.ok) throw new Error(`native UIA ScrollPattern could not reach the exact installed window: ${uiaOutcome.reason}`);
+        verifyActiveNativeInputTarget("after-uia-horizontal-memory-scroll");
+        state = getState(true);
+        after = memoryVisibilityReadback(state);
+      }
+    }
     result.memory.visibility.after_scroll = after;
     await captureScreenshot("reuse-memory-after-restart", state);
   } else {
@@ -1026,15 +1075,20 @@ async function ensureMemoryVisibleAfterRestart() {
 
   const reachable = memoryIsFullyReachable(after);
   result.memory.visibility.status = reachable
-    ? (result.memory.visibility.native_scroll ? "VISIBLE_AFTER_NATIVE_HORIZONTAL_SCROLL" : "ALREADY_VISIBLE_IN_NATIVE_WINDOW")
+    ? (result.memory.visibility.uia_scroll ? "VISIBLE_AFTER_NATIVE_UIA_SCROLL"
+      : result.memory.visibility.native_scroll ? "VISIBLE_AFTER_NATIVE_HORIZONTAL_WHEEL"
+        : "ALREADY_VISIBLE_IN_NATIVE_WINDOW")
     : "FAILED_OUTSIDE_NATIVE_WINDOW";
   addCheck("post-restart Memory header, synthetic project text, and Add action are fully inside the exact native window", reachable, {
     expected_project_memory: memoryText,
     required_elements: ["MEMORY", memoryText, "+ ADD"],
     native_visibility: after,
-    navigation: result.memory.visibility.native_scroll,
+    navigation: {
+      horizontal_wheel: result.memory.visibility.native_scroll,
+      uia_scroll_pattern: result.memory.visibility.uia_scroll,
+    },
   });
-  if (!reachable) throw new Error(`persisted Memory remains outside the exact native window after user-operable horizontal scroll: ${JSON.stringify(after)}`);
+  if (!reachable) throw new Error(`persisted Memory remains outside the exact native window after user-operable wheel and UIA navigation: ${JSON.stringify(after)}`);
   return state;
 }
 

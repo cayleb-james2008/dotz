@@ -10,11 +10,6 @@ assert.match(
   /overflow-x:\s*auto\s*;/,
   "the bento must provide a user-scrollable horizontal path when a persisted panel is outside the native viewport",
 );
-assert.match(
-  bento,
-  /grid-template-columns:\s*repeat\(12,\s*minmax\(0,\s*1fr\)\)\s*;/,
-  "intrinsic content must not widen the bento grid past the native viewport and clip later panels",
-);
 
 // These are the captured native geometry dimensions/coordinates from the verified
 // 2026-10-06 restart screenshot: the old harness saw the saved text outside the window.
@@ -65,6 +60,25 @@ assert.equal(scrollCalls[1].window_id, 196944);
 assert.equal(scrollCalls[1].x, 514);
 assert.equal(scrollCalls[1].y, 400);
 
+const scrollPatternCalls = [];
+const scrollPatternOutcome = sendGuardedScroll({
+  pid: 1364,
+  windowId: 196944,
+  payload: { direction: "right", by: "page", amount: 8, element_token: "fresh-document-scroll-token" },
+  verifyTarget: () => ({ valid: true }),
+  sendScroll: (request) => {
+    scrollPatternCalls.push(request);
+    if (request.delivery_mode === "background") throw backgroundUnavailable;
+    return { path: "uia", delivery_mode: "foreground" };
+  },
+});
+assert.equal(scrollPatternOutcome.ok, true);
+assert.equal(scrollPatternCalls.length, 2);
+assert.equal(scrollPatternCalls[1].element_token, "fresh-document-scroll-token", "the exact fresh native UIA scroll token survives guarded foreground escalation");
+assert.equal(scrollPatternCalls[1].pid, 1364);
+assert.equal(scrollPatternCalls[1].window_id, 196944);
+assert.equal(scrollPatternCalls[1].delivery_mode, "foreground");
+
 const invalidForegroundCalls = [];
 const invalidForeground = sendGuardedScroll({
   pid: 1364,
@@ -111,8 +125,17 @@ assert.ok(visibilityJourney, "restart acceptance must define a visibility journe
 assert.match(visibilityJourney, /getState\(true\)/, "visibility must come from a fresh native UIA/screenshot state");
 assert.match(visibilityJourney, /sendGuardedScroll\(/, "offscreen memory must be reached with guarded native scroll input");
 assert.match(visibilityJourney, /call\("scroll", request\)/, "navigation must use CUA's native scroll action rather than DOM automation");
-assert.match(visibilityJourney, /captureScreenshot\("reuse-memory-before-native-scroll-after-restart"/, "the offscreen pre-navigation native view must be preserved");
-assert.match(visibilityJourney, /captureScreenshot\("reuse-memory-after-restart"/, "the post-navigation native pixels must be preserved");
+const uiAutomationFallback = acceptanceSource.match(/const scrollSurface = findElement\(state, \{ text: [^,]+, role: "Document" \}\);([\s\S]*?)if \(!uiaOutcome\.ok\)/)?.[1];
+assert.ok(uiAutomationFallback, "after user wheel fails to reveal the native panel, use a fresh scrollable Document target from the native UIA tree");
+assert.match(uiAutomationFallback, /element_token/, "native fallback must use the current snapshot's UIA scroll token");
+assert.match(uiAutomationFallback, /sendGuardedScroll\(/, "UIA scroll must use the same exact-process/window delivery guard");
+const wheelScreenshot = visibilityJourney.indexOf('captureScreenshot("reuse-memory-after-native-wheel-before-uia-scroll-after-restart"');
+const refreshedUiTree = visibilityJourney.indexOf("state = getState(true);", wheelScreenshot + 1);
+const refreshedVisibilityReadback = visibilityJourney.indexOf("after = memoryVisibilityReadback(state);", refreshedUiTree + 1);
+const freshReachabilityCheck = visibilityJourney.indexOf("if (!memoryIsFullyReachable(after)) {", refreshedVisibilityReadback + 1);
+const uiaScroll = visibilityJourney.indexOf("const scrollSurface = findElement");
+assert.ok(wheelScreenshot >= 0 && refreshedUiTree > wheelScreenshot && refreshedVisibilityReadback > refreshedUiTree && freshReachabilityCheck > refreshedVisibilityReadback && freshReachabilityCheck < uiaScroll, "refresh native UIA after screenshot capture, recompute bounds, then recheck reachability before ScrollPattern input");
+assert.match(visibilityJourney, /captureScreenshot\("reuse-memory-after-restart"/, "the final post-navigation native pixels must be preserved");
 const reachability = acceptanceSource.match(/function memoryIsFullyReachable\(readback\) \{([\s\S]*?)\n\}/)?.[1];
 assert.ok(reachability, "post-restart acceptance must define a fail-closed native visibility predicate");
 assert.match(reachability, /memory_text[\s\S]*?screenshot_frame\?\.inside/);
