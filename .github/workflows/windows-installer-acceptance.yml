@@ -12,6 +12,7 @@ permissions:
 jobs:
   released_native:
     name: Released v0.2.8 installer on Windows x64
+    if: ${{ github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/diagnostic/windows-installer-acceptance' }}
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -94,7 +95,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dotz-windows-acceptance-released-${{ github.run_id }}
+          name: dotz-windows-acceptance-released-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dotz-acceptance-released/
           if-no-files-found: error
           retention-days: 30
@@ -102,6 +103,7 @@ jobs:
 
   candidate_build:
     name: Build unsigned candidate NSIS installer
+    if: ${{ github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/diagnostic/windows-installer-acceptance' }}
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -113,6 +115,12 @@ jobs:
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify candidate output-path contract
+        shell: pwsh
+        run: |
+          node scripts/test-windows-candidate-output-path.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install locked dependencies and real embedding resources
         shell: pwsh
@@ -140,7 +148,7 @@ jobs:
           if (-not $rustHostMatch.Success -or $rustHostMatch.Groups[1].Value -ne 'x86_64-pc-windows-msvc') {
             throw "Candidate Rust host is not x86_64-pc-windows-msvc: $rustInfo"
           }
-          $installer = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\target\release\bundle\nsis\dotz_0.2.8_x64-setup.exe'
+          $installer = Join-Path $env:GITHUB_WORKSPACE 'target\release\bundle\nsis\dotz_0.2.8_x64-setup.exe'
           if (-not (Test-Path -LiteralPath $installer)) { throw "Built NSIS installer is missing: $installer" }
           $info = Get-Item -LiteralPath $installer
           $sha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -173,7 +181,7 @@ jobs:
       - name: Publish candidate installer artifact for this workflow only
         uses: actions/upload-artifact@v4
         with:
-          name: dotz-windows-candidate-${{ github.run_id }}
+          name: dotz-windows-candidate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dotz-candidate-package/
           if-no-files-found: error
           retention-days: 2
@@ -182,7 +190,7 @@ jobs:
   candidate_native:
     name: Candidate installer on a fresh Windows x64 profile
     needs: [released_native, candidate_build]
-    if: ${{ !cancelled() && needs.candidate_build.result == 'success' && needs.released_native.result != 'skipped' }}
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/diagnostic/windows-installer-acceptance') && needs.candidate_build.result == 'success' && needs.released_native.result != 'skipped' }}
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -208,7 +216,7 @@ jobs:
       - name: Download exact candidate package from this workflow run
         uses: actions/download-artifact@v4
         with:
-          name: dotz-windows-candidate-${{ github.run_id }}
+          name: dotz-windows-candidate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dotz-candidate-package
 
       - name: Install cua-driver from its documented Windows installer
@@ -264,7 +272,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dotz-windows-acceptance-candidate-${{ github.run_id }}
+          name: dotz-windows-acceptance-candidate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dotz-acceptance-candidate/
           if-no-files-found: error
           retention-days: 30

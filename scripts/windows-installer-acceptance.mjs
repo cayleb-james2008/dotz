@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { isSupportedSetupPe, isX64ApplicationPe, readPeInfo } from "./windows-pe-validation.mjs";
-import { parseDriverOutput, sleep } from "./windows-installer-runtime.mjs";
+import { classifyInitialOnboarding, classifyOnboardingReuse, classifyProcessStateReadback, classifyRestartUiSamples, isDotzWindowForPid, isInstalledDotzProcess, parseDriverOutput, processStateProbeCommand, sleep, uiFailureDetails } from "./windows-installer-runtime.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -34,6 +34,14 @@ const RELEASED_ASSET = {
   feedBytes: 971,
   feedSha256: "e67d7cf6e12bcfd9c57b3d829416c4c2947b1ebacaa598a6f79cfe3cd100a142",
   signatureBase64Sha256: "4194a09c14c54cc5008db922cafdd5bb51fda0d79e78ed5c2fff3adeefa6f9c8",
+  firstRunSource: {
+    rawBaseUrl: "https://raw.githubusercontent.com/cayleb-james2008/dotz/16f27f5878c44cf7aa13ea3719a84dce9b58b0fd",
+    wizardModuleHttpStatus: 404,
+    indexHtmlSha256: "7d5204adad6a67cc8acf007eef3a56076eefdffc86b78537ebbe814fcd157f52",
+    indexHtmlWizardReferenceCount: 0,
+    serverModuleSha256: "72092052fd3181cf1f7c94cd3e5adea329f11ab9b898f4f9473c69f30b24a9db",
+    serverModuleFirstRunRouteReferenceCount: 0,
+  },
 };
 const driverBin = process.env.CUA_DRIVER_BIN || path.join(
   process.env.LOCALAPPDATA || "",
@@ -86,7 +94,7 @@ const result = {
   checks: [],
   skips: [],
   raw_counts: { total: 0, passed: 0, failed: 0, skipped: 0 },
-  cleanup: { app_stopped: false, cua_daemon_stopped: false },
+  cleanup: { app_stopped: false, cua_daemon_stopped: false, process_stops: [] },
 };
 
 let daemonStartedByTest = false;
@@ -183,7 +191,7 @@ function addCheck(name, ok, detail = {}) {
 }
 
 function addSkip(name, reason) {
-  const item = { name, status: "SKIP", reason, at: new Date().toISOString() };
+  const item = { name, phase: currentPhase, status: "SKIP", reason, at: new Date().toISOString() };
   result.checks.push(item);
   result.skips.push(item);
   log(`SKIP ${name}: ${reason}`);
@@ -346,6 +354,36 @@ async function captureScreenshot(name, state) {
   persist();
 }
 
+async function captureFailureUi(name) {
+  let state = null;
+  let uiReadError = null;
+  let screenshotError = null;
+  let labelError = null;
+  try {
+    state = getState(false);
+  } catch (error) {
+    uiReadError = error instanceof Error ? error.message : String(error);
+  }
+  try {
+    await captureScreenshot(name, state);
+  } catch (error) {
+    screenshotError = error instanceof Error ? error.message : String(error);
+  }
+  let textSample = null;
+  try {
+    if (state) textSample = labels(state).slice(0, 2_000);
+  } catch (error) {
+    labelError = error instanceof Error ? error.message : String(error);
+  }
+  return {
+    state,
+    text_sample: textSample,
+    ui_read_error: uiReadError,
+    screenshot_error: screenshotError,
+    label_error: labelError,
+  };
+}
+
 function saveUiSnapshot(name, state) {
   const sanitized = {
     pid: state.pid,
@@ -390,6 +428,32 @@ function labels(state) {
   return (state.elements || []).map((item) => `${item.role || ""} ${item.label || ""}`).join("\n") + `\n${state.tree_markdown || ""}`;
 }
 
+async function withUiFailureCheck(checkName, evidenceName, operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    const failureUi = await captureFailureUi(evidenceName);
+    addCheck(checkName, false, uiFailureDetails(error, failureUi));
+    throw error;
+  }
+}
+
+function waitForTextChecked(checkName, evidenceName, text, timeoutMs = 30_000) {
+  return withUiFailureCheck(checkName, evidenceName, () => waitForText(text, timeoutMs));
+}
+
+function clickByTextChecked(checkName, evidenceName, text, options = {}) {
+  return withUiFailureCheck(checkName, evidenceName, () => clickByText(text, options));
+}
+
+function typeIntoChecked(checkName, evidenceName, text, value, options = {}) {
+  return withUiFailureCheck(checkName, evidenceName, () => typeInto(text, value, options));
+}
+
+function getStateChecked(checkName, evidenceName, includeScreenshot = false) {
+  return withUiFailureCheck(checkName, evidenceName, () => getState(includeScreenshot));
+}
+
 function findElement(state, { text, role } = {}) {
   const needle = String(text || "").toLowerCase();
   return (state.elements || []).find((element) => {
@@ -408,6 +472,28 @@ async function waitForText(text, timeoutMs = 30_000) {
   }
   const visible = (latest?.elements || []).map((element) => `${element.role}:${element.label}`).join(" | ");
   throw new Error(`Timed out waiting for native UI text ${JSON.stringify(text)}; visible=${visible}`);
+}
+
+async function waitForFirstRunBranch(timeoutMs = 30_000) {
+  const start = Date.now();
+  let latest = null;
+  while (Date.now() - start < timeoutMs) {
+    latest = getState(false);
+    if (/WELCOME TO dotz|STEP [1-4]|NO PROJECT/i.test(labels(latest))) return latest;
+    await sleep(400);
+  }
+  throw new Error(`Timed out waiting for native first-run wizard or dashboard; visible=${labels(latest).slice(0, 2_000)}`);
+}
+
+async function waitForFirstRunWizard(timeoutMs = 45_000) {
+  const start = Date.now();
+  let latest = null;
+  while (Date.now() - start < timeoutMs) {
+    latest = getState(false);
+    if (/WELCOME TO dotz|STEP [1-4]/i.test(labels(latest))) return latest;
+    await sleep(400);
+  }
+  throw new Error(`Timed out waiting for native first-run wizard; visible=${labels(latest).slice(0, 2_000)}`);
 }
 
 async function clickByText(text, { role, timeoutMs = 30_000 } = {}) {
@@ -640,15 +726,37 @@ function appProcessInfo(pid) {
 async function launchNativeApp(appExe) {
   const launched = call("launch_app", { path: appExe });
   const pid = Number(launched.pid);
-  if (!Number.isInteger(pid) || pid <= 0) throw new Error(`cua-driver launch_app returned no valid process id: ${JSON.stringify(launched)}`);
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`cua-driver launch_app returned no valid process id: ${JSON.stringify(launched)}`);
+  let processInfo;
+  try {
+    processInfo = appProcessInfo(pid);
+  } catch (error) {
+    result.app = { pid, executable: appExe, process_query_error: error instanceof Error ? error.message : String(error) };
+    addCheck("launched PID is verified as the installed dotz.exe", false, { pid, expected_executable: appExe, process_query_error: result.app.process_query_error });
+    throw new Error(`refusing to track or stop unverified launch pid ${pid}: ${result.app.process_query_error}`);
+  }
+  const processOwned = isInstalledDotzProcess(processInfo, appExe);
+  result.app = { pid, window_id: null, title: null, app_name: null, executable: appExe, process: processInfo };
+  addCheck("launched PID is verified as the installed dotz.exe", processOwned, { pid, expected_executable: appExe, process: processInfo });
+  if (!processOwned) throw new Error(`refusing to track or stop pid ${pid}: process identity does not match installed ${appExe}`);
   activeAppPid = pid;
-  const window = await waitForAppWindow(pid);
+
+  let window;
+  try {
+    window = await waitForAppWindow(pid);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    result.app.window_query_error = message;
+    addCheck("native dotz window becomes available for the verified installed process", false, { pid, error: message });
+    throw error;
+  }
+  const windowOwned = isDotzWindowForPid(window, pid);
+  addCheck("native dotz window is bound to the verified installed process", windowOwned, { pid, window });
+  if (!windowOwned) throw new Error(`native window returned for pid ${pid} is not the installed dotz.exe window`);
   activeWindowId = window.window_id;
-  result.app = { pid, window_id: activeWindowId, title: window.title || null, app_name: window.app_name || null, executable: appExe };
-  const process = appProcessInfo(pid);
-  result.app.process = process;
-  addCheck("installed native dotz process owns the target window", Boolean(process && process.Name?.toLowerCase() === "dotz.exe" && path.resolve(process.ExecutablePath || "").toLowerCase() === path.resolve(appExe).toLowerCase()), { window, process });
-  addCheck("native dotz window is not a browser proxy", Boolean(window.app_name?.toLowerCase() === "dotz.exe" && pid === window.pid), { pid, window_app_name: window.app_name, window_pid: window.pid, title: window.title });
+  result.app.window_id = activeWindowId;
+  result.app.title = window.title || null;
+  result.app.app_name = window.app_name || null;
   const children = webviewChildren(pid);
   result.webview2_processes = children;
   addCheck("WebView2 child process is present under installed dotz", children.some((child) => child.Name?.toLowerCase() === "msedgewebview2.exe"), { count: children.length, processes: children });
@@ -663,92 +771,179 @@ async function launchNativeApp(appExe) {
   return state;
 }
 
+function readProcessState(pid) {
+  const probe = runSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", processStateProbeCommand(pid)], { timeoutMs: 10_000 });
+  return { classification: classifyProcessStateReadback(probe, pid), probe };
+}
+
 async function stopApp() {
   if (!activeAppPid) return;
   const pid = activeAppPid;
-  const killResponse = call("kill_app", { pid });
-  result.cleanup.app_stop_response = killResponse;
-  if (Number.isInteger(killResponse?.pid) && killResponse.pid !== pid) {
-    throw new Error(`cua-driver kill_app targeted pid ${killResponse.pid}, expected ${pid}`);
+  const stopRecord = { phase: currentPhase, pid, requested_at: new Date().toISOString() };
+  result.cleanup.process_stops ||= [];
+  result.cleanup.process_stops.push(stopRecord);
+
+  const beforeClose = readProcessState(pid);
+  stopRecord.before_close_process_state = beforeClose;
+  if (beforeClose.classification === "absent") {
+    stopRecord.close_refused_reason = "installed process was already absent before the requested restart close";
+    addCheck("installed dotz process remained live until the controlled restart close", false, { pid, process_state: beforeClose });
+    result.cleanup.stop_method = "already absent before Alt+F4; no close sent";
+    result.cleanup.app_stopped = true;
+    stopRecord.exited = true;
+    activeAppPid = null;
+    activeWindowId = null;
+    throw new Error(`installed dotz process ${pid} exited before the controlled restart close`);
   }
-  const start = Date.now();
-  let exited = false;
-  while (Date.now() - start < 15_000) {
-    const probe = runSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", `Get-Process -Id ${pid} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id | ConvertTo-Json -Compress`], { timeoutMs: 10_000 });
-    if (probe.status === 0 && !(probe.stdout || "").trim()) {
-      exited = true;
-      break;
+  if (beforeClose.classification !== "present") {
+    stopRecord.close_refused_reason = "process-state readback was not a verified live-process record";
+    addCheck("native close target has a conclusive live-process readback", false, { pid, process_state: beforeClose });
+    result.cleanup.stop_refused = true;
+    activeAppPid = null;
+    activeWindowId = null;
+    throw new Error(`refusing to close pid ${pid}: explicit process-state readback was ${beforeClose.classification}`);
+  }
+
+  let processInfo;
+  try {
+    processInfo = appProcessInfo(pid);
+  } catch (error) {
+    stopRecord.close_refused_reason = error instanceof Error ? error.message : String(error);
+    addCheck("native close target is the exact installed dotz.exe", false, { pid, expected_executable: result.installation.app_exe, error: stopRecord.close_refused_reason });
+    result.cleanup.stop_refused = true;
+    activeAppPid = null;
+    activeWindowId = null;
+    throw new Error(`refusing to close pid ${pid}: installed executable identity could not be revalidated`);
+  }
+  const closeTargetOwned = isInstalledDotzProcess(processInfo, result.installation.app_exe);
+  stopRecord.close_target_process = processInfo;
+  addCheck("native close target is the exact installed dotz.exe", closeTargetOwned, { pid, expected_executable: result.installation.app_exe, process: processInfo });
+  if (!closeTargetOwned) {
+    stopRecord.close_refused_reason = "current PID no longer identifies the installed dotz.exe";
+    result.cleanup.stop_refused = true;
+    activeAppPid = null;
+    activeWindowId = null;
+    throw new Error(`refusing to send Alt+F4 to pid ${pid}: current executable does not match installed dotz.exe`);
+  }
+
+  let closeResponse = null;
+  let closeError = null;
+  try {
+    closeResponse = call("hotkey", { pid, keys: ["alt", "f4"] });
+    stopRecord.cua_alt_f4_response = closeResponse;
+  } catch (error) {
+    closeError = error instanceof Error ? error.message : String(error);
+    stopRecord.cua_alt_f4_error = closeError;
+  }
+  result.cleanup.alt_f4_close_response = closeResponse;
+  result.cleanup.alt_f4_close_error = closeError;
+  addCheck("cua-driver Alt+F4 close request succeeded", !closeError, { pid, keys: ["alt", "f4"], response: closeResponse, error: closeError });
+
+  const waitForExit = async (timeoutMs) => {
+    const start = Date.now();
+    let latest = null;
+    while (Date.now() - start < timeoutMs) {
+      latest = readProcessState(pid);
+      if (latest.classification === "absent") return { exited: true, latest };
+      await sleep(250);
     }
-    await sleep(250);
-  }
-  addCheck("installed app process exited before restart/cleanup", exited, { pid, timeout_ms: 15_000 });
-  if (!exited) throw new Error(`Installed dotz process ${pid} remained alive after kill_app; restart persistence was not tested`);
+    return { exited: false, latest };
+  };
+  const exitResult = await waitForExit(15_000);
+  const exited = exitResult.exited;
+  stopRecord.after_close_process_state = exitResult.latest;
+  stopRecord.stop_method = "cua-driver hotkey alt+f4; no forced PID termination";
+  stopRecord.exited = exited;
+  result.cleanup.cua_alt_f4_exit_observed = !closeError && exited;
+  result.cleanup.stop_method = stopRecord.stop_method;
+  addCheck("installed app process exited after native Alt+F4 close", exited, {
+    pid,
+    timeout_ms: 15_000,
+    method: stopRecord.stop_method,
+    close_request_error: closeError,
+    final_process_state: exitResult.latest,
+    forced_termination: null,
+  });
+  if (!exited) throw new Error(`Installed dotz process ${pid} remained alive after native Alt+F4; restart persistence was not tested`);
   activeAppPid = null;
   activeWindowId = null;
   result.cleanup.app_stopped = true;
 }
 
 async function createProjectInUi() {
-  let state = getState(false);
-  if (labels(state).includes(projectName)) {
-    // A fresh app cannot contain this run-specific name before the UI creates it.
-    throw new Error(`Unexpected project name already visible before create: ${projectName}`);
+  let state = await getStateChecked("fresh native UI state is readable before project creation", "project-create-initial-state-failed");
+  const unexpectedProjectVisible = labels(state).includes(projectName);
+  addCheck("run-specific project is absent before native creation", !unexpectedProjectVisible, { project: projectName, visible: unexpectedProjectVisible });
+  if (unexpectedProjectVisible) throw new Error(`Unexpected project name already visible before create: ${projectName}`);
+  await clickByTextChecked("project selector opens before new-project creation", "project-create-selector-failed", "NO PROJECT", { role: "Button" });
+  await clickByTextChecked("new-project form is requested through the selector", "project-create-form-button-failed", "+ NEW PROJECT", { role: "Button" });
+  state = await waitForTextChecked("new-project form becomes visible", "project-create-form-timeout", "project name");
+  try {
+    fs.mkdirSync(projectDir, { recursive: true });
+  } catch (error) {
+    addCheck("synthetic project workspace directory is created", false, { cwd: projectDir, error: error instanceof Error ? error.message : String(error) });
+    throw error;
   }
-  await clickByText("NO PROJECT", { role: "Button" });
-  await clickByText("+ NEW PROJECT", { role: "Button" });
-  await waitForText("project name");
-  fs.mkdirSync(projectDir, { recursive: true });
-  await typeInto("project name", projectName);
-  await typeInto("cwd (absolute path)", projectDir);
-  await captureScreenshot("project-form", getState(false));
-  await clickByText("CREATE & OPEN", { role: "Button" });
-  state = await waitForText(projectName, 45_000);
+  addCheck("synthetic project workspace directory is created", true, { cwd: projectDir });
+  await typeIntoChecked("native project form accepts run-specific name", "project-name-entry-failed", "project name", projectName);
+  await typeIntoChecked("native project form accepts synthetic workspace path", "project-cwd-entry-failed", "cwd (absolute path)", projectDir);
+  await withUiFailureCheck("native project form screenshot is captured", "project-form-screenshot-failed", () => captureScreenshot("project-form", getState(false)));
+  await clickByTextChecked("native CREATE & OPEN action completes", "project-create-action-failed", "CREATE & OPEN", { role: "Button" });
+  state = await waitForTextChecked("new project appears open in the native UI", "project-open-timeout", projectName, 45_000);
   result.project.status = "CREATED_AND_OPENED_IN_NATIVE_UI";
   addCheck("project created and opened through native UI", labels(state).includes(projectName), { name: projectName, cwd: projectDir });
-  await captureScreenshot("project-open", state);
+  await withUiFailureCheck("native opened-project screenshot is captured", "project-open-screenshot-failed", () => captureScreenshot("project-open", state));
 }
 
 async function ensureMemoryPanel() {
-  let state = getState(false);
+  let state = await getStateChecked("native UI state is readable before adding Memory panel", "memory-panel-initial-state-failed");
   if (labels(state).toLowerCase().includes("+ add")) return state;
-  await clickByText("+ PANELS", { role: "Button" });
-  state = await waitForText("ADD PANEL");
-  await captureScreenshot("panel-palette", state);
-  await clickByText("MEMORY");
-  state = await waitForText("+ ADD", 30_000);
+  await clickByTextChecked("panel palette opens through native UI", "memory-panel-palette-button-failed", "+ PANELS", { role: "Button" });
+  state = await waitForTextChecked("panel palette becomes visible", "memory-panel-palette-timeout", "ADD PANEL");
+  await withUiFailureCheck("panel palette screenshot is captured", "memory-panel-palette-screenshot-failed", () => captureScreenshot("panel-palette", state));
+  await clickByTextChecked("Memory panel is selected from the native palette", "memory-panel-select-failed", "MEMORY");
+  state = await waitForTextChecked("Memory panel exposes its add action", "memory-panel-add-timeout", "+ ADD", 30_000);
   addCheck("Memory panel opened through native panel palette", labels(state).toLowerCase().includes("+ add"), {});
   return state;
 }
 
 async function saveSyntheticMemory() {
   let state = await ensureMemoryPanel();
-  await clickByText("+ ADD", { role: "Button" });
-  state = await waitForText("a durable fact to remember");
-  await typeInto("a durable fact to remember", memoryText, { role: "Edit" });
+  await clickByTextChecked("memory form opens from the native Memory panel", "memory-add-button-failed", "+ ADD", { role: "Button" });
+  state = await waitForTextChecked("synthetic-memory entry form becomes visible", "memory-form-timeout", "a durable fact to remember");
+  await typeIntoChecked("native Memory form accepts synthetic text", "memory-text-entry-failed", "a durable fact to remember", memoryText, { role: "Edit" });
   const category = findElement(state, { text: "category (convention" });
   if (category?.element_token) {
-    call("type_text", { pid: activeAppPid, window_id: activeWindowId, element_token: category.element_token, text: memoryCategory });
+    await withUiFailureCheck("native Memory form accepts the synthetic category", "memory-category-entry-failed", () => call("type_text", { pid: activeAppPid, window_id: activeWindowId, element_token: category.element_token, text: memoryCategory }));
   }
-  state = getState(false);
-  if (!labels(state).toLowerCase().includes("project")) throw new Error("Memory form did not expose its default project scope");
-  await captureScreenshot("memory-form", state);
-  await clickByText("SAVE", { role: "Button" });
-  state = await waitForText(memoryText, 45_000);
+  state = await getStateChecked("native Memory form state is readable before save", "memory-form-state-failed");
+  const projectScopeVisible = labels(state).toLowerCase().includes("project");
+  addCheck("memory form exposes the intended project scope", projectScopeVisible, { scope: "project", text_sample: labels(state).slice(0, 2_000) });
+  if (!projectScopeVisible) throw new Error("Memory form did not expose its default project scope");
+  await withUiFailureCheck("synthetic-memory form screenshot is captured", "memory-form-screenshot-failed", () => captureScreenshot("memory-form", state));
+  await clickByTextChecked("synthetic Memory SAVE action completes", "memory-save-action-failed", "SAVE", { role: "Button" });
+  state = await waitForTextChecked("synthetic memory appears in the native Memory panel", "memory-saved-list-timeout", memoryText, 45_000);
   result.memory.status = "SAVED_THROUGH_NATIVE_UI";
   addCheck("synthetic project memory saved and listed in native UI", labels(state).includes(memoryText), { category: memoryCategory, scope: "project" });
-  await captureScreenshot("memory-saved", state);
+  await withUiFailureCheck("saved-memory screenshot is captured", "memory-saved-screenshot-failed", () => captureScreenshot("memory-saved", state));
 }
 
 function readEmbeddingFromDatabase(stage) {
   const dbPath = path.join(dotzProfile, "ai-agents", "memory.db");
   const helper = path.join(scriptDir, "verify-windows-memory-embedding.py");
-  const completed = runSync(process.env.DOTZ_PYTHON || "python", [helper, "--db", dbPath, "--text", memoryText, "--cwd", projectDir, "--category", memoryCategory], { timeoutMs: 60_000 });
-  fs.writeFileSync(path.join(outputDir, `memory-${stage}-raw.stdout.json`), completed.stdout || "", "utf8");
-  fs.writeFileSync(path.join(outputDir, `memory-${stage}-raw.stderr.log`), completed.stderr || "", "utf8");
-  if (completed.status !== 0) throw new Error(`SQLite memory/embedding probe exited ${completed.status}: ${completed.stderr || completed.stdout}`);
-  const proof = JSON.parse(completed.stdout);
-  fs.writeFileSync(path.join(outputDir, `memory-${stage}.json`), `${JSON.stringify(proof, null, 2)}\n`, "utf8");
-  return proof;
+  try {
+    const completed = runSync(process.env.DOTZ_PYTHON || "python", [helper, "--db", dbPath, "--text", memoryText, "--cwd", projectDir, "--category", memoryCategory], { timeoutMs: 60_000 });
+    fs.writeFileSync(path.join(outputDir, `memory-${stage}-raw.stdout.json`), completed.stdout || "", "utf8");
+    fs.writeFileSync(path.join(outputDir, `memory-${stage}-raw.stderr.log`), completed.stderr || "", "utf8");
+    if (completed.status !== 0) throw new Error(`SQLite memory/embedding probe exited ${completed.status}: ${completed.stderr || completed.stdout}`);
+    const proof = JSON.parse(completed.stdout);
+    fs.writeFileSync(path.join(outputDir, `memory-${stage}.json`), `${JSON.stringify(proof, null, 2)}\n`, "utf8");
+    addCheck(`local memory/embedding proof read succeeds (${stage})`, true, { database: dbPath, dimensions: proof.dimensions, embedding_sha256: proof.embedding_sha256 });
+    return proof;
+  } catch (error) {
+    addCheck(`local memory/embedding proof read succeeds (${stage})`, false, { database: dbPath, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }
 
 async function main() {
@@ -867,34 +1062,99 @@ async function main() {
   addCheck("cua-driver native UI session started", true, { session: driverSession });
   currentPhase = "first-run";
   let state = await launchNativeApp(appExe);
-  const nativeWebViewTree = labels(state);
-  if (!nativeWebViewTree.toLowerCase().includes("step 1") && !nativeWebViewTree.toLowerCase().includes("welcome to dotz")) {
-    state = await waitForText("WELCOME TO dotz", 45_000);
+  await withUiFailureCheck("fresh native launch screenshot is captured", "fresh-native-launch-screenshot-failed", () => captureScreenshot("fresh-native-launch-initial", state));
+  let firstLaunchText = labels(state);
+  if (!/WELCOME TO dotz|STEP [1-4]|NO PROJECT/i.test(firstLaunchText)) {
+    try {
+      state = await waitForFirstRunBranch();
+      firstLaunchText = labels(state);
+    } catch (error) {
+      result.onboarding.status = "FAILED";
+      const message = error instanceof Error ? error.message : String(error);
+      const failureUi = await captureFailureUi("first-run-branch-timeout");
+      addCheck("fresh native launch reaches first-run wizard or dashboard", false, {
+        wait_error: message,
+        text_sample: failureUi.text_sample,
+        ui_read_error: failureUi.ui_read_error,
+        screenshot_error: failureUi.screenshot_error,
+        label_error: failureUi.label_error,
+      });
+      throw error;
+    }
   }
-  addCheck("fresh native WebView2 first-run wizard is visible", /WELCOME TO dotz|STEP 1/i.test(labels(state)), { text_sample: labels(state).slice(0, 2_000) });
-  await captureScreenshot("first-run-step-1", state);
-  saveUiSnapshot("first-run-step-1", state);
-  result.onboarding.status = "IN_PROGRESS";
-
-  await clickByText("SKIP", { role: "Button" });
-  state = await waitForText("STEP 2", 30_000);
-  await captureScreenshot("first-run-step-2", state);
-  const modelStatusVisible = /model files present/i.test(labels(state));
-  addCheck("onboarding sees bundled model resources", modelStatusVisible, { text_sample: labels(state).slice(0, 1_500) });
-  await clickByText("NEXT", { role: "Button" });
-  state = await waitForText("STEP 3", 30_000);
-  addCheck("native onboarding reached its optional project step", /STEP 3/i.test(labels(state)), {});
-  await clickByText("SKIP", { role: "Button" });
-  state = await waitForText("STEP 4", 30_000);
-  await captureScreenshot("first-run-step-4", state);
-  await clickByText("FINISH", { role: "Button" });
-  await waitForText("NO PROJECT", 30_000);
+  await withUiFailureCheck("settled first-run/dashboard screenshot is captured", "fresh-native-launch-settled-screenshot-failed", () => captureScreenshot("fresh-native-launch-settled", state));
+  const initialOnboarding = classifyInitialOnboarding(mode, firstLaunchText);
   const markerPath = path.join(dotzProfile, "first-run-done");
-  addCheck("onboarding Finish wrote the first-run marker", fs.existsSync(markerPath), { marker: markerPath });
-  result.onboarding.status = fs.existsSync(markerPath) ? "COMPLETED_IN_NATIVE_UI" : "FAILED";
-  await captureScreenshot("first-run-home", getState(false));
-  const firstRunProfile = await snapshotProfile("first-run-complete");
-  addCheck("first-run created a persisted Dotz profile", firstRunProfile.exists && firstRunProfile.file_count > 0, { file_count: firstRunProfile.file_count, aggregate_sha256: firstRunProfile.aggregate_sha256 });
+  if (mode === "released" && initialOnboarding === "wizard-visible") {
+    addCheck("released v0.2.8 runtime agrees with its source-confirmed wizard absence", false, {
+      tag: RELEASED_ASSET.tag,
+      tag_commit: RELEASED_ASSET.tagCommit,
+      first_run_source: RELEASED_ASSET.firstRunSource,
+      text_sample: firstLaunchText.slice(0, 2_000),
+    });
+  }
+  if (initialOnboarding === "released-wizard-missing") {
+    result.onboarding.status = "NOT_PRESENT_IN_RELEASE_TAG";
+    addCheck("public v0.2.8 ships the required native first-run onboarding", false, {
+      tag: RELEASED_ASSET.tag,
+      tag_commit: RELEASED_ASSET.tagCommit,
+      dashboard_visible: firstLaunchText.toLowerCase().includes("no project"),
+      first_run_source: RELEASED_ASSET.firstRunSource,
+      text_sample: firstLaunchText.slice(0, 2_000),
+    });
+    addSkip("released provider/key onboarding interaction", "v0.2.8 source does not ship web/wizard.js or its index.html reference");
+    addSkip("released embedding/browser onboarding interaction", "v0.2.8 source does not ship the first-run wizard");
+    addSkip("released optional project onboarding interaction", "v0.2.8 source does not ship the first-run wizard");
+    addSkip("released Finish marker interaction", "v0.2.8 source does not ship the first-run wizard");
+  } else {
+    if (initialOnboarding === "candidate-wizard-wait") {
+      try {
+        state = await waitForFirstRunWizard();
+      } catch (error) {
+        result.onboarding.status = "FAILED";
+        const message = error instanceof Error ? error.message : String(error);
+        const failureUi = await captureFailureUi("candidate-first-run-wizard-timeout");
+        addCheck("fresh native WebView2 first-run wizard is visible", false, {
+          wait_error: message,
+          text_sample: failureUi.text_sample,
+          ui_read_error: failureUi.ui_read_error,
+          screenshot_error: failureUi.screenshot_error,
+          label_error: failureUi.label_error,
+        });
+        throw error;
+      }
+    }
+    const wizardVisible = /WELCOME TO dotz|STEP [1-4]/i.test(labels(state));
+    addCheck("fresh native WebView2 first-run wizard is visible", wizardVisible, { text_sample: labels(state).slice(0, 2_000) });
+    if (!wizardVisible) throw new Error(`candidate first-run wizard did not appear in native WebView2: ${labels(state).slice(0, 2_000)}`);
+    await withUiFailureCheck("onboarding step-1 screenshot is captured", "onboarding-step1-screenshot-failed", () => captureScreenshot("first-run-step-1", state));
+    result.onboarding.status = "IN_PROGRESS";
+
+    await clickByTextChecked("onboarding step 1 Skip interaction completes", "onboarding-step1-skip-failed", "SKIP", { role: "Button" });
+    state = await waitForTextChecked("candidate onboarding reaches step 2", "onboarding-step2-timeout", "STEP 2", 30_000);
+    await withUiFailureCheck("onboarding step-2 screenshot is captured", "onboarding-step2-screenshot-failed", () => captureScreenshot("first-run-step-2", state));
+    const modelStatusVisible = /model files present/i.test(labels(state));
+    addCheck("onboarding sees bundled model resources", modelStatusVisible, { text_sample: labels(state).slice(0, 1_500) });
+    await clickByTextChecked("onboarding step 2 Next interaction completes", "onboarding-step2-next-failed", "NEXT", { role: "Button" });
+    state = await waitForTextChecked("candidate onboarding reaches optional project step 3", "onboarding-step3-timeout", "STEP 3", 30_000);
+    const projectStepReached = /STEP 3/i.test(labels(state));
+    addCheck("native onboarding reached its optional project step", projectStepReached, {});
+    if (!projectStepReached) throw new Error("native onboarding did not expose optional project step 3");
+    await clickByTextChecked("onboarding optional project step is skipped without user data", "onboarding-step3-skip-failed", "SKIP", { role: "Button" });
+    state = await waitForTextChecked("candidate onboarding reaches final step 4", "onboarding-step4-timeout", "STEP 4", 30_000);
+    await withUiFailureCheck("onboarding step-4 screenshot is captured", "onboarding-step4-screenshot-failed", () => captureScreenshot("first-run-step-4", state));
+    await clickByTextChecked("onboarding Finish interaction completes", "onboarding-finish-action-failed", "FINISH", { role: "Button" });
+    state = await waitForTextChecked("candidate onboarding returns to command center", "onboarding-home-timeout", "NO PROJECT", 30_000);
+    addCheck("onboarding Finish returned to native command center", /NO PROJECT/i.test(labels(state)), { text_sample: labels(state).slice(0, 1_500) });
+    addCheck("onboarding Finish wrote the first-run marker", fs.existsSync(markerPath), { marker: markerPath });
+    result.onboarding.status = fs.existsSync(markerPath) ? "COMPLETED_IN_NATIVE_UI" : "FAILED";
+    await withUiFailureCheck("first-run home UI state and screenshot are captured", "first-run-home-screenshot-failed", async () => {
+      state = getState(false);
+      await captureScreenshot("first-run-home", state);
+    });
+    const firstRunProfile = await snapshotProfile("first-run-complete");
+    addCheck("first-run created a persisted Dotz profile", firstRunProfile.exists && firstRunProfile.file_count > 0, { file_count: firstRunProfile.file_count, aggregate_sha256: firstRunProfile.aggregate_sha256 });
+  }
 
   await createProjectInUi();
   await ensureMemoryPanel();
@@ -904,7 +1164,6 @@ async function main() {
   result.memory.first_run = firstEmbedding;
   addCheck("saved memory has a local 384-dimensional normalized ONNX embedding", firstEmbedding.dimensions === 384 && firstEmbedding.embedding_bytes === 1536 && firstEmbedding.finite === true && Math.abs(firstEmbedding.l2_norm - 1) < 0.0001, { dimensions: firstEmbedding.dimensions, embedding_bytes: firstEmbedding.embedding_bytes, l2_norm: firstEmbedding.l2_norm, embedding_sha256: firstEmbedding.embedding_sha256, database: memoryDbPath });
   addCheck("saved memory belongs to the synthetic project scope", firstEmbedding.scope === "project" && firstEmbedding.user_id === firstEmbedding.expected_user_id, { scope: firstEmbedding.scope, user_id: firstEmbedding.user_id, expected_user_id: firstEmbedding.expected_user_id });
-  result.onboarding.status = "COMPLETED_IN_NATIVE_UI";
   const projectMemoryProfile = await snapshotProfile("project-memory-first-run");
   addCheck("first-run project/memory state changed the on-disk profile", projectMemoryProfile.file_count > freshProfile.file_count && projectMemoryProfile.aggregate_sha256 !== freshProfile.aggregate_sha256, { fresh_file_count: freshProfile.file_count, memory_file_count: projectMemoryProfile.file_count, fresh_sha256: freshProfile.aggregate_sha256, memory_sha256: projectMemoryProfile.aggregate_sha256 });
 
@@ -912,19 +1171,118 @@ async function main() {
   await stopApp();
   await sleep(1_200);
   state = await launchNativeApp(appExe);
-  const wizardReturned = /WELCOME TO dotz|STEP 1/i.test(labels(state));
-  addCheck("first-run wizard does not return on same-profile restart", !wizardReturned, { wizard_visible: wizardReturned, marker_exists: fs.existsSync(markerPath) });
-  if (!labels(state).includes(projectName)) {
-    await clickByText("NO PROJECT", { role: "Button" });
-    state = await waitForText(projectName, 30_000);
-    await clickByText(projectName);
-    state = await waitForText(projectName, 30_000);
+  const restartUiSamples = [labels(state)];
+  for (let sample = 1; sample < 8; sample += 1) {
+    await sleep(500);
+    state = getState(false);
+    restartUiSamples.push(labels(state));
   }
+  // The UI deliberately boots to its command center and resets the selector label to "NO PROJECT";
+  // persisted project-list membership is asserted below by opening the selector after this stable state.
+  const restartUiClass = classifyRestartUiSamples(restartUiSamples);
+  const restartSampleSummary = restartUiSamples.map((text, index) => ({
+    index,
+    wizard_visible: /WELCOME TO dotz|STEP [1-4]/i.test(text),
+    command_center_visible: /NO PROJECT/i.test(text) && /\bSEND\b/i.test(text),
+  }));
+  await withUiFailureCheck("restart UIA screenshot is captured", "restart-ui-screenshot-failed", () => captureScreenshot("restart-ui-settled-samples", state));
+  const reuseDecision = classifyOnboardingReuse(mode, result.onboarding.status);
+  const commandCenterSettled = restartUiClass === "dashboard";
+  addCheck("same-profile restart settles on command center across consecutive UIA samples", commandCenterSettled, {
+    classification: restartUiClass,
+    sample_count: restartUiSamples.length,
+    samples: restartSampleSummary,
+  });
+  if (reuseDecision === "assert-reuse") {
+    addCheck("first-run wizard does not return on same-profile restart", commandCenterSettled, {
+      classification: restartUiClass,
+      marker_exists: fs.existsSync(markerPath),
+      samples: restartSampleSummary,
+    });
+  } else if (reuseDecision === "skip-release-reuse" && restartUiClass !== "wizard") {
+    addSkip("first-run wizard reuse assertion after restart", "the released v0.2.8 tag did not ship a first-run wizard");
+  } else if (reuseDecision === "skip-release-reuse") {
+    addCheck("released v0.2.8 runtime remains consistent with source-confirmed wizard absence after restart", false, {
+      source: RELEASED_ASSET.firstRunSource,
+      samples: restartSampleSummary,
+    });
+  } else {
+    addCheck("first-run completion state was available for reuse assertion", false, { mode, onboarding_status: result.onboarding.status, classification: restartUiClass, marker_exists: fs.existsSync(markerPath), samples: restartSampleSummary });
+  }
+  if (!commandCenterSettled) throw new Error(`same-profile restart did not settle on the native command center; observed ${restartUiClass}`);
+  try {
+    await clickByText("NO PROJECT", { role: "Button" });
+    state = await waitForText("+ NEW PROJECT", 10_000);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const failureUi = await captureFailureUi("reuse-project-selector-open-failed");
+    addCheck("native project selector menu opens after restart", false, {
+      selector_button: "NO PROJECT",
+      error: message,
+      text_sample: failureUi.text_sample,
+      ui_read_error: failureUi.ui_read_error,
+      screenshot_error: failureUi.screenshot_error,
+      label_error: failureUi.label_error,
+    });
+    addCheck("run-specific project appears in the native project selector after restart", false, { project: projectName, selector_open_error: message });
+    throw error;
+  }
+  const selectorMenuVisible = labels(state).includes("+ NEW PROJECT");
+  addCheck("native project selector menu opens after restart", selectorMenuVisible, {
+    selector_button: "NO PROJECT",
+    text_sample: labels(state).slice(0, 2_000),
+  });
+  if (!selectorMenuVisible) throw new Error("project selector click did not expose its + NEW PROJECT menu action");
+  await withUiFailureCheck("open restart project selector screenshot is captured", "reuse-project-selector-screenshot-failed", () => captureScreenshot("reuse-project-selector-open-after-restart", state));
+  try {
+    state = await waitForText(projectName, 30_000);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const failureUi = await captureFailureUi("reuse-project-not-listed-after-restart");
+    addCheck("run-specific project appears in the native project selector after restart", false, {
+      project: projectName,
+      wait_error: message,
+      text_sample: failureUi.text_sample,
+      ui_read_error: failureUi.ui_read_error,
+      screenshot_error: failureUi.screenshot_error,
+      label_error: failureUi.label_error,
+    });
+    throw error;
+  }
+  const persistedProjectVisible = labels(state).includes(projectName);
+  addCheck("run-specific project appears in the native project selector after restart", persistedProjectVisible, {
+    project: projectName,
+    text_sample: labels(state).slice(0, 2_000),
+  });
+  if (!persistedProjectVisible) throw new Error(`project selector did not expose persisted project ${projectName}`);
+  await withUiFailureCheck("persisted project-list screenshot is captured", "reuse-project-list-screenshot-failed", () => captureScreenshot("reuse-project-list-after-restart", state));
+  try {
+    await clickByText(projectName, { role: "Button" });
+    state = await waitForText(projectName, 30_000);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const failureUi = await captureFailureUi("reuse-project-open-failed-after-restart");
+    addCheck("persisted project reopens from the native selector", false, {
+      project: projectName,
+      error: message,
+      text_sample: failureUi.text_sample,
+      ui_read_error: failureUi.ui_read_error,
+      screenshot_error: failureUi.screenshot_error,
+      label_error: failureUi.label_error,
+    });
+    throw error;
+  }
+  addCheck("persisted project reopens from the native selector", labels(state).includes(projectName), {
+    project: projectName,
+    text_sample: labels(state).slice(0, 2_000),
+  });
+  result.project.reuse_status = "OPENED_FROM_PERSISTED_NATIVE_SELECTOR";
+  await withUiFailureCheck("reopened project screenshot is captured", "reuse-project-open-screenshot-failed", () => captureScreenshot("reuse-project-open-after-restart", state));
   addCheck("project is present after app restart", labels(state).includes(projectName), { project: projectName, visible: labels(state).includes(projectName) });
   if (!labels(state).toLowerCase().includes("+ add")) await ensureMemoryPanel();
-  state = await waitForText(memoryText, 45_000);
+  state = await waitForTextChecked("synthetic memory remains listed in the native panel after restart", "reuse-memory-list-timeout", memoryText, 45_000);
   addCheck("synthetic memory is listed in the native Memory panel after restart", labels(state).includes(memoryText), { memory: memoryText });
-  await captureScreenshot("reuse-memory-after-restart", state);
+  await withUiFailureCheck("reused-memory screenshot is captured", "reuse-memory-screenshot-failed", () => captureScreenshot("reuse-memory-after-restart", state));
   const reusedEmbedding = readEmbeddingFromDatabase("reuse-after-restart");
   result.memory.reuse = reusedEmbedding;
   addCheck("384-dimensional memory embedding persists unchanged after restart", reusedEmbedding.dimensions === 384 && reusedEmbedding.embedding_sha256 === firstEmbedding.embedding_sha256 && reusedEmbedding.embedding_bytes === firstEmbedding.embedding_bytes, { first_run_sha256: firstEmbedding.embedding_sha256, reuse_sha256: reusedEmbedding.embedding_sha256, first_run_bytes: firstEmbedding.embedding_bytes, reuse_bytes: reusedEmbedding.embedding_bytes });
@@ -932,7 +1290,7 @@ async function main() {
   const childrenAfterRestart = webviewChildren(activeAppPid);
   result.webview2_processes_after_restart = childrenAfterRestart;
   addCheck("restarted installed app has native WebView2 child processes", childrenAfterRestart.length > 0, { count: childrenAfterRestart.length, processes: childrenAfterRestart });
-  await captureScreenshot("reuse-window-after-restart", getState(false));
+  await withUiFailureCheck("restarted native window screenshot is captured", "reuse-window-screenshot-failed", () => captureScreenshot("reuse-window-after-restart", getState(false)));
   result.memory.status = "PERSISTED_AFTER_RESTART";
   result.project.status = "PERSISTED_AFTER_RESTART";
 }

@@ -1,0 +1,21 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const workflowPath = path.resolve(scriptDir, "../.github/workflows/windows-installer-acceptance.yml");
+const workflow = fs.readFileSync(workflowPath, "utf8");
+const pathGuardIndex = workflow.indexOf("- name: Verify candidate output-path contract");
+const dependencyInstallIndex = workflow.indexOf("- name: Install locked dependencies and real embedding resources");
+const candidateBuildIndex = workflow.indexOf("- name: Build local NSIS bundle without updater signing artifacts");
+assert.ok(pathGuardIndex >= 0 && pathGuardIndex < dependencyInstallIndex, "candidate output-path guard must run before npm/model downloads");
+assert.ok(dependencyInstallIndex < candidateBuildIndex, "dependency/model setup must precede the candidate NSIS build");
+const lines = workflow.split(/\r?\n/).filter((line) => line.includes("$installer = Join-Path $env:GITHUB_WORKSPACE"));
+assert.equal(lines.length, 1, "candidate installer identity must use one explicit output path");
+const expected = String.raw`$installer = Join-Path $env:GITHUB_WORKSPACE 'target\release\bundle\nsis\dotz_0.2.8_x64-setup.exe'`;
+assert.ok(lines[0].includes(expected), `candidate identity path must match Tauri's observed workspace target output: ${lines[0]}`);
+const dispatchGuard = "if: ${{ github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/diagnostic/windows-installer-acceptance' }}";
+assert.equal(workflow.split(dispatchGuard).length - 1, 2, "manual dispatch release and candidate build jobs must be gated to the owned diagnostic ref");
+assert.ok(workflow.includes("${{ github.run_attempt }}"), "evidence artifact names must be unique across reruns of the same workflow");
+console.log("candidate NSIS output path and owned-ref/retry-safe workflow guards passed (6 assertions)");
