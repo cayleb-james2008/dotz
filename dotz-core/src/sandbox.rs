@@ -2900,6 +2900,7 @@ fn pids_with_marker(marker: &str) -> Vec<u32> {
 /// stay visible by design.
 #[cfg(test)]
 mod containment_tests {
+    #[cfg(target_os = "linux")]
     use super::*;
 
     /// Explicit platform boundary marker (kept visible per the evidence rules): escaped-
