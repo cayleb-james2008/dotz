@@ -825,11 +825,20 @@ async function stopApp() {
     activeWindowId = null;
     throw new Error(`refusing to send Alt+F4 to pid ${pid}: current executable does not match installed dotz.exe`);
   }
+  if (!Number.isSafeInteger(activeWindowId) || activeWindowId < 1) {
+    const reason = "no verified native dotz window ID is available";
+    stopRecord.close_refused_reason = reason;
+    result.cleanup.stop_refused = true;
+    addCheck("native close target has a verified dotz window ID", false, { pid, window_id: activeWindowId, reason });
+    activeAppPid = null;
+    activeWindowId = null;
+    throw new Error(`refusing to send Alt+F4 to pid ${pid}: ${reason}`);
+  }
 
   let closeResponse = null;
   let closeError = null;
   try {
-    closeResponse = call("hotkey", { pid, keys: ["alt", "f4"] });
+    closeResponse = call("hotkey", { pid, window_id: activeWindowId, keys: ["alt", "f4"] });
     stopRecord.cua_alt_f4_response = closeResponse;
   } catch (error) {
     closeError = error instanceof Error ? error.message : String(error);
@@ -912,10 +921,7 @@ async function saveSyntheticMemory() {
   await clickByTextChecked("memory form opens from the native Memory panel", "memory-add-button-failed", "+ ADD", { role: "Button" });
   state = await waitForTextChecked("synthetic-memory entry form becomes visible", "memory-form-timeout", "a durable fact to remember");
   await typeIntoChecked("native Memory form accepts synthetic text", "memory-text-entry-failed", "a durable fact to remember", memoryText, { role: "Edit" });
-  const category = findElement(state, { text: "category (convention" });
-  if (category?.element_token) {
-    await withUiFailureCheck("native Memory form accepts the synthetic category", "memory-category-entry-failed", () => call("type_text", { pid: activeAppPid, window_id: activeWindowId, element_token: category.element_token, text: memoryCategory }));
-  }
+  await typeIntoChecked("native Memory form accepts the synthetic category", "memory-category-entry-failed", "category (convention", memoryCategory, { role: "Edit" });
   state = await getStateChecked("native Memory form state is readable before save", "memory-form-state-failed");
   const projectScopeVisible = labels(state).toLowerCase().includes("project");
   addCheck("memory form exposes the intended project scope", projectScopeVisible, { scope: "project", text_sample: labels(state).slice(0, 2_000) });
