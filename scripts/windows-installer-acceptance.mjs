@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { isSupportedSetupPe, isX64ApplicationPe, readPeInfo } from "./windows-pe-validation.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -236,11 +237,13 @@ function loadAndValidateMetadata(installerPath, installerHash, installerBytes) {
     const feedBytes = fs.readFileSync(feedPath);
     const feedHash = crypto.createHash("sha256").update(feedBytes).digest("hex");
     const feed = JSON.parse(feedBytes.toString("utf8"));
-    if (feed.version !== "0.2.8" || feed.platforms?.["windows-x86_64"]?.url !== RELEASED_ASSET.url ||
-        feedHash !== RELEASED_ASSET.feedSha256 || feedHash !== metadata.feed_sha256 || feedBytes.length !== RELEASED_ASSET.feedBytes || feedBytes.length !== metadata.feed_bytes) {
-      throw new Error("raw public update-feed bytes do not match the pinned v0.2.8 release manifest and public installer URL");
+    const feedPlatform = "windows-x86_64";
+    if (feed.version !== "0.2.8" || feed.platforms?.[feedPlatform]?.url !== RELEASED_ASSET.url ||
+        feedHash !== RELEASED_ASSET.feedSha256 || feedHash !== metadata.feed_sha256 || feedBytes.length !== RELEASED_ASSET.feedBytes || feedBytes.length !== metadata.feed_bytes ||
+        metadata.target_platform !== feedPlatform || metadata.target_arch !== "x64" || !metadata.source_bundle_targets?.includes("nsis")) {
+      throw new Error("raw public update-feed bytes or tag metadata do not identify the pinned v0.2.8 Windows x64 NSIS package");
     }
-    const signatureText = feed.platforms["windows-x86_64"].signature;
+    const signatureText = feed.platforms[feedPlatform].signature;
     const signatureBytes = Buffer.from(signatureText, "base64");
     if (!signatureBytes.length || signatureBytes.toString("base64") !== signatureText) {
       throw new Error("updater-feed signature is not canonical base64 Minisign data");
@@ -261,8 +264,14 @@ function loadAndValidateMetadata(installerPath, installerHash, installerBytes) {
       addCheck("public v0.2.8 Minisign verification is mandatory before setup.exe execution", false, minisign || { status: "missing" });
       throw new Error(`Refusing to run the public installer without successful Minisign positive/tamper-negative verification: ${JSON.stringify(minisign)}`);
     }
-  } else if (metadata.source_sha !== process.env.GITHUB_SHA || metadata.branch !== "diagnostic/windows-installer-acceptance") {
-    throw new Error("candidate artifact manifest does not match this workflow HEAD and diagnostic branch");
+  } else {
+    if (metadata.source_sha !== process.env.GITHUB_SHA || metadata.branch !== "diagnostic/windows-installer-acceptance") {
+      throw new Error("candidate artifact manifest does not match this workflow HEAD and diagnostic branch");
+    }
+    if (metadata.runner_arch !== "X64" || metadata.target_triple !== "x86_64-pc-windows-msvc" ||
+        metadata.target_arch !== "x64" || String(metadata.bundle_target || "").toLowerCase() !== "nsis") {
+      throw new Error("candidate artifact manifest does not prove an x64 Tauri NSIS build target");
+    }
   }
   result.artifact_metadata = metadata;
   return expected;
@@ -278,29 +287,6 @@ function runSync(command, commandArgs, options = {}) {
   });
   if (completed.error) throw new Error(`${command} ${commandArgs.join(" ")} failed to spawn: ${completed.error.message}`);
   return completed;
-}
-
-function readPeInfo(filePath) {
-  const fd = fs.openSync(filePath, "r");
-  try {
-    const signature = Buffer.alloc(2);
-    fs.readSync(fd, signature, 0, 2, 0);
-    const offsetBuf = Buffer.alloc(4);
-    fs.readSync(fd, offsetBuf, 0, 4, 0x3c);
-    const peOffset = offsetBuf.readUInt32LE(0);
-    const peSignature = Buffer.alloc(4);
-    fs.readSync(fd, peSignature, 0, 4, peOffset);
-    const machine = Buffer.alloc(2);
-    fs.readSync(fd, machine, 0, 2, peOffset + 4);
-    return {
-      mz: signature.toString("ascii") === "MZ",
-      pe: peSignature.equals(Buffer.from([0x50, 0x45, 0, 0])),
-      machine: `0x${machine.readUInt16LE(0).toString(16).padStart(4, "0")}`,
-      x64: machine.readUInt16LE(0) === 0x8664,
-    };
-  } finally {
-    fs.closeSync(fd);
-  }
 }
 
 async function sha256File(filePath) {
@@ -787,12 +773,19 @@ async function main() {
     sha256: installerHash,
     expected_sha256: trustedSha,
     pe,
-    artifact_type: mode === "released" ? "public GitHub v0.2.8 Tauri NSIS x64 setup.exe" : "candidate Tauri NSIS x64 setup.exe",
-    nsis_evidence: "Source bundle targets NSIS; Tauri documents uppercase /S for silent installation (https://v2.tauri.app/distribute/microsoft-store/); default NSIS install mode is current-user.",
+    payload_target_arch: result.artifact_metadata.target_arch,
+    artifact_type: mode === "released" ? "public GitHub v0.2.8 Tauri NSIS setup.exe (x64 payload target)" : "candidate Tauri NSIS setup.exe (x64 payload target)",
+    nsis_evidence: "The pinned Tauri bundle/feed target is windows-x86_64 and NSIS; a PE32 x86 NSIS bootstrapper is allowed, while the installed dotz.exe is checked separately as AMD64 PE32+.",
   };
-  const validInstaller = stat.isFile() && pe.mz && pe.pe && pe.x64 && path.extname(installerPath).toLowerCase() === ".exe";
-  addCheck("installer is the trusted x64 PE setup executable", validInstaller, { bytes: stat.size, pe, expected_sha256: trustedSha });
-  if (!validInstaller) throw new Error("refusing to run a missing, non-PE, or non-x64 installer");
+  const validInstaller = stat.isFile() && path.extname(installerPath).toLowerCase() === ".exe" &&
+    isSupportedSetupPe(pe, result.artifact_metadata.target_arch);
+  addCheck("installer is a valid PE container for the pinned x64 NSIS package", validInstaller, {
+    bytes: stat.size,
+    payload_target_arch: result.artifact_metadata.target_arch,
+    pe,
+    expected_sha256: trustedSha,
+  });
+  if (!validInstaller) throw new Error("refusing to run a malformed setup PE or one without independently verified x64 package metadata");
   addCheck("installer SHA-256 matches pinned release/build metadata", installerHash.toLowerCase() === trustedSha, { actual_sha256: installerHash, expected_sha256: trustedSha });
   if (installerHash.toLowerCase() !== trustedSha) throw new Error("installer bytes do not match the verified public release or exact candidate build artifact");
 
@@ -823,8 +816,13 @@ async function main() {
   addCheck("installer registered a dotz installation", entries.length > 0 || exePaths.length > 0, { entries, exe_paths: exePaths });
   if (exePaths.length !== 1) throw new Error(`Expected exactly one installed dotz.exe; discovered ${JSON.stringify(exePaths)}`);
   const appExe = exePaths[0];
-  const installDir = path.dirname(appExe);
   result.installation.app_exe = appExe;
+  const appPe = readPeInfo(appExe);
+  result.installation.app_exe_pe = appPe;
+  const installedAppIsX64 = isX64ApplicationPe(appPe);
+  addCheck("installed dotz.exe is AMD64 PE32+ x64 application binary", installedAppIsX64, { app_exe: appExe, pe: appPe });
+  if (!installedAppIsX64) throw new Error(`Installed dotz.exe is not an AMD64 PE32+ x64 binary: ${JSON.stringify(appPe)}`);
+  const installDir = path.dirname(appExe);
   result.installation.install_dir = installDir;
   const localAppDataRoot = path.resolve(process.env.LOCALAPPDATA || "");
   const relativeToLocalAppData = localAppDataRoot ? path.relative(localAppDataRoot, installDir) : "";

@@ -138,8 +138,13 @@ if ($minisign) {
     $minisignResult.positive_exit_code = $positiveExit
     $minisignResult.tamper_negative_exit_code = $negativeExit
     $minisignResult.tampered_sha256 = $tamperedSha
-    if ($positiveExit -eq 0 -and $negativeExit -ne 0) { $minisignResult.status = 'PASS' }
-    else { $minisignResult.status = 'FAIL' }
+    if ($positiveExit -eq 0 -and $negativeExit -ne 0) {
+        $minisignResult.status = 'PASS'
+        $minisignResult.reason = 'Verified the public v0.2.8 feed signature and confirmed a byte-flipped installer is rejected.'
+    } else {
+        $minisignResult.status = 'FAIL'
+        $minisignResult.reason = "Verification failed: positive_exit=$positiveExit tamper_negative_exit=$negativeExit."
+    }
 } else {
     $reason = 'Minisign CLI was unavailable; public tag/feed/hash checks still ran.'
     if (Test-Path -LiteralPath $minisignInstallLog) { $reason = (Get-Content -LiteralPath $minisignInstallLog -Raw).Trim() }
@@ -165,6 +170,8 @@ $metadata = [ordered]@{
     source_config_url = $sourceConfigUrl
     source_config_sha256 = Get-Sha256 $configPath
     source_bundle_targets = @($config.bundle.targets)
+    target_platform = 'windows-x86_64'
+    target_arch = 'x64'
     source_nsis_install_mode = if ($config.bundle.windows.nsis.installMode) { $config.bundle.windows.nsis.installMode } else { 'currentUser (Tauri default; not overridden at tag)' }
     source_webview2_install_mode = if ($config.bundle.windows.webviewInstallMode.type) { $config.bundle.windows.webviewInstallMode.type } else { 'downloadBootstrapper (Tauri default)' }
     public_key_id = $keyMatch.Groups[1].Value.ToUpperInvariant()

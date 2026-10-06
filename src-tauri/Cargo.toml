@@ -7,9 +7,6 @@ default-run = "dotz"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-# winres: Windows resource compiler — embeds the app icon, version info, and manifest
-# into the .exe at build time for a professional installer appearance.
-winres = "0.1"
 
 [dependencies]
 tauri = { version = "2", features = [] }

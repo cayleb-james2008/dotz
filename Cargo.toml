@@ -20,9 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # lancedb: embedded vector database for production-scale semantic search.
 # Supplements rusqlite as the memory store grows; Rust-native, in-process.
 lancedb = "0.33"
-# winres: Windows resource compiler — embeds app icon, version info, and manifest
-# into the .exe at build time. Add as a build-dependency in src-tauri.
-# Uncomment when integrating: winres = "0.1"
+# Do not add winres to src-tauri: Tauri already emits the Windows VERSION resource;
+# a second VERSIONINFO caused MSVC CVTRES CVT1100 duplicate-resource link failure.
 
 [profile.release]
 strip = true

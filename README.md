@@ -267,7 +267,7 @@ or already in use, with a migration path for the pieces still evolving:
 | **`rusqlite`** | ✅ In use | Bundled SQLite for the current vector index + metadata. Stays as the metadata store; LanceDB would supplement it for vector search at scale. |
 | **`tokio`** | ✅ In use | The async runtime — axum, reqwest, sandbox process management, WebSocket streaming all run on tokio. |
 | **`tracing`** + **`tracing-subscriber`** | 🔜 Recommended | Structured logging and distributed tracing. Replaces ad-hoc `eprintln!` / `println!` with span-aware, level-filtered, subscriber-pluggable instrumentation. Critical for observability as the agent runtime grows. |
-| **`winres`** | 🔜 Recommended (build dep) | Windows resource compiler — embeds the app icon, version info, and manifest into the `.exe` at build time. Improves the installer's professional appearance and Windows integration. |
+| **`winres`** | 🚫 Not used | Tauri already emits the Windows VERSION resource; a second `winres` VERSIONINFO caused MSVC `CVTRES CVT1100` duplicate-resource failure. Avoid adding a second resource compiler to the app build. |
 
 #### Slint UI Migration Plan
 
