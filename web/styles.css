@@ -332,7 +332,7 @@ code { font-family: var(--mono); color: var(--peach); }
   background: transparent;
   /* Scroll instead of clipping so every open panel is actually reachable, however many are open. */
   overflow-y: auto;
-  overflow-x: hidden;
+  overflow-x: auto;
   align-content: start;
 }
 .panel {

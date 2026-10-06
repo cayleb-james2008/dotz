@@ -204,6 +204,103 @@ function structuredCloseSignal(attempt) {
   };
 }
 
+function structuredScrollSignal(attempt) {
+  const driverFailure = attempt.error?.driver_failure;
+  if (!Number.isSafeInteger(driverFailure?.exit_code) || driverFailure.exit_code <= 0) return null;
+  const payload = driverFailure.parsed_error;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  return {
+    code: typeof payload.code === "string" ? payload.code : null,
+    recommended: typeof payload.escalation?.recommended === "string" ? payload.escalation.recommended : null,
+  };
+}
+
+/** Convert UIA screen-space bounds to pixels in the matching native window screenshot. */
+export function projectFrameToWindowScreenshot(frame, window, screenshotWidth, screenshotHeight) {
+  const bounds = window?.bounds;
+  const values = [frame?.x, frame?.y, frame?.w, frame?.h, bounds?.x, bounds?.y,
+    bounds?.width, bounds?.height, screenshotWidth, screenshotHeight];
+  if (!values.every((value) => Number.isFinite(value))
+      || frame.w <= 0 || frame.h <= 0 || bounds.width <= 0 || bounds.height <= 0
+      || screenshotWidth <= 0 || screenshotHeight <= 0) {
+    return { x: null, y: null, w: null, h: null, inside: false };
+  }
+  const originX = bounds.x + (bounds.width - screenshotWidth) / 2;
+  const originY = bounds.y + (bounds.height - screenshotHeight) / 2;
+  const x = frame.x - originX;
+  const y = frame.y - originY;
+  return {
+    x,
+    y,
+    w: frame.w,
+    h: frame.h,
+    inside: x >= 0 && y >= 0 && x + frame.w <= screenshotWidth && y + frame.h <= screenshotHeight,
+  };
+}
+
+/**
+ * Deliver a user-like native scroll in the background first. Escalate once only
+ * for an explicit structured refusal recommending foreground, and revalidate
+ * the exact launched process/window immediately before that foreground input.
+ */
+export function sendGuardedScroll({ pid, windowId, payload, verifyTarget, sendScroll }) {
+  if (!Number.isSafeInteger(pid) || pid < 1) throw new TypeError("scroll PID must be a positive safe integer");
+  if (!Number.isSafeInteger(windowId) || windowId < 1) throw new TypeError("scroll window ID must be a positive safe integer");
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new TypeError("scroll payload must be an object");
+  if (typeof verifyTarget !== "function" || typeof sendScroll !== "function") throw new TypeError("scroll target verifier and input sender are required");
+
+  const attempts = [];
+  const verifications = [];
+  const verify = (stage) => {
+    let value;
+    try {
+      value = verifyTarget(stage);
+    } catch (error) {
+      value = { valid: false, error: serializeCloseError(error) };
+    }
+    const snapshot = { stage, ...(value && typeof value === "object" ? value : { valid: false }) };
+    verifications.push(snapshot);
+    return snapshot;
+  };
+  const act = (deliveryMode) => {
+    const request = { ...payload, pid, window_id: windowId, delivery_mode: deliveryMode };
+    const attempt = { number: attempts.length + 1, delivery_mode: deliveryMode, request, response: null, error: null };
+    try {
+      attempt.response = sendScroll(request);
+    } catch (error) {
+      attempt.error = serializeCloseError(error);
+      attempt.error.driver_failure = error?.driverFailure || null;
+    }
+    attempts.push(attempt);
+    return attempt;
+  };
+  const failure = (reason) => ({ ok: false, reason, attempts, verifications });
+
+  const beforeBackground = verify("before-background-scroll");
+  if (beforeBackground.valid !== true) return failure("exact installed process/window identity was not valid before background scroll");
+  const background = act("background");
+  const backgroundSignal = structuredScrollSignal(background);
+  if (!background.error && backgroundSignal?.code !== "background_unavailable") {
+    return { ok: true, reason: null, attempts, verifications };
+  }
+  if (backgroundSignal?.code !== "background_unavailable") {
+    return failure(background.error?.message || "background scroll returned an unrecognized error");
+  }
+  if (backgroundSignal.recommended !== "foreground") {
+    return failure("background_unavailable did not carry escalation.recommended=foreground");
+  }
+
+  const beforeForeground = verify("before-foreground-scroll");
+  if (beforeForeground.valid !== true) return failure("exact installed process/window identity was not valid before foreground scroll");
+  const foreground = act("foreground");
+  if (foreground.error) return failure(foreground.error.message);
+  const foregroundSignal = structuredScrollSignal(foreground);
+  if (foregroundSignal?.code === "background_unavailable") {
+    return failure("foreground scroll returned background_unavailable; retry limit reached");
+  }
+  return { ok: true, reason: null, attempts, verifications };
+}
+
 /**
  * Send a default-background close. Retry only a parsed background_unavailable
  * that recommends foreground, after revalidating the exact launch/window.

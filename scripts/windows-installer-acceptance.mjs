@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { isSupportedSetupPe, isX64ApplicationPe, readPeInfo } from "./windows-pe-validation.mjs";
-import { classifyInitialOnboarding, classifyOnboardingReuse, classifyProcessStateReadback, classifyRestartUiSamples, createDriverCallError, installedProcessLaunchIdentity, isDotzWindowForPid, isInstalledDotzProcess, parseDriverOutput, processStateProbeCommand, requireVerifiedCloseForRelaunch, sendGuardedClose, sleep, uiFailureDetails, validateNativeCloseTarget } from "./windows-installer-runtime.mjs";
+import { classifyInitialOnboarding, classifyOnboardingReuse, classifyProcessStateReadback, classifyRestartUiSamples, createDriverCallError, installedProcessLaunchIdentity, isDotzWindowForPid, isInstalledDotzProcess, parseDriverOutput, processStateProbeCommand, projectFrameToWindowScreenshot, requireVerifiedCloseForRelaunch, sendGuardedClose, sendGuardedScroll, sleep, uiFailureDetails, validateNativeCloseTarget } from "./windows-installer-runtime.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -903,6 +903,140 @@ async function stopApp() {
   result.cleanup.app_stopped = true;
 }
 
+function verifyActiveNativeInputTarget(stage) {
+  const errors = [];
+  let processState = null;
+  let processInfo = null;
+  let windows = [];
+  try { processState = readProcessState(activeAppPid); }
+  catch (error) { errors.push({ probe: "process_state", error: error instanceof Error ? error.message : String(error) }); }
+  try { processInfo = appProcessInfo(activeAppPid); }
+  catch (error) { errors.push({ probe: "process_identity", error: error instanceof Error ? error.message : String(error) }); }
+  try {
+    const response = call("list_windows", { pid: activeAppPid });
+    windows = response.windows || response._legacy_windows || [];
+  } catch (error) { errors.push({ probe: "native_window_association", error: error instanceof Error ? error.message : String(error) }); }
+  const proof = validateNativeCloseTarget({
+    pid: activeAppPid,
+    windowId: activeWindowId,
+    expectedExecutable: result.installation.app_exe,
+    expectedLaunchIdentity: activeLaunchIdentity,
+    processState,
+    processInfo,
+    windows,
+  });
+  if (errors.length) {
+    proof.valid = false;
+    proof.reasons.push("one or more exact process/window identity readbacks failed");
+    proof.readback_errors = errors;
+  }
+  proof.stage = stage;
+  addCheck(`exact installed process and native window identity verified ${stage}`, proof.valid, proof);
+  return proof;
+}
+
+function memoryVisibilityReadback(state) {
+  const response = call("list_windows", { pid: activeAppPid });
+  const windows = response.windows || response._legacy_windows || [];
+  const window = windows.find((item) => Number(item.window_id) === activeWindowId && isDotzWindowForPid(item, activeAppPid));
+  const width = Number(state?.screenshot_width);
+  const height = Number(state?.screenshot_height);
+  const convert = (element) => element?.frame && window?.bounds
+    ? projectFrameToWindowScreenshot(element.frame, window, width, height)
+    : { x: null, y: null, w: null, h: null, inside: false };
+  const memory = findElement(state, { text: memoryText, role: "Text" });
+  const header = findElement(state, { text: "MEMORY", role: "Text" });
+  const addButton = findElement(state, { text: "+ ADD", role: "Button" });
+  return {
+    pid: state?.pid ?? activeAppPid,
+    window_id: state?.window_id ?? activeWindowId,
+    window_bounds: window?.bounds || null,
+    screenshot: { width: Number.isFinite(width) ? width : null, height: Number.isFinite(height) ? height : null },
+    window_is_verified_dotz: Boolean(window && isDotzWindowForPid(window, activeAppPid)),
+    memory_text: { present_in_uia: Boolean(memory), frame: memory?.frame || null, screenshot_frame: convert(memory) },
+    memory_panel_header: { present_in_uia: Boolean(header), frame: header?.frame || null, screenshot_frame: convert(header) },
+    add_button: { present_in_uia: Boolean(addButton), frame: addButton?.frame || null, screenshot_frame: convert(addButton) },
+  };
+}
+
+function memoryIsFullyReachable(readback) {
+  return readback?.pid === activeAppPid
+    && readback?.window_id === activeWindowId
+    && readback?.window_is_verified_dotz === true
+    && readback?.memory_text?.present_in_uia === true
+    && readback?.memory_text?.screenshot_frame?.inside === true
+    && readback?.memory_panel_header?.present_in_uia === true
+    && readback?.memory_panel_header?.screenshot_frame?.inside === true
+    && readback?.add_button?.present_in_uia === true
+    && readback?.add_button?.screenshot_frame?.inside === true;
+}
+
+async function ensureMemoryVisibleAfterRestart() {
+  let state = getState(true);
+  if (!labels(state).includes(memoryText)) throw new Error("post-restart native UIA no longer contains the exact persisted synthetic memory text");
+  const before = memoryVisibilityReadback(state);
+  result.memory.visibility = { status: "NAVIGATION_REQUIRED", before_scroll: before, native_scroll: null, after_scroll: null };
+  await captureScreenshot("reuse-memory-before-native-scroll-after-restart", state);
+
+  let after = before;
+  if (!memoryIsFullyReachable(before)) {
+    const width = Number(state.screenshot_width);
+    const height = Number(state.screenshot_height);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width < 100 || height < 150) {
+      throw new Error(`native window screenshot dimensions are invalid for horizontal Memory navigation: ${width}x${height}`);
+    }
+    const scrollPoint = { x: Math.floor(width / 2), y: Math.floor(height * 0.55) };
+    if (scrollPoint.x < 0 || scrollPoint.y < 0 || scrollPoint.x >= width || scrollPoint.y >= height) {
+      throw new Error(`horizontal scroll point is outside the exact native screenshot: ${JSON.stringify(scrollPoint)} in ${width}x${height}`);
+    }
+    const scrollOutcome = sendGuardedScroll({
+      pid: activeAppPid,
+      windowId: activeWindowId,
+      payload: { direction: "right", by: "page", amount: 8, ...scrollPoint },
+      verifyTarget: verifyActiveNativeInputTarget,
+      sendScroll: (request) => call("scroll", request),
+    });
+    result.memory.visibility.native_scroll = {
+      method: "cua-driver scroll direction=right by=page amount=8 over visible native chat area",
+      point_window_local_pixels: scrollPoint,
+      exact_target: { pid: activeAppPid, window_id: activeWindowId, launch_identity: activeLaunchIdentity },
+      outcome: scrollOutcome,
+    };
+    log(`MEMORY_HORIZONTAL_SCROLL ${JSON.stringify(result.memory.visibility.native_scroll)}`);
+    addCheck("guarded native horizontal scroll input is accepted by the exact installed window", scrollOutcome.ok, {
+      direction: "right",
+      point_window_local_pixels: scrollPoint,
+      pid: activeAppPid,
+      window_id: activeWindowId,
+      delivery_attempts: scrollOutcome.attempts,
+      exact_target_verifications: scrollOutcome.verifications,
+      error: scrollOutcome.reason,
+    });
+    if (!scrollOutcome.ok) throw new Error(`native horizontal scroll could not be delivered to the verified dotz window: ${scrollOutcome.reason}`);
+    verifyActiveNativeInputTarget("after-horizontal-memory-scroll");
+    state = getState(true);
+    after = memoryVisibilityReadback(state);
+    result.memory.visibility.after_scroll = after;
+    await captureScreenshot("reuse-memory-after-restart", state);
+  } else {
+    result.memory.visibility.status = "ALREADY_VISIBLE_IN_NATIVE_WINDOW";
+    result.memory.visibility.after_scroll = after;
+    await captureScreenshot("reuse-memory-after-restart", state);
+  }
+
+  const reachable = memoryIsFullyReachable(after);
+  result.memory.visibility.status = reachable
+    ? (result.memory.visibility.native_scroll ? "VISIBLE_AFTER_NATIVE_HORIZONTAL_SCROLL" : "ALREADY_VISIBLE_IN_NATIVE_WINDOW")
+    : "FAILED_OUTSIDE_NATIVE_WINDOW";
+  addCheck("post-restart Memory header, synthetic project text, and Add action are fully inside the exact native window", reachable, {
+    expected_project_memory: memoryText,
+    required_elements: ["MEMORY", memoryText, "+ ADD"],
+    native_visibility: after,
+    navigation: result.memory.visibility.native_scroll,
+  });
+  if (!reachable) throw new Error(`persisted Memory remains outside the exact native window after user-operable horizontal scroll: ${JSON.stringify(after)}`);
+  return state;
+}
 
 async function createProjectInUi() {
   let state = await getStateChecked("fresh native UI state is readable before project creation", "project-create-initial-state-failed");
@@ -1311,9 +1445,10 @@ async function main() {
   await withUiFailureCheck("reopened project screenshot is captured", "reuse-project-open-screenshot-failed", () => captureScreenshot("reuse-project-open-after-restart", state));
   addCheck("project is present after app restart", labels(state).includes(projectName), { project: projectName, visible: labels(state).includes(projectName) });
   if (!labels(state).toLowerCase().includes("+ add")) await ensureMemoryPanel();
-  state = await waitForTextChecked("synthetic memory remains listed in the native panel after restart", "reuse-memory-list-timeout", memoryText, 45_000);
-  addCheck("synthetic memory is listed in the native Memory panel after restart", labels(state).includes(memoryText), { memory: memoryText });
-  await withUiFailureCheck("reused-memory screenshot is captured", "reuse-memory-screenshot-failed", () => captureScreenshot("reuse-memory-after-restart", state));
+  state = await waitForTextChecked("synthetic memory text remains in the native UIA tree after restart", "reuse-memory-list-timeout", memoryText, 45_000);
+  addCheck("exact synthetic project-memory text persists in native UIA after restart", labels(state).includes(memoryText), { memory: memoryText, visible_in_window: "not inferred from UIA text alone" });
+  if (!labels(state).includes(memoryText)) throw new Error("post-restart native UIA did not expose the exact synthetic project memory text");
+  state = await ensureMemoryVisibleAfterRestart();
   const reusedEmbedding = readEmbeddingFromDatabase("reuse-after-restart");
   result.memory.reuse = reusedEmbedding;
   addCheck("384-dimensional memory embedding persists unchanged after restart", reusedEmbedding.dimensions === 384 && reusedEmbedding.embedding_sha256 === firstEmbedding.embedding_sha256 && reusedEmbedding.embedding_bytes === firstEmbedding.embedding_bytes, { first_run_sha256: firstEmbedding.embedding_sha256, reuse_sha256: reusedEmbedding.embedding_sha256, first_run_bytes: firstEmbedding.embedding_bytes, reuse_bytes: reusedEmbedding.embedding_bytes });
