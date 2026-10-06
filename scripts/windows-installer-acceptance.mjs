@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { isSupportedSetupPe, isX64ApplicationPe, readPeInfo } from "./windows-pe-validation.mjs";
-import { classifyInitialOnboarding, classifyOnboardingReuse, classifyProcessStateReadback, classifyRestartUiSamples, isDotzWindowForPid, isInstalledDotzProcess, parseDriverOutput, processStateProbeCommand, sleep, uiFailureDetails } from "./windows-installer-runtime.mjs";
+import { classifyInitialOnboarding, classifyOnboardingReuse, classifyProcessStateReadback, classifyRestartUiSamples, createDriverCallError, installedProcessLaunchIdentity, isDotzWindowForPid, isInstalledDotzProcess, parseDriverOutput, processStateProbeCommand, requireVerifiedCloseForRelaunch, sendGuardedClose, sleep, uiFailureDetails, validateNativeCloseTarget } from "./windows-installer-runtime.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -101,6 +101,8 @@ let daemonStartedByTest = false;
 let driverSessionStarted = false;
 let activeAppPid = null;
 let activeWindowId = null;
+let activeLaunchIdentity = null;
+let activeStopAttempted = false;
 let fatalError = null;
 let currentPhase = "preflight";
 
@@ -406,9 +408,7 @@ function saveUiSnapshot(name, state) {
 function invokeDriver(tool, payload = {}, timeoutMs = 120_000) {
   const withSession = { ...payload, session: payload.session || driverSession };
   const completed = runSync(driverBin, ["call", tool], { input: JSON.stringify(withSession), timeoutMs });
-  if (completed.status !== 0) {
-    throw new Error(`cua-driver call ${tool} exited ${completed.status}: ${(completed.stderr || completed.stdout || "").trim()}`);
-  }
+  if (completed.status !== 0) throw createDriverCallError(tool, completed);
   return parseDriverOutput(tool, completed.stdout);
 }
 
@@ -718,7 +718,7 @@ async function modelResources(installDir) {
 }
 
 function appProcessInfo(pid) {
-  const command = `Get-CimInstance Win32_Process -Filter 'ProcessId = ${Number(pid)}' | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,SessionId | ConvertTo-Json -Depth 3 -Compress`;
+  const command = `Get-CimInstance Win32_Process -Filter 'ProcessId = ${Number(pid)}' | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,SessionId,CreationDate | ConvertTo-Json -Depth 3 -Compress`;
   const data = runPowerShellJson(command);
   return Array.isArray(data) ? data[0] || null : data;
 }
@@ -736,10 +736,15 @@ async function launchNativeApp(appExe) {
     throw new Error(`refusing to track or stop unverified launch pid ${pid}: ${result.app.process_query_error}`);
   }
   const processOwned = isInstalledDotzProcess(processInfo, appExe);
-  result.app = { pid, window_id: null, title: null, app_name: null, executable: appExe, process: processInfo };
+  activeLaunchIdentity = installedProcessLaunchIdentity(processInfo, appExe);
+  result.app = { pid, window_id: null, title: null, app_name: null, executable: appExe, process: processInfo, launch_identity: activeLaunchIdentity };
   addCheck("launched PID is verified as the installed dotz.exe", processOwned, { pid, expected_executable: appExe, process: processInfo });
   if (!processOwned) throw new Error(`refusing to track or stop pid ${pid}: process identity does not match installed ${appExe}`);
   activeAppPid = pid;
+  activeStopAttempted = false;
+  const stableLaunchIdentity = activeLaunchIdentity?.pid === pid;
+  addCheck("launched installed dotz PID has a stable process-instance identity", stableLaunchIdentity, { pid, launch_identity: activeLaunchIdentity, required_fields: ["ProcessId", "ExecutablePath", "CreationDate", "SessionId"] });
+  if (!stableLaunchIdentity) throw new Error(`refusing to close/restart pid ${pid}: launch identity lacks a stable creation-time/session record`);
 
   let window;
   try {
@@ -778,75 +783,75 @@ function readProcessState(pid) {
 
 async function stopApp() {
   if (!activeAppPid) return;
+  if (activeStopAttempted) throw new Error(`native close was already attempted for installed dotz pid ${activeAppPid}; refusing duplicate input`);
+  activeStopAttempted = true;
   const pid = activeAppPid;
   const stopRecord = { phase: currentPhase, pid, requested_at: new Date().toISOString() };
   result.cleanup.process_stops ||= [];
   result.cleanup.process_stops.push(stopRecord);
 
-  const beforeClose = readProcessState(pid);
-  stopRecord.before_close_process_state = beforeClose;
-  if (beforeClose.classification === "absent") {
-    stopRecord.close_refused_reason = "installed process was already absent before the requested restart close";
-    addCheck("installed dotz process remained live until the controlled restart close", false, { pid, process_state: beforeClose });
-    result.cleanup.stop_method = "already absent before Alt+F4; no close sent";
-    result.cleanup.app_stopped = true;
-    stopRecord.exited = true;
-    activeAppPid = null;
-    activeWindowId = null;
-    throw new Error(`installed dotz process ${pid} exited before the controlled restart close`);
-  }
-  if (beforeClose.classification !== "present") {
-    stopRecord.close_refused_reason = "process-state readback was not a verified live-process record";
-    addCheck("native close target has a conclusive live-process readback", false, { pid, process_state: beforeClose });
-    result.cleanup.stop_refused = true;
-    activeAppPid = null;
-    activeWindowId = null;
-    throw new Error(`refusing to close pid ${pid}: explicit process-state readback was ${beforeClose.classification}`);
-  }
-
-  let processInfo;
-  try {
-    processInfo = appProcessInfo(pid);
-  } catch (error) {
-    stopRecord.close_refused_reason = error instanceof Error ? error.message : String(error);
-    addCheck("native close target is the exact installed dotz.exe", false, { pid, expected_executable: result.installation.app_exe, error: stopRecord.close_refused_reason });
-    result.cleanup.stop_refused = true;
-    activeAppPid = null;
-    activeWindowId = null;
-    throw new Error(`refusing to close pid ${pid}: installed executable identity could not be revalidated`);
-  }
-  const closeTargetOwned = isInstalledDotzProcess(processInfo, result.installation.app_exe);
-  stopRecord.close_target_process = processInfo;
-  addCheck("native close target is the exact installed dotz.exe", closeTargetOwned, { pid, expected_executable: result.installation.app_exe, process: processInfo });
-  if (!closeTargetOwned) {
-    stopRecord.close_refused_reason = "current PID no longer identifies the installed dotz.exe";
-    result.cleanup.stop_refused = true;
-    activeAppPid = null;
-    activeWindowId = null;
-    throw new Error(`refusing to send Alt+F4 to pid ${pid}: current executable does not match installed dotz.exe`);
-  }
   if (!Number.isSafeInteger(activeWindowId) || activeWindowId < 1) {
     const reason = "no verified native dotz window ID is available";
     stopRecord.close_refused_reason = reason;
     result.cleanup.stop_refused = true;
     addCheck("native close target has a verified dotz window ID", false, { pid, window_id: activeWindowId, reason });
-    activeAppPid = null;
-    activeWindowId = null;
     throw new Error(`refusing to send Alt+F4 to pid ${pid}: ${reason}`);
   }
 
-  let closeResponse = null;
-  let closeError = null;
-  try {
-    closeResponse = call("hotkey", { pid, window_id: activeWindowId, keys: ["alt", "f4"] });
-    stopRecord.cua_alt_f4_response = closeResponse;
-  } catch (error) {
-    closeError = error instanceof Error ? error.message : String(error);
-    stopRecord.cua_alt_f4_error = closeError;
-  }
-  result.cleanup.alt_f4_close_response = closeResponse;
-  result.cleanup.alt_f4_close_error = closeError;
-  addCheck("cua-driver Alt+F4 close request succeeded", !closeError, { pid, keys: ["alt", "f4"], response: closeResponse, error: closeError });
+  const verifyCloseTarget = (stage) => {
+    const errors = [];
+    let processState = null;
+    let processInfo = null;
+    let windows = [];
+    try { processState = readProcessState(pid); }
+    catch (error) { errors.push({ probe: "process_state", error: error instanceof Error ? error.message : String(error) }); }
+    try { processInfo = appProcessInfo(pid); }
+    catch (error) { errors.push({ probe: "process_identity", error: error instanceof Error ? error.message : String(error) }); }
+    try {
+      const response = call("list_windows", { pid });
+      windows = response.windows || response._legacy_windows || [];
+    } catch (error) { errors.push({ probe: "native_window_association", error: error instanceof Error ? error.message : String(error) }); }
+    const proof = validateNativeCloseTarget({
+      pid,
+      windowId: activeWindowId,
+      expectedExecutable: result.installation.app_exe,
+      expectedLaunchIdentity: activeLaunchIdentity,
+      processState,
+      processInfo,
+      windows,
+    });
+    if (errors.length) {
+      proof.valid = false;
+      proof.reasons.push("one or more exact process/window identity readbacks failed");
+      proof.readback_errors = errors;
+    }
+    proof.stage = stage;
+    addCheck(`exact installed process and native window identity verified ${stage}`, proof.valid, proof);
+    return proof;
+  };
+
+  const closeOutcome = sendGuardedClose({
+    pid,
+    windowId: activeWindowId,
+    keys: ["alt", "f4"],
+    verifyTarget: verifyCloseTarget,
+    sendInput: (request) => call("hotkey", request),
+  });
+  stopRecord.close_target_verifications = closeOutcome.verifications;
+  stopRecord.cua_alt_f4_attempts = closeOutcome.attempts;
+  stopRecord.cua_alt_f4_response = closeOutcome.attempts.at(-1)?.response || null;
+  stopRecord.cua_alt_f4_error = closeOutcome.ok ? null : closeOutcome.reason;
+  result.cleanup.alt_f4_close_attempts = closeOutcome.attempts;
+  result.cleanup.alt_f4_close_response = stopRecord.cua_alt_f4_response;
+  result.cleanup.alt_f4_close_error = stopRecord.cua_alt_f4_error;
+  addCheck("cua-driver Alt+F4 close request succeeded after identity-guarded delivery", closeOutcome.ok, {
+    pid,
+    window_id: activeWindowId,
+    keys: ["alt", "f4"],
+    attempts: closeOutcome.attempts,
+    target_verifications: closeOutcome.verifications,
+    error: closeOutcome.reason,
+  });
 
   const waitForExit = async (timeoutMs) => {
     const start = Date.now();
@@ -861,23 +866,39 @@ async function stopApp() {
   const exitResult = await waitForExit(15_000);
   const exited = exitResult.exited;
   stopRecord.after_close_process_state = exitResult.latest;
-  stopRecord.stop_method = "cua-driver hotkey alt+f4; no forced PID termination";
+  stopRecord.stop_method = "cua-driver hotkey alt+f4; identity-guarded foreground retry only after structured background_unavailable; no forced PID termination";
   stopRecord.exited = exited;
-  result.cleanup.cua_alt_f4_exit_observed = !closeError && exited;
+  result.cleanup.cua_alt_f4_exit_observed = closeOutcome.ok && exited;
   result.cleanup.stop_method = stopRecord.stop_method;
-  addCheck("installed app process exited after native Alt+F4 close", exited, {
+  addCheck("installed app process exited after guarded native Alt+F4", exited, {
     pid,
     timeout_ms: 15_000,
     method: stopRecord.stop_method,
-    close_request_error: closeError,
+    close_request_error: closeOutcome.reason,
     final_process_state: exitResult.latest,
     forced_termination: null,
   });
-  if (!exited) throw new Error(`Installed dotz process ${pid} remained alive after native Alt+F4; restart persistence was not tested`);
+
+  try {
+    requireVerifiedCloseForRelaunch(closeOutcome, exitResult);
+  } catch (error) {
+    stopRecord.relaunch_refused_reason = error instanceof Error ? error.message : String(error);
+    const failureUi = await captureFailureUi(`native-close-failure-${currentPhase}`);
+    stopRecord.failure_ui = {
+      text_sample: failureUi.text_sample,
+      ui_read_error: failureUi.ui_read_error,
+      screenshot_error: failureUi.screenshot_error,
+      label_error: failureUi.label_error,
+    };
+    throw error;
+  }
+
   activeAppPid = null;
   activeWindowId = null;
+  activeLaunchIdentity = null;
   result.cleanup.app_stopped = true;
 }
+
 
 async function createProjectInUi() {
   let state = await getStateChecked("fresh native UI state is readable before project creation", "project-create-initial-state-failed");
@@ -1310,7 +1331,7 @@ try {
   log(`FATAL ${fatalError}`);
   result.error = fatalError;
 } finally {
-  try { await stopApp(); }
+  try { if (activeAppPid && !activeStopAttempted) await stopApp(); }
   catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     log(`CLEANUP_APP_ERROR ${message}`);

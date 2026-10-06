@@ -64,11 +64,11 @@ const memorySave = acceptanceSource.match(/async function saveSyntheticMemory\(\
 assert.ok(memorySave, "native acceptance must define the synthetic Memory save journey");
 assert.match(memorySave[1], /typeIntoChecked\(\s*"native Memory form accepts the synthetic category"/, "category entry must acquire a fresh UIA state/token after the text field changes the snapshot");
 assert.doesNotMatch(memorySave[1], /findElement\(state,\s*\{\s*text:\s*"category/, "category entry must not reuse a token from the pre-text-entry UIA state");
-assert.match(acceptanceSource, /call\("hotkey",\s*\{\s*pid,\s*window_id:\s*activeWindowId,\s*keys:\s*\["alt",\s*"f4"\]\s*\}\)/, "Alt+F4 must target the already-verified exact native dotz window when its PID owns multiple windows");
+assert.match(acceptanceSource, /sendGuardedClose\(\{[\s\S]*?windowId: activeWindowId,[\s\S]*?keys: \["alt", "f4"\],[\s\S]*?verifyTarget: verifyCloseTarget,[\s\S]*?sendInput: \(request\) => call\("hotkey", request\)/, "Alt+F4 must use the identity-guarded fallback with the exact native dotz window");
 const stopApp = acceptanceSource.match(/async function stopApp\(\) \{([\s\S]*?)\n\}/);
 assert.ok(stopApp, "native cleanup must define stopApp");
 assert.match(stopApp[1], /if \(!Number\.isSafeInteger\(activeWindowId\) \|\| activeWindowId < 1\) \{[\s\S]*?stopRecord\.close_refused_reason[\s\S]*?stop_refused[\s\S]*?throw new Error[\s\S]*?\}/, "cleanup must refuse Alt+F4 if launch never verified a native window ID");
-assert.ok(stopApp[1].indexOf("if (!Number.isSafeInteger(activeWindowId)") < stopApp[1].indexOf('call("hotkey"'), "window-ID guard must run before native close input");
+assert.ok(stopApp[1].indexOf("if (!Number.isSafeInteger(activeWindowId)") < stopApp[1].indexOf("sendGuardedClose({"), "window-ID guard must run before any native close input");
 
 if (process.platform === "win32") {
   const runProbe = (pid) => spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", processStateProbeCommand(pid)], {
