@@ -1,0 +1,251 @@
+name: Windows Installer Acceptance
+
+on:
+  push:
+    branches:
+      - diagnostic/windows-installer-acceptance
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  released_native:
+    name: Released v0.2.8 installer on Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic HEAD
+        uses: actions/checkout@v4
+
+      - name: Set up Node and Python
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Create isolated evidence directory
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'dotz-acceptance-released'
+          if (Test-Path -LiteralPath $out) { throw "Unexpected pre-existing acceptance directory: $out" }
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          "DOTZ_ACCEPTANCE_OUT=$out" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+          Write-Host "DOTZ_ACCEPTANCE_OUT=$out"
+
+      - name: Install cua-driver from its documented Windows installer
+        shell: pwsh
+        run: |
+          irm https://cua.ai/driver/install.ps1 | iex
+          $cua = Join-Path $env:LOCALAPPDATA 'Programs\Cua\cua-driver\bin\cua-driver.exe'
+          if (-not (Test-Path -LiteralPath $cua)) { throw "cua-driver was not installed at $cua" }
+          "CUA_DRIVER_BIN=$cua" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+          & $cua --version
+          if ($LASTEXITCODE -ne 0) { throw "cua-driver --version exited $LASTEXITCODE" }
+
+      - name: Validate acceptance helpers on Windows before any install
+        shell: pwsh
+        run: |
+          node --check scripts/windows-installer-acceptance.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/test-verify-windows-memory-embedding.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tokens = $null; $parseErrors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'scripts/prepare-v028-acceptance.ps1'), [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count) { $parseErrors | ForEach-Object { Write-Error $_ }; exit 1 }
+
+      - name: Prove interactive Windows desktop and UI Automation before install
+        shell: pwsh
+        run: |
+          $doctor = & $env:CUA_DRIVER_BIN doctor 2>&1
+          $doctor | Out-File -LiteralPath (Join-Path $env:DOTZ_ACCEPTANCE_OUT 'cua-driver-preflight.log') -Encoding utf8
+          $doctorText = $doctor | Out-String
+          Write-Host $doctorText
+          if ($LASTEXITCODE -ne 0 -or $doctorText -notmatch 'attached interactive desktop' -or $doctorText -notmatch 'UI Automation.*succeeded') {
+            throw 'Hosted runner did not prove an attached interactive desktop and working Windows UI Automation.'
+          }
+          $sessionId = (Get-Process -Id $PID).SessionId
+          "WINDOWS_JOB_SESSION_ID=$sessionId" | Out-File -LiteralPath (Join-Path $env:DOTZ_ACCEPTANCE_OUT 'windows-session.txt') -Encoding utf8
+          Write-Host "WINDOWS_JOB_SESSION_ID=$sessionId"
+
+      - name: Download and verify the exact public v0.2.8 installer and update feed
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'dotz_0.2.8_x64-setup.exe'
+          & "$env:GITHUB_WORKSPACE\scripts\prepare-v028-acceptance.ps1" -OutputDir $env:DOTZ_ACCEPTANCE_OUT -InstallerPath $installer
+          if ($LASTEXITCODE -ne 0) { throw "Public release verification script exited $LASTEXITCODE" }
+          "DOTZ_RELEASED_INSTALLER=$installer" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+
+      - name: Run native acceptance against the released installer
+        shell: pwsh
+        run: |
+          node scripts/windows-installer-acceptance.mjs --mode released --installer $env:DOTZ_RELEASED_INSTALLER --expected-sha256 64a7e18f6b00d04f7a20533ecd860684bcaf365de11185d032472424cf729642 --metadata "$env:DOTZ_ACCEPTANCE_OUT\release-metadata.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Preserve raw released-installer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotz-windows-acceptance-released-${{ github.run_id }}
+          path: ${{ runner.temp }}/dotz-acceptance-released/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  candidate_build:
+    name: Build unsigned candidate NSIS installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact diagnostic HEAD
+        uses: actions/checkout@v4
+
+      - name: Set up Node and Rust
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install locked dependencies and real embedding resources
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw "npm ci exited $LASTEXITCODE" }
+          npm run fetch-model
+          if ($LASTEXITCODE -ne 0) { throw "npm run fetch-model exited $LASTEXITCODE" }
+
+      - name: Build local NSIS bundle without updater signing artifacts
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: src-tauri
+          includeUpdaterJson: false
+          args: --bundles nsis --config tauri.acceptance.conf.json
+
+      - name: Record candidate package identity
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_ARCH -ne 'X64') { throw "Candidate runner is not x64: $env:RUNNER_ARCH" }
+          if ($env:GITHUB_REF_NAME -ne 'diagnostic/windows-installer-acceptance') { throw "Unexpected candidate ref: $env:GITHUB_REF_NAME" }
+          $installer = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\target\release\bundle\nsis\dotz_0.2.8_x64-setup.exe'
+          if (-not (Test-Path -LiteralPath $installer)) { throw "Built NSIS installer is missing: $installer" }
+          $info = Get-Item -LiteralPath $installer
+          $sha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $package = Join-Path $env:RUNNER_TEMP 'dotz-candidate-package'
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          $copy = Join-Path $package 'dotz_0.2.8_x64-setup.exe'
+          Copy-Item -LiteralPath $installer -Destination $copy
+          $manifest = [ordered]@{
+            schema_version = 1
+            mode = 'candidate'
+            branch = $env:GITHUB_REF_NAME
+            source_sha = $env:GITHUB_SHA
+            workflow_run_id = $env:GITHUB_RUN_ID
+            runner_arch = $env:RUNNER_ARCH
+            asset_name = [IO.Path]::GetFileName($copy)
+            asset_bytes = [long]$info.Length
+            sha256 = $sha
+            bundle_target = 'NSIS'
+            nsis_install_mode = 'currentUser (Tauri default; not overridden by candidate config)'
+            webview2_install_mode = 'downloadBootstrapper (Tauri default; preinstalled prerequisite verified before /S)'
+            updater_signing_artifacts = $false
+            model_download_step = 'npm run fetch-model'
+            test_bundle_config = 'src-tauri/tauri.acceptance.conf.json'
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $package 'candidate-metadata.json') -Encoding utf8
+          Write-Host "CANDIDATE_ASSET=$($manifest.asset_name) bytes=$($manifest.asset_bytes) sha256=$sha source_sha=$env:GITHUB_SHA"
+
+      - name: Publish candidate installer artifact for this workflow only
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotz-windows-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/dotz-candidate-package/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+  candidate_native:
+    name: Candidate installer on a fresh Windows x64 profile
+    needs: [released_native, candidate_build]
+    if: ${{ !cancelled() && needs.candidate_build.result == 'success' && needs.released_native.result != 'skipped' }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic HEAD
+        uses: actions/checkout@v4
+      - name: Set up Node and Python
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Create isolated evidence directory
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'dotz-acceptance-candidate'
+          if (Test-Path -LiteralPath $out) { throw "Unexpected pre-existing acceptance directory: $out" }
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          "DOTZ_ACCEPTANCE_OUT=$out" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+          Write-Host "DOTZ_ACCEPTANCE_OUT=$out"
+
+      - name: Download exact candidate package from this workflow run
+        uses: actions/download-artifact@v4
+        with:
+          name: dotz-windows-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/dotz-candidate-package
+
+      - name: Install cua-driver from its documented Windows installer
+        shell: pwsh
+        run: |
+          irm https://cua.ai/driver/install.ps1 | iex
+          $cua = Join-Path $env:LOCALAPPDATA 'Programs\Cua\cua-driver\bin\cua-driver.exe'
+          if (-not (Test-Path -LiteralPath $cua)) { throw "cua-driver was not installed at $cua" }
+          "CUA_DRIVER_BIN=$cua" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+          & $cua --version
+          if ($LASTEXITCODE -ne 0) { throw "cua-driver --version exited $LASTEXITCODE" }
+
+      - name: Validate acceptance helpers on Windows before any install
+        shell: pwsh
+        run: |
+          node --check scripts/windows-installer-acceptance.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/test-verify-windows-memory-embedding.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tokens = $null; $parseErrors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'scripts/prepare-v028-acceptance.ps1'), [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count) { $parseErrors | ForEach-Object { Write-Error $_ }; exit 1 }
+
+      - name: Prove interactive Windows desktop and UI Automation before install
+        shell: pwsh
+        run: |
+          $doctor = & $env:CUA_DRIVER_BIN doctor 2>&1
+          $doctor | Out-File -LiteralPath (Join-Path $env:DOTZ_ACCEPTANCE_OUT 'cua-driver-preflight.log') -Encoding utf8
+          $doctorText = $doctor | Out-String
+          Write-Host $doctorText
+          if ($LASTEXITCODE -ne 0 -or $doctorText -notmatch 'attached interactive desktop' -or $doctorText -notmatch 'UI Automation.*succeeded') {
+            throw 'Hosted runner did not prove an attached interactive desktop and working Windows UI Automation.'
+          }
+          $sessionId = (Get-Process -Id $PID).SessionId
+          "WINDOWS_JOB_SESSION_ID=$sessionId" | Out-File -LiteralPath (Join-Path $env:DOTZ_ACCEPTANCE_OUT 'windows-session.txt') -Encoding utf8
+          Write-Host "WINDOWS_JOB_SESSION_ID=$sessionId"
+
+      - name: Run native acceptance against the exact candidate artifact
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'dotz-candidate-package\dotz_0.2.8_x64-setup.exe'
+          $metadata = Join-Path $env:RUNNER_TEMP 'dotz-candidate-package\candidate-metadata.json'
+          node scripts/windows-installer-acceptance.mjs --mode candidate --installer $installer --metadata $metadata
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Preserve raw candidate-installer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotz-windows-acceptance-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/dotz-acceptance-candidate/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
