@@ -225,6 +225,7 @@ def main() -> int:
         termination_at: float | None = None
         kill_sent = False
         post_exit_since: float | None = None
+        forced_abandon = False
 
         def trigger_timeout(reason: str, details: dict[str, Any], now: float) -> None:
             nonlocal timeout_reason, termination_at
@@ -357,8 +358,39 @@ def main() -> int:
                 kill_sent = True
                 write_event(progress, {"event": "process_group_sigkill", "timestamp": utc_now(),
                                        "reason": timeout_reason, "elapsed_seconds": round(now - start, 1)})
+            if (termination_at is not None and command_return_code is None
+                    and kill_sent
+                    and now - termination_at >= max(args.termination_grace, 0.0)
+                    + max(args.post_exit_drain_timeout, 0.0)):
+                details = {
+                    "event": "command_process_exit_timeout", "timestamp": utc_now(),
+                    "timeout_reason": timeout_reason,
+                    "pid": proc.pid,
+                    "elapsed_seconds": round(now - start, 1),
+                    "threshold_seconds": max(args.termination_grace, 0.0)
+                    + max(args.post_exit_drain_timeout, 0.0),
+                }
+                write_event(progress, details)
+                print("[ci-watchdog] " + json.dumps(details, sort_keys=True), flush=True)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                # The process may have moved groups despite the new session; still kill the
+                # owned command leader directly before abandoning pipe collection.
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    selector.unregister(proc.stdout)
+                except (KeyError, ValueError):
+                    pass
+                proc.stdout.close()
+                stream_eof = True
+                forced_abandon = True
             return_code = proc.poll()
-            if return_code is not None and stream_eof:
+            if (return_code is not None and stream_eof) or forced_abandon:
                 break
         if timeout_reason is not None and not kill_sent:
             try:
@@ -372,8 +404,19 @@ def main() -> int:
             text = output_buffer.decode(errors="replace")
             for message in emit_test_events(text, counters, progress):
                 print(message, flush=True)
-        command_return_code = proc.wait()
-        return_code = 124 if timeout_reason is not None else command_return_code
+        command_return_code = proc.poll()
+        if forced_abandon:
+            try:
+                command_return_code = proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                command_return_code = proc.poll()
+        else:
+            command_return_code = proc.wait()
+        if timeout_reason is None:
+            assert command_return_code is not None
+            return_code = command_return_code
+        else:
+            return_code = 124
         final_sample = system_snapshot()
         final_sample.update({
             "event": "resource_final", "elapsed_seconds": round(time.monotonic() - start, 1),
