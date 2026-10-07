@@ -42,7 +42,7 @@ AGENT = agent_browser_target(AGENT_COMMAND, pathlib.Path(AGENT_CANDIDATE))
 TARGET_DIR = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
 SERVE = pathlib.Path(os.environ["DOTZ_SERVE_BIN"]) if os.environ.get("DOTZ_SERVE_BIN") else serve_binary_path(TARGET_DIR, sys.platform)
 CHROMIUM = os.environ.get("CHROMIUM_PATH") or shutil.which("chromium") or shutil.which("chromium-browser")
-SESSION = "dotz-ui-init-" + uuid.uuid4().hex[:12]
+SESSION = "d" + uuid.uuid4().hex[:8]
 PANEL_DEFINITIONS_EXPECTED = [
     {"name": "chat", "icon": "▓", "label": "CHAT"},
     {"name": "graph", "icon": "◐", "label": "WORKFLOW GRAPH", "color": "var(--cyan)", "toolMap": [{"exact": "subagent"}]},
@@ -201,6 +201,10 @@ private_tmp = app_home / "tmp"
 private_tmp.mkdir()
 private_cache = app_home / "cache"
 private_cache.mkdir()
+socket_dir = None
+if os.name == "posix":
+    socket_dir = pathlib.Path(tempfile.gettempdir()) / ("dotz-browser-" + uuid.uuid4().hex[:8])
+    socket_dir.mkdir()
 app_env = dict(base_environment)
 app_env.update({
     "HOME": str(app_home),
@@ -215,7 +219,13 @@ app_env.update({
     "AGENT_BROWSER_IDLE_TIMEOUT_MS": "15000",
     "AGENT_BROWSER_INIT_SCRIPTS": str(OUT / "capture-ui-errors.js"),
 })
+if socket_dir is not None:
+    app_env["AGENT_BROWSER_SOCKET_DIR"] = str(socket_dir)
 browser_env = dict(app_env)
+if socket_dir is not None:
+    # Chromium embeds this temporary path in Unix-domain socket filenames; keep it short enough
+    # for the platform socket limit while backend data remains isolated under app_home.
+    browser_env["TMPDIR"] = tempfile.gettempdir()
 
 (OUT / "capture-ui-errors.js").write_text(
     "window.__dotzUiErrors = [];\n"
@@ -496,6 +506,8 @@ finally:
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait(timeout=5)
+    if socket_dir is not None:
+        shutil.rmtree(socket_dir, ignore_errors=True)
 
 result = {
     "revision": subprocess.run(
