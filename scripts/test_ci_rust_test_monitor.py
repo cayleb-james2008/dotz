@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from typing import Any
 
@@ -84,6 +85,30 @@ class CiRustTestMonitorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertTrue(any(e["event"] == "post_exit_drain_timeout" for e in events))
         self.assertTrue(any(e["event"] == "test_completed" for e in events))
+
+    @unittest.skipUnless(os.name == "posix" and Path("/usr/bin/setsid").exists(), "requires setsid")
+    def test_command_timeout_still_enforces_hard_drain_deadline_for_escaped_pipe(self) -> None:
+        child = (
+            "import subprocess,sys,time; "
+            "subprocess.Popen(['/usr/bin/setsid', sys.executable, '-c', 'import time; time.sleep(3)']); "
+            "print('running 1 test', flush=True); time.sleep(20)"
+        )
+        started = time.monotonic()
+        result, events = self.invoke(
+            [sys.executable, "-u", "-c", child],
+            "--command-timeout",
+            "0.3",
+            "--post-exit-drain-timeout",
+            "0.3",
+            "--termination-grace",
+            "0.1",
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertLess(elapsed, 2.0, f"monitor exceeded hard drain deadline: {elapsed:.2f}s")
+        self.assertTrue(any(e["event"] == "command_timeout" for e in events))
+        self.assertTrue(any(e["event"] == "post_exit_drain_timeout" for e in events))
+        self.assertEqual(events[-1]["event"], "command_exit")
 
     def test_long_running_test_warning_bounds_the_named_test(self) -> None:
         child = (

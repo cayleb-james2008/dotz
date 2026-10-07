@@ -376,11 +376,16 @@ const UNSHARE_WRAPPER_FLAGS: &[&str] = &[
     "--kill-child=KILL",
 ];
 
-/// Containment wrapper binary. `DOTZ_UNSHARE_BIN` is a test seam used only by the fail-closed
-/// helper-process test; product code never sets it.
-#[cfg(target_os = "linux")]
+/// Containment wrapper binary. The environment override exists only in test builds so a
+/// deployment environment cannot replace the namespace probe with a successful no-op wrapper.
+#[cfg(all(target_os = "linux", test))]
 fn unshare_bin() -> String {
     std::env::var("DOTZ_UNSHARE_BIN").unwrap_or_else(|_| "unshare".to_string())
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn unshare_bin() -> String {
+    "unshare".to_string()
 }
 
 /// Probe that PID-namespace containment can actually be created on this host before any
@@ -408,6 +413,7 @@ fn probe_containment() -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn containment_available() -> Result<(), String> {
+    #[cfg(test)]
     if std::env::var_os("DOTZ_UNSHARE_BIN").is_some() {
         // Test seam: re-probe on every call so the fail-closed helper process can force
         // failure without poisoning a process-wide cache used by concurrent tests.
@@ -2494,13 +2500,33 @@ mod tests {
     /// `execute_run` exit path's `finish()` was a no-op (status already terminal), so the actual
     /// process output was silently lost — the run record showed only "\n[killed]\n".
     ///
-    /// This test starts a real `execute_run` that prints a marker line then replaces its shell
-    /// with a long-lived process, kills it after the marker has been produced, and asserts the
+    /// This test starts a real `execute_run`, kills it after a streamed marker, and asserts the
     /// final record contains BOTH the marker AND the "[killed]" marker — not just the latter.
-    /// The direct `exec` keeps this output-preservation test separate from descendant-tree
-    /// cleanup, which has its own process-tree regression test.
     #[tokio::test]
     async fn manual_kill_preserves_child_output_in_final_record() {
+        let marker = "dotz-kill-output-survives";
+        let (language, code) = if cfg!(windows) {
+            (
+                "powershell",
+                format!("Write-Output '{marker}'; Start-Sleep -Seconds 60"),
+            )
+        } else {
+            ("bash", format!("echo '{marker}'; exec sleep 60"))
+        };
+        assert_manual_kill_preserves_output(language, code, marker).await;
+    }
+
+    /// A separate multi-process case keeps inherited stdout/stderr cleanup covered on macOS,
+    /// where process-group signaling (not Linux PID namespaces) is the documented boundary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manual_kill_drains_inherited_pipe_from_process_group_child() {
+        let marker = "dotz-kill-inherited-pipe-survives";
+        assert_manual_kill_preserves_output("bash", format!("echo '{marker}'; sleep 60"), marker)
+            .await;
+    }
+
+    async fn assert_manual_kill_preserves_output(language: &str, code: String, marker: &str) {
         let id = uuid::Uuid::new_v4().to_string();
         {
             let mut store = runs_guard();
@@ -2510,8 +2536,8 @@ mod tests {
                     run: SandboxRun {
                         id: id.clone(),
                         project_id: None,
-                        language: "bash".to_string(),
-                        code: String::new(),
+                        language: language.to_string(),
+                        code: code.clone(),
                         status: "running".to_string(),
                         output: String::new(),
                         exit_code: None,
@@ -2526,31 +2552,15 @@ mod tests {
             );
         }
 
-        // Print a unique marker immediately, then sleep long enough for the kill to arrive
-        // mid-execution.  The marker is what we assert survives in the final output.
-        let marker = "dotz-kill-output-survives";
-        let (language, code) = if cfg!(windows) {
-            (
-                "powershell",
-                format!("Write-Output '{marker}'; Start-Sleep -Seconds 60"),
-            )
-        } else {
-            ("bash", format!("echo '{marker}'; exec sleep 60"))
-        };
-
         // Drive execute_run in a spawned task with a broadcast sender so we can observe the
-        // child's stdout line-by-line as it is produced, rather than guessing with a fixed
-        // sleep.  The previous version waited a hard-coded 300ms after the pid appeared and
-        // then killed — which raced PowerShell's slow stdout flush under parallel test load
-        // (the marker had not yet reached the pipe when taskkill /F struck, so the final
-        // record showed only "\n[killed]\n" and the test failed intermittently).  Waiting for
-        // the actual `sandbox_output` event carrying the marker makes the kill deterministic.
+        // child's stdout line-by-line as it is produced, rather than guessing with a fixed sleep.
         let (tx, mut rx) = broadcast::channel::<Value>(16);
         let id_for_task = id.clone();
-        let run_task = tokio::spawn(async move {
+        let language = language.to_string();
+        let mut run_task = tokio::spawn(async move {
             execute_run(
                 id_for_task,
-                language.to_string(),
+                language,
                 code,
                 60_000, // long timeout so the watchdog doesn't fire first
                 "terminal".to_string(),
@@ -2595,13 +2605,18 @@ mod tests {
             "kill_run_by_id should signal a live run"
         );
 
-        // Wait for execute_run to finish reaping the child and writing the final record. Do not
-        // ignore the timeout result: reading the immediately-updated `[killed]` record before
-        // this async cleanup completes would report missing output without distinguishing a
-        // capture bug from a process/pipe that did not finish reaping.
-        tokio::time::timeout(std::time::Duration::from_secs(20), run_task)
-            .await
-            .expect("execute_run must finish collecting output after a manual kill")
+        // Require child wait AND stdout/stderr EOF. If the join stalls, report the tracked child
+        // process state to distinguish a pending child wait from a likely inherited-pipe drain.
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(20), &mut run_task).await;
+        if joined.is_err() {
+            let pid = runs_guard().get(&id).and_then(|entry| entry.pid);
+            panic!(
+                "execute_run did not finish child wait + stdout/stderr drain after manual kill: {}",
+                manual_kill_process_diagnostic(pid)
+            );
+        }
+        joined
+            .expect("checked timeout")
             .expect("execute_run task must not panic");
 
         // The final run record must contain BOTH the child's actual output AND the
@@ -2629,6 +2644,42 @@ mod tests {
 
         // Clean up the process-global store.
         remove_test_run(&id);
+    }
+
+    fn manual_kill_process_diagnostic(pid: Option<u32>) -> String {
+        let Some(pid) = pid else {
+            return "no child PID was recorded; spawn or PID bookkeeping may be pending"
+                .to_string();
+        };
+        let pid = pid.to_string();
+        let snapshot = if cfg!(windows) {
+            std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}")])
+                .output()
+        } else {
+            std::process::Command::new("ps")
+                .args(["-o", "pid=,ppid=,pgid=,stat=,command=", "-p", &pid])
+                .output()
+        };
+        match snapshot {
+            Ok(output) if output.status.success() => {
+                let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if state.is_empty() {
+                    format!(
+                        "tracked child PID {pid} is absent; child wait likely completed, so stdout/stderr EOF is the likely pending stage"
+                    )
+                } else {
+                    format!(
+                        "tracked child PID {pid} remains present; child wait may be pending: {state}"
+                    )
+                }
+            }
+            Ok(output) => format!(
+                "could not inspect tracked child PID {pid}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) => format!("could not inspect tracked child PID {pid}: {error}"),
+        }
     }
 
     // ---- SandboxBackend trait tests (B1 cross-platform safe subset) ----
