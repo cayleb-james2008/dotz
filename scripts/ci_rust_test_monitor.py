@@ -32,6 +32,63 @@ def write_event(stream: Any, event: dict[str, Any]) -> None:
     stream.flush()
 
 
+def signal_process_group(proc: subprocess.Popen[bytes], sig: int, progress: Any,
+                        timeout_reason: str | None, start: float) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        details = {
+            "event": "process_group_signal_error", "timestamp": utc_now(),
+            "pid": proc.pid, "signal": sig, "timeout_reason": timeout_reason,
+            "elapsed_seconds": round(time.monotonic() - start, 1),
+            "errno": exc.errno, "error": str(exc),
+        }
+        write_event(progress, details)
+        print("[ci-watchdog] " + json.dumps(details, sort_keys=True), flush=True)
+
+
+def wait_for_owned_leader(proc: subprocess.Popen[bytes], progress: Any,
+                          timeout_reason: str | None, start: float) -> int:
+    """Keep ownership until Popen confirms the command leader was reaped."""
+    pending_reported = False
+    kill_error_reported = False
+    while True:
+        try:
+            return proc.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            return_code = proc.poll()
+            if return_code is not None:
+                return return_code
+            if not pending_reported:
+                details = {
+                    "event": "command_leader_reap_pending", "timestamp": utc_now(),
+                    "pid": proc.pid, "timeout_reason": timeout_reason,
+                    "elapsed_seconds": round(time.monotonic() - start, 1),
+                }
+                write_event(progress, details)
+                print("[ci-watchdog] " + json.dumps(details, sort_keys=True), flush=True)
+                pending_reported = True
+            try:
+                # Popen still owns this unreaped child PID; do not broaden cleanup to
+                # unrelated processes if the group signal was ineffective.
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                if not kill_error_reported:
+                    details = {
+                        "event": "command_leader_kill_error", "timestamp": utc_now(),
+                        "pid": proc.pid, "timeout_reason": timeout_reason,
+                        "elapsed_seconds": round(time.monotonic() - start, 1),
+                        "errno": exc.errno, "error": str(exc),
+                    }
+                    write_event(progress, details)
+                    print("[ci-watchdog] " + json.dumps(details, sort_keys=True), flush=True)
+                    kill_error_reported = True
+
+
 def proc_snapshot() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     proc = Path("/proc")
@@ -239,10 +296,7 @@ def main() -> int:
             }
             write_event(progress, event)
             print("[ci-watchdog] " + json.dumps(event, sort_keys=True), flush=True)
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            signal_process_group(proc, signal.SIGTERM, progress, timeout_reason, start)
 
         while True:
             now = time.monotonic()
@@ -337,10 +391,7 @@ def main() -> int:
                             **details,
                         }, sort_keys=True), flush=True)
                     if not kill_sent:
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                        signal_process_group(proc, signal.SIGKILL, progress, timeout_reason, start)
                         kill_sent = True
                         write_event(progress, {
                             "event": "process_group_sigkill", "timestamp": utc_now(),
@@ -351,10 +402,7 @@ def main() -> int:
                     stream_eof = True
             elif (termination_at is not None and not kill_sent
                     and now - termination_at >= max(args.termination_grace, 0.0)):
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                signal_process_group(proc, signal.SIGKILL, progress, timeout_reason, start)
                 kill_sent = True
                 write_event(progress, {"event": "process_group_sigkill", "timestamp": utc_now(),
                                        "reason": timeout_reason, "elapsed_seconds": round(now - start, 1)})
@@ -372,16 +420,22 @@ def main() -> int:
                 }
                 write_event(progress, details)
                 print("[ci-watchdog] " + json.dumps(details, sort_keys=True), flush=True)
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                signal_process_group(proc, signal.SIGKILL, progress, timeout_reason, start)
                 # The process may have moved groups despite the new session; still kill the
                 # owned command leader directly before abandoning pipe collection.
                 try:
                     proc.kill()
                 except ProcessLookupError:
                     pass
+                except OSError as exc:
+                    details = {
+                        "event": "command_leader_kill_error", "timestamp": utc_now(),
+                        "pid": proc.pid, "timeout_reason": timeout_reason,
+                        "elapsed_seconds": round(time.monotonic() - start, 1),
+                        "errno": exc.errno, "error": str(exc),
+                    }
+                    write_event(progress, details)
+                    print("[ci-watchdog] " + json.dumps(details, sort_keys=True), flush=True)
                 try:
                     selector.unregister(proc.stdout)
                 except (KeyError, ValueError):
@@ -393,10 +447,7 @@ def main() -> int:
             if (return_code is not None and stream_eof) or forced_abandon:
                 break
         if timeout_reason is not None and not kill_sent:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            signal_process_group(proc, signal.SIGKILL, progress, timeout_reason, start)
             kill_sent = True
             write_event(progress, {"event": "process_group_sigkill", "timestamp": utc_now(),
                                    "reason": timeout_reason, "elapsed_seconds": round(time.monotonic() - start, 1)})
@@ -406,14 +457,11 @@ def main() -> int:
                 print(message, flush=True)
         command_return_code = proc.poll()
         if forced_abandon:
-            try:
-                command_return_code = proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                command_return_code = proc.poll()
+            command_return_code = wait_for_owned_leader(proc, progress, timeout_reason, start)
         else:
             command_return_code = proc.wait()
+        assert command_return_code is not None
         if timeout_reason is None:
-            assert command_return_code is not None
             return_code = command_return_code
         else:
             return_code = 124
