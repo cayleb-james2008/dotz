@@ -2494,9 +2494,11 @@ mod tests {
     /// `execute_run` exit path's `finish()` was a no-op (status already terminal), so the actual
     /// process output was silently lost — the run record showed only "\n[killed]\n".
     ///
-    /// This test starts a real `execute_run` that prints a marker line then sleeps, kills it
-    /// after the marker has been produced, waits for `execute_run` to finish, and asserts the
+    /// This test starts a real `execute_run` that prints a marker line then replaces its shell
+    /// with a long-lived process, kills it after the marker has been produced, and asserts the
     /// final record contains BOTH the marker AND the "[killed]" marker — not just the latter.
+    /// The direct `exec` keeps this output-preservation test separate from descendant-tree
+    /// cleanup, which has its own process-tree regression test.
     #[tokio::test]
     async fn manual_kill_preserves_child_output_in_final_record() {
         let id = uuid::Uuid::new_v4().to_string();
@@ -2530,10 +2532,10 @@ mod tests {
         let (language, code) = if cfg!(windows) {
             (
                 "powershell",
-                format!("Write-Output '{marker}'; Start-Sleep -Seconds 30"),
+                format!("Write-Output '{marker}'; Start-Sleep -Seconds 60"),
             )
         } else {
-            ("bash", format!("echo '{marker}'; sleep 30"))
+            ("bash", format!("echo '{marker}'; exec sleep 60"))
         };
 
         // Drive execute_run in a spawned task with a broadcast sender so we can observe the
@@ -2593,8 +2595,14 @@ mod tests {
             "kill_run_by_id should signal a live run"
         );
 
-        // Wait for execute_run to finish reaping the child and writing the final record.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), run_task).await;
+        // Wait for execute_run to finish reaping the child and writing the final record. Do not
+        // ignore the timeout result: reading the immediately-updated `[killed]` record before
+        // this async cleanup completes would report missing output without distinguishing a
+        // capture bug from a process/pipe that did not finish reaping.
+        tokio::time::timeout(std::time::Duration::from_secs(20), run_task)
+            .await
+            .expect("execute_run must finish collecting output after a manual kill")
+            .expect("execute_run task must not panic");
 
         // The final run record must contain BOTH the child's actual output AND the
         // "[killed]" marker — not just the latter.
