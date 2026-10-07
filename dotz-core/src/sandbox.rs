@@ -1064,7 +1064,9 @@ fn finish(id: &str, status: &str, exit_code: Option<i64>, output: &str) {
             // stdout/stderr would be silently lost without writing it here.
             if e.run.status != "running" {
                 if !output.is_empty() {
-                    e.run.output = output.to_string();
+                    // Preserve any markers already appended (e.g. "[killed]" from
+                    // kill_run_by_id) by appending the collected output rather than replacing.
+                    e.run.output.push_str(output);
                 }
             } else {
                 e.run.status = status.to_string();
