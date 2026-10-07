@@ -152,23 +152,18 @@ pub fn try_mark_end_emitted(id: &str) -> bool {
 
 // ---- platform sandbox backend ----
 //
-// Cross-platform abstraction over the two Windows-conditional seams in sandbox process
-// management: (1) spawn-time flags (CREATE_NO_WINDOW on Windows, process_group on posix), and
-// (2) tree-kill (taskkill /T /F on Windows, kill -9 -<pgid> on posix). The Windows impl is
-// verbatim from the former inline `#[cfg(windows)]` blocks; the Mac/Linux impls carry the posix
-// fallback (process_group + kill -9 -<pgid>) and reserve seatbelt/bwrap fields that are NOT yet
-// applied.
-//
-// ponytail: the seatbelt (macOS `sandbox-exec -p <profile>`) and bwrap (Linux `bwrap --unshare-...`)
-// argv are deferred — the stubs set process_group + tree-kill the posix way, which is the safe
-// subset that compiles and runs on every host without a macOS/Linux build box. The
-// `if self.seatbelt` / `if self.bwrap` branches are empty by design; filling them requires a
-// macOS/Linux host to validate and is tracked as the B2 hardening follow-up.
+// Process-management boundary: `prepare_command` creates a separate process group on POSIX and
+// hides Windows console windows. Cleanup uses `taskkill /T` on Windows, process-group signaling
+// on macOS, and Linux pidfd-scoped live-descendant cleanup. The Linux path catches `setsid`
+// descendants that remain in the owned parent tree; it does not sweep processes that daemonize
+// and reparent before cancellation.
 
-/// Platform abstraction over the two Windows-conditional seams in sandbox process management:
-/// (1) spawn-time flags (CREATE_NO_WINDOW on Windows, own process group on posix), and
-/// (2) tree-kill (taskkill /T /F on Windows, kill -9 -<pgid> on posix). Best-effort;
-/// implementations must reap their own kill subprocess (`.status()`, not `.spawn()`).
+/// Cross-platform process-management interface. `prepare_command` establishes the platform's
+/// spawn boundary (no-window on Windows, a new process group on POSIX); `kill_tree` performs
+/// platform-specific cleanup. Windows uses `taskkill /T /F`, macOS uses process-group signaling,
+/// and Linux pins the tracked child plus live descendants with pidfds. Linux catches `setsid`
+/// while descendants remain in the owned parent tree; already-daemonized/reparented processes are
+/// outside that boundary.
 pub trait SandboxBackend: Send + Sync + 'static {
     /// Configure a `tokio::process::Command` before spawn (hide window on Windows, own process
     /// group on posix). Called for every sandbox + agent-browser spawn.
@@ -246,9 +241,11 @@ impl SandboxBackend for MacSandbox {
     }
 }
 
-/// Linux backend stub: posix fallback (process_group + `kill -9 -<pgid>`). The `bwrap` field
-/// reserves the `bwrap --unshare-... <argv>` wrap for a future Linux-host follow-up; the
-/// `if self.bwrap` branch is empty by design (ponytail: deferred — requires a Linux host).
+/// Linux backend: spawn commands in their own process group and terminate the tracked process
+/// plus its live `/proc` descendants through pidfds. This reaches live descendants that call
+/// `setsid` without signalling unrelated processes. Descendants that daemonize/reparent before
+/// cancellation are outside this ancestry-based boundary. The `bwrap` field still reserves the
+/// `bwrap --unshare-...` wrap for a future Linux-host follow-up.
 #[cfg(target_os = "linux")]
 struct LinuxSandbox {
     bwrap: bool,
@@ -280,16 +277,13 @@ impl SandboxBackend for LinuxSandbox {
     }
 
     fn kill_tree(&self, pid: u32) {
-        posix_kill_tree(pid);
+        linux_kill_owned_tree(pid);
     }
 }
 
-/// Posix tree-kill: signal the child's process group (pgid == child pid when spawned with
-/// `process_group(0)`), falling back to a direct signal if the group doesn't exist (e.g. a
-/// caller that spawned the child without its own process group, as some unit tests do). Uses
-/// `.status()` so the kill subprocess is reaped. Verbatim from the former inline
-/// `#[cfg(not(windows))]` block in `kill_pid`.
-#[cfg(unix)]
+/// macOS process-group cleanup. `prepare_command` creates a fresh group, so signaling this group
+/// catches its normal descendants; it does not claim to catch a descendant that calls `setsid`.
+#[cfg(target_os = "macos")]
 fn posix_kill_tree(pid: u32) {
     let group = std::process::Command::new("kill")
         .args(["-9", &format!("-{pid}")])
@@ -303,6 +297,154 @@ fn posix_kill_tree(pid: u32) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+
+/// Linux ownership-scoped cleanup. Stop the spawned root, discover live descendants by parent
+/// PID, pin each process identity with a pidfd, and stop every discovered child before scanning
+/// again. Finally signal only those pinned process identities with SIGKILL. `setsid()` changes a
+/// process group/session, not its parent relationship, and pidfds cannot start targeting a reused
+/// PID. Daemonized/reparented processes are deliberately outside this ancestry-based boundary.
+#[cfg(target_os = "linux")]
+fn linux_kill_owned_tree(root_pid: u32) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    const SIGKILL: libc::c_int = 9;
+    const SIGSTOP: libc::c_int = 19;
+
+    fn open_pidfd(pid: u32) -> Option<OwnedFd> {
+        if pid <= 1 || pid > libc::pid_t::MAX as u32 {
+            return None;
+        }
+        // SAFETY: pidfd_open has no pointer arguments; the numeric pid is checked above.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if fd < 0 {
+            None
+        } else {
+            // SAFETY: successful pidfd_open returns a new owned file descriptor.
+            Some(unsafe { OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) })
+        }
+    }
+
+    fn signal_pidfd(fd: &OwnedFd, signal: libc::c_int) -> bool {
+        // SAFETY: the pidfd refers to one pinned process identity; null siginfo is valid for
+        // pidfd_send_signal and flags=0 requests the standard signal behavior.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            ) == 0
+        }
+    }
+
+    fn parent_pid(pid: u32) -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, fields) = stat.rsplit_once(") ")?;
+        fields.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    fn wait_until_stopped(pid: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        loop {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, fields)| fields.to_string()))
+                .and_then(|fields| fields.chars().next());
+            if matches!(state, Some('T' | 't' | 'Z' | 'X')) || std::time::Instant::now() >= deadline
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn children_by_parent() -> HashMap<u32, Vec<u32>> {
+        let mut children = HashMap::<u32, Vec<u32>>::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return children;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if let Some(parent) = parent_pid(pid) {
+                children.entry(parent).or_default().push(pid);
+            }
+        }
+        children
+    }
+
+    if root_pid <= 1 || root_pid == std::process::id() {
+        return;
+    }
+    let Some(root_fd) = open_pidfd(root_pid) else {
+        // Older kernels may lack pidfd support. Do not use a process-group signal here: the
+        // fail-safe fallback signals only the still-owned direct child, if procfs confirms it.
+        if parent_pid(root_pid) == Some(std::process::id()) {
+            // SAFETY: the direct child is still our unreaped child, so its PID cannot have been
+            // recycled to an unrelated process.
+            unsafe { libc::kill(root_pid as libc::pid_t, SIGKILL) };
+        }
+        return;
+    };
+    if parent_pid(root_pid) != Some(std::process::id()) {
+        return;
+    }
+    if !signal_pidfd(&root_fd, SIGSTOP) {
+        return;
+    }
+    // Do not scan while the root can still fork a child between the procfs snapshot and its stop.
+    wait_until_stopped(root_pid);
+
+    let mut known = HashSet::from([root_pid]);
+    let mut owned = vec![(root_pid, root_fd)];
+    loop {
+        let snapshot = children_by_parent();
+        let mut new_children = Vec::new();
+        for (parent, _) in &owned {
+            if let Some(children) = snapshot.get(parent) {
+                for child in children {
+                    if !known.contains(child) {
+                        new_children.push((*parent, *child));
+                    }
+                }
+            }
+        }
+        if new_children.is_empty() {
+            break;
+        }
+
+        let mut added = false;
+        for (parent, child) in new_children {
+            let Some(child_fd) = open_pidfd(child) else {
+                continue;
+            };
+            // Confirm the relationship after pinning the child identity; do not signal a PID
+            // that exited and was reused between the procfs scan and pidfd_open.
+            if parent_pid(child) != Some(parent) || !signal_pidfd(&child_fd, SIGSTOP) {
+                continue;
+            }
+            // Stop each child before scanning it for grandchildren, including those that escaped
+            // the process group with setsid().
+            wait_until_stopped(child);
+            known.insert(child);
+            owned.push((child, child_fd));
+            added = true;
+        }
+        if !added {
+            break;
+        }
+    }
+
+    for (_, process_fd) in owned.iter().rev() {
+        let _ = signal_pidfd(process_fd, SIGKILL);
     }
 }
 

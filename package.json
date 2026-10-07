@@ -14,7 +14,8 @@
     "install:deps": "node scripts/install-npm-deps.mjs",
     "fetch-model": "node scripts/fetch-embed-model.mjs",
     "test:ui": "node scripts/run-ui-regression.mjs",
-    "test:install-wrapper": "node scripts/test-install-wrapper.mjs"
+    "test:install-wrapper": "node scripts/test-install-wrapper.mjs",
+    "test:release-install-policy": "node scripts/test-release-install-policy.mjs"
   },
   "dependencies": {
     "agent-browser": "0.27.0"

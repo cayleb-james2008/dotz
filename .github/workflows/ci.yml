@@ -22,6 +22,7 @@ jobs:
           python-version: '3.12'
       - run: npm run install:deps
       - run: npm run test:install-wrapper
+      - run: npm run test:release-install-policy
       - run: python -m unittest discover -s scripts -p test_ui_regression_platform.py -v
 
   check:

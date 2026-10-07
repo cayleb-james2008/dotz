@@ -11,9 +11,12 @@
 //! are NEVER exposed. The closed action set is validated up front so a typo'd action can't no-op into a
 //! false-success observation.
 //!
-//! ponytail: no persistent daemon management beyond what browser.ts does — one spawn per command, and
-//! a best-effort `reap_stray_browsers` backstop on app shutdown (the Tauri shell calls `dispose_all`
-//! and `reap_stray_browsers` on `RunEvent::Exit` so headless Chrome instances do not outlive the app).
+//! The controller intentionally preserves agent-browser's session daemon after successful one-shot
+//! commands; `close` during `stop`/`dispose_all` is the supported session teardown path. Timeout
+//! cleanup on Linux cancels the one-shot process and live descendants still in its parent tree,
+//! including `setsid` children. It does not claim to kill an agent-browser/Chrome daemon that has
+//! daemonized/reparented, and no global image-name kill is used because it could signal unrelated
+//! user processes.
 use axum::{
     Json, Router,
     extract::Query,
@@ -572,8 +575,10 @@ fn split_role_name(descriptor: &str) -> (String, String) {
 }
 
 // ---- the one-shot command runner ----
-/// Spawn agent-browser ONE-SHOT with the exact security flags + AGENT_BROWSER_HEADED=false, a 35s
-/// timeout, capture stdout/stderr, kill-tree on timeout, parse stdout as JSON. `command` is the
+/// Spawn agent-browser ONE-SHOT with the exact security flags + AGENT_BROWSER_HEADED=false, a
+/// bounded timeout, capture stdout/stderr, cancel the owned process tree on timeout, and parse
+/// stdout as JSON. On Linux cleanup reaches live descendants still in the parent tree, including
+/// `setsid` children; it does not sweep daemonized/reparented browser processes. `command` is the
 /// trailing `--json <command...>` portion.
 async fn run(
     session_id: &str,
@@ -636,7 +641,7 @@ async fn run(
         .stderr(Stdio::from(err_file))
         .env("AGENT_BROWSER_HEADED", "false");
     // Cross-platform spawn flags via the shared sandbox backend: CREATE_NO_WINDOW on Windows,
-    // own process group on posix (so the tree-kill reaches the headless Chrome grandchild).
+    // own process group on POSIX. Linux cleanup also tracks live descendants that call `setsid`.
     crate::sandbox::backend().prepare_command(&mut cmd);
 
     let mut child = cmd
@@ -689,9 +694,9 @@ async fn run(
     }
 }
 
-/// Kill a pid and its descendant tree — `taskkill /T /F` on win32, `kill -9 -<pgid>` on posix.
-/// The blocking backend runs off the Tokio worker. Explicit command timeouts await its completion;
-/// the guard below detaches it on future cancellation (for example, stop() timing out run()).
+/// Kill a pid and its owned descendants via the platform backend. The blocking backend runs off
+/// the Tokio worker. Explicit command timeouts await its completion; the guard below detaches it
+/// on future cancellation (for example, stop() timing out run()).
 fn kill_pid(pid: Option<u32>) -> Option<tokio::task::JoinHandle<()>> {
     let pid = pid?;
     Some(tokio::task::spawn_blocking(move || {
@@ -700,8 +705,8 @@ fn kill_pid(pid: Option<u32>) -> Option<tokio::task::JoinHandle<()>> {
 }
 
 /// A dropped `run()` future must not orphan the spawned process tree. `Child` itself does not
-/// kill descendants on drop, so schedule the shared process-group cleanup unless normal completion
-/// or the explicit timeout path disarms this guard.
+/// kill descendants on drop, so schedule owned-tree cleanup unless normal completion or the
+/// explicit timeout path disarms this guard.
 struct ProcessTreeGuard {
     pid: Option<u32>,
 }
@@ -1360,8 +1365,9 @@ pub async fn stop(session_id: &str) -> Result<BrowserObservation, String> {
         profile_dir: profile_dir.clone(),
         disarm: false,
     };
-    // Bound close so a hung agent-browser cannot block shutdown. If this outer timeout cancels
-    // run(), its ProcessTreeGuard still schedules a process-group cleanup before stop returns.
+    // Bound close so a hung agent-browser cannot block shutdown. On Linux, cancellation reaches
+    // the one-shot process and live descendants still in its parent tree (including setsid); it
+    // does not claim to reap a daemon that agent-browser has already daemonized/reparented.
     let _ = tokio::time::timeout(
         CLOSE_TIMEOUT,
         run(session_id, &profile_dir, &allowed_origins, &["close"]),
@@ -1423,37 +1429,14 @@ fn frame(session_id: &str, after_seq: i64) -> Option<(i64, Vec<u8>)> {
     Some((seq, data.clone()))
 }
 
-/// Dispose every browser session. Called by the Tauri shell on `RunEvent::Exit` so the app does
-/// not leave headless Chrome profiles/processes behind. Each session stop is bounded so a hung
-/// `agent-browser close` command cannot block shutdown indefinitely.
+/// Dispose every browser session. Called by the Tauri shell on `RunEvent::Exit`; each stop asks
+/// agent-browser to close its session and is bounded so a hung close cannot block shutdown. A
+/// daemon that has already daemonized/reparented and ignores close is outside the owned-child
+/// cleanup boundary and is not globally killed by image name.
 pub async fn dispose_all() {
     let ids: Vec<String> = sessions_guard().keys().cloned().collect();
     for id in ids {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stop(&id)).await;
-    }
-}
-
-/// Force-kill any lingering agent-browser process tree by image name. Best-effort backstop —
-/// `agent-browser close` does not reliably reap the headless-Chrome grandchild. Exposed publicly
-/// so the Tauri shell can call it after `dispose_all` on shutdown.
-/// Blocking (`.status()`, not `.spawn()`): only called at process exit, where waiting a few ms
-/// for taskkill/pkill is fine and reaping the subprocess avoids leaving a zombie behind.
-pub fn reap_stray_browsers() {
-    #[cfg(windows)]
-    {
-        let mut cmd = std::process::Command::new("taskkill");
-        cmd.args(["/IM", "agent-browser-win32-x64.exe", "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _ = crate::util::no_window(&mut cmd).status();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "agent-browser"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
     }
 }
 
@@ -1933,16 +1916,9 @@ mod tests {
         #[cfg(unix)]
         let script_path = {
             let sh = dir.join("fake-browser.sh");
-            tokio::fs::write(
-                &sh,
-                format!(
-                    "#!/bin/sh\necho $$ > \"{}\"\nsleep 30 &\nchild=$!\necho \"$child\" > \"{}\"\nwait \"$child\"\n",
-                    pidfile.to_string_lossy(),
-                    sleep_pidfile.to_string_lossy(),
-                ),
-            )
-            .await
-            .unwrap();
+            tokio::fs::write(&sh, fake_browser_waiting_script(&pidfile, &sleep_pidfile))
+                .await
+                .unwrap();
             use std::os::unix::fs::PermissionsExt;
             let mut perms = tokio::fs::metadata(&sh).await.unwrap().permissions();
             perms.set_mode(0o755);
@@ -2025,7 +2001,7 @@ mod tests {
             let child_stopped = wait_for_process_exit(&sleep_pidfile).await;
             assert!(
                 child_stopped.is_ok(),
-                "stop() must terminate the fake browser's descendant: {child_stopped:?}"
+                "stop() must terminate the fake browser's setsid-escaped descendant: {child_stopped:?}"
             );
         }
 
@@ -2158,6 +2134,29 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn fake_browser_waiting_script(
+        pid_file: &std::path::Path,
+        escaped_child_pid_file: &std::path::Path,
+    ) -> String {
+        #[cfg(target_os = "linux")]
+        let child_command = format!(
+            "setsid sh -c 'echo $$ > \"{}\"; exec sleep 30' & child=$!\necho \"$child\" > \"{}.launcher\"\nwait \"$child\"\n",
+            escaped_child_pid_file.to_string_lossy(),
+            escaped_child_pid_file.to_string_lossy(),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let child_command = format!(
+            "sleep 30 & child=$!\necho \"$child\" > \"{}\"\nwait \"$child\"\n",
+            escaped_child_pid_file.to_string_lossy(),
+        );
+        format!(
+            "#!/bin/sh\necho $$ > \"{}\"\n{}",
+            pid_file.to_string_lossy(),
+            child_command,
+        )
+    }
+
     #[cfg(target_os = "linux")]
     async fn wait_for_process_exit(pid_file: &std::path::Path) -> Result<(), String> {
         let contents = std::fs::read_to_string(pid_file)
@@ -2187,9 +2186,9 @@ mod tests {
         }
     }
 
-    /// A timed-out agent-browser command must terminate its full process tree, including shell
-    /// descendants. The test keeps a child sleeper alive past the command deadline and verifies
-    /// that timeout cleanup prevents it from outliving the returned error.
+    /// A timed-out agent-browser command must cancel its live owned descendants, including a
+    /// Linux child that calls `setsid` and escapes the command's process group. An unrelated
+    /// sleeper acts as a negative control and must remain alive after cleanup.
     #[tokio::test]
     async fn run_reaps_child_after_timeout() {
         let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
@@ -2205,9 +2204,22 @@ mod tests {
         #[cfg(unix)]
         let sleep_pidfile = dir.join("sleep-pid");
         #[cfg(unix)]
+        let unrelated_pidfile = dir.join("unrelated-pid");
+        #[cfg(unix)]
         let _cleanup = TimeoutTestProcessCleanup {
-            pid_files: vec![pidfile.clone(), sleep_pidfile.clone()],
+            pid_files: vec![
+                pidfile.clone(),
+                sleep_pidfile.clone(),
+                unrelated_pidfile.clone(),
+            ],
         };
+        #[cfg(target_os = "linux")]
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unrelated control process");
+        #[cfg(target_os = "linux")]
+        std::fs::write(&unrelated_pidfile, unrelated.id().to_string()).unwrap();
 
         // Fake agent-browser binary: a shell launches a separate sleeper to verify tree cleanup.
         #[cfg(windows)]
@@ -2221,16 +2233,9 @@ mod tests {
         #[cfg(unix)]
         let script_path = {
             let sh = dir.join("fake-browser.sh");
-            tokio::fs::write(
-                &sh,
-                format!(
-                    "#!/bin/sh\necho $$ > \"{}\"\nsleep 30 &\nchild=$!\necho \"$child\" > \"{}\"\nwait \"$child\"\n",
-                    pidfile.to_string_lossy(),
-                    sleep_pidfile.to_string_lossy(),
-                ),
-            )
-            .await
-            .unwrap();
+            tokio::fs::write(&sh, fake_browser_waiting_script(&pidfile, &sleep_pidfile))
+                .await
+                .unwrap();
             use std::os::unix::fs::PermissionsExt;
             let mut perms = tokio::fs::metadata(&sh).await.unwrap().permissions();
             perms.set_mode(0o755);
@@ -2323,8 +2328,16 @@ mod tests {
             let child_stopped = wait_for_process_exit(&sleep_pidfile).await;
             assert!(
                 child_stopped.is_ok(),
-                "timed-out browser command must terminate its descendant: {child_stopped:?}"
+                "timed-out browser command must terminate its setsid-escaped descendant: {child_stopped:?}"
             );
+            let unrelated_running = unrelated.try_wait().unwrap().is_none();
+            let _ = std::fs::remove_file(&unrelated_pidfile);
+            assert!(
+                unrelated_running,
+                "browser cancellation must not signal an unrelated process"
+            );
+            unrelated.kill().unwrap();
+            let _ = unrelated.wait();
         }
 
         sessions_guard().remove(&sid);

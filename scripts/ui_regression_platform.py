@@ -1,8 +1,54 @@
 from __future__ import annotations
 
 import shutil
+import os
+import re
 import sys
 from pathlib import Path
+
+UNIX_SOCKET_PATH_LIMIT_BYTES = 103
+_SOCKET_FILENAME_RESERVE_BYTES = 64
+
+
+class BrowserStartupUnavailable(RuntimeError):
+    """Raised when browser checks depend on a failed agent-browser startup."""
+
+
+class BrowserStartupGate:
+    """Prevent browser-dependent checks from cascading after `open` fails."""
+
+    def __init__(self) -> None:
+        self.failure: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.failure is None
+
+    def record_open_result(self, returncode: int) -> None:
+        if returncode != 0:
+            self.failure = f"agent-browser open exited with status {returncode}"
+
+    def require_ready(self) -> None:
+        if self.failure is not None:
+            raise BrowserStartupUnavailable(self.failure)
+
+
+def browser_socket_directory(run_token: str, roots: list[Path]) -> Path:
+    """Select an isolated short POSIX socket directory, preferring shortest usable roots.
+
+    Reserve room for a socket filename instead of only checking the directory itself; the
+    agent-browser/Chromium Unix-domain socket path must fit within the conservative 103-byte
+    limit even when the caller's temporary root is unusually long.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,12}", run_token):
+        raise ValueError("run_token must be 1-12 safe filename characters")
+    candidates = sorted({Path(root) for root in roots}, key=lambda root: len(os.fsencode(root)))
+    for root in candidates:
+        directory = root / f"db-{run_token}"
+        worst_case_socket = directory / ("s" * _SOCKET_FILENAME_RESERVE_BYTES)
+        if len(os.fsencode(worst_case_socket)) <= UNIX_SOCKET_PATH_LIMIT_BYTES:
+            return directory
+    raise OSError("no candidate temporary root fits the Unix-domain socket path limit")
 
 
 def serve_binary_path(target_dir: Path, platform_name: str | None = None) -> Path:

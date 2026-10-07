@@ -19,7 +19,14 @@ import urllib.error
 import urllib.request
 import uuid
 
-from ui_regression_platform import agent_browser_argv, agent_browser_target, serve_binary_path
+from ui_regression_platform import (
+    BrowserStartupGate,
+    BrowserStartupUnavailable,
+    agent_browser_argv,
+    agent_browser_target,
+    browser_socket_directory,
+    serve_binary_path,
+)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if os.environ.get("DOTZ_UI_TEST_OUT"):
@@ -42,7 +49,7 @@ AGENT = agent_browser_target(AGENT_COMMAND, pathlib.Path(AGENT_CANDIDATE))
 TARGET_DIR = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
 SERVE = pathlib.Path(os.environ["DOTZ_SERVE_BIN"]) if os.environ.get("DOTZ_SERVE_BIN") else serve_binary_path(TARGET_DIR, sys.platform)
 CHROMIUM = os.environ.get("CHROMIUM_PATH") or shutil.which("chromium") or shutil.which("chromium-browser")
-SESSION = "dotz-ui-init-" + uuid.uuid4().hex[:12]
+SESSION = "d" + uuid.uuid4().hex[:8]
 PANEL_DEFINITIONS_EXPECTED = [
     {"name": "chat", "icon": "▓", "label": "CHAT"},
     {"name": "graph", "icon": "◐", "label": "WORKFLOW GRAPH", "color": "var(--cyan)", "toolMap": [{"exact": "subagent"}]},
@@ -84,6 +91,7 @@ checks: list[dict] = []
 failures: list[str] = []
 server: subprocess.Popen | None = None
 base_url = ""
+browser_startup = BrowserStartupGate()
 
 
 def check(name: str, ok: bool, detail=None) -> None:
@@ -96,6 +104,7 @@ def check(name: str, ok: bool, detail=None) -> None:
 
 
 def run(name: str, *args: str, timeout: int = 30) -> dict:
+    browser_startup.require_ready()
     argv = [*AGENT_COMMAND, "--session", SESSION, *args]
     try:
         proc = subprocess.run(
@@ -201,6 +210,12 @@ private_tmp = app_home / "tmp"
 private_tmp.mkdir()
 private_cache = app_home / "cache"
 private_cache.mkdir()
+socket_dir: pathlib.Path | None = None
+if os.name == "posix":
+    socket_roots = [pathlib.Path(tempfile.gettempdir()), pathlib.Path("/tmp"), pathlib.Path("/var/tmp")]
+    socket_roots = [root for root in socket_roots if root.is_dir() and os.access(root, os.W_OK)]
+    socket_dir = browser_socket_directory(SESSION[1:], socket_roots)
+    socket_dir.mkdir(mode=0o700)
 app_env = dict(base_environment)
 app_env.update({
     "HOME": str(app_home),
@@ -215,7 +230,12 @@ app_env.update({
     "AGENT_BROWSER_IDLE_TIMEOUT_MS": "15000",
     "AGENT_BROWSER_INIT_SCRIPTS": str(OUT / "capture-ui-errors.js"),
 })
+if socket_dir is not None:
+    app_env["AGENT_BROWSER_SOCKET_DIR"] = str(socket_dir)
 browser_env = dict(app_env)
+if socket_dir is not None:
+    # Chromium embeds TMPDIR in Unix-domain socket paths too; keep it on the selected short root.
+    browser_env["TMPDIR"] = str(socket_dir.parent)
 
 (OUT / "capture-ui-errors.js").write_text(
     "window.__dotzUiErrors = [];\n"
@@ -254,7 +274,9 @@ try:
             check("actual backend health", health_ok, health)
             if health_ok:
                 opened = run("open-app", "open", base_url + "/")
-                check("browser opens app", opened["returncode"] == 0, opened["stderr"])
+                browser_startup.record_open_result(opened["returncode"])
+                check("browser opens app", browser_startup.ready, opened["stderr"])
+                browser_startup.require_ready()
                 run("set-viewport", "set", "viewport", "1920", "1080")
                 run("wait-for-module-initialization", "wait", "1200")
 
@@ -473,6 +495,14 @@ try:
                 check("onboarding writes only the isolated config marker", marker.is_file(), str(marker))
                 check("provider auth file remains absent", not (app_home / ".pi/agent/auth.json").exists(),
                       str(app_home / ".pi/agent/auth.json"))
+except BrowserStartupUnavailable as exc:
+    # `open-app` already recorded the primary failure. Do not run dependent checks or report
+    # each skipped browser operation as another failure.
+    checks.append({
+        "name": "browser-dependent checks skipped after startup failure",
+        "passed": True,
+        "detail": str(exc),
+    })
 except Exception as exc:
     failures.append(f"test harness exception: {exc!r}")
 finally:
@@ -496,6 +526,8 @@ finally:
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait(timeout=5)
+    if socket_dir is not None:
+        shutil.rmtree(socket_dir, ignore_errors=True)
 
 result = {
     "revision": subprocess.run(
@@ -505,6 +537,7 @@ result = {
     "server_cwd": str(ROOT),
     "DOTZ_WEB_DIR_override": os.environ.get("DOTZ_WEB_DIR"),
     "isolated_home": str(app_home),
+    "agent_browser_socket_dir": str(socket_dir) if socket_dir is not None else None,
     "removed_provider_environment_names": removed_provider_vars,
     "provider_or_prompt_call": False,
     "first_run_wizard_buttons": ["SKIP", "NEXT", "SKIP", "FINISH ✓"],
