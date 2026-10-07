@@ -212,7 +212,12 @@ The tool sandbox is a managed run store (run lifecycle `pending → running → 
 agent may call (see `PLAN_TOOLS` in `dotz-core/src/agent/tools.rs`), the in-app browser enforces
 an origin allowlist (`dotz-core/src/browser.rs`), and the loopback API rejects disallowed
 `Origin`/`Host` with `403` (`dotz-core/src/server/guard.rs`). The `bash` tool itself runs the
-given command in the session cwd with a wall-clock timeout — no command allowlist. The sandbox runs in two modes:
+given command in the session cwd with a wall-clock timeout — no command allowlist. On Linux, each
+sandbox workload runs under a per-run PID namespace; runs fail closed when that namespace cannot be
+created. This contains process-tree cleanup, not filesystem or network access. Windows keeps
+`taskkill /T`, and macOS uses process-group signaling; neither has the Linux PID-namespace
+cleanup guarantee. The browser has its own controller and persistent Chrome daemon. Escaped-process
+cleanup there is not covered by this sandbox containment path. The sandbox runs in two modes:
 
 - **`terminal`** mode — streams stdout/stderr back into the chat panel.
 - **`web`** mode — starts a long-lived process bound to a local HTTP port; the UI renders an inline
