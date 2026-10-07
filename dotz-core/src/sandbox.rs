@@ -2522,8 +2522,8 @@ mod tests {
     #[tokio::test]
     async fn manual_kill_drains_inherited_pipe_from_process_group_child() {
         let marker = "dotz-kill-inherited-pipe-survives";
-        assert_manual_kill_preserves_output("bash", format!("echo '{marker}'; sleep 60"), marker)
-            .await;
+        let code = format!("sleep 60 &\nchild=$!\nprintf '%s\\n' '{marker}'\nwait \"$child\"\n");
+        assert_manual_kill_preserves_output("bash", code, marker).await;
     }
 
     async fn assert_manual_kill_preserves_output(language: &str, code: String, marker: &str) {
@@ -2599,6 +2599,13 @@ mod tests {
             "child did not stream the marker within 15s; kill would race stdout flush"
         );
 
+        // Preserve the pid before kill_run_by_id clears it from the run record.
+        let tracked_pid = runs_guard().get(&id).and_then(|entry| entry.pid);
+        assert!(
+            tracked_pid.is_some(),
+            "live child PID must be recorded before kill"
+        );
+
         // Kill the run mid-execution, now that we know the marker is already in the pipe.
         assert!(
             kill_run_by_id(&id),
@@ -2609,10 +2616,9 @@ mod tests {
         // process state to distinguish a pending child wait from a likely inherited-pipe drain.
         let joined = tokio::time::timeout(std::time::Duration::from_secs(20), &mut run_task).await;
         if joined.is_err() {
-            let pid = runs_guard().get(&id).and_then(|entry| entry.pid);
             panic!(
                 "execute_run did not finish child wait + stdout/stderr drain after manual kill: {}",
-                manual_kill_process_diagnostic(pid)
+                manual_kill_process_diagnostic(tracked_pid)
             );
         }
         joined
