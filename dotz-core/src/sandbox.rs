@@ -2753,17 +2753,21 @@ mod tests {
     /// a future platform impl can't silently diverge from the sandbox's `kill_pid`.
     #[test]
     fn sandbox_backend_kill_tree_dispatches_to_platform() {
-        let mut child = if cfg!(windows) {
-            std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
-                .spawn()
-                .expect("powershell should be available")
+        let mut command = if cfg!(windows) {
+            let mut command = std::process::Command::new("powershell");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+            command
         } else {
-            std::process::Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("sleep should be available")
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            command
         };
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().expect("test process should start");
         // `std::process::Child::id()` returns `u32` on every platform (see note above).
         let pid = child.id();
 
