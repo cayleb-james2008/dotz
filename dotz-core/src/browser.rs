@@ -647,23 +647,38 @@ async fn run(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("agent-browser spawn failed: {e}"))?;
-    let pid = child.id();
-    let mut process_tree_guard = ProcessTreeGuard::new(pid);
+    let process = match crate::sandbox::OwnedProcess::pin(child.id()) {
+        Ok(process) => process,
+        Err(reason) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = std::fs::remove_file(&out_path);
+            let _ = std::fs::remove_file(&err_path);
+            return Err(format!("agent-browser process tracking failed: {reason}"));
+        }
+    };
+    let mut process_tree_guard = ProcessTreeGuard::new(process.clone());
 
     let status = match tokio::time::timeout(command_timeout(), child.wait()).await {
         Err(_) => {
             // Timed out: kill-tree (the child + its headless Chrome grandchild), reap the
             // process so it does not become a zombie (Unix) or leak handles (Windows), then
             // clean up the temp output files after the process has released them.
-            if let Some(kill_task) = kill_pid(pid) {
-                let _ = kill_task.await;
-            }
+            let cleanup = match kill_process(Some(process.clone())) {
+                Some(kill_task) => kill_task.await.unwrap_or(Err("cleanup worker failed")),
+                None => Err("spawned process identity unavailable"),
+            };
             let _ = child.start_kill();
             let _ = child.wait().await;
             process_tree_guard.disarm();
             let _ = std::fs::remove_file(&out_path);
             let _ = std::fs::remove_file(&err_path);
-            return Err("agent-browser command timed out".into());
+            return Err(match cleanup {
+                Ok(()) => "agent-browser command timed out".into(),
+                Err(reason) => {
+                    format!("agent-browser command timed out; cleanup incomplete: {reason}")
+                }
+            });
         }
         Ok(status) => {
             if status.is_ok() {
@@ -697,10 +712,20 @@ async fn run(
 /// Kill a pid and its owned descendants via the platform backend. The blocking backend runs off
 /// the Tokio worker. Explicit command timeouts await its completion; the guard below detaches it
 /// on future cancellation (for example, stop() timing out run()).
-fn kill_pid(pid: Option<u32>) -> Option<tokio::task::JoinHandle<()>> {
-    let pid = pid?;
+fn kill_process(
+    process: Option<crate::sandbox::OwnedProcess>,
+) -> Option<tokio::task::JoinHandle<Result<(), &'static str>>> {
+    let process = process?;
     Some(tokio::task::spawn_blocking(move || {
-        crate::sandbox::backend().kill_tree(pid);
+        let result = crate::sandbox::backend().kill_tree(&process);
+        if let Err(reason) = result {
+            tracing::warn!(
+                pid = process.pid(),
+                reason,
+                "browser process cleanup incomplete"
+            );
+        }
+        result
     }))
 }
 
@@ -708,22 +733,24 @@ fn kill_pid(pid: Option<u32>) -> Option<tokio::task::JoinHandle<()>> {
 /// kill descendants on drop, so schedule owned-tree cleanup unless normal completion or the
 /// explicit timeout path disarms this guard.
 struct ProcessTreeGuard {
-    pid: Option<u32>,
+    process: Option<crate::sandbox::OwnedProcess>,
 }
 
 impl ProcessTreeGuard {
-    fn new(pid: Option<u32>) -> Self {
-        Self { pid }
+    fn new(process: crate::sandbox::OwnedProcess) -> Self {
+        Self {
+            process: Some(process),
+        }
     }
 
     fn disarm(&mut self) {
-        self.pid = None;
+        self.process = None;
     }
 }
 
 impl Drop for ProcessTreeGuard {
     fn drop(&mut self) {
-        let _ = kill_pid(self.pid.take());
+        let _ = kill_process(self.process.take());
     }
 }
 
@@ -1899,10 +1926,24 @@ mod tests {
         let pidfile = dir.join("pid");
         #[cfg(unix)]
         let sleep_pidfile = dir.join("sleep-pid");
+        #[cfg(target_os = "linux")]
+        let unrelated_pidfile = dir.join("unrelated-pid");
         #[cfg(unix)]
         let _cleanup = TimeoutTestProcessCleanup {
-            pid_files: vec![pidfile.clone(), sleep_pidfile.clone()],
+            pid_files: vec![
+                pidfile.clone(),
+                sleep_pidfile.clone(),
+                #[cfg(target_os = "linux")]
+                unrelated_pidfile.clone(),
+            ],
         };
+        #[cfg(target_os = "linux")]
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unrelated control process");
+        #[cfg(target_os = "linux")]
+        std::fs::write(&unrelated_pidfile, unrelated.id().to_string()).unwrap();
 
         // Fake agent-browser binary: a shell launches a separate sleeper to verify tree cleanup.
         #[cfg(windows)]
@@ -1958,7 +1999,19 @@ mod tests {
         unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "300000") };
 
         let start = std::time::Instant::now();
-        let result = stop(&sid).await;
+        let stop_sid = sid.clone();
+        let stop_task = tokio::spawn(async move { stop(&stop_sid).await });
+        #[cfg(target_os = "linux")]
+        {
+            let (root, escaped) = wait_for_linux_process_pair(&pidfile, &sleep_pidfile)
+                .await
+                .unwrap();
+            assert_ne!(
+                escaped, root,
+                "the stop-test descendant must have escaped the browser's process group and session"
+            );
+        }
+        let result = stop_task.await.expect("browser stop task should not panic");
         let elapsed = start.elapsed();
 
         match prev_bin {
@@ -2002,6 +2055,16 @@ mod tests {
             assert!(
                 child_stopped.is_ok(),
                 "stop() must terminate the fake browser's setsid-escaped descendant: {child_stopped:?}"
+            );
+            let unrelated_running = unrelated.try_wait().unwrap().is_none();
+            let _ = std::fs::remove_file(&unrelated_pidfile);
+            if unrelated_running {
+                unrelated.kill().unwrap();
+            }
+            let _ = unrelated.wait();
+            assert!(
+                unrelated_running,
+                "session stop must not signal an unrelated process"
             );
         }
 
@@ -2186,6 +2249,53 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn linux_session_group(pid_file: &std::path::Path) -> Result<(u32, u32), String> {
+        let contents = std::fs::read_to_string(pid_file)
+            .map_err(|e| format!("could not read browser-test pid file: {e}"))?;
+        let pid = contents
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| format!("invalid browser-test pid {contents:?}: {e}"))?;
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_err(|e| format!("could not read process {pid} stat: {e}"))?;
+        let (_, fields) = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| format!("malformed process {pid} stat"))?;
+        let fields = fields.split_whitespace().collect::<Vec<_>>();
+        let group = fields
+            .get(2)
+            .ok_or_else(|| format!("missing process group for pid {pid}"))?
+            .parse::<u32>()
+            .map_err(|e| format!("invalid process group for pid {pid}: {e}"))?;
+        let session = fields
+            .get(3)
+            .ok_or_else(|| format!("missing session for pid {pid}"))?
+            .parse::<u32>()
+            .map_err(|e| format!("invalid session for pid {pid}: {e}"))?;
+        Ok((group, session))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_linux_process_pair(
+        root_file: &std::path::Path,
+        descendant_file: &std::path::Path,
+    ) -> Result<((u32, u32), (u32, u32)), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let (Ok(root), Ok(descendant)) = (
+                linux_session_group(root_file),
+                linux_session_group(descendant_file),
+            ) {
+                return Ok((root, descendant));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("browser-test processes did not become observable".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// A timed-out agent-browser command must cancel its live owned descendants, including a
     /// Linux child that calls `setsid` and escapes the command's process group. An unrelated
     /// sleeper acts as a negative control and must remain alive after cleanup.
@@ -2274,7 +2384,25 @@ mod tests {
         unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "500") };
 
         let start = std::time::Instant::now();
-        let result = run(&sid, &profile_dir, &allowed, &["get", "url"]).await;
+        let task_sid = sid.clone();
+        let task_profile_dir = profile_dir.clone();
+        let task_allowed = allowed.clone();
+        let run_task = tokio::spawn(async move {
+            run(&task_sid, &task_profile_dir, &task_allowed, &["get", "url"]).await
+        });
+        #[cfg(target_os = "linux")]
+        {
+            let (root, escaped) = wait_for_linux_process_pair(&pidfile, &sleep_pidfile)
+                .await
+                .unwrap();
+            assert_ne!(
+                escaped, root,
+                "the timeout-test descendant must have escaped the browser's process group and session"
+            );
+        }
+        let result = run_task
+            .await
+            .expect("browser timeout task should not panic");
         let elapsed = start.elapsed();
 
         match prev_bin {
