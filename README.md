@@ -31,7 +31,7 @@ agent runtime (no third-party agent SDK, no IPC serialization — everything run
 [Tauri](https://tauri.app) 2 (WebView2) shell wraps it into a signed, self-updating Windows app. It is
 **multi-provider** (Ollama Cloud, OpenRouter, Anthropic, OpenAI, Google, Groq, and more), keeps
 **persistent projects** + an on-device **memory store** (local ONNX embeddings) injected into the
-agent's prompt, ships a **deterministic tool sandbox** with a live web preview the agent drives an
+agent's prompt, ships a **managed tool runner** with a live web preview the agent drives an
 on-screen cursor over, and a native **Open Design** workspace (150+ design systems, live preview,
 HTML/PDF export).
 
@@ -183,8 +183,8 @@ flowchart TD
 | **Lead agent** | Receives the user prompt, decomposes the task, disperses subagents, conducts verification, delivers the result. |
 | **Scout** | Research and context-gathering: memory recall, codebase exploration, reading existing patterns. |
 | **Planner** | Architecture and task breakdown: maps the work into build units, sequences dependencies. |
-| **Worker** | Implementation: writes code, runs tests, fixes bugs — fanned out in parallel per independent unit. |
-| **Reviewer** | Adversarial verification: checks the work against the spec, tests, and quality bar before it lands. |
+| **Worker** | Implementation: writes code, runs tests, fixes bugs; runs sequentially or in parallel according to the dispatch. |
+| **Reviewer** | When requested, audits the implementation against the spec, tests, and quality bar; its output requires inspection. |
 
 ### Workflow DAG
 
@@ -201,17 +201,19 @@ SVG node/edge graph.
 
 ## Safety Patterns
 
-dotz is built around three safety patterns that make autonomous coding trustworthy enough to watch
-in real time:
+dotz exposes runtime controls and review tools. Their use depends on the selected profile, enabled
+tools, and workflow; inspect the resulting actions and checks.
 
-### 1. Deterministic Tool Sandbox
+### 1. Managed Tool Runs
 
 The tool sandbox is a managed run store (run lifecycle `pending → running → done|error|killed`,
 `dotz-core/src/sandbox.rs`). Allowlists apply at the boundaries: profiles gate which tools an
 agent may call (see `PLAN_TOOLS` in `dotz-core/src/agent/tools.rs`), the in-app browser enforces
 an origin allowlist (`dotz-core/src/browser.rs`), and the loopback API rejects disallowed
 `Origin`/`Host` with `403` (`dotz-core/src/server/guard.rs`). The `bash` tool itself runs the
-given command in the session cwd with a wall-clock timeout — no command allowlist. The sandbox runs in two modes:
+given command in the session cwd with a wall-clock timeout — no command allowlist. The Linux
+bubblewrap and macOS seatbelt wrappers are deferred in this checkout; the managed runner does not
+establish filesystem or network isolation. It runs in two modes:
 
 - **`terminal`** mode — streams stdout/stderr back into the chat panel.
 - **`web`** mode — starts a long-lived process bound to a local HTTP port; the UI renders an inline
@@ -222,21 +224,21 @@ given command in the session cwd with a wall-clock timeout — no command allowl
 Run lifecycle: `pending → running → done|error|killed`. The sandbox owns process lifecycle for both
 modes — no other module spawns sandbox processes directly.
 
-### 2. Adversarial Verify-Before-Merge
+### 2. Explicit Review Workflows
 
-Every non-trivial task is verified by an independent `reviewer` subagent before its output lands.
-The reviewer checks the work against the spec, tests, and a quality bar — not the worker's claims.
-If gaps are found, the work goes back to the lead agent for another cycle. The workflow DAG makes
-this visible: the verify step is a real node, and its verdict (`pass` / `gaps`) drives the graph
-forward or loops back.
+The `/implement-and-review` prompt requests a sequential `worker → reviewer → worker` chain;
+`/implement` does not include a reviewer. A reviewer is another model run, and its response is input
+to the next step. The graph records execution status; it does not automatically certify a reviewer's
+verdict or prevent commits and merges when review was omitted. Inspect the diff and project checks
+before accepting the result. See the [workflow guide](docs/agent-team-workflow.md).
 
-### 3. Human Gate as Terminal DAG Node
+### 3. Interactive Human Approval
 
-The **human gate** is a first-class node in the workflow DAG — not an afterthought. When a task
-reaches a point that genuinely requires human judgment (a material choice, an irreversible
-operation, a security-sensitive decision), the graph pauses at the human-gate node and surfaces the
-question to the operator. The work does not proceed until the gate is cleared. This makes autonomy
-safe: the agent runs as far as it can, then stops exactly where a human should decide.
+When the lead agent calls `human_gate`, dotz sends an approval card over the session WebSocket and
+waits up to five minutes for an operator response. Approval returns a tool result; rejection or a
+timeout returns an error. The tool requires an interactive session and is unavailable to subagents
+(`dotz-core/src/agent/extra_tools.rs`). It is not automatically inserted into every workflow or a
+runtime policy that blocks every sensitive action; the lead must request it before proceeding.
 
 ## Tech Stack
 
