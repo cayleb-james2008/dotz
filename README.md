@@ -4,7 +4,7 @@
 
 # dotz
 
-**The in-process multi-agent coding dashboard — one prompt becomes a team of AI coding agents.**
+**An in-process coding dashboard for directing work to a team of AI coding agents.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-first-89b4fa)](#what-works-today)
@@ -20,10 +20,11 @@
 
 </div>
 
-dotz is a **native-Rust, multi-agent coding-agent dashboard**. Give it one task and it
-decomposes the work, disperses it to a team of subagents, runs them in parallel on a **live workflow
-graph**, and adversarially verifies the result before it lands — with live controls for **model,
-reasoning effort, tools, skills, and subagent orchestration**, all in a single self-updating desktop app.
+dotz is a **native-Rust, multi-agent coding dashboard**. A lead agent can delegate work to subagents,
+and the live workflow graph shows those dispatches and tool calls as they happen. The built-in
+profiles and slash-command prompts define different ways to work: some use sequential chains, some
+request an explicit review step, and some keep the work with one agent. The operator controls the
+provider, model, reasoning effort, tools, and skills in a single desktop app.
 
 Under the hood: `dotz-core` is an [axum](https://github.com/tokio-rs/axum) server with dotz's own
 agent runtime (no third-party agent SDK, no IPC serialization — everything runs **in-process**), and a
@@ -42,6 +43,7 @@ HTML/PDF export).
 
 - [Highlights](#highlights)
 - [How It Works](#how-it-works)
+- [Agent-team workflow](docs/agent-team-workflow.md)
 - [Architecture](#architecture)
 - [Safety Patterns](#safety-patterns)
 - [Tech Stack](#tech-stack)
@@ -66,8 +68,8 @@ HTML/PDF export).
 
 - **Live workflow graph** — every subagent materializes as a node, every tool it reaches for
   streams onto that node as a live chip; click any node/chip to open the exact panel it drives.
-- **Multi-agent by default** — non-trivial tasks fan out to `scout` / `planner` / `worker` /
-  `reviewer` subagents in parallel, then the result is adversarially verified before it lands.
+- **Agent-team workflows** — the lead can delegate to specialist subagents. The `/implement` and
+  `/implement-and-review` presets use different sequences; see the [agent-team walkthrough](docs/agent-team-workflow.md).
 - **In-process runtime** — no IPC serialization, no subprocess per agent, no third-party agent SDK.
   The entire agent runtime (chat loop, tools, subagents, providers) lives inside `dotz-core`.
 - **Sessions over WebSocket** — the UI is a plain web app (`fetch` + WS streaming), identical in a
@@ -93,22 +95,19 @@ HTML/PDF export).
 
 ```mermaid
 flowchart LR
-    U([Your prompt]) --> L[Lead agent]
-    L -->|decompose + disperse| S[scout]
-    L --> P[planner]
-    L --> W[worker]
-    L --> R[reviewer]
-    S --> V{adversarial verify}
-    P --> V
-    W --> V
-    R --> V
-    V -->|pass| D([Verified result])
-    V -->|gaps| L
+    U([Your prompt]) --> P[Choose profile or preset]
+    P --> L[Lead agent]
+    L -->|when it dispatches| A[Subagent run or chain]
+    A --> G[Live workflow graph]
+    L --> R[Report, review, or next step]
 ```
 
-Every non-trivial task fans out to `scout` / `planner` / `worker` / `reviewer` subagents that run in
-parallel, then their output is adversarially verified before it lands. Pick a **profile** to change the
-strategy (WORKFLOW · SOLO · PLAN · FRONTEND · BACKEND · DESIGN · NEW MODEL, NEW PROJECT).
+Delegation depends on the selected profile or prompt and the lead agent's decisions; an ordinary chat
+message does not guarantee that subagents will run. The `/implement` preset uses a sequential
+`scout → planner → worker` chain after its OpenSpec and branch setup. `/implement-and-review` uses a
+`worker → reviewer → worker` chain. Neither preset runs those steps in parallel. The WORKFLOW profile
+encourages delegation, while SOLO and PLAN offer direct-execution and read-only strategies. See the
+[agent-team walkthrough](docs/agent-team-workflow.md) for the complete sequences and their limits.
 
 ### The Live Workflow Graph — Watch Every Agent and Every Tool
 
@@ -293,9 +292,8 @@ the agent runtime.
 
 - **Profile** — the top-bar segmented picker switches dotz's operating mode. Each profile injects
   a doctrine (`appendSystemPrompt`) and a default tool set; switching it starts a fresh session.
-    - **WORKFLOW** *(default)* — multi-agent dispersal: every non-trivial task is decomposed and
-      dispersed to `scout` / `planner` / `reviewer` / `worker` subagents, then adversarially
-      verified.
+    - **WORKFLOW** *(default)* — encourages the lead agent to delegate non-trivial work; actual
+      dispatch and review steps depend on the request and workflow prompt.
     - **SOLO** — single agent, direct execution, no subagents unless asked.
     - **PLAN** — read-only research + planning (`read, grep, find, ls, subagent`; no edits).
     - **FRONTEND** — workflow mode tuned for UI/design work (WCAG, real focus states, no AI-slop).
