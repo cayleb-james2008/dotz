@@ -327,7 +327,7 @@ impl Tool for BashTool {
                 // Build a std Command so we can place the child in its own process group
                 // (tokio's Command doesn't expose process_group). The group lets a timeout
                 // tree-kill the shell AND every descendant (cargo/npm/sleep …) with
-                // `kill -9 -<pgrp>`. Without this, `start_kill` only terminates the shell
+                // the shared process-group kill helper. Without this, `start_kill` only terminates the shell
                 // and leaves the real workload running as an orphan that keeps consuming CPU.
                 use std::os::unix::process::CommandExt;
                 let mut sc = std::process::Command::new("sh");
@@ -380,7 +380,7 @@ impl Tool for BashTool {
                 //
                 // Windows: `taskkill /PID <pid> /T /F` kills the whole process tree
                 // (matching the sandbox's kill_pid).  POSIX: the child was placed in
-                // its own process group at spawn, so `kill -9 -<pgrp>` reaps the
+                // its own process group at spawn, so the shared process-group kill helper reaps the
                 // entire group — shell + every descendant.
                 //
                 // Use .status() (not .spawn()) so the kill/taskkill subprocess is reaped.
@@ -400,11 +400,7 @@ impl Tool for BashTool {
                 #[cfg(not(windows))]
                 {
                     if let Some(pid) = child.id() {
-                        let _ = std::process::Command::new("kill")
-                            .args(["-9", &format!("-{pid}")])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
+                        crate::sandbox::backend().kill_tree(pid);
                     }
                 }
                 // Reap the killed child so it does not become a zombie (Unix) or

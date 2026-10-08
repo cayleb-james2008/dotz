@@ -154,9 +154,9 @@ pub fn try_mark_end_emitted(id: &str) -> bool {
 //
 // Cross-platform abstraction over the two Windows-conditional seams in sandbox process
 // management: (1) spawn-time flags (CREATE_NO_WINDOW on Windows, process_group on posix), and
-// (2) tree-kill (taskkill /T /F on Windows, kill -9 -<pgid> on posix). The Windows impl is
+// (2) tree-kill (taskkill /T /F on Windows, kill(2) on the owned process group on posix). The Windows impl is
 // verbatim from the former inline `#[cfg(windows)]` blocks; the Mac/Linux impls carry the posix
-// fallback (process_group + kill -9 -<pgid>) and reserve seatbelt/bwrap fields that are NOT yet
+// fallback (process_group + kill(2) on the owned process group) and reserve seatbelt/bwrap fields that are NOT yet
 // applied.
 //
 // ponytail: the seatbelt (macOS `sandbox-exec -p <profile>`) and bwrap (Linux `bwrap --unshare-...`)
@@ -167,7 +167,7 @@ pub fn try_mark_end_emitted(id: &str) -> bool {
 
 /// Platform abstraction over the two Windows-conditional seams in sandbox process management:
 /// (1) spawn-time flags (CREATE_NO_WINDOW on Windows, own process group on posix), and
-/// (2) tree-kill (taskkill /T /F on Windows, kill -9 -<pgid> on posix). Best-effort;
+/// (2) tree-kill (taskkill /T /F on Windows, kill(2) on the owned process group on posix). Best-effort;
 /// implementations must reap their own kill subprocess (`.status()`, not `.spawn()`).
 pub trait SandboxBackend: Send + Sync + 'static {
     /// Configure a `tokio::process::Command` before spawn (hide window on Windows, own process
@@ -208,7 +208,7 @@ impl SandboxBackend for WindowsSandbox {
     }
 }
 
-/// macOS backend stub: posix fallback (process_group + `kill -9 -<pgid>`). The `seatbelt` field
+/// macOS backend stub: posix fallback (process_group + `kill(2) on the owned process group`). The `seatbelt` field
 /// reserves the `sandbox-exec -p <profile>` wrap for a future macOS-host follow-up; the
 /// `if self.seatbelt` branch is empty by design (ponytail: deferred — requires a macOS host).
 #[cfg(target_os = "macos")]
@@ -246,7 +246,7 @@ impl SandboxBackend for MacSandbox {
     }
 }
 
-/// Linux backend stub: posix fallback (process_group + `kill -9 -<pgid>`). The `bwrap` field
+/// Linux backend stub: posix fallback (process_group + `kill(2) on the owned process group`). The `bwrap` field
 /// reserves the `bwrap --unshare-... <argv>` wrap for a future Linux-host follow-up; the
 /// `if self.bwrap` branch is empty by design (ponytail: deferred — requires a Linux host).
 #[cfg(target_os = "linux")]
@@ -909,7 +909,7 @@ fn mark_killed_by_us(id: &str) {
     }
 }
 
-/// Kill a pid and its descendants — `taskkill /T /F` on win32, `kill -9 -<pgid>` on posix.
+/// Kill a pid and its descendants — `taskkill /T /F` on win32, `kill(2) on the owned process group` on posix.
 /// Dispatched via the shared `SandboxBackend` so the kill logic lives in one place and
 /// `browser.rs` reuses it for the agent-browser process tree. Best-effort; the kill subprocess
 /// is reaped (`.status()`, not `.spawn()`) by each platform impl.

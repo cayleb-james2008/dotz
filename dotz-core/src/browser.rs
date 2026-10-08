@@ -679,12 +679,12 @@ async fn run(
     }
 }
 
-/// Kill a pid and its descendant tree — `taskkill /T /F` on win32, `kill -9 -<pgid>` on posix.
+/// Kill a pid and its descendant tree — `taskkill /T /F` on win32, `kill(2) on the owned process group` on posix.
 /// Best-effort. Dispatched through the shared `sandbox::backend()` so browser + sandbox use the
 /// SAME platform kill path. This FIXES the former posix gap: the old inline `#[cfg(not(windows))]`
 /// branch sent `kill -9 <pid>` (single-pid only), so a headless Chrome grandchild that the
 /// agent-browser child spawned leaked as an orphan on timeout/stop. The backend's posix
-/// `kill_tree` signals the whole process group (`kill -9 -<pgid>`), matching sandbox.rs parity.
+/// `kill_tree` signals the whole process group (`kill(2) on the owned process group`), matching sandbox.rs parity.
 ///
 /// The kill is dispatched on a blocking thread (spawn_blocking) and not awaited by the caller:
 /// `CreateProcess` for taskkill.exe is a synchronous syscall that can take several hundred ms

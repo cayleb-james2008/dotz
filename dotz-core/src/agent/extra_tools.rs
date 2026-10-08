@@ -319,7 +319,7 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
     let timeout = gate_timeout();
 
     // Build the command with the child placed in its OWN process group (POSIX) so a timeout
-    // can tree-kill the shell AND every descendant (cargo/npm/sleep …) with `kill -9 -<pgrp>`.
+    // can tree-kill the shell AND every descendant (cargo/npm/sleep …) with the shared process-group kill helper.
     // Without this, `start_kill` only terminates the shell and leaves the real workload running
     // as an orphan that keeps consuming CPU — the exact bug already fixed in the `bash` tool.
     // tokio's Command doesn't expose process_group, so build a std Command and convert.
@@ -442,7 +442,7 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
             // only terminates the direct child (the shell), leaving the spawned workload alive.
             //
             // Windows: `taskkill /PID <pid> /T /F` kills the whole process tree.  POSIX: the
-            // child was placed in its own process group at spawn, so `kill -9 -<pgrp>` reaps
+            // child was placed in its own process group at spawn, so the shared process-group kill helper reaps
             // the entire group — shell + every descendant.
             // Use .status() (not .spawn()) so the kill/taskkill subprocess is reaped instead of
             // leaking a zombie/handle — same fix the bash tool's timeout path already carries.
@@ -459,11 +459,7 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
             #[cfg(not(windows))]
             {
                 if let Some(pid) = child.id() {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &format!("-{pid}")])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
+                    crate::sandbox::backend().kill_tree(pid);
                 }
             }
             // Reap the killed child so it does not become a zombie (Unix) or leak handles
@@ -2352,7 +2348,7 @@ mod tests {
 
         // `sleep 30 & echo $! > pidfile; wait` — the shell forks `sleep 30` as a background
         // child, writes the *sleep*'s PID ($!) to the pidfile, then waits. The 1s timeout fires
-        // during the `wait`; the process-group kill (`kill -9 -<pgrp>`) must reap both the shell
+        // during the `wait`; the process-group kill (the shared process-group kill helper) must reap both the shell
         // AND the `sleep 30` grandchild. Before the fix, only the shell was killed and `sleep 30`
         // survived as an orphan.
         let command = if cfg!(windows) {
