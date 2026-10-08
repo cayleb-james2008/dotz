@@ -15,7 +15,7 @@ competing harness.
 ## Distribution
 
 **Operator preference: ship a signed Windows installer.** dotz packages via
-`cargo tauri build` → `src-tauri/target/release/bundle/nsis/` (signed NSIS installer +
+`cargo tauri build` → `target/release/bundle/nsis/` (signed NSIS installer +
 `latest.json`). The backend (`dotz-core`), the Tauri shell (`dotz-tauri`), the bundled
 `.pi/` agent resources, and the vanilla-HTML UI are all packaged inside the single installer.
 The operator runs the installer directly.
@@ -27,7 +27,7 @@ no separate updater executable. Signing key is configured via env (see `src-taur
 
 ## Architecture in one paragraph
 
-dotz is a Rust workspace (edition 2021, v0.2.0) with two members: `dotz-core` (the pure library +
+dotz is a Rust workspace (edition 2024, v0.2.0) with two members: `dotz-core` (the pure library +
 headless `serve`/`selfeval` bins) and `src-tauri` (the `dotz-tauri` desktop shell v0.2.8).
 `dotz-core` owns the whole agent runtime — provider adapters, sessions, the workflow DAG,
 sandbox, isolated browser, on-device memory, skills, projects, specs — and exposes it over a
@@ -132,7 +132,7 @@ The model surface is **multi-provider**, not just Ollama. Providers: **Ollama Cl
 executive `glm-5.2`, subagent `minimax-m3`), OpenRouter (free fallback `nex-agi/nex-n2-pro:free`),
 Anthropic, OpenAI, Google, Groq, Mistral, xAI, DeepSeek, Cohere, NVIDIA NIM, and Local. Ollama,
 OpenRouter, and Local are **free-form model-id inputs** (not dropdowns); `resolveModel` clones any
-same-provider template for unknown ids. Auth is resolved via `~/.pi/agent/auth.json` → env vars.
+same-provider template for unknown ids. Auth is resolved via env vars → `~/.pi/agent/auth.json`.
 
 **Automatic task distribution**: `LOW_COST_MODELS` (in `types.rs`) lists the low-cost sub-models
 per provider (Ollama `minimax-m3`; OpenRouter `nex-agi/nex-n2-pro:free`). This list is injected
@@ -183,14 +183,14 @@ frame endpoint (never embedded in the JSON event stream). The `agent-browser` bi
 ## Verification commands
 
 ```bash
-cargo test -p dotz-core                # the test gate — 526 tests (the Solomon RSI lane runs this)
+cargo test -p dotz-core                # core unit/integration test gate
 cargo run -p dotz-core --bin serve      # headless backend on http://127.0.0.1:4317
 cargo tauri dev                         # native desktop window (WebView2)
-cargo tauri build                       # → src-tauri/target/release/bundle/nsis/ (signed installer + latest.json)
+cargo tauri build                       # → target/release/bundle/nsis/ (signed installer + latest.json)
 npm install && npm run fetch-model      # ship agent-browser binary + fetch all-MiniLM-L6-v2 ONNX into assets/models/
 ```
 
-CI (`.github/workflows/ci.yml`) runs on `windows-latest`: `cargo fmt --all -- --check`,
+CI (`.github/workflows/ci.yml`) runs on Windows, Ubuntu, and macOS: `cargo fmt --all -- --check`,
 `cargo clippy -p dotz-core --all-targets -- -D warnings`, `cargo test -p dotz-core`.
 
 **LLVM OOM is not a code failure.** On the 16 GB dev host with the live fleet resident, an
@@ -203,7 +203,7 @@ only a reproducible second failure is code-red.
 
 ## Provider config
 
-dotz uses normal auth resolution (`~/.pi/agent/auth.json` → env vars). Provide a working provider
+dotz uses normal auth resolution (env vars → `~/.pi/agent/auth.json`). Provide a working provider
 key, e.g. `OLLAMA_API_KEY` (primary) or `OPENROUTER_API_KEY` (free fallback). See `.env.example`.
 OpenRouter + Ollama + Local are **free-form model-id inputs** (not dropdowns). Port via
 `DOTZ_PORT` (default 4317); extra skill pools via `DOTZ_SKILLS_PATHS`. Use `:free` models when the

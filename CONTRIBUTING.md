@@ -7,7 +7,7 @@ in-process multi-agent coding dashboard built in Rust.
 
 1. **Fork** the repository and clone your fork.
 2. **Install prerequisites**:
-   - [Rust](https://rustup.rs/) (stable, edition 2021)
+   - [Rust](https://rustup.rs/) (stable, edition 2024)
    - [Node.js](https://nodejs.org/) (for the agent-browser binary + ONNX model fetch)
    - [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) (WebView2 on Windows)
 3. **Set up the workspace**:

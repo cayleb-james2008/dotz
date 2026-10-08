@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-first-89b4fa)](#what-works-today)
 [![Built with](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri-cba6f7)](https://tauri.app)
-[![Rust](https://img.shields.io/badge/rust-edition%202021-orange.svg)](dotz-core/Cargo.toml)
+[![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](dotz-core/Cargo.toml)
 
 > No live-fact badges here on purpose: the release-feed URLs returned HTTP 404
 > from an unauthenticated check on 2026-09-18 (see [What works today](#what-works-today)),
@@ -244,7 +244,7 @@ safe: the agent runs as far as it can, then stops exactly where a human should d
 
 | Layer | Technology | Notes |
 |-------|-----------|-------|
-| **Language** | Rust (edition 2021) | Native, no GC, no Node.js runtime |
+| **Language** | Rust (edition 2024) | Native, no GC, no Node.js runtime |
 | **Backend** | axum + tower-http + tokio | REST + WebSocket on `127.0.0.1:4317` |
 | **Desktop shell** | Tauri 2 (WebView2) | Thin shell — boots core, opens window, wires updater |
 | **Frontend** | Vanilla HTML/CSS/JS | No build step, no framework, no bundle |
@@ -355,7 +355,7 @@ since the bundled systems are static HTML/CSS — a hardened default that still 
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (stable, edition 2021)
+- [Rust](https://rustup.rs/) (stable, edition 2024)
 - [Node.js](https://nodejs.org/) (for the agent-browser binary + ONNX model fetch)
 - [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) (WebView2 on Windows)
 
@@ -373,8 +373,8 @@ npm run fetch-model    # downloads the all-MiniLM-L6-v2 ONNX model into assets/m
 
 ### Provider configuration
 
-dotz resolves provider auth from `~/.pi/agent/auth.json` → env vars. Set keys for the providers you
-use — **Ollama Cloud** is the primary (executive `glm-5.2`, subagent `minimax-m3`) and **OpenRouter**
+dotz resolves provider auth from environment variables first, then `~/.pi/agent/auth.json`.
+Set keys for the providers you use — **Ollama Cloud** is the primary (executive `glm-5.2`, subagent `minimax-m3`) and **OpenRouter**
 is the free fallback (`nex-agi/nex-n2-pro:free`):
 
 ```bash
@@ -419,8 +419,9 @@ The embed tests need the bundled all-MiniLM-L6-v2 model files (`npm run fetch-mo
 
 ## Development and Gates
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every push and PR to `main`
-(on `windows-latest`) and is the merge gate — run the same three commands locally before pushing:
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on pushes to `main` and on pull
+requests, across Windows, Ubuntu, and macOS. Each OS checks formatting, Clippy, model setup, and
+core tests; Windows also runs the cold-start benchmark. Run the Rust checks locally before pushing:
 
 ```bash
 cargo fmt --all -- --check
@@ -428,6 +429,10 @@ cargo clippy -p dotz-core --all-targets -- -D warnings
 cargo test -p dotz-core
 ```
 
+> The current workflow marks the Ubuntu core-test step `continue-on-error`; a passing workflow
+> alone can therefore hide an unsuccessful Linux test step. Inspect the job and individual step
+> results before treating Linux tests as passed. Windows and macOS test failures remain blocking.
+>
 > **LLVM OOM note:** On memory-constrained hosts, bound parallelism to prevent OOM:
 > `cargo test -p dotz-core -- --test-threads=2`. If a build dies with `STATUS_STACK_BUFFER_OVERRUN`
 > or exit 1455, re-run once before treating the gate as red — only a reproducible second failure
@@ -497,7 +502,7 @@ Status as verified on this Linux host on 2026-09-18. Anything not listed here is
 - The GitHub release feed (`.../releases/latest`, updater `latest.json`) — the URLs returned
   HTTP 404 from an unauthenticated `curl` check on 2026-09-18, so no release artifact or badge
   could be verified. The feed goes live with the first `v*` release.
-- `cargo bench --bench cold_start` — Windows-only CI gate; not run here.
+- `cargo bench --bench cold_start` — Windows-only CI measurement (no performance-regression gate); not run here.
 
 ## Contributing
 
@@ -536,4 +541,6 @@ under `.pi/` (the Open Design systems/skills) keeps its own Apache-2.0 license.
 
 ## Modernization (September 2026)
 
-This repository has been modernized to Rust 2024, dependencies updated, and various safety fixes applied (including icon format and unsafe env var wrappers). Some test failures remain due to unsafe env var calls in test code, which are recorded honestly.
+The workspace declares Rust edition 2024. The dated test results above remain historical; inspect
+the current commit's CI jobs and step results for current validation. A successful core-test job
+does not validate the desktop installer, live-provider behavior, or sandbox isolation.
