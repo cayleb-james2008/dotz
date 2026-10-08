@@ -4,8 +4,18 @@
   "private": true,
   "description": "dotz — a native Rust (axum + Tauri + ort) Claude-Code-style multi-agent coding dashboard: on-the-fly workflow graphs, unified skills, on-device memory, and a bento UI. (This package.json only supports the Rust build — it ships the agent-browser binary and fetches the ONNX embedding model.)",
   "type": "module",
+  "allowScripts": {
+    "agent-browser@0.27.0": true,
+    "onnxruntime-node@1.24.3": true,
+    "protobufjs@7.6.4": true,
+    "sharp@0.34.5": true
+  },
   "scripts": {
-    "fetch-model": "node scripts/fetch-embed-model.mjs"
+    "install:deps": "node scripts/install-npm-deps.mjs",
+    "fetch-model": "node scripts/fetch-embed-model.mjs",
+    "test:ui": "node scripts/run-ui-regression.mjs",
+    "test:install-wrapper": "node scripts/test-install-wrapper.mjs",
+    "test:release-install-policy": "node scripts/test-release-install-policy.mjs"
   },
   "dependencies": {
     "agent-browser": "0.27.0"

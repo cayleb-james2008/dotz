@@ -21,6 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::{os::fd::OwnedFd, sync::Arc};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
 
@@ -100,11 +102,11 @@ pub struct SandboxRun {
     pub ended_at: Option<i64>,
 }
 
-/// Internal entry: the public run record plus runtime handles (pid for kill, mode, detected port).
+/// Internal entry: the public run record plus runtime handles (owned process, mode, detected port).
 struct RunEntry {
     run: SandboxRun,
-    /// OS pid of the spawned child while it is alive; None once it has exited/been reaped.
-    pid: Option<u32>,
+    /// Pinned identity of the spawned child while it is alive; None once it has exited/been reaped.
+    process: Option<OwnedProcess>,
     /// Set before a deliberate kill so the exit path reports "killed", not "error".
     killed_by_us: bool,
     mode: String,
@@ -152,32 +154,71 @@ pub fn try_mark_end_emitted(id: &str) -> bool {
 
 // ---- platform sandbox backend ----
 //
-// Cross-platform abstraction over the two Windows-conditional seams in sandbox process
-// management: (1) spawn-time flags (CREATE_NO_WINDOW on Windows, process_group on posix), and
-// (2) tree-kill (taskkill /T /F on Windows, kill -9 -<pgid> on posix). The Windows impl is
-// verbatim from the former inline `#[cfg(windows)]` blocks; the Mac/Linux impls carry the posix
-// fallback (process_group + kill -9 -<pgid>) and reserve seatbelt/bwrap fields that are NOT yet
-// applied.
-//
-// ponytail: the seatbelt (macOS `sandbox-exec -p <profile>`) and bwrap (Linux `bwrap --unshare-...`)
-// argv are deferred — the stubs set process_group + tree-kill the posix way, which is the safe
-// subset that compiles and runs on every host without a macOS/Linux build box. The
-// `if self.seatbelt` / `if self.bwrap` branches are empty by design; filling them requires a
-// macOS/Linux host to validate and is tracked as the B2 hardening follow-up.
+// Process-management boundary: `prepare_command` creates a separate process group on POSIX and
+// hides Windows console windows. Cleanup uses `taskkill /T` on Windows, process-group signaling
+// on macOS, and Linux pidfd-scoped live-descendant cleanup. The Linux path catches `setsid`
+// descendants that remain in the owned parent tree; it does not sweep processes that daemonize
+// and reparent before cancellation.
 
-/// Platform abstraction over the two Windows-conditional seams in sandbox process management:
-/// (1) spawn-time flags (CREATE_NO_WINDOW on Windows, own process group on posix), and
-/// (2) tree-kill (taskkill /T /F on Windows, kill -9 -<pgid> on posix). Best-effort;
-/// implementations must reap their own kill subprocess (`.status()`, not `.spawn()`).
-pub trait SandboxBackend: Send + Sync + 'static {
+/// Pinned identity for a process spawned by dotz. On Linux the pidfd is opened immediately while
+/// the Tokio child is still unreaped, and retained through cancellation so PID reuse cannot retarget
+/// cleanup. A Linux spawn is rejected if that identity cannot be pinned.
+#[derive(Clone)]
+pub(crate) struct OwnedProcess {
+    pid: u32,
+    #[cfg(target_os = "linux")]
+    pidfd: Arc<OwnedFd>,
+}
+
+impl OwnedProcess {
+    pub(crate) fn pin(pid: Option<u32>) -> Result<Self, &'static str> {
+        let pid = pid.ok_or("spawned process has no pid")?;
+        #[cfg(target_os = "linux")]
+        let pidfd = Arc::new(open_pidfd(pid).ok_or("could not open pidfd for spawned process")?);
+        Ok(Self {
+            pid,
+            #[cfg(target_os = "linux")]
+            pidfd,
+        })
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+/// Cross-platform process-management interface. `prepare_command` establishes the platform's
+/// spawn boundary (no-window on Windows, a new process group on POSIX); `kill_tree` performs
+/// platform-specific cleanup. Linux pins the root at spawn and pins/stops each live descendant
+/// before scanning below it. Cleanup is bounded and reports when it could not establish that
+/// boundary. Already-daemonized/reparented processes remain outside the ancestry-based boundary.
+pub(crate) trait SandboxBackend: Send + Sync + 'static {
     /// Configure a `tokio::process::Command` before spawn (hide window on Windows, own process
     /// group on posix). Called for every sandbox + agent-browser spawn.
     fn prepare_command(&self, command: &mut tokio::process::Command);
 
-    /// Kill a pid and its descendants. Synchronous: the sandbox calls it inline; `browser.rs`
-    /// wraps it in `spawn_blocking` when async dispatch is needed. Must reap its own kill
-    /// subprocess.
-    fn kill_tree(&self, pid: u32);
+    /// Cancel the pinned process and its discoverable descendants. Synchronous: the sandbox calls
+    /// it inline; `browser.rs` wraps it in `spawn_blocking` when async dispatch is needed. An error
+    /// means cleanup was incomplete; callers must not report a full-tree cleanup.
+    fn kill_tree(&self, process: &OwnedProcess) -> Result<(), &'static str>;
+}
+
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u32) -> Option<OwnedFd> {
+    use std::os::fd::FromRawFd;
+
+    if pid <= 1 || pid > libc::pid_t::MAX as u32 {
+        return None;
+    }
+    // SAFETY: pidfd_open has no pointer arguments; the numeric pid is checked above and, when
+    // called for a newly spawned child, Tokio has not yet reaped that child.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        None
+    } else {
+        // SAFETY: successful pidfd_open returns a new owned file descriptor.
+        Some(unsafe { OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) })
+    }
 }
 
 /// Windows backend: `CREATE_NO_WINDOW` on spawn, `taskkill /T /F` for tree-kill. Verbatim from
@@ -196,15 +237,20 @@ impl SandboxBackend for WindowsSandbox {
         crate::util::no_window_tokio(command);
     }
 
-    fn kill_tree(&self, pid: u32) {
-        // Use .status() (not .spawn()) so the taskkill subprocess is reaped. Dropping a spawned
-        // std::process::Child without waiting leaves a zombie that accumulates over a long-lived
-        // server with many sandbox kills.
+    fn kill_tree(&self, process: &OwnedProcess) -> Result<(), &'static str> {
+        // Use .status() (not .spawn()) so the taskkill subprocess is reaped.
         let mut cmd = std::process::Command::new("taskkill");
-        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+        cmd.args(["/PID", &process.pid().to_string(), "/T", "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let _ = crate::util::no_window(&mut cmd).status();
+        let status = crate::util::no_window(&mut cmd)
+            .status()
+            .map_err(|_| "taskkill could not be started")?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("taskkill reported a failure")
+        }
     }
 }
 
@@ -241,14 +287,16 @@ impl SandboxBackend for MacSandbox {
         }
     }
 
-    fn kill_tree(&self, pid: u32) {
-        posix_kill_tree(pid);
+    fn kill_tree(&self, process: &OwnedProcess) -> Result<(), &'static str> {
+        posix_kill_tree(process.pid())
     }
 }
 
-/// Linux backend stub: posix fallback (process_group + `kill -9 -<pgid>`). The `bwrap` field
-/// reserves the `bwrap --unshare-... <argv>` wrap for a future Linux-host follow-up; the
-/// `if self.bwrap` branch is empty by design (ponytail: deferred — requires a Linux host).
+/// Linux backend: spawn commands in their own process group and terminate the tracked process
+/// plus its live `/proc` descendants through pidfds. This reaches live descendants that call
+/// `setsid` without signalling unrelated processes. Descendants that daemonize/reparent before
+/// cancellation are outside this ancestry-based boundary. The `bwrap` field still reserves the
+/// `bwrap --unshare-...` wrap for a future Linux-host follow-up.
 #[cfg(target_os = "linux")]
 struct LinuxSandbox {
     bwrap: bool,
@@ -279,36 +327,207 @@ impl SandboxBackend for LinuxSandbox {
         }
     }
 
-    fn kill_tree(&self, pid: u32) {
-        posix_kill_tree(pid);
+    fn kill_tree(&self, process: &OwnedProcess) -> Result<(), &'static str> {
+        linux_kill_owned_tree(process)
     }
 }
 
-/// Posix tree-kill: signal the child's process group (pgid == child pid when spawned with
-/// `process_group(0)`), falling back to a direct signal if the group doesn't exist (e.g. a
-/// caller that spawned the child without its own process group, as some unit tests do). Uses
-/// `.status()` so the kill subprocess is reaped. Verbatim from the former inline
-/// `#[cfg(not(windows))]` block in `kill_pid`.
-#[cfg(unix)]
-fn posix_kill_tree(pid: u32) {
+/// macOS process-group cleanup. `prepare_command` creates a fresh group, so signaling this group
+/// catches its normal descendants; it does not claim to catch a descendant that calls `setsid`.
+#[cfg(target_os = "macos")]
+fn posix_kill_tree(pid: u32) -> Result<(), &'static str> {
     let group = std::process::Command::new("kill")
         .args(["-9", &format!("-{pid}")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let group_ok = matches!(group, Ok(s) if s.success());
-    if !group_ok {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    if matches!(group, Ok(s) if s.success()) {
+        return Ok(());
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    Err("process-group kill failed; only a root fallback was attempted")
+}
+
+/// Linux ownership-scoped cleanup. Stop the spawned root, discover live descendants by parent
+/// PID, pin each process identity with a pidfd, and stop every discovered child before scanning
+/// again. Finally signal only those pinned process identities with SIGKILL. `setsid()` changes a
+/// process group/session, not its parent relationship, and pidfds cannot start targeting a reused
+/// PID. Daemonized/reparented processes are deliberately outside this ancestry-based boundary.
+#[cfg(target_os = "linux")]
+fn linux_kill_owned_tree(process: &OwnedProcess) -> Result<(), &'static str> {
+    use std::os::fd::AsRawFd;
+
+    const SIGKILL: libc::c_int = 9;
+    const SIGSTOP: libc::c_int = 19;
+    const MAX_PROC_ENTRIES: usize = 16_384;
+    const MAX_OWNED_PROCESSES: usize = 4_096;
+    const CLEANUP_BUDGET: Duration = Duration::from_secs(2);
+
+    fn signal_pidfd(fd: &OwnedFd, signal: libc::c_int) -> bool {
+        // SAFETY: the pidfd refers to one pinned process identity; null siginfo is valid for
+        // pidfd_send_signal and flags=0 requests the standard signal behavior.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            ) == 0
+        }
+    }
+
+    fn parent_pid(pid: u32) -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, fields) = stat.rsplit_once(") ")?;
+        fields.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    fn wait_until_stopped(pid: u32, deadline: std::time::Instant) -> bool {
+        loop {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, fields)| fields.to_string()))
+                .and_then(|fields| fields.chars().next());
+            if matches!(state, Some('T' | 't' | 'Z' | 'X')) {
+                return true;
+            }
+            if state.is_none() || std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn children_by_parent(
+        deadline: std::time::Instant,
+    ) -> Result<HashMap<u32, Vec<u32>>, &'static str> {
+        let mut children = HashMap::<u32, Vec<u32>>::new();
+        let entries = std::fs::read_dir("/proc").map_err(|_| "could not scan procfs")?;
+        let mut scanned = 0;
+        for entry in entries {
+            if std::time::Instant::now() >= deadline {
+                return Err("process-tree scan exceeded cleanup budget");
+            }
+            scanned += 1;
+            if scanned > MAX_PROC_ENTRIES {
+                return Err("process-tree scan exceeded process-count limit");
+            }
+            let entry = entry.map_err(|_| "could not read procfs entry")?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if let Some(parent) = parent_pid(pid) {
+                children.entry(parent).or_default().push(pid);
+            }
+        }
+        Ok(children)
+    }
+
+    let root_pid = process.pid();
+    let deadline = std::time::Instant::now() + CLEANUP_BUDGET;
+    let mut known = HashSet::from([root_pid]);
+    let mut owned = vec![(root_pid, Arc::clone(&process.pidfd))];
+    let mut failure = if signal_pidfd(&process.pidfd, SIGSTOP) {
+        if wait_until_stopped(root_pid, deadline) {
+            None
+        } else {
+            Some("could not confirm the owned root stopped")
+        }
+    } else {
+        Some("could not stop the pinned root process")
+    };
+
+    while failure.is_none() {
+        if std::time::Instant::now() >= deadline {
+            failure = Some("process-tree cleanup exceeded its overall time budget");
+            break;
+        }
+        let snapshot = match children_by_parent(deadline) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => {
+                failure = Some(reason);
+                break;
+            }
+        };
+        let mut new_children = Vec::new();
+        for (parent, _) in &owned {
+            if let Some(children) = snapshot.get(parent) {
+                for child in children {
+                    if !known.contains(child) {
+                        new_children.push((*parent, *child));
+                    }
+                }
+            }
+        }
+        if new_children.is_empty() {
+            break;
+        }
+
+        let mut added = false;
+        for (parent, child) in new_children {
+            if std::time::Instant::now() >= deadline {
+                failure = Some("process-tree cleanup exceeded its overall time budget");
+                break;
+            }
+            if owned.len() >= MAX_OWNED_PROCESSES {
+                failure = Some("process-tree cleanup exceeded process-count limit");
+                break;
+            }
+            let Some(child_fd) = open_pidfd(child) else {
+                failure = Some("could not pin a discovered descendant with pidfd");
+                break;
+            };
+            let child_fd = Arc::new(child_fd);
+            // The parent is frozen, so it cannot fork or replace this relationship while the
+            // child identity is pinned. Never use the numeric PID as a signal target.
+            if parent_pid(child) != Some(parent) {
+                failure = Some("descendant ancestry changed during cleanup");
+                break;
+            }
+            known.insert(child);
+            owned.push((child, Arc::clone(&child_fd)));
+            added = true;
+            if !signal_pidfd(&child_fd, SIGSTOP) {
+                failure = Some("could not stop a pinned descendant");
+                break;
+            }
+            // Do not descend into a child until its stop is observed; otherwise it could fork
+            // after the procfs snapshot and escape this bounded pass.
+            if !wait_until_stopped(child, deadline) {
+                failure = Some("could not confirm a pinned descendant stopped");
+                break;
+            }
+        }
+        if failure.is_some() || !added {
+            break;
+        }
+    }
+
+    let mut kill_failed = false;
+    for (_, process_fd) in owned.iter().rev() {
+        kill_failed |= !signal_pidfd(process_fd, SIGKILL);
+    }
+    if let Some(reason) = failure {
+        Err(reason)
+    } else if kill_failed {
+        Err("SIGKILL failed for one or more pinned processes")
+    } else {
+        Ok(())
     }
 }
 
 /// Select the platform's sandbox backend. The cfg ladder is exhaustive; an unsupported target
 /// fails at compile time.
-pub fn platform_backend() -> Box<dyn SandboxBackend> {
+pub(crate) fn platform_backend() -> Box<dyn SandboxBackend> {
     #[cfg(windows)]
     {
         Box::new(WindowsSandbox)
@@ -493,7 +712,7 @@ pub async fn start_run(
             id.clone(),
             RunEntry {
                 run: run.clone(),
-                pid: None,
+                process: None,
                 killed_by_us: false,
                 mode: mode.to_string(),
                 port: None,
@@ -527,7 +746,14 @@ pub fn lookup(id: &str) -> Option<SandboxRun> {
 /// for `execute_run` to actually spawn the child (a powershell cold start can take several
 /// seconds under load) instead of sleeping a fixed interval before killing it.
 pub fn test_run_pid(id: &str) -> Option<u32> {
-    runs_guard().get(id).and_then(|e| e.pid)
+    runs_guard()
+        .get(id)
+        .and_then(|e| e.process.as_ref().map(OwnedProcess::pid))
+}
+
+#[cfg(test)]
+fn test_run_process(id: &str) -> Option<OwnedProcess> {
+    runs_guard().get(id).and_then(|e| e.process.clone())
 }
 
 #[cfg(test)]
@@ -563,7 +789,7 @@ async fn execute_run(
     // recorded the terminal "killed" state and "[killed]" output marker, so simply never spawn.
     let killed_before_spawn = runs_guard()
         .get(&id)
-        .map(|e| e.killed_by_us && e.pid.is_none())
+        .map(|e| e.killed_by_us && e.process.is_none())
         .unwrap_or(false);
     if killed_before_spawn {
         return;
@@ -629,24 +855,35 @@ async fn execute_run(
         }
     };
 
-    // Record the pid so kill_run and the timeout watchdog can reach the child.
-    if let Some(pid) = child.id() {
-        let killed_before_spawn = {
-            let mut guard = runs_guard();
-            match guard.get_mut(&id) {
-                Some(e) => {
-                    e.pid = Some(pid);
-                    e.killed_by_us
-                }
-                None => false,
-            }
-        };
-        // A kill/supersede that ran before the pid landed (kill_run_by_id and the web
-        // supersession path are no-ops while pid is None) could not signal the child;
-        // deliver it now so a superseded preview can't live out its full timeout.
-        if killed_before_spawn {
-            kill_pid(Some(pid));
+    // Pin the spawned identity before any await can reap the root or let its PID be reused.
+    let process = match OwnedProcess::pin(child.id()) {
+        Ok(process) => process,
+        Err(reason) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            finish(
+                &id,
+                "error",
+                None,
+                &format!("[spawn error] process tracking failed: {reason}\n"),
+            );
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            return;
         }
+    };
+    let killed_before_spawn = {
+        let mut guard = runs_guard();
+        match guard.get_mut(&id) {
+            Some(e) => {
+                e.process = Some(process.clone());
+                e.killed_by_us
+            }
+            None => false,
+        }
+    };
+    // A kill/supersede that raced the spawn could not signal before the process was pinned.
+    if killed_before_spawn {
+        let _ = kill_pid(Some(process.clone()));
     }
 
     // Watchdog: kill the child tree after timeout_ms. The collection future then finishes naturally
@@ -656,8 +893,8 @@ async fn execute_run(
         Some(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(timeout_ms as u64)).await;
             mark_killed_by_us(&id2);
-            let pid = runs_guard().get(&id2).and_then(|e| e.pid);
-            kill_pid(pid);
+            let process = runs_guard().get(&id2).and_then(|e| e.process.clone());
+            let _ = kill_pid(process);
         }))
     } else {
         None
@@ -870,7 +1107,7 @@ fn cap(s: &str) -> String {
     out
 }
 
-/// Set the terminal state on a run: status, exitCode, output, endedAt; clear the pid.
+/// Set the terminal state on a run: status, exitCode, output, endedAt; clear its process token.
 fn finish(id: &str, status: &str, exit_code: Option<i64>, output: &str) {
     // All mutations happen inside this block so the runs mutex guard is dropped before
     // prune_finished_runs() re-locks it (std::sync::Mutex is not reentrant).
@@ -890,8 +1127,8 @@ fn finish(id: &str, status: &str, exit_code: Option<i64>, output: &str) {
                 e.run.exit_code = exit_code;
                 e.run.output = output.to_string();
                 e.run.ended_at = Some(crate::util::now_ms());
-                e.pid = None;
             }
+            e.process = None;
         }
     }
     // A run just became terminal — sweep oldest finished runs so the store stays bounded.
@@ -904,13 +1141,20 @@ fn mark_killed_by_us(id: &str) {
     }
 }
 
-/// Kill a pid and its descendants — `taskkill /T /F` on win32, `kill -9 -<pgid>` on posix.
-/// Dispatched via the shared `SandboxBackend` so the kill logic lives in one place and
-/// `browser.rs` reuses it for the agent-browser process tree. Best-effort; the kill subprocess
-/// is reaped (`.status()`, not `.spawn()`) by each platform impl.
-fn kill_pid(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-    backend().kill_tree(pid);
+/// Cancel a pinned process through the shared backend and log any incomplete cleanup boundary.
+fn kill_pid(process: Option<OwnedProcess>) -> Result<(), &'static str> {
+    let Some(process) = process else {
+        return Ok(());
+    };
+    let result = backend().kill_tree(&process);
+    if let Err(reason) = result {
+        tracing::warn!(
+            pid = process.pid(),
+            reason,
+            "sandbox process cleanup incomplete"
+        );
+    }
+    result
 }
 
 /// Kill a running sandbox run by id, returning true if a live child was signalled. Shared by the
@@ -921,22 +1165,22 @@ fn kill_pid(pid: Option<u32>) {
 /// has already exited, `finish` is a no-op; otherwise the cleanup path removes the temp dir as
 /// usual once the child reaps.
 pub fn kill_run_by_id(id: &str) -> bool {
-    let pid = {
+    let process = {
         let mut store = runs_guard();
         match store.get_mut(id) {
-            Some(e) if e.pid.is_some() && e.run.status == "running" => {
+            Some(e) if e.process.is_some() && e.run.status == "running" => {
                 e.killed_by_us = true;
                 e.run.status = "killed".to_string();
                 e.run.ended_at = Some(crate::util::now_ms());
                 e.run.output.push_str("\n[killed]\n");
-                e.pid.take()
+                e.process.take()
             }
             _ => None,
         }
     };
-    match pid {
-        Some(p) => {
-            kill_pid(Some(p));
+    match process {
+        Some(process) => {
+            let _ = kill_pid(Some(process));
             true
         }
         None => false,
@@ -1172,9 +1416,9 @@ mod tests {
         }
 
         // Clean up the child before asserting so a failure doesn't leak a 20s sleeper.
-        let pid = runs_guard().get(&run.id).and_then(|e| e.pid);
+        let process = test_run_process(&run.id);
         mark_killed_by_us(&run.id);
-        kill_pid(pid);
+        let _ = kill_pid(process);
         drop(listener);
 
         assert_eq!(
@@ -1250,16 +1494,14 @@ mod tests {
         );
 
         // Clean up: kill the second child and drop both entries from the global store.
-        let mut pid2 = None;
         for _ in 0..300 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            pid2 = test_run_pid(&second.id);
-            if pid2.is_some() {
+            if test_run_pid(&second.id).is_some() {
                 break;
             }
         }
         mark_killed_by_us(&second.id);
-        kill_pid(pid2);
+        let _ = kill_pid(test_run_process(&second.id));
         remove_test_run(&first.id);
         remove_test_run(&second.id);
     }
@@ -1284,7 +1526,7 @@ mod tests {
                 started_at: crate::util::now_ms(),
                 ended_at: None,
             },
-            pid: None,
+            process: None,
             killed_by_us: false,
             mode: mode.to_string(),
             port: None,
@@ -1357,7 +1599,7 @@ mod tests {
                         started_at: crate::util::now_ms(),
                         ended_at: Some(crate::util::now_ms()),
                     },
-                    pid: None,
+                    process: None,
                     killed_by_us: true,
                     mode: "web".to_string(),
                     port: None,
@@ -1435,7 +1677,7 @@ mod tests {
                         started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
-                    pid: None,
+                    process: None,
                     killed_by_us: false,
                     mode: "terminal".to_string(),
                     port: None,
@@ -1494,7 +1736,7 @@ mod tests {
                             started_at: 1 + i as i64,
                             ended_at: None,
                         },
-                        pid: None,
+                        process: None,
                         killed_by_us: false,
                         mode: "terminal".to_string(),
                         port: None,
@@ -1516,7 +1758,7 @@ mod tests {
                             started_at: 100 + i as i64,
                             ended_at: Some(100 + i as i64),
                         },
-                        pid: None,
+                        process: None,
                         killed_by_us: false,
                         mode: "terminal".to_string(),
                         port: None,
@@ -1694,7 +1936,7 @@ mod tests {
                         started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
-                    pid: None,
+                    process: None,
                     killed_by_us: false,
                     mode: "web".to_string(),
                     // Port already detected — the function must not re-probe.
@@ -1768,7 +2010,7 @@ mod tests {
                         started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
-                    pid: None,
+                    process: None,
                     killed_by_us: false,
                     mode: "terminal".to_string(),
                     port: None,
@@ -1846,7 +2088,7 @@ mod tests {
                         started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
-                    pid: None,
+                    process: None,
                     killed_by_us: false,
                     mode: "terminal".to_string(),
                     port: None,
@@ -1933,7 +2175,7 @@ mod tests {
                         started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
-                    pid: None,
+                    process: None,
                     killed_by_us: false,
                     mode: "terminal".to_string(),
                     port: None,
@@ -1977,7 +2219,7 @@ mod tests {
                         started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
-                    pid: None,
+                    process: None,
                     killed_by_us: false,
                     mode: "terminal".to_string(),
                     port: None,
@@ -2062,7 +2304,7 @@ mod tests {
                         started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
-                    pid: None,
+                    process: None,
                     killed_by_us: false,
                     mode: "web".to_string(),
                     port: None,
@@ -2183,7 +2425,7 @@ mod tests {
                         started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
-                    pid: Some(pid),
+                    process: Some(OwnedProcess::pin(Some(pid)).expect("pin test child")),
                     killed_by_us: false,
                     mode: "terminal".to_string(),
                     port: None,
@@ -2208,8 +2450,8 @@ mod tests {
                 "endedAt must be set immediately"
             );
             assert!(
-                entry.pid.is_none(),
-                "pid must be cleared so the cleanup path does not double-kill"
+                entry.process.is_none(),
+                "process token must be transferred to the cleanup path"
             );
             assert!(
                 entry.run.output.contains("[killed]"),
@@ -2263,7 +2505,8 @@ mod tests {
 
         // kill_pid must kill the target. With .status() it also blocks until the kill/taskkill
         // subprocess exits and is reaped, so by the time kill_pid returns no zombie lingers.
-        kill_pid(Some(pid));
+        let process = OwnedProcess::pin(Some(pid)).expect("pin test process");
+        let _ = kill_pid(Some(process));
 
         // The target process must have been killed. Poll with try_wait — the signal was already
         // delivered, so this resolves quickly. A generous deadline guards against slow taskkill
@@ -2311,7 +2554,7 @@ mod tests {
                         started_at: crate::util::now_ms(),
                         ended_at: None,
                     },
-                    pid: None,
+                    process: None,
                     killed_by_us: false,
                     mode: "terminal".to_string(),
                     port: None,
@@ -2510,22 +2753,29 @@ mod tests {
     /// a future platform impl can't silently diverge from the sandbox's `kill_pid`.
     #[test]
     fn sandbox_backend_kill_tree_dispatches_to_platform() {
-        let mut child = if cfg!(windows) {
-            std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
-                .spawn()
-                .expect("powershell should be available")
+        let mut command = if cfg!(windows) {
+            let mut command = std::process::Command::new("powershell");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+            command
         } else {
-            std::process::Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("sleep should be available")
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            command
         };
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().expect("test process should start");
         // `std::process::Child::id()` returns `u32` on every platform (see note above).
         let pid = child.id();
 
         // Dispatch through the trait. Each impl reaps its own kill subprocess.
-        backend().kill_tree(pid);
+        let process = OwnedProcess::pin(Some(pid)).expect("pin test process");
+        backend()
+            .kill_tree(&process)
+            .expect("platform cleanup should signal the test process");
 
         // The target must be killed and reaped. Poll try_wait — the signal was already
         // delivered, so this resolves quickly. Generous deadline for slow taskkill on AV-heavy
