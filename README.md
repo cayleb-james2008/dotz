@@ -193,6 +193,10 @@ The workflow graph is the **single source of truth** — execution and observabi
 auto-promote to `ready` when all parents are `done`. The UI renders the live DAG as an interactive
 SVG node/edge graph.
 
+Lead-session subagent calls use this executor. A custom agent that explicitly enables nested
+`subagent` calls uses the direct dispatcher; those nested runs do not create their own workflow
+nodes. See the [workflow guide](docs/agent-team-workflow.md) for dispatch limits and timeout layers.
+
 - `workflows.rs` — the `WorkflowRun` DAG domain (`WorkflowStep`, `ToolCallRef` with inspectable
   `args`+`result`).
 - `workflow_executor.rs` — drives steps to completion.
