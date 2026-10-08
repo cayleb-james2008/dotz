@@ -10,7 +10,9 @@ decides whether to call `subagent`. The workflow graph records the subagent call
    <http://127.0.0.1:4317>, or launch the desktop app.
 2. Open or create a project for the repository you intend to change. Configure a provider in the
    Connections panel or with an environment variable; see [provider setup](provider-setup.md). The
-   lead and subagents make model-provider requests, so their usage and charges follow that provider.
+   lead and subagents make model-provider requests. Provider-health failover can automatically use
+   a backup provider, and a dispatch-specific model can name another provider. Usage and charges
+   follow the provider that actually serves each request.
 3. Choose a model and subagent model, then submit `/implement-and-review <small, specific change>`.
 4. Watch the workflow graph for the dispatched agents and their tool calls. Inspect the review
    output and the actual diff, and run the project checks before accepting the result.
@@ -32,8 +34,14 @@ chat can also delegate, but the prompt itself does not guarantee a particular te
 - Each subagent is a fresh LLM run with its own prompt and message history, inside the same dotz
   process. It is not a separate operating-system process or an independent security boundary.
 - The `subagent` tool supports one run, a sequential chain of up to 16 steps, or parallel dispatch
-  of up to 8 tasks with at most 4 running at once. A subagent has a five-minute default timeout;
-  `DOTZ_SUBAGENT_TIMEOUT_MS` can change it.
+  of up to 8 tasks. Production calls use the workflow executor, which defaults to 4 concurrent
+  steps per workflow run. `DOTZ_WF_CONCURRENCY` is clamped to 1–16; raising it can let all 8 tasks
+  in a parallel dispatch run at once, but does not increase the 8-task dispatch limit.
+- Production steps have two independent deadlines: `DOTZ_SUBAGENT_TIMEOUT_MS` limits each model
+  response stream, while `DOTZ_WF_STEP_TIMEOUT_MS` caps the executing workflow step, including its
+  model rounds and tool calls. Both default to five minutes and are clamped to 1 second–1 hour.
+  Configure both for a longer step with longer response streams; raising only
+  `DOTZ_SUBAGENT_TIMEOUT_MS` leaves the executor's five-minute step cap in place.
 - A dispatch-specific model choice takes precedence. Otherwise the configured Subagent model is
   used, then the agent profile's model, then `ollama/minimax-m3` as the fallback. The configured
   Subagent model applies to bundled agents as well as custom agents.
