@@ -2240,14 +2240,8 @@ mod tests {
         }
     }
 
-    /// `kill_pid` must deliver a signal to the target process AND reap its own
-    /// `kill`/`taskkill` subprocess. The old code used `.spawn()` and immediately dropped the
-    /// `Child` handle — in Rust's std, dropping a `Child` does NOT call `waitpid`, so the
-    /// `kill`/`taskkill` subprocess became a zombie that persisted until the dotz-core process
-    /// exited. Over a long-lived server with many sandbox kills (timeouts + manual kills),
-    /// zombies accumulated. The fix uses `.status()` which runs the signal-delivery command to
-    /// completion and reaps it. This test verifies `kill_pid` still kills the target and returns
-    /// only after the signal-delivery subprocess has been reaped (i.e., `.status()` completed).
+    /// Signal delivery must terminate the target. Windows waits for and reaps taskkill;
+    /// POSIX uses a direct syscall and has no signal-delivery subprocess to reap.
     #[test]
     fn kill_pid_kills_target_and_reaps_kill_subprocess() {
         let mut child = if cfg!(windows) {
@@ -2266,8 +2260,7 @@ mod tests {
         // compile on non-Windows.
         let pid = child.id();
 
-        // kill_pid must kill the target. With .status() it also blocks until the kill/taskkill
-        // subprocess exits and is reaped, so by the time kill_pid returns no zombie lingers.
+        // Windows reaps taskkill before returning; POSIX delivers the signal directly.
         kill_pid(Some(pid));
 
         // The target process must have been killed. Poll with try_wait — the signal was already
@@ -2508,7 +2501,7 @@ mod tests {
     }
 
     /// `kill_tree` must dispatch to the platform-correct kill path: taskkill /T /F on Windows,
-    /// `kill -9 -<pgid>` on posix. We verify the dispatch end-to-end by spawning a long-lived
+    /// direct process-group signalling on POSIX. Verify dispatch by spawning a long-lived
     /// child, calling `backend().kill_tree(pid)`, and asserting the child actually dies (and is
     /// reaped, so no zombie lingers). This is the trait-level mirror of the existing
     /// `kill_pid_kills_target_and_reaps_kill_subprocess` test, but routed through the trait so
@@ -2529,7 +2522,7 @@ mod tests {
         // `std::process::Child::id()` returns `u32` on every platform (see note above).
         let pid = child.id();
 
-        // Dispatch through the trait. Each impl reaps its own kill subprocess.
+        // Dispatch through the trait. Windows reaps taskkill; POSIX needs no subprocess.
         backend().kill_tree(pid);
 
         // The target must be killed and reaped. Poll try_wait — the signal was already

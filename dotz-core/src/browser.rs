@@ -690,9 +690,8 @@ async fn run(
 /// `CreateProcess` for taskkill.exe is a synchronous syscall that can take several hundred ms
 /// under load, and running it inline on the timeout path would stall a tokio worker thread for
 /// that whole time (and let the caller's wall-clock timeout balloon past its budget). Inside the
-/// blocking task the kill subprocess IS waited on (`.status()`, not `.spawn()`) by each backend
-/// impl, so it gets reaped — dropping a spawned `std::process::Child` without waiting leaves a
-/// zombie that accumulates over a long-lived server with many browser kills.
+/// blocking task, Windows waits for and reaps taskkill. POSIX signals the process group
+/// directly through kill(2), with no signal-delivery subprocess to reap.
 fn kill_pid(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     tokio::task::spawn_blocking(move || {
