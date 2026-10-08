@@ -2317,8 +2317,9 @@ mod tests {
             );
         }
 
-        // Print a unique marker immediately, then sleep long enough for the kill to arrive
-        // mid-execution.  The marker is what we assert survives in the final output.
+        // On Unix, establish the sleeper before emitting the marker: killing immediately
+        // after `echo; sleep` can race bash's creation of a child that inherits the pipes.
+        // `wait` is a shell builtin, so no new child is created after the marker barrier.
         let marker = "dotz-kill-output-survives";
         let (language, code) = if cfg!(windows) {
             (
@@ -2326,7 +2327,10 @@ mod tests {
                 format!("Write-Output '{marker}'; Start-Sleep -Seconds 30"),
             )
         } else {
-            ("bash", format!("echo '{marker}'; sleep 30"))
+            (
+                "bash",
+                format!("sleep 30 & sleeper=$!; echo '{marker}'; wait \"$sleeper\""),
+            )
         };
 
         // Drive execute_run in a spawned task with a broadcast sender so we can observe the
@@ -2387,7 +2391,10 @@ mod tests {
         );
 
         // Wait for execute_run to finish reaping the child and writing the final record.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), run_task).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), run_task)
+            .await
+            .expect("execute_run must finish reaping the child and draining its output within 30s")
+            .expect("execute_run task must complete without panicking");
 
         // The final run record must contain BOTH the child's actual output AND the
         // "[killed]" marker — not just the latter.
