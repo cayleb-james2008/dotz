@@ -16,7 +16,8 @@ you are entering it; after Save it is stored in `auth.json` and never displayed 
 2. Select a provider, paste your key, and **Save**.
 3. The key is written to `~/.pi/agent/auth.json` and used on every subsequent launch.
 
-This is the easiest path and the only one that survives an OS reinstall of your env files.
+Saved credentials persist across app restarts. An OS reinstall or deletion of `auth.json` requires
+restoring that file from your own backup or entering the keys again.
 
 ## Option B — Environment variables
 

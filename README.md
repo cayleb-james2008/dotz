@@ -4,12 +4,12 @@
 
 # dotz
 
-**The in-process multi-agent coding dashboard — one prompt becomes a team of AI coding agents.**
+**An in-process coding dashboard for directing work to a team of AI coding agents.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-first-89b4fa)](#what-works-today)
 [![Built with](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri-cba6f7)](https://tauri.app)
-[![Rust](https://img.shields.io/badge/rust-edition%202021-orange.svg)](dotz-core/Cargo.toml)
+[![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](dotz-core/Cargo.toml)
 
 > No live-fact badges here on purpose: the release-feed URLs returned HTTP 404
 > from an unauthenticated check on 2026-09-18 (see [What works today](#what-works-today)),
@@ -20,17 +20,18 @@
 
 </div>
 
-dotz is a **native-Rust, multi-agent coding-agent dashboard**. Give it one task and it
-decomposes the work, disperses it to a team of subagents, runs them in parallel on a **live workflow
-graph**, and adversarially verifies the result before it lands — with live controls for **model,
-reasoning effort, tools, skills, and subagent orchestration**, all in a single self-updating desktop app.
+dotz is a **native-Rust, multi-agent coding dashboard**. A lead agent can delegate work to subagents,
+and the live workflow graph shows those dispatches and tool calls as they happen. The built-in
+profiles and slash-command prompts define different ways to work: some use sequential chains, some
+request an explicit review step, and some keep the work with one agent. The operator controls the
+provider, model, reasoning effort, tools, and skills in a single desktop app.
 
 Under the hood: `dotz-core` is an [axum](https://github.com/tokio-rs/axum) server with dotz's own
 agent runtime (no third-party agent SDK, no IPC serialization — everything runs **in-process**), and a
 [Tauri](https://tauri.app) 2 (WebView2) shell wraps it into a signed, self-updating Windows app. It is
 **multi-provider** (Ollama Cloud, OpenRouter, Anthropic, OpenAI, Google, Groq, and more), keeps
 **persistent projects** + an on-device **memory store** (local ONNX embeddings) injected into the
-agent's prompt, ships a **deterministic tool sandbox** with a live web preview the agent drives an
+agent's prompt, ships a **managed tool runner** with a live web preview the agent drives an
 on-screen cursor over, and a native **Open Design** workspace (150+ design systems, live preview,
 HTML/PDF export).
 
@@ -42,6 +43,7 @@ HTML/PDF export).
 
 - [Highlights](#highlights)
 - [How It Works](#how-it-works)
+- [Agent-team workflow](docs/agent-team-workflow.md)
 - [Architecture](#architecture)
 - [Safety Patterns](#safety-patterns)
 - [Tech Stack](#tech-stack)
@@ -66,8 +68,8 @@ HTML/PDF export).
 
 - **Live workflow graph** — every subagent materializes as a node, every tool it reaches for
   streams onto that node as a live chip; click any node/chip to open the exact panel it drives.
-- **Multi-agent by default** — non-trivial tasks fan out to `scout` / `planner` / `worker` /
-  `reviewer` subagents in parallel, then the result is adversarially verified before it lands.
+- **Agent-team workflows** — the lead can delegate to specialist subagents. The `/implement` and
+  `/implement-and-review` presets use different sequences; see the [agent-team walkthrough](docs/agent-team-workflow.md).
 - **In-process runtime** — no IPC serialization, no subprocess per agent, no third-party agent SDK.
   The entire agent runtime (chat loop, tools, subagents, providers) lives inside `dotz-core`.
 - **Sessions over WebSocket** — the UI is a plain web app (`fetch` + WS streaming), identical in a
@@ -93,22 +95,19 @@ HTML/PDF export).
 
 ```mermaid
 flowchart LR
-    U([Your prompt]) --> L[Lead agent]
-    L -->|decompose + disperse| S[scout]
-    L --> P[planner]
-    L --> W[worker]
-    L --> R[reviewer]
-    S --> V{adversarial verify}
-    P --> V
-    W --> V
-    R --> V
-    V -->|pass| D([Verified result])
-    V -->|gaps| L
+    U([Your prompt]) --> P[Choose profile or preset]
+    P --> L[Lead agent]
+    L -->|when it dispatches| A[Subagent run or chain]
+    A --> G[Live workflow graph]
+    L --> R[Report, review, or next step]
 ```
 
-Every non-trivial task fans out to `scout` / `planner` / `worker` / `reviewer` subagents that run in
-parallel, then their output is adversarially verified before it lands. Pick a **profile** to change the
-strategy (WORKFLOW · SOLO · PLAN · FRONTEND · BACKEND · DESIGN · NEW MODEL, NEW PROJECT).
+Delegation depends on the selected profile or prompt and the lead agent's decisions; an ordinary chat
+message does not guarantee that subagents will run. The `/implement` preset uses a sequential
+`scout → planner → worker` chain after its OpenSpec and branch setup. `/implement-and-review` uses a
+`worker → reviewer → worker` chain. Neither preset runs those steps in parallel. The WORKFLOW profile
+encourages delegation, while SOLO and PLAN offer direct-execution and read-only strategies. See the
+[agent-team walkthrough](docs/agent-team-workflow.md) for the complete sequences and their limits.
 
 ### The Live Workflow Graph — Watch Every Agent and Every Tool
 
@@ -184,8 +183,8 @@ flowchart TD
 | **Lead agent** | Receives the user prompt, decomposes the task, disperses subagents, conducts verification, delivers the result. |
 | **Scout** | Research and context-gathering: memory recall, codebase exploration, reading existing patterns. |
 | **Planner** | Architecture and task breakdown: maps the work into build units, sequences dependencies. |
-| **Worker** | Implementation: writes code, runs tests, fixes bugs — fanned out in parallel per independent unit. |
-| **Reviewer** | Adversarial verification: checks the work against the spec, tests, and quality bar before it lands. |
+| **Worker** | Implementation: writes code, runs tests, fixes bugs; runs sequentially or in parallel according to the dispatch. |
+| **Reviewer** | When requested, audits the implementation against the spec, tests, and quality bar; its output requires inspection. |
 
 ### Workflow DAG
 
@@ -202,17 +201,19 @@ SVG node/edge graph.
 
 ## Safety Patterns
 
-dotz is built around three safety patterns that make autonomous coding trustworthy enough to watch
-in real time:
+dotz exposes runtime controls and review tools. Their use depends on the selected profile, enabled
+tools, and workflow; inspect the resulting actions and checks.
 
-### 1. Deterministic Tool Sandbox
+### 1. Managed Tool Runs
 
 The tool sandbox is a managed run store (run lifecycle `pending → running → done|error|killed`,
 `dotz-core/src/sandbox.rs`). Allowlists apply at the boundaries: profiles gate which tools an
 agent may call (see `PLAN_TOOLS` in `dotz-core/src/agent/tools.rs`), the in-app browser enforces
 an origin allowlist (`dotz-core/src/browser.rs`), and the loopback API rejects disallowed
 `Origin`/`Host` with `403` (`dotz-core/src/server/guard.rs`). The `bash` tool itself runs the
-given command in the session cwd with a wall-clock timeout — no command allowlist. The sandbox runs in two modes:
+given command in the session cwd with a wall-clock timeout — no command allowlist. The Linux
+bubblewrap and macOS seatbelt wrappers are deferred in this checkout; the managed runner does not
+establish filesystem or network isolation. It runs in two modes:
 
 - **`terminal`** mode — streams stdout/stderr back into the chat panel.
 - **`web`** mode — starts a long-lived process bound to a local HTTP port; the UI renders an inline
@@ -223,21 +224,21 @@ given command in the session cwd with a wall-clock timeout — no command allowl
 Run lifecycle: `pending → running → done|error|killed`. The sandbox owns process lifecycle for both
 modes — no other module spawns sandbox processes directly.
 
-### 2. Adversarial Verify-Before-Merge
+### 2. Explicit Review Workflows
 
-Every non-trivial task is verified by an independent `reviewer` subagent before its output lands.
-The reviewer checks the work against the spec, tests, and a quality bar — not the worker's claims.
-If gaps are found, the work goes back to the lead agent for another cycle. The workflow DAG makes
-this visible: the verify step is a real node, and its verdict (`pass` / `gaps`) drives the graph
-forward or loops back.
+The `/implement-and-review` prompt requests a sequential `worker → reviewer → worker` chain;
+`/implement` does not include a reviewer. A reviewer is another model run, and its response is input
+to the next step. The graph records execution status; it does not automatically certify a reviewer's
+verdict or prevent commits and merges when review was omitted. Inspect the diff and project checks
+before accepting the result. See the [workflow guide](docs/agent-team-workflow.md).
 
-### 3. Human Gate as Terminal DAG Node
+### 3. Interactive Human Approval
 
-The **human gate** is a first-class node in the workflow DAG — not an afterthought. When a task
-reaches a point that genuinely requires human judgment (a material choice, an irreversible
-operation, a security-sensitive decision), the graph pauses at the human-gate node and surfaces the
-question to the operator. The work does not proceed until the gate is cleared. This makes autonomy
-safe: the agent runs as far as it can, then stops exactly where a human should decide.
+When the lead agent calls `human_gate`, dotz sends an approval card over the session WebSocket and
+waits up to five minutes for an operator response. Approval returns a tool result; rejection or a
+timeout returns an error. The tool requires an interactive session and is unavailable to subagents
+(`dotz-core/src/agent/extra_tools.rs`). It is not automatically inserted into every workflow or a
+runtime policy that blocks every sensitive action; the lead must request it before proceeding.
 
 ## Tech Stack
 
@@ -245,7 +246,7 @@ safe: the agent runs as far as it can, then stops exactly where a human should d
 
 | Layer | Technology | Notes |
 |-------|-----------|-------|
-| **Language** | Rust (edition 2021) | Native, no GC, no Node.js runtime |
+| **Language** | Rust (edition 2024) | Native, no GC, no Node.js runtime |
 | **Backend** | axum + tower-http + tokio | REST + WebSocket on `127.0.0.1:4317` |
 | **Desktop shell** | Tauri 2 (WebView2) | Thin shell — boots core, opens window, wires updater |
 | **Frontend** | Vanilla HTML/CSS/JS | No build step, no framework, no bundle |
@@ -293,9 +294,8 @@ the agent runtime.
 
 - **Profile** — the top-bar segmented picker switches dotz's operating mode. Each profile injects
   a doctrine (`appendSystemPrompt`) and a default tool set; switching it starts a fresh session.
-    - **WORKFLOW** *(default)* — multi-agent dispersal: every non-trivial task is decomposed and
-      dispersed to `scout` / `planner` / `reviewer` / `worker` subagents, then adversarially
-      verified.
+    - **WORKFLOW** *(default)* — encourages the lead agent to delegate non-trivial work; actual
+      dispatch and review steps depend on the request and workflow prompt.
     - **SOLO** — single agent, direct execution, no subagents unless asked.
     - **PLAN** — read-only research + planning (`read, grep, find, ls, subagent`; no edits).
     - **FRONTEND** — workflow mode tuned for UI/design work (WCAG, real focus states, no AI-slop).
@@ -357,7 +357,7 @@ since the bundled systems are static HTML/CSS — a hardened default that still 
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (stable, edition 2021)
+- [Rust](https://rustup.rs/) (stable, edition 2024)
 - [Node.js](https://nodejs.org/) (for the agent-browser binary + ONNX model fetch)
 - [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) (WebView2 on Windows)
 
@@ -375,8 +375,8 @@ npm run fetch-model    # downloads the all-MiniLM-L6-v2 ONNX model into assets/m
 
 ### Provider configuration
 
-dotz resolves provider auth from `~/.pi/agent/auth.json` → env vars. Set keys for the providers you
-use — **Ollama Cloud** is the primary (executive `glm-5.2`, subagent `minimax-m3`) and **OpenRouter**
+dotz resolves provider auth from environment variables first, then `~/.pi/agent/auth.json`.
+Set keys for the providers you use — **Ollama Cloud** is the primary (executive `glm-5.2`, subagent `minimax-m3`) and **OpenRouter**
 is the free fallback (`nex-agi/nex-n2-pro:free`):
 
 ```bash
@@ -401,7 +401,7 @@ cargo tauri dev
 ### Build the installer
 
 ```bash
-cargo tauri build   # → src-tauri/target/release/bundle/nsis/  (signed NSIS installer + latest.json)
+cargo tauri build   # Windows NSIS output: target/release/bundle/nsis/
 ```
 
 The signed build needs the updater signing key in the environment — see
@@ -421,8 +421,9 @@ The embed tests need the bundled all-MiniLM-L6-v2 model files (`npm run fetch-mo
 
 ## Development and Gates
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every push and PR to `main`
-(on `windows-latest`) and is the merge gate — run the same three commands locally before pushing:
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on pushes to `main` and on pull
+requests, across Windows, Ubuntu, and macOS. Each OS checks formatting, Clippy, model setup, and
+core tests; Windows also runs the cold-start benchmark. Run the Rust checks locally before pushing:
 
 ```bash
 cargo fmt --all -- --check
@@ -430,10 +431,8 @@ cargo clippy -p dotz-core --all-targets -- -D warnings
 cargo test -p dotz-core
 ```
 
-> **LLVM OOM note:** On memory-constrained hosts, bound parallelism to prevent OOM:
-> `cargo test -p dotz-core -- --test-threads=2`. If a build dies with `STATUS_STACK_BUFFER_OVERRUN`
-> or exit 1455, re-run once before treating the gate as red — only a reproducible second failure
-> is code-red.
+> All three OS test steps are blocking. The suite streams test output for diagnosis; a runner
+> communication failure remains a failed gate until a fresh exact-head run completes.
 
 Pushing a `v*` tag triggers [`release.yml`](.github/workflows/release.yml), which builds the NSIS
 installer and cuts a draft GitHub Release with the signed `latest.json` updater feed.
@@ -499,7 +498,7 @@ Status as verified on this Linux host on 2026-09-18. Anything not listed here is
 - The GitHub release feed (`.../releases/latest`, updater `latest.json`) — the URLs returned
   HTTP 404 from an unauthenticated `curl` check on 2026-09-18, so no release artifact or badge
   could be verified. The feed goes live with the first `v*` release.
-- `cargo bench --bench cold_start` — Windows-only CI gate; not run here.
+- `cargo bench --bench cold_start` — Windows-only CI measurement (no performance-regression gate); not run here.
 
 ## Contributing
 
@@ -538,4 +537,6 @@ under `.pi/` (the Open Design systems/skills) keeps its own Apache-2.0 license.
 
 ## Modernization (September 2026)
 
-This repository has been modernized to Rust 2024, dependencies updated, and various safety fixes applied (including icon format and unsafe env var wrappers). Some test failures remain due to unsafe env var calls in test code, which are recorded honestly.
+The workspace declares Rust edition 2024. The dated test results above remain historical; inspect
+the current commit's CI jobs and step results for current validation. A successful core-test job
+does not validate the desktop installer, live-provider behavior, or sandbox isolation.

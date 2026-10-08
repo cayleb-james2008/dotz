@@ -426,6 +426,22 @@ fn parse_subagent_model(effective_model: &str) -> (String, String) {
     }
 }
 
+/// Resolve a subagent's model. A model chosen for this dispatch is most specific; otherwise
+/// honor the operator's configured model before falling back to the agent profile's suggestion.
+/// The UI's subagent-model control is intended to apply across the team, including bundled agents
+/// whose frontmatter carries a default.
+fn resolve_effective_model(
+    model_override: Option<&str>,
+    configured_model: Option<&str>,
+    agent_default: Option<&str>,
+) -> String {
+    model_override
+        .or_else(|| configured_model.filter(|model| !model.trim().is_empty()))
+        .or(agent_default)
+        .unwrap_or("ollama/minimax-m3")
+        .to_string()
+}
+
 /// Run one subagent to completion: a fresh agent loop with the agent's system prompt + the resolved
 /// model, NO memory autonomy (the agent's own prompt only), and the agent's tool set (or the default
 /// active set). Captures the message list + usage as a SingleResult. A wall-clock timeout prevents a
@@ -481,16 +497,14 @@ async fn run_single_agent_inner(
         return unknown_agent_result(agent_name, task, agents, step);
     };
 
-    // Model resolution: explicit override → agent's own default → DOTZ_SUBAGENT_MODEL → ollama/minimax-m3.
-    let effective_model = model_override
-        .map(|s| s.to_string())
-        .or_else(|| agent.model.clone())
-        .or_else(|| {
-            std::env::var("DOTZ_SUBAGENT_MODEL")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "ollama/minimax-m3".to_string());
+    // A model selected for this dispatch wins; the configured team model then overrides the
+    // bundled agent's suggested default so the Subagent control applies consistently.
+    let configured_model = std::env::var("DOTZ_SUBAGENT_MODEL").ok();
+    let effective_model = resolve_effective_model(
+        model_override,
+        configured_model.as_deref(),
+        agent.model.as_deref(),
+    );
     // Split "provider/model-id" → (provider, model_id). A bare id falls back to ollama.
     // Normalize a redundant "provider/" prefix so the upstream API receives a bare model id,
     // matching the executive session + config behavior.
@@ -1770,6 +1784,38 @@ mod tests {
         assert_eq!(
             parse_subagent_model("openrouter/ollama/glm-5.2"),
             ("openrouter".to_string(), "ollama/glm-5.2".to_string())
+        );
+    }
+
+    #[test]
+    fn subagent_model_precedence_honors_dispatch_then_operator_then_agent() {
+        assert_eq!(
+            resolve_effective_model(
+                Some("local/request-specific"),
+                Some("ollama/operator-choice"),
+                Some("nvidia-nim/role-default"),
+            ),
+            "local/request-specific"
+        );
+        assert_eq!(
+            resolve_effective_model(
+                None,
+                Some("ollama/operator-choice"),
+                Some("nvidia-nim/role-default"),
+            ),
+            "ollama/operator-choice"
+        );
+        assert_eq!(
+            resolve_effective_model(None, Some(""), Some("nvidia-nim/role-default")),
+            "nvidia-nim/role-default"
+        );
+        assert_eq!(
+            resolve_effective_model(None, Some("  "), Some("nvidia-nim/role-default")),
+            "nvidia-nim/role-default"
+        );
+        assert_eq!(
+            resolve_effective_model(None, None, None),
+            "ollama/minimax-m3"
         );
     }
 
