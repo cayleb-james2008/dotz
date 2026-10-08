@@ -399,7 +399,7 @@ cargo tauri dev
 ### Build the installer
 
 ```bash
-cargo tauri build   # → src-tauri/target/release/bundle/nsis/  (signed NSIS installer + latest.json)
+cargo tauri build   # Windows NSIS output: target/release/bundle/nsis/
 ```
 
 The signed build needs the updater signing key in the environment — see
