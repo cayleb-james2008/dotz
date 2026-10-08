@@ -309,24 +309,44 @@ def main() -> int:
                         "tests_completed": counters["completed"],
                         "tests_total_known": counters["suite_total_known"],
                     }, now)
-                command_return_code = proc.poll()
-                if (timeout_reason is None and command_return_code is not None and not stream_eof
-                        and args.post_exit_drain_timeout > 0):
-                    if post_exit_since is None:
-                        post_exit_since = now
-                    elif now - post_exit_since >= args.post_exit_drain_timeout:
-                        lingering = system_snapshot().get("processes_top_rss", [])
-                        trigger_timeout("post_exit_drain_timeout", {
-                            "command_return_code": command_return_code,
-                            "drain_seconds": round(now - post_exit_since, 1),
-                            "threshold_seconds": args.post_exit_drain_timeout,
-                            "tests_completed": counters["completed"],
-                            "tests_total_known": counters["suite_total_known"],
-                            "lingering_process_names": [row.get("name") for row in lingering[:10]],
-                        }, now)
-                elif command_return_code is None or stream_eof:
-                    post_exit_since = None
-            elif (termination_at is not None and not kill_sent
+            command_return_code = proc.poll()
+            if (command_return_code is not None and not stream_eof
+                    and args.post_exit_drain_timeout > 0):
+                if post_exit_since is None:
+                    post_exit_since = now
+                elif now - post_exit_since >= args.post_exit_drain_timeout:
+                    lingering = system_snapshot().get("processes_top_rss", [])
+                    details = {
+                        "command_return_code": command_return_code,
+                        "drain_seconds": round(now - post_exit_since, 1),
+                        "threshold_seconds": args.post_exit_drain_timeout,
+                        "tests_completed": counters["completed"],
+                        "tests_total_known": counters["suite_total_known"],
+                        "lingering_process_names": [row.get("name") for row in lingering[:10]],
+                    }
+                    if timeout_reason is None:
+                        trigger_timeout("post_exit_drain_timeout", details, now)
+                    else:
+                        event = {
+                            "event": "post_exit_drain_timeout", "timestamp": utc_now(),
+                            "timeout_reason": timeout_reason, **details,
+                        }
+                        write_event(progress, event)
+                        print("[ci-watchdog] " + json.dumps(event, sort_keys=True), flush=True)
+                    if not kill_sent:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        kill_sent = True
+                        write_event(progress, {"event": "process_group_sigkill", "timestamp": utc_now(),
+                                               "reason": timeout_reason, "elapsed_seconds": round(now - start, 1)})
+                    selector.unregister(proc.stdout)
+                    proc.stdout.close()
+                    stream_eof = True
+            elif command_return_code is None or stream_eof:
+                post_exit_since = None
+            if (termination_at is not None and not kill_sent
                     and now - termination_at >= max(args.termination_grace, 0.0)):
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
