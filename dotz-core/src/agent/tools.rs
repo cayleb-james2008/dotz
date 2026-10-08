@@ -383,10 +383,8 @@ impl Tool for BashTool {
                 // its own process group at spawn, so the shared process-group kill helper reaps the
                 // entire group — shell + every descendant.
                 //
-                // Use .status() (not .spawn()) so the kill/taskkill subprocess is reaped.
-                // Dropping a spawned std::process::Child without waiting leaves a zombie
-                // that accumulates over a long-lived server with many timed-out bash
-                // commands — the exact reliability gap sandbox.rs::kill_pid already fixed.
+                // Windows waits for taskkill; POSIX uses the guarded shared syscall helper
+                // so no external kill parser or signal-delivery subprocess is involved.
                 #[cfg(windows)]
                 {
                     if let Some(pid) = child.id() {

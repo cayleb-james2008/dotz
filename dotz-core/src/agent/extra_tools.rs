@@ -444,8 +444,8 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
             // Windows: `taskkill /PID <pid> /T /F` kills the whole process tree.  POSIX: the
             // child was placed in its own process group at spawn, so the shared process-group kill helper reaps
             // the entire group — shell + every descendant.
-            // Use .status() (not .spawn()) so the kill/taskkill subprocess is reaped instead of
-            // leaking a zombie/handle — same fix the bash tool's timeout path already carries.
+            // Windows waits for taskkill; POSIX shares the guarded syscall helper with
+            // sandbox and bash cleanup, avoiding the external kill parser entirely.
             #[cfg(windows)]
             {
                 if let Some(pid) = child.id() {

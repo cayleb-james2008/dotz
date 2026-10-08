@@ -168,15 +168,15 @@ pub fn try_mark_end_emitted(id: &str) -> bool {
 /// Platform abstraction over the two Windows-conditional seams in sandbox process management:
 /// (1) spawn-time flags (CREATE_NO_WINDOW on Windows, own process group on posix), and
 /// (2) tree-kill (taskkill /T /F on Windows, kill(2) on the owned process group on posix). Best-effort;
-/// implementations must reap their own kill subprocess (`.status()`, not `.spawn()`).
+/// implementations must reap any signal-delivery subprocess they spawn.
 pub trait SandboxBackend: Send + Sync + 'static {
     /// Configure a `tokio::process::Command` before spawn (hide window on Windows, own process
     /// group on posix). Called for every sandbox + agent-browser spawn.
     fn prepare_command(&self, command: &mut tokio::process::Command);
 
     /// Kill a pid and its descendants. Synchronous: the sandbox calls it inline; `browser.rs`
-    /// wraps it in `spawn_blocking` when async dispatch is needed. Must reap its own kill
-    /// subprocess.
+    /// wraps it in `spawn_blocking` when async dispatch is needed. Reap any subprocess used
+    /// for signal delivery; POSIX uses no subprocess.
     fn kill_tree(&self, pid: u32);
 }
 
