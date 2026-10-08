@@ -32,6 +32,62 @@ def write_event(stream: Any, event: dict[str, Any]) -> None:
     stream.flush()
 
 
+def signal_process_group(proc: subprocess.Popen[bytes], sig: int, progress: Any,
+                        timeout_reason: str | None, start: float) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        event = {
+            "event": "process_group_signal_error", "timestamp": utc_now(),
+            "pid": proc.pid, "signal": sig, "timeout_reason": timeout_reason,
+            "elapsed_seconds": round(time.monotonic() - start, 1),
+            "errno": exc.errno, "error": str(exc),
+        }
+        write_event(progress, event)
+        print("[ci-watchdog] " + json.dumps(event, sort_keys=True), flush=True)
+
+
+def wait_for_owned_leader(proc: subprocess.Popen[bytes], progress: Any,
+                          timeout_reason: str | None, start: float) -> int:
+    """Keep ownership until Popen confirms the command leader was reaped."""
+    pending_reported = False
+    kill_error_reported = False
+    while True:
+        try:
+            return proc.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            return_code = proc.poll()
+            if return_code is not None:
+                return return_code
+            if not pending_reported:
+                event = {
+                    "event": "command_leader_reap_pending", "timestamp": utc_now(),
+                    "pid": proc.pid, "timeout_reason": timeout_reason,
+                    "elapsed_seconds": round(time.monotonic() - start, 1),
+                }
+                write_event(progress, event)
+                print("[ci-watchdog] " + json.dumps(event, sort_keys=True), flush=True)
+                pending_reported = True
+            try:
+                # Popen still owns this unreaped PID; never broaden cleanup to other processes.
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                if not kill_error_reported:
+                    event = {
+                        "event": "command_leader_kill_error", "timestamp": utc_now(),
+                        "pid": proc.pid, "timeout_reason": timeout_reason,
+                        "elapsed_seconds": round(time.monotonic() - start, 1),
+                        "errno": exc.errno, "error": str(exc),
+                    }
+                    write_event(progress, event)
+                    print("[ci-watchdog] " + json.dumps(event, sort_keys=True), flush=True)
+                    kill_error_reported = True
+
+
 def proc_snapshot() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     proc = Path("/proc")
@@ -225,6 +281,7 @@ def main() -> int:
         termination_at: float | None = None
         kill_sent = False
         post_exit_since: float | None = None
+        forced_abandon = False
 
         def trigger_timeout(reason: str, details: dict[str, Any], now: float) -> None:
             nonlocal timeout_reason, termination_at
@@ -238,10 +295,7 @@ def main() -> int:
             }
             write_event(progress, event)
             print("[ci-watchdog] " + json.dumps(event, sort_keys=True), flush=True)
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            signal_process_group(proc, signal.SIGTERM, progress, timeout_reason, start)
 
         while True:
             now = time.monotonic()
@@ -334,10 +388,7 @@ def main() -> int:
                         write_event(progress, event)
                         print("[ci-watchdog] " + json.dumps(event, sort_keys=True), flush=True)
                     if not kill_sent:
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                        signal_process_group(proc, signal.SIGKILL, progress, timeout_reason, start)
                         kill_sent = True
                         write_event(progress, {"event": "process_group_sigkill", "timestamp": utc_now(),
                                                "reason": timeout_reason, "elapsed_seconds": round(now - start, 1)})
@@ -348,21 +399,49 @@ def main() -> int:
                 post_exit_since = None
             if (termination_at is not None and not kill_sent
                     and now - termination_at >= max(args.termination_grace, 0.0)):
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                signal_process_group(proc, signal.SIGKILL, progress, timeout_reason, start)
                 kill_sent = True
                 write_event(progress, {"event": "process_group_sigkill", "timestamp": utc_now(),
                                        "reason": timeout_reason, "elapsed_seconds": round(now - start, 1)})
+            if (termination_at is not None and command_return_code is None and kill_sent
+                    and now - termination_at >= max(args.termination_grace, 0.0)
+                    + max(args.post_exit_drain_timeout, 0.0)):
+                event = {
+                    "event": "command_process_exit_timeout", "timestamp": utc_now(),
+                    "timeout_reason": timeout_reason, "pid": proc.pid,
+                    "elapsed_seconds": round(now - start, 1),
+                    "threshold_seconds": max(args.termination_grace, 0.0)
+                    + max(args.post_exit_drain_timeout, 0.0),
+                }
+                write_event(progress, event)
+                print("[ci-watchdog] " + json.dumps(event, sort_keys=True), flush=True)
+                signal_process_group(proc, signal.SIGKILL, progress, timeout_reason, start)
+                try:
+                    # Popen pins the original leader; process-group cleanup can miss it if it escaped.
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                except OSError as exc:
+                    event = {
+                        "event": "command_leader_kill_error", "timestamp": utc_now(),
+                        "pid": proc.pid, "timeout_reason": timeout_reason,
+                        "elapsed_seconds": round(time.monotonic() - start, 1),
+                        "errno": exc.errno, "error": str(exc),
+                    }
+                    write_event(progress, event)
+                    print("[ci-watchdog] " + json.dumps(event, sort_keys=True), flush=True)
+                try:
+                    selector.unregister(proc.stdout)
+                except (KeyError, ValueError):
+                    pass
+                proc.stdout.close()
+                stream_eof = True
+                forced_abandon = True
             return_code = proc.poll()
-            if return_code is not None and stream_eof:
+            if (return_code is not None and stream_eof) or forced_abandon:
                 break
         if timeout_reason is not None and not kill_sent:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            signal_process_group(proc, signal.SIGKILL, progress, timeout_reason, start)
             kill_sent = True
             write_event(progress, {"event": "process_group_sigkill", "timestamp": utc_now(),
                                    "reason": timeout_reason, "elapsed_seconds": round(time.monotonic() - start, 1)})
@@ -370,7 +449,8 @@ def main() -> int:
             text = output_buffer.decode(errors="replace")
             for message in emit_test_events(text, counters, progress):
                 print(message, flush=True)
-        command_return_code = proc.wait()
+        command_return_code = (wait_for_owned_leader(proc, progress, timeout_reason, start)
+                               if forced_abandon else proc.wait())
         return_code = 124 if timeout_reason is not None else command_return_code
         final_sample = system_snapshot()
         final_sample.update({
