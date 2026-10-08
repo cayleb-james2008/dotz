@@ -431,14 +431,8 @@ cargo clippy -p dotz-core --all-targets -- -D warnings
 cargo test -p dotz-core
 ```
 
-> The current workflow marks the Ubuntu core-test step `continue-on-error`; a passing workflow
-> alone can therefore hide an unsuccessful Linux test step. Inspect the job and individual step
-> results before treating Linux tests as passed. Windows and macOS test failures remain blocking.
->
-> **LLVM OOM note:** On memory-constrained hosts, bound parallelism to prevent OOM:
-> `cargo test -p dotz-core -- --test-threads=2`. If a build dies with `STATUS_STACK_BUFFER_OVERRUN`
-> or exit 1455, re-run once before treating the gate as red — only a reproducible second failure
-> is code-red.
+> All three OS test steps are blocking. The suite streams test output for diagnosis; a runner
+> communication failure remains a failed gate until a fresh exact-head run completes.
 
 Pushing a `v*` tag triggers [`release.yml`](.github/workflows/release.yml), which builds the NSIS
 installer and cuts a draft GitHub Release with the signed `latest.json` updater feed.

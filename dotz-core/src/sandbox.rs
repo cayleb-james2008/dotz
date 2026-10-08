@@ -284,26 +284,31 @@ impl SandboxBackend for LinuxSandbox {
     }
 }
 
-/// Posix tree-kill: signal the child's process group (pgid == child pid when spawned with
-/// `process_group(0)`), falling back to a direct signal if the group doesn't exist (e.g. a
-/// caller that spawned the child without its own process group, as some unit tests do). Uses
-/// `.status()` so the kill subprocess is reaped. Verbatim from the former inline
-/// `#[cfg(not(windows))]` block in `kill_pid`.
+/// Signal the owned child's process group (pgid == child pid after `process_group(0)`),
+/// falling back to the child itself when it has no group. Use kill(2) directly: kill(1)
+/// implementations parse negative operands differently without `--`, which can target an
+/// unrelated group or all permitted processes. Refuse reserved and out-of-range process IDs.
 #[cfg(unix)]
 fn posix_kill_tree(pid: u32) {
-    let group = std::process::Command::new("kill")
-        .args(["-9", &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let group_ok = matches!(group, Ok(s) if s.success());
-    if !group_ok {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    use std::ffi::c_int;
+    unsafe extern "C" {
+        fn kill(pid: c_int, sig: c_int) -> c_int;
     }
+    let Some(pid) = owned_posix_pid(pid) else {
+        return;
+    };
+    const SIGKILL: c_int = 9;
+    // SAFETY: kill touches no memory. `pid` comes from the owned child spawn record;
+    // negating a validated positive ID targets that child's process group only.
+    if unsafe { kill(-pid, SIGKILL) } != 0 {
+        // SAFETY: the fallback targets the same owned child by its positive process ID.
+        let _ = unsafe { kill(pid, SIGKILL) };
+    }
+}
+
+#[cfg(unix)]
+fn owned_posix_pid(pid: u32) -> Option<std::ffi::c_int> {
+    std::ffi::c_int::try_from(pid).ok().filter(|pid| *pid > 1)
 }
 
 /// Select the platform's sandbox backend. The cfg ladder is exhaustive; an unsupported target
@@ -2451,8 +2456,8 @@ mod tests {
     }
 
     /// `MacSandbox`/`LinuxSandbox::prepare_command` must set `process_group(0)` so the posix
-    /// tree-kill (`kill -9 -<pgid>`) can signal the whole group. We can't easily inspect the
-    /// process-group flag on a `tokio::process::Command`, so we assert the observable
+    /// tree-kill (`kill(2)` with a negative pgid) can signal the whole group. We cannot inspect
+    /// the process-group flag on a `tokio::process::Command`, so we assert the observable
     /// consequence: a child spawned through the backend ends up in its OWN process group
     /// (pgid == child pid), distinct from this test's process group. posix-only.
     #[cfg(unix)]
@@ -2543,6 +2548,56 @@ mod tests {
                 Err(e) => panic!("try_wait failed: {e}"),
             }
         }
+    }
+
+    /// Reserved IDs must never reach kill(2): 0 addresses our group and -1 broadcasts.
+    /// This also exercises conversion rejection before negating an out-of-range u32.
+    #[cfg(unix)]
+    #[test]
+    fn posix_tree_kill_rejects_reserved_and_out_of_range_ids() {
+        for pid in [0, 1, u32::MAX] {
+            assert_eq!(owned_posix_pid(pid), None);
+        }
+        assert_eq!(owned_posix_pid(2), Some(2));
+        assert_eq!(owned_posix_pid(i32::MAX as u32), Some(i32::MAX));
+    }
+
+    /// Group cleanup must preserve an unrelated sibling. This exercises the negative-ID
+    /// syscall path even on hosts whose kill(1) command has different argument parsing.
+    #[cfg(unix)]
+    #[test]
+    fn posix_tree_kill_preserves_unrelated_process_group() {
+        use std::os::unix::process::CommandExt;
+        let spawn = || {
+            std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut owned = spawn();
+        let mut unrelated = spawn();
+        posix_kill_tree(owned.id());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let killed = loop {
+            if owned.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let sibling_survived = unrelated.try_wait().unwrap().is_none();
+        // Reap both children before assertions, including a failed cleanup path.
+        let _ = owned.kill();
+        let _ = owned.wait();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+        assert!(killed, "owned process group must be killed");
+        assert!(sibling_survived, "unrelated process group must survive");
     }
 
     /// `backend()` must return the SAME `&'static dyn SandboxBackend` across calls — a
