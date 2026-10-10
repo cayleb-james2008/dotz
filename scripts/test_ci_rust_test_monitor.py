@@ -68,6 +68,38 @@ class CiRustTestMonitorTests(unittest.TestCase):
         self.assertTrue(any(e["event"] == "test_idle_timeout" for e in events))
         self.assertTrue(any(e["event"] == "command_exit" and e.get("return_code") == 124 for e in events))
 
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux waitid/procfs")
+    def test_post_exit_group_signal_retains_unreaped_owner(self) -> None:
+        with tempfile.TemporaryDirectory(dir=os.environ.get("CI_MONITOR_TEMP_ROOT")) as temp:
+            root = Path(temp)
+            wrapper = root / "guarded_monitor.py"
+            wrapper.write_text(
+                "import os,pathlib,runpy,sys\n"
+                "real = os.killpg\n"
+                "def guarded(pid, sig):\n"
+                " if not pathlib.Path(f'/proc/{pid}/stat').exists():\n"
+                "  raise RuntimeError('leader reaped before group signal')\n"
+                " return real(pid, sig)\n"
+                "os.killpg = guarded\n"
+                f"sys.argv[0] = {str(MONITOR)!r}\n"
+                f"runpy.run_path({str(MONITOR)!r}, run_name='__main__')\n"
+            )
+            child = (
+                "import subprocess,sys; "
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(2)']); "
+                "print('fixture finished', flush=True)"
+            )
+            result = subprocess.run([
+                sys.executable, str(wrapper),
+                "--log", str(root / "child.log"),
+                "--telemetry", str(root / "telemetry.jsonl"),
+                "--progress", str(root / "progress.jsonl"),
+                "--interval", "0.05", "--post-exit-drain-timeout", "0.2",
+                "--termination-grace", "0.1", "--", sys.executable, "-u", "-c", child,
+            ], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+            self.assertNotIn("leader reaped before group signal", result.stderr)
+
     def test_finished_cargo_with_inherited_child_pipe_is_bounded_and_failed(self) -> None:
         child = (
             "import subprocess,sys; "

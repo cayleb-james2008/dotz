@@ -32,8 +32,23 @@ def write_event(stream: Any, event: dict[str, Any]) -> None:
     stream.flush()
 
 
+def peek_return_code(proc: subprocess.Popen[bytes]) -> int | None:
+    """Observe exit without reaping: the zombie reserves its PID/PGID until cleanup ends."""
+    if proc.returncode is not None:
+        return proc.returncode
+    info = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    if info is None:
+        return None
+    return info.si_status if info.si_code == os.CLD_EXITED else -info.si_status
+
+
 def signal_process_group(proc: subprocess.Popen[bytes], sig: int, progress: Any,
                         timeout_reason: str | None, start: float) -> None:
+    # Never signal a numeric group after Popen has reaped the leader: its ID can be reused.
+    if proc.returncode is not None:
+        write_event(progress, {"event": "reaped_owner_signal_refused", "pid": proc.pid,
+                               "signal": sig, "timestamp": utc_now()})
+        return
     try:
         os.killpg(proc.pid, sig)
     except ProcessLookupError:
@@ -321,7 +336,7 @@ def main() -> int:
                 sample = system_snapshot()
                 sample.update({
                     "event": "resource_sample", "elapsed_seconds": round(now - start, 1),
-                    "cargo_pid": proc.pid, "cargo_return_code": proc.poll(),
+                    "cargo_pid": proc.pid, "cargo_return_code": peek_return_code(proc),
                     "tests_completed": counters["completed"],
                     "tests_total_known": counters["suite_total_known"],
                 })
@@ -363,7 +378,7 @@ def main() -> int:
                         "tests_completed": counters["completed"],
                         "tests_total_known": counters["suite_total_known"],
                     }, now)
-            command_return_code = proc.poll()
+            command_return_code = peek_return_code(proc)
             if (command_return_code is not None and not stream_eof
                     and args.post_exit_drain_timeout > 0):
                 if post_exit_since is None:
