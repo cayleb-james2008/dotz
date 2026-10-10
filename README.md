@@ -11,29 +11,30 @@
 [![Built with](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri-cba6f7)](https://tauri.app)
 [![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](dotz-core/Cargo.toml)
 
-> No live-fact badges here on purpose: the release-feed URLs returned HTTP 404
-> from an unauthenticated check on 2026-09-18 (see [What works today](#what-works-today)),
-> so CI-status / download-count / release-version badges would render as error badges.
-> Releases are cut by [`.github/workflows/release.yml`](.github/workflows/release.yml),
-> which builds the signed NSIS installer + the minisign-signed `latest.json` updater feed
-> on every `v*` tag.
+> Release availability is not runtime acceptance. On 2026-10-10, unauthenticated GET checks
+> returned HTTP 200 for the latest release and updater manifest (version `0.2.8`,
+> `windows-x86_64` only). See [What works today](#what-works-today) for the evidence limits.
+> The tag-triggered [release workflow](.github/workflows/release.yml) is configured to build
+> Windows NSIS and updater artifacts and create a draft release; it is not an acceptance gate.
 
 </div>
 
-dotz is a **native-Rust, multi-agent coding dashboard**. A lead agent can delegate work to subagents,
-and the live workflow graph shows those dispatches and tool calls as they happen. The built-in
-profiles and slash-command prompts define different ways to work: some use sequential chains, some
-request an explicit review step, and some keep the work with one agent. The operator controls the
-provider, model, reasoning effort, tools, and skills in a single desktop app.
+I'm working on **dotz**, a Rust/Tauri coding dashboard that brings agent sessions, a workflow graph,
+persistent projects, and local memory into one interface. My current focus is making setup and
+process cleanup reproducible, with tests and clear notes about what has actually been checked.
 
-Under the hood: `dotz-core` is an [axum](https://github.com/tokio-rs/axum) server with dotz's own
-agent runtime (no third-party agent SDK, no IPC serialization — everything runs **in-process**), and a
-[Tauri](https://tauri.app) 2 (WebView2) shell wraps it into a signed, self-updating Windows app. It is
-**multi-provider** (Ollama Cloud, OpenRouter, Anthropic, OpenAI, Google, Groq, and more), keeps
-**persistent projects** + an on-device **memory store** (local ONNX embeddings) injected into the
-agent's prompt, ships a **managed tool runner** with a live web preview the agent drives an
-on-screen cursor over, and a native **Open Design** workspace (150+ design systems, live preview,
-HTML/PDF export).
+The backend is an [axum](https://github.com/tokio-rs/axum) server with an in-process Rust agent runtime;
+the UI is plain HTML, CSS, and JavaScript, wrapped by a [Tauri](https://tauri.app) 2 desktop shell.
+The lead can delegate to subagents, and the graph displays dispatched work and tool calls. Profiles
+and slash-command prompts request different strategies: sequential chains, review, parallel
+dispatch, or direct work by one agent. None of those prompts guarantees a finished or approved repo.
+
+The source includes multi-provider adapters, persistent projects, SQLite memory with local ONNX
+embeddings, a managed tool runner, and a design workspace built around vendored
+[Open Design](https://github.com/nexu-io/open-design) resources. Local embeddings do **not** mean
+conversation text stays local: chat and best-effort memory extraction use configured endpoints.
+Windows packaging and updater wiring are present; verified release/runtime behavior is listed
+separately below.
 
 <div align="center">
 <img src="docs/screenshot.png" alt="dotz — the in-process multi-agent coding dashboard" width="820" />
@@ -52,7 +53,7 @@ HTML/PDF export).
 - [Design Mode](#design-mode-open-design-native)
 - [Setup](#setup)
 - [Build and Test](#build-and-test)
-- [Development and Gates](#development--gates)
+- [Development and Gates](#development-and-gates)
 - [Cross-device Auto-update](#cross-device-auto-update)
 - [What works today](#what-works-today)
 - [Contributing](#contributing)
@@ -72,24 +73,26 @@ HTML/PDF export).
   `/implement-and-review` presets use different sequences; see the [agent-team walkthrough](docs/agent-team-workflow.md).
 - **In-process runtime** — no IPC serialization, no subprocess per agent, no third-party agent SDK.
   The entire agent runtime (chat loop, tools, subagents, providers) lives inside `dotz-core`.
-- **Sessions over WebSocket** — the UI is a plain web app (`fetch` + WS streaming), identical in a
-  browser against the headless `serve` bin and inside the Tauri window.
+- **Sessions over WebSocket** — the shared UI uses `fetch` + WS streaming against headless `serve`
+  or the Tauri shell. Desktop bridges and platform-specific behavior need their own checks.
 - **Managed tool sandbox** — `terminal` mode streams stdout/stderr back into chat; `web` mode
   renders an inline preview iframe the agent drives with an on-screen cursor you both can see.
   Profiles gate which tools are available (the PLAN profile uses a fixed tool allowlist),
   the in-app browser enforces an origin allowlist, and the loopback API rejects
   disallowed `Origin`/`Host` with `403`. The `bash` tool itself runs the given command
   in the session cwd with a wall-clock timeout — review commands in `terminal` mode.
-- **On-device memory** — automatic capture/recall/consolidation via `rusqlite` + local ONNX
-  embeddings (all-MiniLM-L6-v2, in-process — no embeddings API), mirrored to a committable `MEMORY.md`.
+- **Local memory storage and embeddings** — `rusqlite` + local ONNX all-MiniLM-L6-v2 embeddings,
+  mirrored to a committable `MEMORY.md`. Recall and capture are best-effort; fact extraction uses
+  a configured chat endpoint, and optional Cognee can receive queries and captured facts.
 - **Model-agnostic providers** — multi-provider auth with per-provider UI modes (free-form model-id
   input or fixed list) and a reasoning-effort slider constrained to what the model supports.
-- **Origin-guarded local API** — the loopback axum server rejects disallowed `Origin`/`Host`
-  requests with `403`, closing browser-CSRF and DNS-rebinding against the code-exec endpoints.
+- **Origin-guarded local API** — rejects disallowed `Origin`/`Host` with `403`. These checks do not
+  authenticate hostile local processes; the optional session-token guard is a separate boundary.
 - **Skills + native Open Design** — a unified skill pool plus a design workspace with 150+ bundled
   design systems, live preview, and HTML/PDF export.
-- **Signed self-updates** — `tauri-plugin-updater` verifies a minisign-signed `latest.json` from
-  GitHub Releases and updates in place.
+- **Updater wiring** — `tauri-plugin-updater` uses the GitHub Releases manifest and bundled public
+  key to verify downloaded update artifacts. This is separate from Authenticode signing and from
+  an exercised install/relaunch journey.
 
 ## How It Works
 
@@ -118,11 +121,11 @@ The graph is the single live visual of what the agents are doing; **click a node
 exact panel** that tool drives. Nothing pops open on its own — you watch it happen and drill in on
 demand.
 
-### NEW MODEL, NEW PROJECT — One Prompt Ships a Repo
+### NEW MODEL, NEW PROJECT — A Prompt for the Full Project Arc
 
-The **NEW MODEL, NEW PROJECT** profile turns one line into a genuinely-useful app shipped to a fresh
-public GitHub repo, driven by a **required capability spine** — each phase is its own agent, so each is
-a node on the graph:
+This profile requests design, specification, implementation, checks, documentation, and
+publication in one workflow. The diagram describes the requested phases, not an enforced execution
+plan or proof that one prompt ships a working app:
 
 ```mermaid
 flowchart LR
@@ -136,11 +139,10 @@ flowchart LR
     SH --> SC([score])
 ```
 
-The **design** phase picks a bundled Open Design system and produces an app icon; **sandbox** and a
-**visual E2E / bug-bounty** phase (the agent launches the built app in its own web-sandbox and clicks
-through the real frontend) are the authoritative ship gate; the repo is beautified (README, badges,
-screenshot, topics) before it ships. A phase runs unless it's genuinely impossible, in which case it's
-logged as `skipped <phase>: <reason>` — never faked.
+The prompt asks for a bundled design system and app icon, sandbox checks, visual E2E/bug review,
+and readable repository docs. Actual delegation depends on the model, tools, and request. Inspect
+the resulting diffs, checks, and runtime receipts before publishing; a graph node or model verdict
+is not a ship gate. Keep failed and skipped phases visible with their reasons.
 
 ## Architecture
 
@@ -172,8 +174,8 @@ flowchart TD
 | Component | Path | Role |
 |-----------|------|------|
 | **dotz-core** | `dotz-core/` | The pure library + headless `serve`/`selfeval` bins. Owns the whole agent runtime: provider adapters, sessions, the workflow DAG, sandbox, isolated browser, on-device memory, skills, projects, specs. Exposes it over a lean axum + tower-http REST + WebSocket surface. |
-| **dotz-tauri** | `src-tauri/` | A thin Tauri 2 shell (`src/main.rs` + `build.rs`) that boots dotz-core on `127.0.0.1:4317`, loads the bundled vanilla-HTML UI into a WebView2 window, and wires `tauri-plugin-updater` for signed cross-device updates. |
-| **web/** | `web/` | The bento-style dashboard UI — vanilla HTML/CSS/JS, no build step, no framework. Runs identically in a browser (against headless `serve`) and inside the Tauri WebView2 window. |
+| **dotz-tauri** | `src-tauri/` | A thin Tauri 2 shell (`src/main.rs` + `build.rs`) that boots dotz-core on `127.0.0.1:4317`, opens the UI in the platform webview (WebView2 on Windows), and wires updater check/install commands. |
+| **web/** | `web/` | The dashboard UI — vanilla HTML/CSS/JS, no frontend build step or framework. Shared by headless `serve` and the desktop shell; native-only bridges still need separate checks. |
 | **.pi/** | `.pi/` | Bundled agent resources: agent profiles, workflow prompts, design systems, design skills. |
 
 ### Agent Roles
@@ -215,12 +217,15 @@ The tool sandbox is a managed run store (run lifecycle `pending → running → 
 agent may call (see `PLAN_TOOLS` in `dotz-core/src/agent/tools.rs`), the in-app browser enforces
 an origin allowlist (`dotz-core/src/browser.rs`), and the loopback API rejects disallowed
 `Origin`/`Host` with `403` (`dotz-core/src/server/guard.rs`). The `bash` tool itself runs the
-given command in the session cwd with a wall-clock timeout — no command allowlist. On Linux, each
-sandbox workload runs under a per-run PID namespace; runs fail closed when that namespace cannot be
-created. This contains process-tree cleanup, not filesystem or network access. Windows keeps
-`taskkill /T`, and macOS uses process-group signaling; neither has the Linux PID-namespace
-cleanup guarantee. The browser has its own controller and persistent Chrome daemon. Escaped-process
-cleanup there is not covered by this sandbox containment path. The sandbox runs in two modes:
+given command in the session cwd with a wall-clock timeout — no command allowlist.
+
+**Unmerged candidate work:** the Linux sandbox path uses a per-run PID namespace and fails closed
+when it cannot create one. This is process lifecycle containment, not filesystem or network
+isolation, and is not a current-main or release acceptance claim. Windows keeps `taskkill /T`;
+macOS uses process-group signaling. Neither establishes the Linux namespace guarantee. The browser
+has a persistent Chrome daemon whose lifetime spans one-shot commands. Persistent browser ownership
+and pre-spawn cancellation repairs are under implementation/review; this documentation does not
+claim those gaps are fixed. The sandbox runs in two modes:
 
 - **`terminal`** mode — streams stdout/stderr back into the chat panel.
 - **`web`** mode — starts a long-lived process bound to a local HTTP port; the UI renders an inline
@@ -253,7 +258,7 @@ runtime policy that blocks every sensitive action; the lead must request it befo
 
 | Layer | Technology | Notes |
 |-------|-----------|-------|
-| **Language** | Rust (edition 2024) | Native, no GC, no Node.js runtime |
+| **Language** | Rust (edition 2024) | Agent runtime in Rust; Node.js is needed for dependency/model setup |
 | **Backend** | axum + tower-http + tokio | REST + WebSocket on `127.0.0.1:4317` |
 | **Desktop shell** | Tauri 2 (WebView2) | Thin shell — boots core, opens window, wires updater |
 | **Frontend** | Vanilla HTML/CSS/JS | No build step, no framework, no bundle |
@@ -261,41 +266,19 @@ runtime policy that blocks every sensitive action; the lead must request it befo
 | **Vector store** | `rusqlite` (bundled SQLite) | Derived cache; `MEMORY.md` is the source of truth |
 | **HTTP client** | `reqwest` | Provider API calls, SSE streaming |
 | **Serialization** | `serde` + `serde_json` + `serde_yaml_ng` | Config, provider payloads, skill frontmatter |
-| **Packaging** | `cargo tauri build` → NSIS installer | Signed, self-updating via `tauri-plugin-updater` |
+| **Packaging** | `cargo tauri build` → platform bundles | Windows NSIS + updater artifacts configured; signing and native acceptance need receipts |
 
-### Rust AI Desktop Tech Stack — Recommended Evolution
+### Implemented Dependencies and Possible Next Steps
 
-dotz is built on a forward-looking Rust AI desktop stack. The following dependencies are recommended
-or already in use, with a migration path for the pieces still evolving:
+`ort` is exact-pinned to `=2.0.0-rc.12`, guarded by `ort_pin_guard.rs`. The current embedder creates
+an ONNX session without selecting a GPU execution provider; I do not claim DirectML acceleration.
+`tracing` and `tracing-subscriber` are already declared dependencies, not future additions; that
+does not mean every log site is instrumented. `winres` is already a desktop build dependency,
+invoked on Windows in `src-tauri/build.rs` (resource compilation failure is a warning).
 
-| Dependency | Status | Role |
-|-----------|--------|------|
-| **`ort`** | ✅ In use (pinned `=2.0.0-rc.12`) | ONNX Runtime bindings for in-process ML inference. DirectML execution provider for GPU acceleration on Windows. Pinned pre-release because no stable 2.x exists yet — guarded by `ort_pin_guard.rs`. |
-| **`lancedb`** | 🔜 Recommended | Embedded vector database for production-scale semantic search. Replaces the `rusqlite` vector index as the memory store grows. LanceDB is Rust-native, runs in-process, and integrates with the ONNX embedding pipeline. |
-| **`rusqlite`** | ✅ In use | Bundled SQLite for the current vector index + metadata. Stays as the metadata store; LanceDB would supplement it for vector search at scale. |
-| **`tokio`** | ✅ In use | The async runtime — axum, reqwest, sandbox process management, WebSocket streaming all run on tokio. |
-| **`tracing`** + **`tracing-subscriber`** | 🔜 Recommended | Structured logging and distributed tracing. Replaces ad-hoc `eprintln!` / `println!` with span-aware, level-filtered, subscriber-pluggable instrumentation. Critical for observability as the agent runtime grows. |
-| **`winres`** | 🔜 Recommended (build dep) | Windows resource compiler — embeds the app icon, version info, and manifest into the `.exe` at build time. Improves the installer's professional appearance and Windows integration. |
-
-#### Slint UI Migration Plan
-
-The current frontend is vanilla HTML/CSS/JS rendered in WebView2 — zero build step, zero framework,
-runs identically in a browser and in the app. This is the right choice for the current scope.
-
-As the UI grows more complex (live graph rendering, real-time panel composition, custom widgets),
-a **Slint** migration is the recommended path:
-
-1. **Phase 1 (now)** — vanilla HTML/CSS/JS in WebView2. No build step. The UI is a plain web app.
-2. **Phase 2 (future)** — introduce Slint for performance-critical panels (the workflow graph SVG,
-   the agent-cursor overlay) while keeping the chat composer and static panels in HTML. Slint compiles
-   to native code, runs in the same process, and shares the tokio runtime — no IPC.
-3. **Phase 3 (future)** — full Slint UI if the HTML layer becomes a bottleneck. The axum REST + WS
-   surface stays the same; only the rendering layer changes.
-
-Slint is the recommended native UI for Rust desktop apps: it compiles to native code, has a
-declarative `.slint` markup language, and integrates cleanly with Tauri 2's custom protocol or a
-standalone window. The in-process architecture means no serialization boundary between the UI and
-the agent runtime.
+LanceDB and Slint remain possible future changes, not implemented features or committed migrations.
+The current memory index is SQLite and the current UI is HTML/CSS/JS. I'd only replace those pieces
+after measuring a problem they cannot reasonably solve.
 
 ## Controls (the five knobs)
 
@@ -308,8 +291,8 @@ the agent runtime.
     - **FRONTEND** — workflow mode tuned for UI/design work (WCAG, real focus states, no AI-slop).
     - **BACKEND** — workflow mode tuned for APIs/data/infra (TDD, boring tech, honest errors).
     - **DESIGN** — graphic/visual design backed by native Open Design (gallery, preview, export).
-    - **NEW MODEL, NEW PROJECT** — autonomous "own the full arc": one idea → a shipped public GitHub
-      repo, orchestrated as the required capability spine above, each phase a node on the live graph.
+    - **NEW MODEL, NEW PROJECT** — requests the full project arc described above; execution,
+      publication, and acceptance still depend on tools, results, and operator inspection.
 - **Model** — dotz is **multi-provider**, not just OpenRouter. Each provider declares its own UI
   mode via `ProviderMeta.freeForm`: OpenRouter is a **free-form model-id input** (not a giant
   dropdown), defaulting to `nex-agi/nex-n2-pro:free`; other providers may expose a fixed model list.
@@ -328,12 +311,18 @@ the agent runtime.
 - **Projects** — persistent named workspaces. Each `Project` binds a name, a `cwd`, and default
   `profile` / `model` / `thinking` settings; sessions created with a `projectId` inherit those
   defaults. Projects survive server restarts.
-- **Memory** — an **autonomous, on-device memory store** (`rusqlite` + local ONNX embeddings,
-  all-MiniLM-L6-v2, injected in-process — no embeddings API). Durable facts (`project` or `global`
-  scope) are **captured automatically** from each task, **recalled automatically** before the next one
-  (semantic search of the folder + global memory, injected into the turn), and **consolidated
-  automatically** — you never manage it. A git-committable `MEMORY.md` mirror is the source of truth;
-  the vector index is a derived cache. Memory persists across restarts alongside projects.
+- **Memory** — storage and sentence embeddings run locally with `rusqlite` and ONNX Runtime
+  (all-MiniLM-L6-v2, no embeddings API). The database is
+  `<DOTZ_CONFIG_DIR>/ai-agents/memory.db`, defaulting to `~/.dotz/ai-agents/memory.db`.
+  `MEMORY.md` mirrors live at `~/.dotz/ai-agents/MEMORY.md` and `<cwd>/.ai-agents/MEMORY.md`
+  (the global path follows `DOTZ_CONFIG_DIR`); the vector index is a derived cache.
+  The Rust session loop attempts query-relevant recall before a turn and fact capture after an
+  exchange. Capture sends the exchange to a configured OpenAI-compatible chat endpoint, defaulting
+  to Ollama Cloud; missing credentials or extraction errors can yield no facts. Near-duplicate
+  pruning runs locally. If `DOTZ_COGNEE_URL` is configured, recall queries and captured facts can
+  also go to that service. Inspect/edit stored memories through the panel or API: automatic attempts
+  do not guarantee useful capture, and local embeddings do not make the app offline or private
+  from its configured services. See [the API contract](docs/api-contract.md#memory-local-storage-and-embeddings-best-effort-capture).
 - **Sandbox** — run code in two modes. **`terminal`** mode streams stdout/stderr back into the
   chat. **`web`** mode starts a long-lived process bound to a local HTTP port and the UI renders an
   inline web preview iframe at that port; the agent drives an **agent cursor** over the live
@@ -341,15 +330,16 @@ the agent runtime.
 
 ## Design Mode (Open Design, native)
 
-dotz ships a native port of [Open Design](https://github.com/nexu-io/open-design) — its content,
-in dotz's own shell. Open the **DESIGN panel** from the `+ PANELS` palette: a design workspace with
-a searchable gallery of **150+ bundled design systems** (Stripe, Linear, Apple, Notion, Vercel,
+The design workspace adapts vendored content from the
+[Open Design authors](https://github.com/nexu-io/open-design) to dotz's own shell; those resources
+are not my original design systems. Open the **DESIGN panel** from the `+ PANELS` palette for
+a searchable gallery of bundled design systems (Stripe, Linear, Apple, Notion, Vercel,
 Figma, …), a live same-origin preview iframe, and one-click **HTML / PDF export** of the rendered
 artifact.
 
 - **Design systems** live at `.pi/design-systems/<slug>/` (each a `DESIGN.md` + `tokens.css` +
   `components.html`), served read-only via `GET /api/design/systems`. Apache-2.0 — see the bundled
-  `LICENSE` + `NOTICE`.
+  [LICENSE](.pi/design-systems/LICENSE) + [NOTICE](.pi/design-systems/NOTICE).
 - **Design skills** (150+) are vendored into the unified skill pool tagged `source: design` at
   *lowest* priority (they never shadow your own same-named skills) and kept out of the always-on
   prompt index — load any by name with the `skill` tool.
@@ -360,16 +350,33 @@ artifact.
 The preview iframe is sandboxed (`allow-same-origin allow-modals allow-popups`, **no** `allow-scripts`)
 since the bundled systems are static HTML/CSS — a hardened default that still supports print-to-PDF.
 
+The 2026-10-10 exact-main tree audit at `430d6a2d9abfcbfe3463d4453573ac66a62b892d` counted
+150 `DESIGN.md` and 156 design-skill `SKILL.md` resources. These are resource counts, not tested
+integrations. Keep the [skill notice](.pi/design-skills/NOTICE), adjacent license, and individual
+upstream licenses/credits when redistributing them.
+
 ## Setup
 
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) (stable, edition 2024)
-- [Node.js](https://nodejs.org/) (for the agent-browser binary + ONNX model fetch)
+- [Node.js](https://nodejs.org/) and npm (for the agent-browser binary + ONNX model fetch)
 - [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) (WebView2 on Windows)
+- Linux candidate sandbox runs require `unshare` with working user/PID namespaces; unavailable
+  containment is an error, not a reason to run the workload uncontained
 - Python 3 and Chromium/Chrome (for `npm run test:ui`)
 
 ### Install dependencies
+
+Run setup/build commands from the repository root. For a new development checkout:
+
+```bash
+git clone --branch main https://github.com/cayleb-james2008/dotz.git
+cd dotz
+```
+
+Identify an unmerged candidate by its exact revision separately; these instructions are not a
+fresh-download acceptance receipt for that candidate.
 
 ```bash
 npm run install:deps     # installs dependencies and runs only approved lifecycle hooks
@@ -390,16 +397,19 @@ required for the `onnxruntime-node` runtime download.
 
 ### Provider configuration
 
-dotz resolves provider auth from environment variables first, then `~/.pi/agent/auth.json`.
+dotz resolves provider auth from non-empty environment variables first, then `~/.pi/agent/auth.json`.
 Set keys for the providers you use — **Ollama Cloud** is the primary (executive `glm-5.2`, subagent `minimax-m3`) and **OpenRouter**
 is the free fallback (`nex-agi/nex-n2-pro:free`):
 
 ```bash
-OLLAMA_API_KEY=...        # primary — Ollama Cloud
-OPENROUTER_API_KEY=...    # fallback — OpenRouter :free models
+export OLLAMA_API_KEY="..."        # primary — Ollama Cloud
+export OPENROUTER_API_KEY="..."    # fallback — OpenRouter :free models
 ```
 
-See [.env.example](.env.example). Never commit real keys.
+Use only the providers you need. [.env.example](.env.example) is a reference, not proof of a `.env`
+loader: export variables in the launching shell or save keys in-app. See
+[provider setup](docs/provider-setup.md) for PowerShell, precedence, and request-header differences.
+Never commit real keys.
 
 ## Build and Test
 
@@ -409,7 +419,7 @@ See [.env.example](.env.example). Never commit real keys.
 # Headless backend (browser dev loop) — open http://127.0.0.1:4317
 cargo run -p dotz-core --bin serve
 
-# Native desktop window (Tauri / WebView2)
+# Native desktop window (Tauri; WebView2 on Windows)
 cargo tauri dev
 ```
 
@@ -419,7 +429,7 @@ cargo tauri dev
 cargo tauri build   # Windows NSIS output: target/release/bundle/nsis/
 ```
 
-The signed build needs the updater signing key in the environment — see
+Updater-signed artifacts need the signing key in the environment; this is not Authenticode — see
 [src-tauri/DEPLOY.md](src-tauri/DEPLOY.md) for the full build + release flow.
 
 ### Tests
@@ -443,78 +453,68 @@ core tests; Windows also runs the cold-start benchmark. Run the Rust checks loca
 ```bash
 cargo fmt --all -- --check
 cargo clippy -p dotz-core --all-targets -- -D warnings
-cargo test -p dotz-core
+cargo test -p dotz-core --locked -- --test-threads=2
 ```
 
 > All three OS test steps are blocking. The suite streams test output for diagnosis; a runner
 > communication failure remains a failed gate until a fresh exact-head run completes.
 
-Pushing a `v*` tag triggers [`release.yml`](.github/workflows/release.yml), which builds the NSIS
-installer and cuts a draft GitHub Release with the signed `latest.json` updater feed.
+Pushing a `v*` tag triggers [`release.yml`](.github/workflows/release.yml), configured to build
+Windows NSIS/updater artifacts and create a draft GitHub Release. Successful build, publication,
+signature verification, and runtime acceptance are separate checks.
 
 ## Cross-device Auto-update
 
-The installed app self-updates via `tauri-plugin-updater` (wired in `src-tauri/src/main.rs`,
-endpoint + pubkey in `src-tauri/tauri.conf.json`): it checks this repo's releases for a
-minisign-signed `latest.json`, verifies it against the bundled pubkey, and installs + relaunches
-in place. Note: the release-feed URL returned HTTP 404 from an unauthenticated check on
-2026-09-18, so no updater feed could be verified yet — the mechanism is implemented and the feed
-goes live with the first `v*` release. Full topology and the release commands are in
-[src-tauri/DEPLOY.md](src-tauri/DEPLOY.md).
+The shell wires check and apply commands through `tauri-plugin-updater` in `src-tauri/src/main.rs`;
+`src-tauri/tauri.conf.json` supplies the manifest endpoint and public key. The JSON manifest carries
+platform artifact URLs and signatures; the updater verifies downloaded artifacts before installation.
+The apply path calls `download_and_install` and then requests a restart. That source wiring is not
+evidence that the native UI bridge, update installation, or relaunch has succeeded.
+
+On 2026-10-10 at 18:07 UTC, both public release URLs returned HTTP 200; the manifest reported
+`0.2.8` and `windows-x86_64`. The earlier 2026-09-18 HTTP 404 observation is historical, not the
+current feed state. Neither HTTP availability nor a signature field proves signature validity,
+Authenticode, or that a release was built from this unmerged candidate. See
+[src-tauri/DEPLOY.md](src-tauri/DEPLOY.md) for build and release boundaries.
 
 ## What works today
 
-Status as verified on this Linux host on 2026-10-04. Anything not listed here is not re-tested in this pass.
+I'm keeping source inspection, historical local receipts, hosted checks, and release acceptance
+separate. This documentation pass reads the isolated integration snapshot
+`c6b465616ec3e9b9ad679542330c5a8be249ba31` on 2026-10-10; it does not rerun or accept the runtime.
+That snapshot locally reconciles main and draft candidates. Local integration is not a remote merge.
 
-**Verified in code (file proves the claim):**
+**Source inspection:** the Rust agent runtime, local embedder, project/memory persistence paths,
+provider adapters, API guards, and updater commands are present in their respective modules.
+`package.json` exposes `install:deps`; the wrapper installs with scripts disabled and rebuilds only
+present, exact-version approved packages. Those facts explain the implementation, not its end-to-end
+success. The shared web UI does not prove that native-only controls work on every OS.
 
-- Own agent runtime, no third-party agent SDK — `dotz-core/src/agent/mod.rs` ("the Rust
-  replacement for the third-party pi SDK"); subagents are isolated in-process LLM runs
-  (`dotz-core/src/agent/subagent.rs`), not child processes.
-- Local ONNX embeddings via `ort` — `dotz-core/src/embed.rs` (all-MiniLM-L6-v2, 384-dim,
-  in-process); `ort` is deliberately exact-pinned (`=2.0.0-rc.12`), guarded by
-  `dotz-core/tests/ort_pin_guard.rs`.
-- Persistent projects + memory store — `dotz-core/src/projects.rs`, `dotz-core/src/memory.rs`
-  (`rusqlite` vector index + git-committable `MEMORY.md` mirror).
-- 150+ design systems and 150+ design skills — `.pi/design-systems/` (154 dirs, 150 with
-  `DESIGN.md`) and `.pi/design-skills/` (160 dirs, 156 with `SKILL.md`), served by
-  `dotz-core/src/design.rs` and `dotz-core/src/skills.rs` via `<cwd>/.pi` (override: `DOTZ_PI`).
-  Keep those paths — the app reads them at runtime.
-- Multi-provider auth — `dotz-core/src/agent/provider.rs` (`provider_endpoint`: ollama,
-  openrouter, openai, groq, mistral, xai, deepseek, cohere, nvidia-nim, local, plus native
-  anthropic/google adapters); keys resolve env var → `~/.pi/agent/auth.json`.
-- Origin-guarded loopback API — `dotz-core/src/server/guard.rs` rejects disallowed
-  `Origin`/`Host` with `403`.
-- Signed self-update wiring — `tauri-plugin-updater` in `src-tauri/Cargo.toml` +
-  endpoint/pubkey in `src-tauri/tauri.conf.json`; releases cut by
-  `.github/workflows/release.yml` on `v*` tags.
-- CI is valid YAML and its referenced paths exist: `scripts/fetch-embed-model.mjs`,
-  `docs/perf-baseline.json` (`cold_start_ms: 526`, measured 2026-07-20), the `cold_start`
-  bench (`dotz-core/benches/cold_start.rs`, `cargo bench --bench cold_start`).
+**Dated evidence and retained limits:**
 
-**Verified by running (exact commands + results):**
+| Evidence | Scope / identity | Result and limit |
+|----------|------------------|------------------|
+| Independent local Rust receipt, 2026-10-08 | Linux, `d22a0567e7976427071ce5783d8f7fcc224dc1d1`; `cargo test -p dotz-core --locked -- --test-threads=1` | 824 passed / 0 failed, cached model assets; formatting and Clippy also passed. Historical local result, not this snapshot or exact-head hosted acceptance. Credential-gated tests can return without inference. |
+| Installer-policy fixture described in the integration baseline | npm 11.19.0 fixture; not a fresh online setup receipt | Wrapper suppressed an unapproved hook and passed `SHARP_IGNORE_GLOBAL_LIBVIPS=1` to approved `sharp@0.34.5`. A fixture does not verify external runtime downloads or the complete quickstart. |
+| Historical native package receipts | Extracted local Linux DEB journeys; the later digest-linked package is candidate `1bdb5df1eeb7988bb44524ce6e2cecef374695d1` | Onboarding, project/memory persistence and 384-dimensional local embeddings were recorded. An earlier first-run attempt failed; semantic-search diagnostic returned HTTP 401 and remains unverified. Distinct package receipts must not be combined into one build identity. No system-wide installation, independent rebuild, or current public-release acceptance is inferred. |
+| Public release GET checks, 2026-10-10 18:07 UTC | [Latest release](https://github.com/cayleb-james2008/dotz/releases/latest), [updater manifest](https://github.com/cayleb-james2008/dotz/releases/latest/download/latest.json); unauthenticated | Both HTTP 200; latest redirected to `v0.2.8`, manifest version `0.2.8`, platform key `windows-x86_64`. No installer execution or new signature verification. |
+| Candidate audit, 2026-10-10 | [PR218](https://github.com/cayleb-james2008/dotz/pull/218) at `016a4a3c49ba58097ca0f1a809520b623fa72b7e`; [PR219](https://github.com/cayleb-james2008/dotz/pull/219) at `45366fa2701d06d467f9c5fab814a95d69d8d934` | Both open draft/unmerged at audit. PR218 pull-request run `37781781173` failed on Ubuntu; Windows/macOS and dependency-policy jobs passed. No PR219 exact-head success established. These are dated observations, not final integration gates. |
 
-- `cargo fmt --all -- --check` — passes.
-- `cargo clippy -p dotz-core --all-targets -- --deny warnings` — passes.
-- `cargo test -p dotz-core --locked -- --test-threads=1` — 824 passed / 0 failed
-  (run with the locally cached all-MiniLM-L6-v2 assets; no live-provider tests are enabled).
-- `npm run install:deps` — an isolated npm 11.19.0 fixture verifies that the wrapper suppresses an
-  unapproved lifecycle hook, runs only `sharp@0.34.5`, and passes `SHARP_IGNORE_GLOBAL_LIBVIPS=1`
-  to that hook. A clean external ONNX Runtime artifact download was not re-run in the networkless
-  review pass; it remains a required online install step.
-- `npm run fetch-model` — downloads the all-MiniLM-L6-v2 files into `assets/models/`; keep
-  this step before local embedder tests when the model is not already cached.
+**Not accepted by this documentation pass:**
 
-**Not run / needs something else:**
-
-- Desktop shell + installer (`cargo tauri dev` / `cargo tauri build`, NSIS target) — needs
-  Windows; not run on this Linux host.
-- GPU acceleration (DirectML execution provider for `ort`) — needs Windows; CPU path only here.
-- Live-provider tests (`e2e_live_prompt`, `DOTZ_E2E_LIVE=1`) — need provider API keys; not run.
-- The GitHub release feed (`.../releases/latest`, updater `latest.json`) — the URLs returned
-  HTTP 404 from an unauthenticated `curl` check on 2026-09-18, so no release artifact or badge
-  could be verified. The feed goes live with the first `v*` release.
-- `cargo bench --bench cold_start` — Windows-only CI measurement (no performance-regression gate); not run here.
+- Final integrated-head CI and independent review, deliberate merge/default-branch readback, and
+  fresh public-download setup/native primary journeys remain separate gates. Distinguish `push`
+  from `pull_request` evidence and record the exact SHA for each result.
+- Browser persistent-daemon teardown and pre-spawn cancellation repairs are active candidate work;
+  no new cleanup acceptance is claimed here. Windows/macOS teardown has not been exercised by this
+  lane and does not inherit the Linux namespace boundary.
+- Windows native installer launch, Authenticode, release-to-candidate build identity, and actual
+  update/install/relaunch need their own receipts. Tauri can build Linux/macOS bundles with their
+  prerequisites; an NSIS build specifically needs a Windows build environment.
+- Live provider inference is not established by an adapter, a readiness banner, or a gated test
+  name. DirectML is not configured/verified by the inspected embedder.
+- Benchmarks and telemetry examples are not current performance or adoption measurements. The
+  weekly-active target in [telemetry docs](docs/telemetry.md) is a goal, not a measured user count.
 
 ## Contributing
 
@@ -525,7 +525,7 @@ Contributions are welcome! dotz is MIT-licensed and open to the community.
    ```bash
    cargo fmt --all -- --check
    cargo clippy -p dotz-core --all-targets -- -D warnings
-   cargo test -p dotz-core
+   cargo test -p dotz-core --locked -- --test-threads=2
    ```
 3. **Write tests** for any new behavior — the test suite under `dotz-core/tests/` is the gate.
 4. **Open a PR** with a clear description of what changed and why. Reference any related issues.
@@ -538,13 +538,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
 
 - **Multi-provider auth**: dotz resolves provider keys from env vars → `~/.pi/agent/auth.json`.
   Provide a working provider key for whichever provider you select.
-- **Subagents** run in dotz's native runtime (each a separate LLM run); the bundled agents default
-  to the free model so `/implement` is runnable out of the box. Edit `.pi/agents/*.md` to change models.
+- **Subagents** run in dotz's native runtime as separate model runs. Bundled model defaults still
+  require a working endpoint, credentials, and model availability; a `:free` label is not an
+  out-of-the-box execution guarantee. Edit `.pi/agents/*.md` to change models.
 - **Fonts** load from Google Fonts (online). Bundle locally for fully-offline use.
 - **`ort` is pinned to a pre-release on purpose** (`=2.0.0-rc.12` in `dotz-core/Cargo.toml`):
-  no stable 2.x exists on crates.io yet and the pin transitively fixes the ONNX Runtime (1.24.2,
-  checksummed) that `download-binaries` bundles into the installer. Enforced by
-  `dotz-core/tests/ort_pin_guard.rs`. When a stable `ort 2.0.0` ships, bump deliberately.
+  the pin fixes the `ort-sys` download table for ONNX Runtime 1.24.2 with per-target checksums.
+  `dotz-core/tests/ort_pin_guard.rs` enforces the exact dependency pin. Re-evaluate upstream
+  versions deliberately; a dependency pin is not an independent reproducible-build attestation.
 
 ## License
 
