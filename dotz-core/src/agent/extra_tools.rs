@@ -345,15 +345,16 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
     };
     #[cfg(not(windows))]
     let mut child = {
-        use std::os::unix::process::CommandExt;
-        let mut sc = std::process::Command::new("sh");
-        sc.arg("-c")
-            .arg(&command)
-            .current_dir(&cwd)
+        let mut sc = match crate::sandbox::owned_shell_command(&command) {
+            Ok(command) => command,
+            Err(e) => {
+                return json!({"error": format!("gate containment unavailable: {e}"), "ok": false, "passed": 0, "failed": 0});
+            }
+        };
+        sc.current_dir(&cwd)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        match tokio::process::Command::from(sc).spawn() {
+            .stderr(Stdio::piped());
+        match sc.spawn() {
             Ok(c) => c,
             Err(e) => {
                 return json!({
@@ -366,6 +367,14 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
         }
     };
 
+    let process = match crate::sandbox::OwnedProcess::pin(child.id()) {
+        Ok(process) => process,
+        Err(reason) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return json!({"error": format!("gate process tracking failed: {reason}"), "ok": false, "passed": 0, "failed": 0});
+        }
+    };
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
     let mut stdout = child.stdout.take();
@@ -446,27 +455,15 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
             // the entire group — shell + every descendant.
             // Windows waits for taskkill; POSIX shares the guarded syscall helper with
             // sandbox and bash cleanup, avoiding the external kill parser entirely.
-            #[cfg(windows)]
-            {
-                if let Some(pid) = child.id() {
-                    let mut kc = std::process::Command::new("taskkill");
-                    kc.args(["/PID", &pid.to_string(), "/T", "/F"])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null());
-                    let _ = crate::util::no_window(&mut kc).status();
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                if let Some(pid) = child.id() {
-                    crate::sandbox::backend().kill_tree(pid);
-                }
-            }
+            let cleanup =
+                tokio::task::spawn_blocking(move || crate::sandbox::backend().kill_tree(&process))
+                    .await
+                    .unwrap_or(Err("cleanup worker failed"));
             // Reap the killed child so it does not become a zombie (Unix) or leak handles
             // (Windows) after the timeout path returns.
             let _ = child.wait().await;
             json!({
-                "error": format!("[timeout] killed after {}ms", timeout.as_millis()),
+                "error": format!("[timeout] after {}ms{}", timeout.as_millis(), cleanup.err().map(|e| format!("; cleanup incomplete: {e}")).unwrap_or_default()),
                 "ok": false,
                 "passed": 0,
                 "failed": 0,
@@ -2345,6 +2342,15 @@ mod tests {
 
         let dir = tmp_dir();
         let pidfile = dir.join("pid");
+        #[cfg(target_os = "linux")]
+        let host_proc = crate::sandbox::inherited_host_proc_for_test();
+        #[cfg(target_os = "linux")]
+        let host_stat = {
+            use std::os::fd::AsRawFd;
+            format!("/proc/self/fd/{}/self/stat", host_proc.as_raw_fd())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let host_stat = "/proc/self/stat";
 
         // `sleep 30 & echo $! > pidfile; wait` — the shell forks `sleep 30` as a background
         // child, writes the *sleep*'s PID ($!) to the pidfile, then waits. The 1s timeout fires
@@ -2354,6 +2360,12 @@ mod tests {
         let command = if cfg!(windows) {
             // ~3s of wall-clock time; the 1s timeout fires first.
             "ping -n 4 127.0.0.1".to_string()
+        } else if cfg!(target_os = "linux") {
+            // Preserve a host-visible PID even though the shell now runs in a PID namespace.
+            format!(
+                "(read pid rest < {host_stat}; echo $pid > {}; exec sleep 30) & wait",
+                pidfile.to_string_lossy()
+            )
         } else {
             format!("sleep 30 & echo $! > {} ; wait", pidfile.to_string_lossy())
         };

@@ -113,7 +113,7 @@ function buildStep2(initialState) {
   const status = el("div", "font-size:13px;color:var(--muted,#aaa);margin-bottom:10px;white-space:pre-wrap;");
   const renderStatus = (st) => {
     const m = st && st.modelFilesPresent ? "✓ model files present" : "○ model files absent — download needed";
-    const b = st && st.agentBrowserPresent ? "✓ agent-browser binary present" : "✗ agent-browser binary missing (run `npm install`)";
+    const b = st && st.agentBrowserPresent ? "✓ agent-browser binary present" : "✗ agent-browser binary missing (run `npm run install:deps`)";
     status.textContent = `${m}\n${b}`;
   };
   renderStatus(initialState);

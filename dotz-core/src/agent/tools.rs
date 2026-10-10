@@ -324,15 +324,8 @@ impl Tool for BashTool {
             }
             #[cfg(not(windows))]
             {
-                // Build a std Command so we can place the child in its own process group
-                // (tokio's Command doesn't expose process_group). The group lets a timeout
-                // tree-kill the shell AND every descendant (cargo/npm/sleep …) with
-                // the shared process-group kill helper. Without this, `start_kill` only terminates the shell
-                // and leaves the real workload running as an orphan that keeps consuming CPU.
-                use std::os::unix::process::CommandExt;
-                let mut sc = std::process::Command::new("sh");
-                sc.arg("-c").arg(&cmd).process_group(0);
-                tokio::process::Command::from(sc)
+                crate::sandbox::owned_shell_command(&cmd)
+                    .map_err(|e| format!("exec containment unavailable: {e}"))?
             }
         };
         c.current_dir(&cwd);
@@ -347,6 +340,14 @@ impl Tool for BashTool {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("exec: {e}"))?;
+        let process = match crate::sandbox::OwnedProcess::pin(child.id()) {
+            Ok(process) => process,
+            Err(reason) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(format!("exec process tracking failed: {reason}"));
+            }
+        };
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();
         let mut stdout_buf = Vec::new();
@@ -385,26 +386,22 @@ impl Tool for BashTool {
                 //
                 // Windows waits for taskkill; POSIX uses the guarded shared syscall helper
                 // so no external kill parser or signal-delivery subprocess is involved.
-                #[cfg(windows)]
-                {
-                    if let Some(pid) = child.id() {
-                        let mut kc = std::process::Command::new("taskkill");
-                        kc.args(["/PID", &pid.to_string(), "/T", "/F"])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null());
-                        let _ = crate::util::no_window(&mut kc).status();
-                    }
-                }
-                #[cfg(not(windows))]
-                {
-                    if let Some(pid) = child.id() {
-                        crate::sandbox::backend().kill_tree(pid);
-                    }
-                }
+                let cleanup = tokio::task::spawn_blocking(move || {
+                    crate::sandbox::backend().kill_tree(&process)
+                })
+                .await
+                .unwrap_or(Err("cleanup worker failed"));
                 // Reap the killed child so it does not become a zombie (Unix) or
                 // leak a process handle (Windows) after the timeout path returns.
                 let _ = child.wait().await;
-                return Err(format!("[timeout] killed after {}ms", timeout.as_millis()));
+                return Err(format!(
+                    "[timeout] after {}ms{}",
+                    timeout.as_millis(),
+                    cleanup
+                        .err()
+                        .map(|e| format!("; cleanup incomplete: {e}"))
+                        .unwrap_or_default()
+                ));
             }
         };
 
@@ -1196,9 +1193,25 @@ mod tests {
             std::env::temp_dir().join(format!("dotz-bash-reap-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
         let pidfile = base.join("pid");
+        #[cfg(target_os = "linux")]
+        let host_proc = crate::sandbox::inherited_host_proc_for_test();
+        #[cfg(target_os = "linux")]
+        let host_stat = {
+            use std::os::fd::AsRawFd;
+            format!("/proc/self/fd/{}/self/stat", host_proc.as_raw_fd())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let host_stat = "/proc/self/stat";
 
         let command = if cfg!(windows) {
             "ping -n 3 127.0.0.1".to_string()
+        } else if cfg!(target_os = "linux") {
+            // $! is namespace-relative. Read via the inherited host-proc descriptor to
+            // capture the background shell's host PID; exec preserves that identity.
+            format!(
+                "(read pid rest < {host_stat}; echo $pid > {}; exec sleep 30) & wait",
+                pidfile.to_string_lossy()
+            )
         } else {
             // Spawn `sleep 30` as a background child of the shell, write its PID to
             // the pidfile, then `wait` so the shell stays alive until the timeout.

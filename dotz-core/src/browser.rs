@@ -11,9 +11,10 @@
 //! are NEVER exposed. The closed action set is validated up front so a typo'd action can't no-op into a
 //! false-success observation.
 //!
-//! ponytail: no persistent daemon management beyond what browser.ts does — one spawn per command, and
-//! a best-effort `reap_stray_browsers` backstop on app shutdown (the Tauri shell calls `dispose_all`
-//! and `reap_stray_browsers` on `RunEvent::Exit` so headless Chrome instances do not outlive the app).
+//! Linux sessions run commands inside one persistent, per-session PID namespace. Its PID-1
+//! supervisor survives successful one-shot commands; stopping the pinned supervisor tears down
+//! reparented browser processes without an image-name sweep. Windows/macOS retain weaker native
+//! process-tree/group cleanup and do not claim containment of daemonized descendants.
 use axum::{
     Json, Router,
     extract::Query,
@@ -28,16 +29,19 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncWriteExt;
 
 const VERSION: u32 = 1;
 const MAX_OUTPUT: i64 = 50_000;
 // 75s (not the oracle's 35s): the COLD first Chrome launch on a fresh profile can take ~40-50s here;
 // subsequent commands hit the warm agent-browser daemon and return fast.
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(75);
-/// Timeout for the `agent-browser close` command inside `stop()`. A hung close must not block
-/// process shutdown: `dispose_all()` wraps each stop, but if stop() itself could wait the full
-/// `command_timeout()` the outer wrap would drop the future and leak the session record.
+/// Timeout for `agent-browser close`. Linux then tears down the persistent namespace even when
+/// close fails; weaker platforms retain the retry record.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+const SCOPE_START_TIMEOUT: Duration = Duration::from_secs(5);
+const SCOPE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configurable wall-clock timeout for each agent-browser command. A hung command (e.g. a
 /// crashed Chrome that never returns) otherwise blocks the controller for 75s. Defaults to 75s;
@@ -276,12 +280,34 @@ pub struct BrowserObservation {
 }
 
 // ---- session store ----
+#[cfg(target_os = "linux")]
+struct LinuxBrowserScope {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    process: crate::sandbox::OwnedProcess,
+    profile_dir: PathBuf,
+    ready: bool,
+    namespace: Option<String>,
+}
+
 struct SessionRecord {
     profile_dir: PathBuf,
     observation: BrowserObservation,
     frame_data: Option<Vec<u8>>,
-    /// Set the instant stop() begins so in-flight run() calls abort before the profile dir is removed.
+    /// Serializes whole start/act/stop operations, not merely individual CLI invocations.
+    operation: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Set when stop() begins; commands other than its own close are rejected afterward.
     disposed: bool,
+    /// True only after the owned Linux namespace has exited (or no command ever started it).
+    scope_terminated: bool,
+    #[cfg(target_os = "linux")]
+    scope_started: bool,
+    #[cfg(target_os = "linux")]
+    scope_poisoned: bool,
+    #[cfg(target_os = "linux")]
+    scope_namespace: Option<String>,
+    #[cfg(target_os = "linux")]
+    scope: std::sync::Arc<tokio::sync::Mutex<Option<LinuxBrowserScope>>>,
 }
 
 fn sessions() -> &'static Mutex<HashMap<String, SessionRecord>> {
@@ -296,6 +322,31 @@ fn sessions_guard() -> std::sync::MutexGuard<'static, HashMap<String, SessionRec
     sessions()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn session_operation(session_id: &str) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>, String> {
+    sessions_guard()
+        .get(session_id)
+        .map(|record| record.operation.clone())
+        .ok_or_else(|| "no such browser session".into())
+}
+
+#[cfg(target_os = "linux")]
+fn mark_scope_terminated(session_id: &str, message: &str) {
+    let mut store = sessions_guard();
+    if let Some(record) = store.get_mut(session_id) {
+        record.scope_terminated = true;
+        record.scope_poisoned = true;
+        record.disposed = true;
+        record.observation.status = "error".into();
+        record.observation.seq += 1;
+        record.observation.updated_at = now_iso();
+        record.observation.error = Some(ObsError {
+            code: "BROWSER_SCOPE_TERMINATED".into(),
+            message: message.to_string(),
+            retryable: true,
+        });
+    }
 }
 
 // ---- executable resolution (mirror executableCandidates) ----
@@ -349,7 +400,8 @@ fn resolve_executable() -> Result<PathBuf, String> {
 
 /// True when the resolved `agent-browser` binary is actually present on disk. Used by the
 /// first-run wizard (`GET /api/first-run/state`) so the UI can tell the operator whether the
-/// browser panel will work out of the box or whether they need to run `npm install` first.
+/// browser panel will work out of the box or whether they need to run
+/// `npm run install:deps` first.
 /// Mirrors [`resolve_executable`] exactly: `DOTZ_BROWSER_BIN` wins (must exist), then the
 /// bundled `node_modules/agent-browser/bin/<name>` path, then a PATH lookup for the bare
 /// `agent-browser[.exe]` name (so a system install is recognized).
@@ -570,9 +622,225 @@ fn split_role_name(descriptor: &str) -> (String, String) {
     (descriptor.trim().to_string(), String::new())
 }
 
+#[cfg(target_os = "linux")]
+impl LinuxBrowserScope {
+    const SUPERVISOR: &'static str = r#"
+umask 077
+dir=$1
+: > "$dir/scope.ready"
+while IFS= read -r request; do
+    [ "$request" = stop ] && exit 0
+    case "$request" in
+        *[!0-9a-f-]*|'') exit 64 ;;
+    esac
+    base="$dir/request-$request"
+    xargs -0 -a "$base.argv" sh -c 'exec "$@"' dotz-browser-scope > "$base.out" 2> "$base.err"
+    result=$?
+    printf '%s\n' "$result" > "$base.status.tmp" || exit 65
+    mv "$base.status.tmp" "$base.status" || exit 66
+done
+"#;
+
+    async fn spawn(profile_dir: &Path) -> Result<Self, String> {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            Self::SUPERVISOR.to_string(),
+            "dotz-browser-scope".to_string(),
+            profile_dir.to_string_lossy().into_owned(),
+        ];
+        let wrapped = crate::sandbox::wrap_sandbox_argv(argv)?;
+        let mut command = tokio::process::Command::new(&wrapped[0]);
+        command
+            .args(&wrapped[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(profile_dir.join("scope.err"))
+                    .map_err(|e| format!("browser scope log: {e}"))?,
+            ))
+            .env("AGENT_BROWSER_HEADED", "false");
+        crate::sandbox::backend().prepare_command(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("browser scope spawn failed: {e}"))?;
+        let process = match crate::sandbox::OwnedProcess::pin(child.id()) {
+            Ok(process) => process,
+            Err(reason) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(format!("browser scope identity tracking failed: {reason}"));
+            }
+        };
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err("browser scope stdin unavailable".to_string());
+        };
+        Ok(Self {
+            child,
+            stdin,
+            process,
+            profile_dir: profile_dir.to_path_buf(),
+            ready: false,
+            namespace: None,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn child_pid_namespace(pid: u32) -> Result<String, String> {
+        let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+            .map_err(|e| format!("read browser scope children: {e}"))?;
+        for child in children.split_whitespace() {
+            let status = std::fs::read_to_string(format!("/proc/{child}/status"))
+                .map_err(|e| format!("read browser namespace init status: {e}"))?;
+            let nspid = status
+                .lines()
+                .find(|line| line.starts_with("NSpid:"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .last();
+            if nspid != Some("1") {
+                continue;
+            }
+            let namespace = std::fs::read_link(format!("/proc/{child}/ns/pid"))
+                .map_err(|e| format!("read browser PID namespace identity: {e}"))?;
+            return Ok(namespace.to_string_lossy().into_owned());
+        }
+        Err("browser PID namespace init was not observable".into())
+    }
+
+    async fn wait_ready(&mut self) -> Result<(), String> {
+        if self.ready {
+            return Ok(());
+        }
+        let ready_path = self.profile_dir.join("scope.ready");
+        let deadline = tokio::time::Instant::now() + SCOPE_START_TIMEOUT;
+        loop {
+            if tokio::fs::metadata(&ready_path).await.is_ok() {
+                self.namespace = Some(Self::child_pid_namespace(self.process.pid())?);
+                self.ready = true;
+                return Ok(());
+            }
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|e| format!("browser scope status failed: {e}"))?
+            {
+                let details = tokio::fs::read_to_string(self.profile_dir.join("scope.err"))
+                    .await
+                    .unwrap_or_default();
+                return Err(format!(
+                    "browser scope exited before ready ({status}): {}",
+                    details.trim()
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("browser scope startup timed out".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn execute(&mut self, argv: &[String]) -> Result<Value, String> {
+        self.wait_ready().await?;
+        let request = uuid::Uuid::new_v4().simple().to_string();
+        let base = self.profile_dir.join(format!("request-{request}"));
+        let argv_path = base.with_extension("argv");
+        let output_path = base.with_extension("out");
+        let error_path = base.with_extension("err");
+        let status_path = base.with_extension("status");
+        let mut encoded = Vec::new();
+        for arg in argv {
+            if arg.as_bytes().contains(&0) {
+                return Err("browser command contains a NUL byte".into());
+            }
+            encoded.extend_from_slice(arg.as_bytes());
+            encoded.push(0);
+        }
+        tokio::fs::write(&argv_path, encoded)
+            .await
+            .map_err(|e| format!("browser command arguments: {e}"))?;
+        self.stdin
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .map_err(|e| format!("browser scope request: {e}"))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| format!("browser scope request: {e}"))?;
+
+        loop {
+            if let Ok(status) = tokio::fs::read_to_string(&status_path).await {
+                let code = status
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|e| format!("invalid browser scope status: {e}"))?;
+                let stdout = tokio::fs::read_to_string(&output_path)
+                    .await
+                    .unwrap_or_default();
+                let stderr = tokio::fs::read_to_string(&error_path)
+                    .await
+                    .unwrap_or_default();
+                if code != 0 {
+                    let message = if !stderr.trim().is_empty() {
+                        stderr.trim()
+                    } else if !stdout.trim().is_empty() {
+                        stdout.trim()
+                    } else {
+                        "agent-browser command failed"
+                    };
+                    for path in [&argv_path, &output_path, &error_path, &status_path] {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    return Err(message.chars().take(1000).collect());
+                }
+                for path in [&argv_path, &output_path, &error_path, &status_path] {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+                return Ok(parse_json_output(&stdout));
+            }
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|e| format!("browser scope status failed: {e}"))?
+            {
+                return Err(format!(
+                    "browser session scope exited during command ({status})"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn terminate(&mut self) -> Result<(), String> {
+        let _ = self.stdin.shutdown().await;
+        let process = self.process.clone();
+        let kill =
+            tokio::task::spawn_blocking(move || crate::sandbox::backend().kill_tree(&process))
+                .await
+                .unwrap_or(Err("browser scope cleanup worker failed"));
+        if kill.is_err() {
+            // Child remains unreaped, so its handle still names this exact process. This fallback
+            // asks the pinned namespace wrapper to exit; --kill-child=KILL tears down PID 1.
+            let _ = self.child.start_kill();
+        }
+        match tokio::time::timeout(SCOPE_STOP_TIMEOUT, self.child.wait()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(format!("browser scope wait failed: {e}")),
+            Err(_) => Err(format!(
+                "browser scope teardown unverified (pinned cleanup: {})",
+                kill.err().unwrap_or("wait timed out")
+            )),
+        }
+    }
+}
+
 // ---- the one-shot command runner ----
-/// Spawn agent-browser ONE-SHOT with the exact security flags + AGENT_BROWSER_HEADED=false, a 35s
-/// timeout, capture stdout/stderr, kill-tree on timeout, parse stdout as JSON. `command` is the
+/// Spawn agent-browser ONE-SHOT with the exact security flags + AGENT_BROWSER_HEADED=false, a
+/// bounded timeout, capture stdout/stderr, cancel the owned process tree on timeout, and parse
+/// stdout as JSON. On Linux cleanup reaches live descendants still in the parent tree, including
+/// `setsid` children; it does not sweep daemonized/reparented browser processes. `command` is the
 /// trailing `--json <command...>` portion.
 async fn run(
     session_id: &str,
@@ -617,86 +885,218 @@ async fn run(
         args.push((*c).to_string());
     }
 
-    // Redirect stdout/stderr to FILES (not pipes): agent-browser leaves a persistent Chrome daemon
-    // that inherits the pipes and never closes them, so a pipe-EOF read (read_to_end) would hang
-    // forever even after the command process exits. Files let us wait on process exit, then read.
-    let nonce = uuid::Uuid::new_v4().to_string();
-    let out_path = profile_dir.join(format!("command-{nonce}.out"));
-    let err_path = profile_dir.join(format!("command-{nonce}.err"));
-    let out_file =
-        std::fs::File::create(&out_path).map_err(|e| format!("browser stdout file: {e}"))?;
-    let err_file =
-        std::fs::File::create(&err_path).map_err(|e| format!("browser stderr file: {e}"))?;
-
-    let mut cmd = tokio::process::Command::new(&executable);
-    cmd.args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(err_file))
-        .env("AGENT_BROWSER_HEADED", "false");
-    // Cross-platform spawn flags via the shared sandbox backend: CREATE_NO_WINDOW on Windows,
-    // own process group on posix (so the tree-kill reaches the headless Chrome grandchild).
-    crate::sandbox::backend().prepare_command(&mut cmd);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("agent-browser spawn failed: {e}"))?;
-    let pid = child.id();
-
-    let status = match tokio::time::timeout(command_timeout(), child.wait()).await {
-        Err(_) => {
-            // Timed out: kill-tree (the child + its headless Chrome grandchild), reap the
-            // process so it does not become a zombie (Unix) or leak handles (Windows), then
-            // clean up the temp output files after the process has released them.
-            kill_pid(pid);
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            let _ = std::fs::remove_file(&out_path);
-            let _ = std::fs::remove_file(&err_path);
-            return Err("agent-browser command timed out".into());
+    #[cfg(target_os = "linux")]
+    {
+        let scope = sessions_guard()
+            .get(session_id)
+            .map(|record| record.scope.clone())
+            .ok_or("no such browser session")?;
+        let mut scope = scope.lock().await;
+        if scope.is_none() {
+            *scope = Some(LinuxBrowserScope::spawn(profile_dir).await?);
+            if let Some(record) = sessions_guard().get_mut(session_id) {
+                record.scope_started = true;
+            }
         }
-        Ok(s) => s,
-    };
-    // Let any final buffered write flush, then read the captured files.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let stdout_s = std::fs::read_to_string(&out_path).unwrap_or_default();
-    let stderr_s = std::fs::read_to_string(&err_path).unwrap_or_default();
-    let _ = std::fs::remove_file(&out_path);
-    let _ = std::fs::remove_file(&err_path);
-    match status {
-        Ok(es) if es.success() => Ok(parse_json_output(&stdout_s)),
-        Ok(es) => {
-            let msg = if !stderr_s.trim().is_empty() {
-                stderr_s.trim().to_string()
-            } else if !stdout_s.trim().is_empty() {
-                stdout_s.trim().to_string()
-            } else {
-                format!("agent-browser exited {}", es.code().unwrap_or(-1))
-            };
-            Err(msg.chars().take(1000).collect())
+        if let Err(error) = scope
+            .as_mut()
+            .expect("scope was initialized")
+            .wait_ready()
+            .await
+        {
+            if let Some(record) = sessions_guard().get_mut(session_id) {
+                record.scope_poisoned = true;
+            }
+            return Err(error);
         }
-        Err(e) => Err(format!("agent-browser wait failed: {e}")),
+        let namespace = scope
+            .as_ref()
+            .and_then(|active| active.namespace.clone())
+            .ok_or("browser PID namespace identity unavailable")?;
+        if let Some(record) = sessions_guard().get_mut(session_id) {
+            record.scope_namespace = Some(namespace);
+        }
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(executable.to_string_lossy().into_owned());
+        argv.extend(args);
+        let outcome = tokio::time::timeout(
+            command_timeout(),
+            scope
+                .as_mut()
+                .expect("scope was initialized")
+                .execute(&argv),
+        )
+        .await;
+        match outcome {
+            Ok(result) => result,
+            Err(_) => {
+                let message = match scope
+                    .as_mut()
+                    .expect("scope was initialized")
+                    .terminate()
+                    .await
+                {
+                    Ok(()) => {
+                        scope.take();
+                        mark_scope_terminated(
+                            session_id,
+                            "browser command timed out; session scope was terminated",
+                        );
+                        "agent-browser command timed out; session scope terminated".to_string()
+                    }
+                    Err(reason) => {
+                        let mut store = sessions_guard();
+                        if let Some(record) = store.get_mut(session_id) {
+                            record.disposed = true;
+                            record.scope_poisoned = true;
+                            record.observation.status = "error".into();
+                            record.observation.seq += 1;
+                            record.observation.updated_at = now_iso();
+                            record.observation.error = Some(ObsError {
+                                code: "BROWSER_CLEANUP_INCOMPLETE".into(),
+                                message: reason.clone(),
+                                retryable: true,
+                            });
+                        }
+                        format!("agent-browser command timed out; cleanup incomplete: {reason}")
+                    }
+                };
+                Err(message)
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Redirect stdout/stderr to FILES (not pipes): agent-browser leaves a persistent Chrome daemon
+        // that inherits the pipes and never closes them, so a pipe-EOF read (read_to_end) would hang
+        // forever even after the command process exits. Files let us wait on process exit, then read.
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let out_path = profile_dir.join(format!("command-{nonce}.out"));
+        let err_path = profile_dir.join(format!("command-{nonce}.err"));
+        let out_file =
+            std::fs::File::create(&out_path).map_err(|e| format!("browser stdout file: {e}"))?;
+        let err_file =
+            std::fs::File::create(&err_path).map_err(|e| format!("browser stderr file: {e}"))?;
+
+        let mut cmd = tokio::process::Command::new(&executable);
+        cmd.args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out_file))
+            .stderr(Stdio::from(err_file))
+            .env("AGENT_BROWSER_HEADED", "false");
+        // Windows uses CREATE_NO_WINDOW; macOS uses a process group and does not claim daemon containment.
+        crate::sandbox::backend().prepare_command(&mut cmd);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("agent-browser spawn failed: {e}"))?;
+        let process = match crate::sandbox::OwnedProcess::pin(child.id()) {
+            Ok(process) => process,
+            Err(reason) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let _ = std::fs::remove_file(&out_path);
+                let _ = std::fs::remove_file(&err_path);
+                return Err(format!("agent-browser process tracking failed: {reason}"));
+            }
+        };
+        let mut process_tree_guard = ProcessTreeGuard::new(process.clone());
+
+        let status = match tokio::time::timeout(command_timeout(), child.wait()).await {
+            Err(_) => {
+                let cleanup = match kill_process(Some(process.clone())) {
+                    Some(kill_task) => kill_task.await.unwrap_or(Err("cleanup worker failed")),
+                    None => Err("spawned process identity unavailable"),
+                };
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                process_tree_guard.disarm();
+                let _ = std::fs::remove_file(&out_path);
+                let _ = std::fs::remove_file(&err_path);
+                return Err(match cleanup {
+                    Ok(()) => "agent-browser command timed out".into(),
+                    Err(reason) => {
+                        format!("agent-browser command timed out; cleanup incomplete: {reason}")
+                    }
+                });
+            }
+            Ok(status) => {
+                if status.is_ok() {
+                    process_tree_guard.disarm();
+                }
+                status
+            }
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stdout_s = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let stderr_s = std::fs::read_to_string(&err_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&out_path);
+        let _ = std::fs::remove_file(&err_path);
+        match status {
+            Ok(es) if es.success() => Ok(parse_json_output(&stdout_s)),
+            Ok(es) => {
+                let msg = if !stderr_s.trim().is_empty() {
+                    stderr_s.trim().to_string()
+                } else if !stdout_s.trim().is_empty() {
+                    stdout_s.trim().to_string()
+                } else {
+                    format!("agent-browser exited {}", es.code().unwrap_or(-1))
+                };
+                Err(msg.chars().take(1000).collect())
+            }
+            Err(e) => Err(format!("agent-browser wait failed: {e}")),
+        }
     }
 }
 
-/// Kill a pid and its descendant tree — `taskkill /T /F` on win32, `kill(2) on the owned process group` on posix.
-/// Best-effort. Dispatched through the shared `sandbox::backend()` so browser + sandbox use the
-/// SAME platform kill path. This FIXES the former posix gap: the old inline `#[cfg(not(windows))]`
-/// branch sent `kill -9 <pid>` (single-pid only), so a headless Chrome grandchild that the
-/// agent-browser child spawned leaked as an orphan on timeout/stop. The backend's posix
-/// `kill_tree` signals the whole process group (`kill(2) on the owned process group`), matching sandbox.rs parity.
-///
-/// The kill is dispatched on a blocking thread (spawn_blocking) and not awaited by the caller:
-/// `CreateProcess` for taskkill.exe is a synchronous syscall that can take several hundred ms
-/// under load, and running it inline on the timeout path would stall a tokio worker thread for
-/// that whole time (and let the caller's wall-clock timeout balloon past its budget). Inside the
-/// blocking task, Windows waits for and reaps taskkill. POSIX signals the process group
-/// directly through kill(2), with no signal-delivery subprocess to reap.
-fn kill_pid(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-    tokio::task::spawn_blocking(move || {
-        crate::sandbox::backend().kill_tree(pid);
-    });
+/// Kill a pid and its owned descendants via the platform backend. The blocking backend runs off
+/// the Tokio worker. Explicit command timeouts await its completion; the guard below detaches it
+/// on future cancellation (for example, stop() timing out run()).
+#[cfg(not(target_os = "linux"))]
+fn kill_process(
+    process: Option<crate::sandbox::OwnedProcess>,
+) -> Option<tokio::task::JoinHandle<Result<(), &'static str>>> {
+    let process = process?;
+    Some(tokio::task::spawn_blocking(move || {
+        let result = crate::sandbox::backend().kill_tree(&process);
+        if let Err(reason) = result {
+            tracing::warn!(
+                pid = process.pid(),
+                reason,
+                "browser process cleanup incomplete"
+            );
+        }
+        result
+    }))
+}
+
+/// A dropped `run()` future must not orphan the spawned process tree. `Child` itself does not
+/// kill descendants on drop, so schedule owned-tree cleanup unless normal completion or the
+/// explicit timeout path disarms this guard.
+#[cfg(not(target_os = "linux"))]
+struct ProcessTreeGuard {
+    process: Option<crate::sandbox::OwnedProcess>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl ProcessTreeGuard {
+    fn new(process: crate::sandbox::OwnedProcess) -> Self {
+        Self {
+            process: Some(process),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.process = None;
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        let _ = kill_process(self.process.take());
+    }
 }
 
 // ---- clamping helpers ----
@@ -930,15 +1330,27 @@ pub async fn start(
     };
     let vw = viewport.width;
     let vh = viewport.height;
+    let operation = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     sessions_guard().insert(
         session_id.clone(),
         SessionRecord {
             profile_dir: profile_dir.clone(),
             observation,
             frame_data: None,
+            operation: operation.clone(),
             disposed: false,
+            scope_terminated: false,
+            #[cfg(target_os = "linux")]
+            scope_started: false,
+            #[cfg(target_os = "linux")]
+            scope_poisoned: false,
+            #[cfg(target_os = "linux")]
+            scope_namespace: None,
+            #[cfg(target_os = "linux")]
+            scope: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         },
     );
+    let _operation_guard = operation.lock().await;
 
     let outcome: Result<BrowserObservation, String> = async {
         run(
@@ -965,10 +1377,10 @@ pub async fn start(
         Ok(obs) => Ok(obs),
         Err(e) => {
             fail(&session_id, &e);
-            let _ = run(&session_id, &profile_dir, &allowed, &["close"]).await;
-            let _ = tokio::fs::remove_dir_all(&profile_dir).await;
-            sessions_guard().remove(&session_id);
-            Err(e)
+            match stop_locked(&session_id).await {
+                Ok(_) => Err(e),
+                Err(cleanup) => Err(format!("{e}; cleanup incomplete: {cleanup}")),
+            }
         }
     }
 }
@@ -981,13 +1393,16 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
         .and_then(|v| v.as_str())
         .ok_or("sessionId is required")?
         .to_string();
+    let operation = session_operation(&session_id)?;
+    let _operation_guard = operation.lock().await;
+
     let action = input
         .get("action")
         .and_then(|v| v.as_str())
         .ok_or("action is required")?
         .to_string();
 
-    let (profile_dir, allowed_origins, cur_seq, refs, viewport, status) = {
+    let (profile_dir, allowed_origins, cur_seq, refs, viewport, status, disposed) = {
         let store = sessions_guard();
         let r = store.get(&session_id).ok_or("no such browser session")?;
         (
@@ -1000,9 +1415,10 @@ pub async fn act(input: &Value) -> Result<BrowserObservation, String> {
                 r.observation.page.viewport.height,
             ),
             r.observation.status.clone(),
+            r.disposed,
         )
     };
-    if status == "stopped" {
+    if disposed || status == "stopped" {
         return Err("browser session is stopped".into());
     }
     if !ACTION_NAMES.contains(&action.as_str()) {
@@ -1300,66 +1716,143 @@ async fn fresh_profile_dir(session_id: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Cleanup guard: ensures the session record and disposable profile directory are removed even
-/// if the async `stop()` future is cancelled (e.g. by `dispose_all()`'s outer timeout). Without
-/// this, a hung `agent-browser close` could leave the session in the in-memory store and its
-/// temp profile behind after the timeout drops the future.
-struct StopGuard {
-    session_id: String,
-    profile_dir: PathBuf,
-    disarm: bool,
-}
-impl StopGuard {
-    fn disarm(mut self) {
-        self.disarm = true;
-    }
-}
-impl Drop for StopGuard {
-    fn drop(&mut self) {
-        if self.disarm {
-            return;
-        }
-        sessions_guard().remove(&self.session_id);
-        let _ = std::fs::remove_dir_all(&self.profile_dir);
+/// Mark a failed stop while preserving the record/profile so a later stop can retry cleanup.
+fn mark_cleanup_error(session_id: &str, message: &str) {
+    let mut store = sessions_guard();
+    if let Some(record) = store.get_mut(session_id) {
+        record.disposed = true;
+        record.observation.status = "error".into();
+        record.observation.seq += 1;
+        record.observation.updated_at = now_iso();
+        record.observation.error = Some(ObsError {
+            code: "BROWSER_CLEANUP_INCOMPLETE".into(),
+            message: message.to_string(),
+            retryable: true,
+        });
     }
 }
 
-/// stop(): mark disposed, close the process, set status "stopped", bump seq, dispose the profile dir.
-pub async fn stop(session_id: &str) -> Result<BrowserObservation, String> {
-    let (profile_dir, allowed_origins) = {
+/// Stop while the per-session operation mutex is held. Linux only removes the profile after the
+/// pinned namespace supervisor has exited; other platforms retain the session if close fails.
+async fn stop_locked(session_id: &str) -> Result<BrowserObservation, String> {
+    let (profile_dir, allowed_origins, already_terminated, scope_started, scope_poisoned) = {
         let mut store = sessions_guard();
-        let r = store.get_mut(session_id).ok_or("no such browser session")?;
-        r.disposed = true; // abort any in-flight run() before we remove the profile dir
-        (r.profile_dir.clone(), r.observation.allowed_origins.clone())
+        let record = store.get_mut(session_id).ok_or("no such browser session")?;
+        record.disposed = true;
+        (
+            record.profile_dir.clone(),
+            record.observation.allowed_origins.clone(),
+            record.scope_terminated,
+            #[cfg(target_os = "linux")]
+            record.scope_started,
+            #[cfg(target_os = "linux")]
+            record.scope_poisoned,
+        )
     };
-    let guard = StopGuard {
-        session_id: session_id.to_string(),
-        profile_dir: profile_dir.clone(),
-        disarm: false,
+
+    #[cfg(target_os = "linux")]
+    let close_error = if scope_started && !already_terminated && !scope_poisoned {
+        match tokio::time::timeout(
+            CLOSE_TIMEOUT,
+            run(session_id, &profile_dir, &allowed_origins, &["close"]),
+        )
+        .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(format!("agent-browser close failed: {error}")),
+            Err(_) => Some("agent-browser close timed out".to_string()),
+        }
+    } else {
+        None
     };
-    // Bound close so a hung agent-browser cannot block shutdown. The result is best-effort:
-    // `reap_stray_browsers()` kills any lingering Chrome process tree afterwards.
-    let _ = tokio::time::timeout(
+
+    #[cfg(target_os = "linux")]
+    {
+        let scope_arc = sessions_guard()
+            .get(session_id)
+            .map(|record| record.scope.clone())
+            .ok_or("no such browser session")?;
+        if scope_started && !already_terminated {
+            let mut scope = scope_arc.lock().await;
+            let Some(active_scope) = scope.as_mut() else {
+                let message = "browser scope handle missing before teardown was verified";
+                mark_cleanup_error(session_id, message);
+                return Err(message.to_string());
+            };
+            if let Err(error) = active_scope.terminate().await {
+                mark_cleanup_error(session_id, &error);
+                return Err(format!("browser scope cleanup incomplete: {error}"));
+            }
+            scope.take();
+        }
+        if let Some(record) = sessions_guard().get_mut(session_id) {
+            record.scope_terminated = true;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let close_error = match tokio::time::timeout(
         CLOSE_TIMEOUT,
         run(session_id, &profile_dir, &allowed_origins, &["close"]),
     )
-    .await;
-
-    let stopped = {
-        let mut store = sessions_guard();
-        let r = store.get_mut(session_id).ok_or("no such browser session")?;
-        r.observation.status = "stopped".into();
-        r.observation.seq += 1;
-        r.observation.updated_at = now_iso();
-        r.observation.current_action = None;
-        r.observation.frame = None;
-        r.frame_data = None;
-        r.observation.clone()
+    .await
+    {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => Some(format!("agent-browser close failed: {error}")),
+        Err(_) => Some("agent-browser close timed out; daemon cleanup is unverified".to_string()),
     };
-    let _ = tokio::fs::remove_dir_all(&profile_dir).await;
+
+    #[cfg(not(target_os = "linux"))]
+    if let Some(error) = close_error.as_deref() {
+        mark_cleanup_error(session_id, error);
+        return Err(error.to_string());
+    }
+
+    if let Err(error) = tokio::fs::remove_dir_all(&profile_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        let message = format!("browser profile cleanup incomplete: {error}");
+        mark_cleanup_error(session_id, &message);
+        return Err(message);
+    }
+
+    let mut stopped = {
+        let mut store = sessions_guard();
+        let record = store.get_mut(session_id).ok_or("no such browser session")?;
+        record.observation.status = "stopped".into();
+        record.observation.seq += 1;
+        record.observation.updated_at = now_iso();
+        record.observation.current_action = None;
+        record.observation.frame = None;
+        record.frame_data = None;
+        record.observation.clone()
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(error) = close_error {
+        stopped.error = Some(ObsError {
+            code: "BROWSER_CLOSE_FAILED_SCOPE_TERMINATED".into(),
+            message: format!("{error}; Linux browser scope was terminated"),
+            retryable: false,
+        });
+        if let Some(record) = sessions_guard().get_mut(session_id) {
+            record.observation.error = stopped.error.clone();
+        }
+    }
     sessions_guard().remove(session_id);
-    guard.disarm();
     Ok(stopped)
+}
+
+/// Stop a session and serialize teardown behind any in-flight command. Marking it disposed before
+/// waiting on the mutex rejects newly arriving commands; the current operation is allowed to drain.
+pub async fn stop(session_id: &str) -> Result<BrowserObservation, String> {
+    let operation = session_operation(session_id)?;
+    {
+        let mut store = sessions_guard();
+        let record = store.get_mut(session_id).ok_or("no such browser session")?;
+        record.disposed = true;
+    }
+    let _operation_guard = operation.lock().await;
+    stop_locked(session_id).await
 }
 
 /// state(sessionId?): the newest (or named) observation. None when no such session.
@@ -1400,37 +1893,14 @@ fn frame(session_id: &str, after_seq: i64) -> Option<(i64, Vec<u8>)> {
     Some((seq, data.clone()))
 }
 
-/// Dispose every browser session. Called by the Tauri shell on `RunEvent::Exit` so the app does
-/// not leave headless Chrome profiles/processes behind. Each session stop is bounded so a hung
-/// `agent-browser close` command cannot block shutdown indefinitely.
+/// Dispose every browser session on application exit. Each `stop()` has bounded close and scope
+/// teardown phases; do not wrap it in a shorter outer timeout that could cancel verified cleanup.
 pub async fn dispose_all() {
     let ids: Vec<String> = sessions_guard().keys().cloned().collect();
     for id in ids {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stop(&id)).await;
-    }
-}
-
-/// Force-kill any lingering agent-browser process tree by image name. Best-effort backstop —
-/// `agent-browser close` does not reliably reap the headless-Chrome grandchild. Exposed publicly
-/// so the Tauri shell can call it after `dispose_all` on shutdown.
-/// Blocking (`.status()`, not `.spawn()`): only called at process exit, where waiting a few ms
-/// for taskkill/pkill is fine and reaping the subprocess avoids leaving a zombie behind.
-pub fn reap_stray_browsers() {
-    #[cfg(windows)]
-    {
-        let mut cmd = std::process::Command::new("taskkill");
-        cmd.args(["/IM", "agent-browser-win32-x64.exe", "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _ = crate::util::no_window(&mut cmd).status();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "agent-browser"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        if let Err(error) = stop(&id).await {
+            tracing::error!(session_id = %id, %error, "browser session cleanup incomplete during exit");
+        }
     }
 }
 
@@ -1844,7 +2314,17 @@ mod tests {
                     profile_dir: p1.clone(),
                     observation: fake_observation(sid1),
                     frame_data: None,
+                    operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    scope_terminated: false,
+                    #[cfg(target_os = "linux")]
+                    scope_started: false,
+                    #[cfg(target_os = "linux")]
+                    scope_poisoned: false,
+                    #[cfg(target_os = "linux")]
+                    scope_namespace: None,
+                    #[cfg(target_os = "linux")]
+                    scope: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
                 },
             );
             store.insert(
@@ -1853,7 +2333,17 @@ mod tests {
                     profile_dir: p2.clone(),
                     observation: fake_observation(sid2),
                     frame_data: None,
+                    operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    scope_terminated: false,
+                    #[cfg(target_os = "linux")]
+                    scope_started: false,
+                    #[cfg(target_os = "linux")]
+                    scope_poisoned: false,
+                    #[cfg(target_os = "linux")]
+                    scope_namespace: None,
+                    #[cfg(target_os = "linux")]
+                    scope: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
                 },
             );
         }
@@ -1889,11 +2379,34 @@ mod tests {
         ));
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        // Fake agent-browser binary: sleeps long enough that only the close timeout can end it.
+        #[cfg(unix)]
+        let pidfile = dir.join("pid");
+        #[cfg(unix)]
+        let sleep_pidfile = dir.join("sleep-pid");
+        #[cfg(target_os = "linux")]
+        let unrelated_pidfile = dir.join("unrelated-pid");
+        #[cfg(unix)]
+        let _cleanup = TimeoutTestProcessCleanup {
+            pid_files: vec![
+                pidfile.clone(),
+                sleep_pidfile.clone(),
+                #[cfg(target_os = "linux")]
+                unrelated_pidfile.clone(),
+            ],
+        };
+        #[cfg(target_os = "linux")]
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unrelated control process");
+        #[cfg(target_os = "linux")]
+        std::fs::write(&unrelated_pidfile, unrelated.id().to_string()).unwrap();
+
+        // Fake agent-browser binary: a shell launches a separate sleeper to verify tree cleanup.
         #[cfg(windows)]
         let script_path = {
             let bat = dir.join("fake-browser.bat");
-            tokio::fs::write(&bat, "@echo off\nping -n 60 127.0.0.1 >nul\n")
+            tokio::fs::write(&bat, "@echo off\nping -n 30 127.0.0.1 >nul\n")
                 .await
                 .unwrap();
             bat
@@ -1901,7 +2414,7 @@ mod tests {
         #[cfg(unix)]
         let script_path = {
             let sh = dir.join("fake-browser.sh");
-            tokio::fs::write(&sh, "#!/bin/sh\nsleep 60\n")
+            tokio::fs::write(&sh, fake_browser_waiting_script(&pidfile, &sleep_pidfile))
                 .await
                 .unwrap();
             use std::os::unix::fs::PermissionsExt;
@@ -1923,11 +2436,34 @@ mod tests {
                     profile_dir: profile_dir.clone(),
                     observation: fake_observation(&sid),
                     frame_data: None,
+                    operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    scope_terminated: false,
+                    #[cfg(target_os = "linux")]
+                    scope_started: false,
+                    #[cfg(target_os = "linux")]
+                    scope_poisoned: false,
+                    #[cfg(target_os = "linux")]
+                    scope_namespace: None,
+                    #[cfg(target_os = "linux")]
+                    scope: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
                 },
             );
         }
 
+        #[cfg(target_os = "linux")]
+        let scope_namespace = {
+            let mut scope = LinuxBrowserScope::spawn(&profile_dir).await.unwrap();
+            scope.wait_ready().await.unwrap();
+            let namespace = scope.namespace.clone().expect("scope namespace is ready");
+            let scope_handle = sessions_guard().get(&sid).unwrap().scope.clone();
+            *scope_handle.lock().await = Some(scope);
+            let mut record = sessions_guard();
+            let record = record.get_mut(&sid).unwrap();
+            record.scope_started = true;
+            record.scope_namespace = Some(namespace.clone());
+            namespace
+        };
         let prev_bin = std::env::var("DOTZ_BROWSER_BIN").ok();
         let prev_timeout = std::env::var("DOTZ_BROWSER_TIMEOUT_MS").ok();
         // Use a huge command timeout so the only thing ending the close call is stop()'s own
@@ -1943,7 +2479,20 @@ mod tests {
         unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "300000") };
 
         let start = std::time::Instant::now();
-        let result = stop(&sid).await;
+        let stop_sid = sid.clone();
+        let stop_task = tokio::spawn(async move { stop(&stop_sid).await });
+        #[cfg(target_os = "linux")]
+        {
+            let (root, escaped) =
+                wait_for_linux_process_pair(&pidfile, &sleep_pidfile, &scope_namespace)
+                    .await
+                    .unwrap();
+            assert_ne!(
+                escaped, root,
+                "the stop-test descendant must have escaped the browser's process group and session"
+            );
+        }
+        let result = stop_task.await.expect("browser stop task should not panic");
         let elapsed = start.elapsed();
 
         match prev_bin {
@@ -1981,8 +2530,168 @@ mod tests {
             !profile_dir.exists(),
             "stop() should remove the profile dir even when close hangs"
         );
+        #[cfg(target_os = "linux")]
+        {
+            let child_stopped = wait_for_process_exit(&sleep_pidfile, &scope_namespace).await;
+            assert!(
+                child_stopped.is_ok(),
+                "stop() must terminate the fake browser's setsid-escaped descendant: {child_stopped:?}"
+            );
+            let unrelated_running = unrelated.try_wait().unwrap().is_none();
+            let _ = std::fs::remove_file(&unrelated_pidfile);
+            if unrelated_running {
+                unrelated.kill().unwrap();
+            }
+            let _ = unrelated.wait();
+            assert!(
+                unrelated_running,
+                "session stop must not signal an unrelated process"
+            );
+        }
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Two simultaneous stop requests must serialize without duplicate teardown, and stopping
+    /// one session must not remove the independent session record or its profile.
+    #[tokio::test]
+    async fn concurrent_stop_is_serialized_and_isolated_to_its_session() {
+        let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "dotz-browser-concurrent-stop-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let profile_a = dir.join("profile-a");
+        let profile_b = dir.join("profile-b");
+        tokio::fs::create_dir_all(&profile_a).await.unwrap();
+        tokio::fs::create_dir_all(&profile_b).await.unwrap();
+        let sid_a = format!("dotz-browser-concurrent-a-{}", uuid::Uuid::new_v4());
+        let sid_b = format!("dotz-browser-concurrent-b-{}", uuid::Uuid::new_v4());
+        {
+            let mut store = sessions_guard();
+            for (sid, profile_dir) in [(&sid_a, &profile_a), (&sid_b, &profile_b)] {
+                store.insert(
+                    sid.clone(),
+                    SessionRecord {
+                        profile_dir: profile_dir.clone(),
+                        observation: fake_observation(sid),
+                        frame_data: None,
+                        operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                        disposed: false,
+                        scope_terminated: false,
+                        #[cfg(target_os = "linux")]
+                        scope_started: false,
+                        #[cfg(target_os = "linux")]
+                        scope_poisoned: false,
+                        #[cfg(target_os = "linux")]
+                        scope_namespace: None,
+                        #[cfg(target_os = "linux")]
+                        scope: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+                    },
+                );
+            }
+        }
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let first = {
+            let barrier = barrier.clone();
+            let sid = sid_a.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                stop(&sid).await
+            })
+        };
+        let second = {
+            let barrier = barrier.clone();
+            let sid = sid_a.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                stop(&sid).await
+            })
+        };
+        barrier.wait().await;
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert_ne!(
+            first.is_ok(),
+            second.is_ok(),
+            "exactly one concurrent stop owns teardown"
+        );
+        let stopped = first.or(second).unwrap();
+        assert_eq!(stopped.status, "stopped");
+        assert!(sessions_guard().get(&sid_a).is_none());
+        assert!(!profile_a.exists());
+
+        assert!(sessions_guard().contains_key(&sid_b));
+        assert!(
+            profile_b.exists(),
+            "stopping session A must retain session B's profile"
+        );
+        assert_eq!(stop(&sid_b).await.unwrap().status, "stopped");
+        assert!(sessions_guard().get(&sid_b).is_none());
+        assert!(!profile_b.exists());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// SIGKILL of the browser-session owner must close the supervisor's control pipe and tear
+    /// down a browser daemon that was already reparented to the namespace init.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn scope_owner_death_reaps_reparented_browser_process() {
+        const OWNER_TEST_DIR: &str = "DOTZ_BROWSER_SCOPE_OWNER_TEST_DIR";
+        let test_dir = if let Some(path) = std::env::var_os(OWNER_TEST_DIR) {
+            let dir = std::path::PathBuf::from(path);
+            let namespace_file = dir.join("namespace");
+            let daemon_pid_file = dir.join("daemon.pid");
+            let mut scope = LinuxBrowserScope::spawn(&dir).await.unwrap();
+            scope.wait_ready().await.unwrap();
+            std::fs::write(
+                &namespace_file,
+                scope.namespace.as_deref().expect("namespace captured"),
+            )
+            .unwrap();
+            let script = format!(
+                "sleep 60 >/dev/null 2>&1 & echo $! > {}",
+                daemon_pid_file.display()
+            );
+            scope
+                .execute(&["/bin/sh".into(), "-c".into(), script])
+                .await
+                .unwrap();
+            std::mem::forget(scope);
+            // Bypass destructors: the parent process really exits while the scope is live.
+            std::process::exit(0);
+        } else {
+            std::env::temp_dir().join(format!(
+                "dotz-browser-owner-death-test-{}",
+                uuid::Uuid::new_v4()
+            ))
+        };
+
+        tokio::fs::create_dir_all(&test_dir).await.unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "browser::tests::scope_owner_death_reaps_reparented_browser_process",
+                "--nocapture",
+            ])
+            .env(OWNER_TEST_DIR, &test_dir)
+            .output()
+            .expect("spawn isolated owner-death helper");
+        assert!(
+            child.status.success(),
+            "owner-death helper failed: {}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let namespace = std::fs::read_to_string(test_dir.join("namespace")).unwrap();
+        let daemon_stopped = wait_for_process_exit(&test_dir.join("daemon.pid"), &namespace).await;
+        assert!(
+            daemon_stopped.is_ok(),
+            "owner exit must kill the reparented browser process: {daemon_stopped:?}"
+        );
+        assert!(!test_dir.join("profile").exists());
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
 
     /// `session_count` must reflect the number of active browser sessions so the `/api/health`
@@ -2010,7 +2719,17 @@ mod tests {
                     profile_dir: dir.join("p1"),
                     observation: fake_observation(&sid1),
                     frame_data: None,
+                    operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    scope_terminated: false,
+                    #[cfg(target_os = "linux")]
+                    scope_started: false,
+                    #[cfg(target_os = "linux")]
+                    scope_poisoned: false,
+                    #[cfg(target_os = "linux")]
+                    scope_namespace: None,
+                    #[cfg(target_os = "linux")]
+                    scope: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
                 },
             );
             store.insert(
@@ -2019,7 +2738,17 @@ mod tests {
                     profile_dir: dir.join("p2"),
                     observation: fake_observation(&sid2),
                     frame_data: None,
+                    operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    scope_terminated: false,
+                    #[cfg(target_os = "linux")]
+                    scope_started: false,
+                    #[cfg(target_os = "linux")]
+                    scope_poisoned: false,
+                    #[cfg(target_os = "linux")]
+                    scope_namespace: None,
+                    #[cfg(target_os = "linux")]
+                    scope: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
                 },
             );
         }
@@ -2088,10 +2817,196 @@ mod tests {
     /// `DOTZ_BROWSER_BIN` env vars so concurrent browser timeout tests do not race.
     static BROWSER_TIMEOUT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// A timed-out agent-browser command must be reaped, not left as a zombie (Unix) or leaking
-    /// handles (Windows). Before the fix, `run()` killed the child but did not wait for it to
-    /// exit, so the process could outlive the timeout error. The timeout is configurable so the
-    /// test can use a very short value.
+    #[cfg(unix)]
+    struct TimeoutTestProcessCleanup {
+        pid_files: Vec<std::path::PathBuf>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for TimeoutTestProcessCleanup {
+        fn drop(&mut self) {
+            for path in &self.pid_files {
+                let Ok(contents) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                let Ok(pid) = contents.trim().parse::<u32>() else {
+                    continue;
+                };
+                let pid = pid.to_string();
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", pid.as_str()])
+                    .status();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_browser_waiting_script(
+        pid_file: &std::path::Path,
+        escaped_child_pid_file: &std::path::Path,
+    ) -> String {
+        #[cfg(target_os = "linux")]
+        let child_command = format!(
+            "setsid sh -c 'sleep 30 >/dev/null 2>&1 & echo $! > \"{}\"' & child=$!\necho \"$child\" > \"{}.launcher\"\nwait \"$child\"\nsleep 30\n",
+            escaped_child_pid_file.to_string_lossy(),
+            escaped_child_pid_file.to_string_lossy(),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let child_command = format!(
+            "sleep 30 & child=$!\necho \"$child\" > \"{}\"\nwait \"$child\"\n",
+            escaped_child_pid_file.to_string_lossy(),
+        );
+        format!(
+            "#!/bin/sh\necho $$ > \"{}\"\n{}",
+            pid_file.to_string_lossy(),
+            child_command,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_host_pid(namespace: &str, namespace_pid: u32) -> Result<Option<u32>, String> {
+        let processes = std::fs::read_dir("/proc").map_err(|e| format!("read /proc: {e}"))?;
+        for entry in processes.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let ns_link = format!("/proc/{pid}/ns/pid");
+            if std::fs::read_link(ns_link)
+                .map(|link| link.to_string_lossy() == namespace)
+                .unwrap_or(false)
+                && std::fs::read_to_string(format!("/proc/{pid}/status"))
+                    .ok()
+                    .and_then(|status| {
+                        status.lines().find_map(|line| {
+                            let values = line.strip_prefix("NSpid:")?;
+                            values
+                                .split_whitespace()
+                                .last()
+                                .and_then(|value| value.parse::<u32>().ok())
+                        })
+                    })
+                    == Some(namespace_pid)
+            {
+                return Ok(Some(pid));
+            }
+        }
+        Ok(None)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_session_namespace(session_id: &str) -> Result<String, String> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(namespace) = sessions_guard()
+                    .get(session_id)
+                    .and_then(|record| record.scope_namespace.clone())
+                {
+                    return Ok(namespace);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "browser session PID namespace did not become ready".to_owned())?
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_exit(
+        pid_file: &std::path::Path,
+        namespace: &str,
+    ) -> Result<(), String> {
+        let contents = std::fs::read_to_string(pid_file)
+            .map_err(|e| format!("could not read timeout-test pid file: {e}"))?;
+        let pid = contents
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| format!("invalid timeout-test pid {contents:?}: {e}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match linux_host_pid(namespace, pid)? {
+                Some(host_pid) => {
+                    let stat_path = format!("/proc/{host_pid}/stat");
+                    match std::fs::read_to_string(&stat_path) {
+                        Ok(stat) => {
+                            let state = stat
+                                .rsplit_once(')')
+                                .and_then(|(_, rest)| rest.split_whitespace().next());
+                            if matches!(state, Some("Z" | "X")) {
+                                return Ok(());
+                            }
+                        }
+                        Err(_) => return Ok(()),
+                    }
+                }
+                None => return Ok(()),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("timed-out child process {pid} remained live"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_session_group(
+        pid_file: &std::path::Path,
+        namespace: &str,
+    ) -> Result<(u32, u32), String> {
+        let contents = std::fs::read_to_string(pid_file)
+            .map_err(|e| format!("could not read browser-test pid file: {e}"))?;
+        let pid = contents
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| format!("invalid browser-test pid {contents:?}: {e}"))?;
+        let pid = linux_host_pid(namespace, pid)?
+            .ok_or_else(|| format!("browser-test pid {pid} is not observable in {namespace}"))?;
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_err(|e| format!("could not read process {pid} stat: {e}"))?;
+        let (_, fields) = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| format!("malformed process {pid} stat"))?;
+        let fields = fields.split_whitespace().collect::<Vec<_>>();
+        let group = fields
+            .get(2)
+            .ok_or_else(|| format!("missing process group for pid {pid}"))?
+            .parse::<u32>()
+            .map_err(|e| format!("invalid process group for pid {pid}: {e}"))?;
+        let session = fields
+            .get(3)
+            .ok_or_else(|| format!("missing session for pid {pid}"))?
+            .parse::<u32>()
+            .map_err(|e| format!("invalid session for pid {pid}: {e}"))?;
+        Ok((group, session))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_linux_process_pair(
+        root_file: &std::path::Path,
+        descendant_file: &std::path::Path,
+        namespace: &str,
+    ) -> Result<((u32, u32), (u32, u32)), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let (Ok(root), Ok(descendant)) = (
+                linux_session_group(root_file, namespace),
+                linux_session_group(descendant_file, namespace),
+            ) {
+                return Ok((root, descendant));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("browser-test processes did not become observable".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A timed-out agent-browser command must cancel its live owned descendants, including a
+    /// Linux child that calls `setsid` and escapes the command's process group. An unrelated
+    /// sleeper acts as a negative control and must remain alive after cleanup.
     #[tokio::test]
     async fn run_reaps_child_after_timeout() {
         let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
@@ -2104,9 +3019,27 @@ mod tests {
 
         #[cfg(unix)]
         let pidfile = dir.join("pid");
+        #[cfg(unix)]
+        let sleep_pidfile = dir.join("sleep-pid");
+        #[cfg(unix)]
+        let unrelated_pidfile = dir.join("unrelated-pid");
+        #[cfg(unix)]
+        let _cleanup = TimeoutTestProcessCleanup {
+            pid_files: vec![
+                pidfile.clone(),
+                sleep_pidfile.clone(),
+                unrelated_pidfile.clone(),
+            ],
+        };
+        #[cfg(target_os = "linux")]
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unrelated control process");
+        #[cfg(target_os = "linux")]
+        std::fs::write(&unrelated_pidfile, unrelated.id().to_string()).unwrap();
 
-        // Fake agent-browser binary: ignores arguments and sleeps long enough to be killed by the
-        // short test timeout. A single batch/shell script keeps the process tree simple.
+        // Fake agent-browser binary: a shell launches a separate sleeper to verify tree cleanup.
         #[cfg(windows)]
         let script_path = {
             let bat = dir.join("fake-browser.bat");
@@ -2118,15 +3051,9 @@ mod tests {
         #[cfg(unix)]
         let script_path = {
             let sh = dir.join("fake-browser.sh");
-            tokio::fs::write(
-                &sh,
-                format!(
-                    "#!/bin/sh\necho $$ > \"{}\"\nsleep 30\n",
-                    pidfile.to_string_lossy()
-                ),
-            )
-            .await
-            .unwrap();
+            tokio::fs::write(&sh, fake_browser_waiting_script(&pidfile, &sleep_pidfile))
+                .await
+                .unwrap();
             use std::os::unix::fs::PermissionsExt;
             let mut perms = tokio::fs::metadata(&sh).await.unwrap().permissions();
             perms.set_mode(0o755);
@@ -2147,7 +3074,17 @@ mod tests {
                     profile_dir: profile_dir.clone(),
                     observation: fake_observation(&sid),
                     frame_data: None,
+                    operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    scope_terminated: false,
+                    #[cfg(target_os = "linux")]
+                    scope_started: false,
+                    #[cfg(target_os = "linux")]
+                    scope_poisoned: false,
+                    #[cfg(target_os = "linux")]
+                    scope_namespace: None,
+                    #[cfg(target_os = "linux")]
+                    scope: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
                 },
             );
         }
@@ -2165,7 +3102,28 @@ mod tests {
         unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "500") };
 
         let start = std::time::Instant::now();
-        let result = run(&sid, &profile_dir, &allowed, &["get", "url"]).await;
+        let task_sid = sid.clone();
+        let task_profile_dir = profile_dir.clone();
+        let task_allowed = allowed.clone();
+        let run_task = tokio::spawn(async move {
+            run(&task_sid, &task_profile_dir, &task_allowed, &["get", "url"]).await
+        });
+        #[cfg(target_os = "linux")]
+        let scope_namespace = wait_for_session_namespace(&sid).await.unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let (root, escaped) =
+                wait_for_linux_process_pair(&pidfile, &sleep_pidfile, &scope_namespace)
+                    .await
+                    .unwrap();
+            assert_ne!(
+                escaped, root,
+                "the timeout-test descendant must have escaped the browser's process group and session"
+            );
+        }
+        let result = run_task
+            .await
+            .expect("browser timeout task should not panic");
         let elapsed = start.elapsed();
 
         match prev_bin {
@@ -2199,7 +3157,7 @@ mod tests {
             "browser timeout should fire on the configured short timeout, not the 75s default, elapsed: {elapsed:?}"
         );
 
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "linux")))]
         {
             let pid_text = std::fs::read_to_string(&pidfile).unwrap_or_default();
             let pid: i32 = pid_text.trim().parse().unwrap_or(-1);
@@ -2213,6 +3171,30 @@ mod tests {
                 gone,
                 "timed-out browser child (pid {pid}) should have been killed and reaped, not still running"
             );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let root_stopped = wait_for_process_exit(&pidfile, &scope_namespace).await;
+            assert!(
+                root_stopped.is_ok(),
+                "timed-out browser root process must be gone or zombie-reaped: {root_stopped:?}"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let child_stopped = wait_for_process_exit(&sleep_pidfile, &scope_namespace).await;
+            assert!(
+                child_stopped.is_ok(),
+                "timed-out browser command must terminate its setsid-escaped descendant: {child_stopped:?}"
+            );
+            let unrelated_running = unrelated.try_wait().unwrap().is_none();
+            let _ = std::fs::remove_file(&unrelated_pidfile);
+            assert!(
+                unrelated_running,
+                "browser cancellation must not signal an unrelated process"
+            );
+            unrelated.kill().unwrap();
+            let _ = unrelated.wait();
         }
 
         sessions_guard().remove(&sid);
@@ -2290,9 +3272,9 @@ mod tests {
     /// `binary_present` must reflect whether the resolved `agent-browser` binary is on disk.
     /// With `DOTZ_BROWSER_BIN` pointed at a temp file that exists, it returns true; pointed at a
     /// missing path, it returns false. With the env var cleared, it falls back to the bundled /
-    /// PATH lookup, which on a dev host without `npm install` returns false (and on a packaged
-    /// install with the bundled binary returns true) — so we only assert the explicit-DOTZ_BROWSER_BIN
-    /// branch here to keep the test host-independent.
+    /// PATH lookup, which on a dev host without `npm run install:deps` returns false (and on a
+    /// packaged install with the bundled binary returns true). We assert only the
+    /// explicit-DOTZ_BROWSER_BIN branch here to keep the test host-independent.
     #[test]
     fn binary_present_matches_disk_state_for_explicit_bin() {
         let _guard = BROWSER_TIMEOUT_TEST_LOCK.blocking_lock();

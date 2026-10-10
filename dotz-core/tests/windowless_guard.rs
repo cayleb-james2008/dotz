@@ -30,7 +30,13 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Attributes whose following item/block is exempt from the windowing convention.
-const EXEMPT_ATTRS: [&str; 3] = ["#[cfg(test)]", "#[cfg(not(windows))]", "#[cfg(unix)]"];
+const EXEMPT_ATTRS: [&str; 5] = [
+    "#[cfg(test)]",
+    "#[cfg(not(windows))]",
+    "#[cfg(unix)]",
+    "#[cfg(target_os = \"macos\")]",
+    "#[cfg(target_os = \"linux\")]",
+];
 
 /// A marker that proves the spawn site suppresses the console window on Windows.
 fn has_marker(text: &str) -> bool {

@@ -26,7 +26,7 @@ jobs:
       # Fetch the embedding model into assets/models (gitignored, needed by the bundled resources).
       - name: fetch embed model
         run: |
-          npm ci || npm install
+          npm run install:deps
           npm run fetch-model
 
       - uses: tauri-apps/tauri-action@v0

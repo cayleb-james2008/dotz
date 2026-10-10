@@ -2,13 +2,20 @@
 
 The chat UI is a static SPA in `web/` served by the dotz server at `http://127.0.0.1:4317`.
 It talks to the backend with **REST** for controls and a **WebSocket** for the live stream.
-This is the contract the claude.ai/design artifact binds to.
+I keep the UI and backend event shapes here so changes can be checked on both sides.
+This is a source contract, not a receipt that every route or native journey has been exercised.
 
 ## Lifecycle
 
 1. `POST /api/sessions` → `{ sessionId, model, thinkingLevel, supportsThinking, availableThinkingLevels, tools }`
 2. Open `ws://127.0.0.1:4317/ws?sessionId=<id>` → receive `{kind:"ready"}`, then a stream of `{kind:"event"}`.
 3. Send prompts over the WS; adjust model/thinking/tools over REST.
+
+The server rejects disallowed `Origin`/`Host` headers with `403`. When a session token is configured,
+all `/api/*` routes except `/api/health` and the `/ws` upgrade require `x-dotz-token` or a `token`
+query parameter; missing/wrong tokens return `401`. The Tauri shell injects its per-process token
+out of band. See `dotz-core/src/server/guard.rs`; origin checks alone do not authenticate local
+processes, and disabling authentication is not a fix for a failed diagnostic.
 
 ## REST
 
@@ -62,7 +69,7 @@ A project is a **persistent named workspace** (cwd + profile + model + thinking 
 survives server restarts. Sessions created with `projectId` inherit the project's `cwd`,
 `profileId`, `model`, and `thinkingLevel` unless overridden on `POST /api/sessions`.
 
-### Memory (on-device rusqlite + ONNX embeddings, autonomous)
+### Memory (local storage and embeddings, best-effort capture)
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
@@ -74,19 +81,35 @@ survives server restarts. Sessions created with `projectId` inherit the project'
 | POST | `/api/memory/consolidate` | `{ projectId? }` | `{ removed, kept }` |
 
 `MemoryView = { id, memory, scope:"project"|"global", category?, folder?, score?, createdAt?, updatedAt? }`
-(`score` only on search/recall results). Memory is backed by **on-device `rusqlite` + local `ort`
-ONNX embeddings** (all-MiniLM-L6-v2, 384-dim, injected in-process — no embeddings API): the sqlite
-vector store + bundled local embedder live under `~/.dotz/ai-agents/mem0/`; the LLM that powers
-extraction/consolidation is dotz's Ollama Cloud chat. Storage is partitioned by scope
-(`"project"` by folder, `"global"` everywhere). A human-readable, git-committable `MEMORY.md` mirror
-is written per scope (global `~/.dotz/ai-agents/MEMORY.md`, project `<cwd>/.ai-agents/MEMORY.md`) and
-is the source of truth — the vector index is a derived cache.
+(`score` only on search/recall results). **Storage and sentence embeddings are local:** bundled
+SQLite (`rusqlite`) plus in-process `ort` ONNX all-MiniLM-L6-v2 embeddings (384 dimensions, no
+embeddings API). The database is `<DOTZ_CONFIG_DIR>/ai-agents/memory.db`, defaulting to
+`~/.dotz/ai-agents/memory.db`. Model files are separate under `assets/models/` (or the configured
+asset/model location); this is not a mem0 directory or service.
 
-Capture, update, consolidation, and recall are **automatic** (no operator action): the dotz-tools
-`before_agent_start` hook injects the most relevant memories into each turn (broadcast to the UI as a
-`{kind:"memory_recall", items}` WS event for observability), and the `agent_end` hook extracts
-durable facts from the completed exchange. Legacy `~/.dotz/ai-agents/memory.json` + project
-`memory.json` are imported once on first run (the JSON files are kept as a backup).
+Storage is partitioned by global scope (`__global__`) or normalized project cwd (`proj:<cwd>`),
+with optional folder/category filters. Human-readable `MEMORY.md` mirrors live at
+`<DOTZ_CONFIG_DIR>/ai-agents/MEMORY.md` and `<cwd>/.ai-agents/MEMORY.md`; the default global path is
+`~/.dotz/ai-agents/MEMORY.md`. The mirror is the committable source of truth; the vector index is a
+derived cache. The API above supports explicit inspection, edits, search, and consolidation.
+
+The native Rust session loop (`dotz-core/src/agent/session.rs`) calls `memory::recall_async` before
+a turn and schedules `memory::capture_exchange` after a completed exchange. These are best-effort
+paths, not the old `before_agent_start`/`agent_end` extension hooks or a promise of useful capture.
+Near-duplicate pruning/consolidation runs locally.
+
+**Extraction can send conversation text off-device.** It uses an OpenAI-compatible chat endpoint:
+`DOTZ_MEMORY_BASE_URL` (default `https://ollama.com/v1`), `DOTZ_MEMORY_MODEL` (configured executive
+model, otherwise `glm-5.2`), and a non-empty `DOTZ_MEMORY_API_KEY`, otherwise the resolved
+`OLLAMA_API_KEY`. Missing credentials, transport/parse errors, or failed embedding/add operations
+can produce no captured facts. `DOTZ_MEMORY_TIMEOUT_MS` controls the extraction timeout (30 seconds
+by default, clamped to 1 second–5 minutes).
+
+If `DOTZ_COGNEE_URL` is configured, `memory.rs` can augment recall with Cognee results and forward
+captured facts to it; queries and facts then cross that service boundary too. Cognee is optional
+and has its own service/auth configuration. Local storage/embeddings therefore do not imply an
+offline application or that exchanges never leave the device. See
+[provider setup](provider-setup.md#memory-endpoints-and-privacy) before using sensitive text.
 
 ### AGENTS.md doctrine editor
 
@@ -196,6 +219,12 @@ origin allowlist. Raw page evaluation, uploads, downloads, and clipboard access 
 interactive refs, current action/cursor, error counters, and frame metadata. The binary JPEG stays
 on `/api/browser/frame`; it is never embedded in the JSON event stream.
 
+**Candidate lifecycle boundary (2026-10-10):** a persistent browser daemon must outlive individual
+commands; the sandbox's per-run Linux PID namespace does not by itself contain that daemon.
+Persistent ownership/teardown repairs are under implementation and review. A stopped observation
+is not an independently verified assertion that a reparented daemon, listener, and profile are
+gone; require exact-source teardown receipts before treating that cleanup gap as resolved.
+
 ### Local connections (provider CLI browser login)
 
 | Method | Path | Body | Returns |
@@ -232,7 +261,7 @@ cursor over it.
   approve or reject a pending `human_gate` request.
 
 **Server → client:** `{ kind:"ready", sessionId }` | `{ kind:"error", error }` |
-`{ kind:"event", sessionId, event }` where `event` is a pi AgentSession event |
+`{ kind:"event", sessionId, event }` where `event` is a native Rust agent event |
 `{ kind:"sandbox", sessionId, event }` where `event` is a sandbox event (below) |
 `{ kind:"workflow", sessionId, runId, event }` where `event` is a workflow event |
 `{ kind:"gate", gateId, plan }` where `plan` is the human-gate plan text.

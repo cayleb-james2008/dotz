@@ -2,10 +2,29 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/acceptance-integration-20261010]
   pull_request:
 
 jobs:
+  dependency-policy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm run install:deps
+      - run: npm run test:install-wrapper
+      - run: npm run test:release-install-policy
+      - run: python -m unittest discover -s scripts -p test_ui_regression_platform.py -v
+
   check:
     strategy:
       fail-fast: false
@@ -21,14 +40,69 @@ jobs:
       # Fetch the bundled ONNX embedding model BEFORE tests — the embed/memory tests require it
       # (assets/models/ is gitignored, so a fresh checkout has no model). The script is
       # cross-platform Node, so it runs on every OS.
-      - run: npm install && npm run fetch-model
-      # Run the complete suite with bounded child-process concurrency and stripped build
-      # debuginfo. Stream test output so a runner failure leaves progress evidence when logs
-      # are retained. All platforms are blocking; a lost runner requires investigation.
-      - run: cargo test -p dotz-core -- --test-threads=2 --nocapture
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm run install:deps && npm run fetch-model
+      # Ubuntu's AppArmor userns restriction can deny unshare on an otherwise
+      # namespace-capable runner. Provision only that executable's permission;
+      # never disable AppArmor/sysctls, run tests as root, skip assertions, or
+      # let the product fall back to an uncontained command.
+      - name: Verify Linux namespace prerequisite
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          diag_dir="${RUNNER_TEMP}/dotz-core-ci"
+          mkdir -p "$diag_dir"
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone > "$diag_dir/userns-before.txt" 2>&1 || true
+          probe=(unshare --user --map-root-user --pid --fork --mount-proc --kill-child=KILL -- sh -c 'test "$$" -eq 1')
+          if ! "${probe[@]}" > "$diag_dir/userns-before-probe.log" 2>&1; then
+            test "$(command -v unshare)" = /usr/bin/unshare
+            sudo apparmor_parser -r .github/ci/dotz-ci-unshare
+            touch "$diag_dir/userns-profile-loaded"
+          fi
+          "${probe[@]}" > "$diag_dir/userns-after-probe.log" 2>&1
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone > "$diag_dir/userns-after.txt" 2>&1 || true
+          cmp "$diag_dir/userns-before.txt" "$diag_dir/userns-after.txt"
+      # Prior Ubuntu runs 37259587470 and 37249846971 lost runner communication in cargo test;
+      # their log endpoints returned 404 and no artifacts were available. That does not establish
+      # whether compilation, a test, a child process, or runner resources caused the failure.
+      # Keep the full suite/assertions and the cargo exit status; stream per-test progress and
+      # host/cgroup/disk/process telemetry, fail bounded hangs, then upload evidence when possible.
+      - name: Test the Linux telemetry/watchdog monitor
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          temp_dir="${RUNNER_TEMP}/dotz-monitor-tests"
+          mkdir -p "$temp_dir"
+          CI_MONITOR_TEMP_ROOT="$temp_dir" python3 -m unittest discover -s scripts -p test_ci_rust_test_monitor.py -v
+      - name: Run full core tests with Linux telemetry
+        if: ${{ runner.os == 'Linux' }}
         env:
           CARGO_PROFILE_TEST_DEBUG: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          diag_dir="${RUNNER_TEMP}/dotz-core-ci"
+          mkdir -p "$diag_dir"
+          python3 scripts/ci_rust_test_monitor.py --log "$diag_dir/core-test.raw.log" --telemetry "$diag_dir/resource.jsonl" --progress "$diag_dir/progress.jsonl" --interval 5 --test-idle-timeout 900 --individual-test-timeout 600 --post-exit-drain-timeout 300 --command-timeout 2400 --termination-grace 10 -- cargo test -p dotz-core -- --test-threads=2
+      - name: Run full core tests on Windows and macOS
+        if: ${{ runner.os != 'Linux' }}
+        env:
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo test -p dotz-core -- --test-threads=2
+      - name: Upload Ubuntu core-test diagnostics
+        if: ${{ always() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-core-test-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/dotz-core-ci/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Remove CI-only namespace profile
+        if: ${{ always() && runner.os == 'Linux' }}
+        run: |
+          if test -f "${RUNNER_TEMP}/dotz-core-ci/userns-profile-loaded"; then
+            sudo apparmor_parser -R .github/ci/dotz-ci-unshare
+          fi
       # Cold-start perf bench (Windows-only): measures Embedder::load() and records the number.
       # The bench is non-gating by design (see dotz-core/benches/cold_start.rs doc header): it
       # skips when the bundled ONNX model is absent, and it does not fail on a regression — a
@@ -43,5 +117,5 @@ jobs:
 # .icns via `iconutil -c icns icon.iconset/` on a macOS host before the first `cargo tauri build`
 # that targets `dmg`. Tauri warns on a malformed .icns but does not fail the build; the macOS
 # build is not exercised on this host (see tauri.conf.json `targets: [nsis, dmg, appimage, deb]`).
-# The seatbelt (macOS sandbox-exec) and bwrap (Linux bubblewrap) argv in dotz-core/src/sandbox.rs
-# are also deferred — see the `# ponytail:` TODOs in MacSandbox/LinuxSandbox::prepare_command.
+# Only the macOS seatbelt (`sandbox-exec`) argv remains deferred. Linux PID namespaces provide
+# process cleanup, not filesystem or network isolation; see the boundary notes in README.md.

@@ -1,10 +1,10 @@
-/* dotz — panel registry + mounting. Split from app.js (C7). No behavior change.
- * The PANEL_REGISTRY (Q3) is the single source of truth for panel metadata — adding a panel =
- * one entry here + a <template id="tpl-<name>"> in index.html. PANEL_NAMES / PANEL_META /
- * PANEL_COLOR / panelForToolJS / the mountPanel wirer are all derived from this array.
+/* dotz — panel registry + mounting. Split from app.js (C7).
+ * Pure metadata lives in panel-registry.js; this module attaches UI wirers and derives
+ * PANEL_NAMES / PANEL_META for the palette and mountPanel.
  */
 import { $, el } from './api.js';
 import { state, saveLayout } from './state.js';
+import { PANEL_DEFINITIONS } from './panel-registry.js';
 import { wireChatPanel } from './panels/chat.js';
 import { wireGraphPanel } from './panels/graph.js';
 import { wireBrainPanel } from './panels/brain.js';
@@ -23,32 +23,31 @@ import { wireDoctrinePanel } from './panels/doctrine.js';
 import { wireMarketplacePanel } from './panels/marketplace.js';
 import { wirePerfPanel } from './panels/perf.js';
 
-// Each entry: { name, icon, label, color?, wire?, toolMap? }
-//   - color: optional CSS-var accent for tool chips (omitted = falls back to var(--surface-2))
-//   - wire:  optional panel-wirer function (hoisted function declaration; called by mountPanel)
-//   - toolMap: optional array of matchers used to derive panelForToolJS. Each matcher is either
-//     {prefix:"memory_"} (startsWith) or {exact:["skill","create_skill",...]} (=== any).
-//     Order matters: the first matching entry wins, mirroring the original if/else chain.
-const PANEL_REGISTRY = [
-  { name: "chat",        icon: "▓", label: "CHAT",            wire: wireChatPanel },
-  { name: "graph",       icon: "◐", label: "WORKFLOW GRAPH", color: "var(--cyan)",   wire: wireGraphPanel, toolMap: [{ exact: "subagent" }] },
-  { name: "brain",       icon: "◆", label: "AGENT BRAIN",    color: "var(--mauve)",  wire: wireBrainPanel, toolMap: [{ exact: ["rsi_baseline", "rsi_compare"] }] },
-  { name: "browser",     icon: "▣", label: "BROWSER",        color: "var(--cyan)",   wire: wireBrowserPanel, toolMap: [{ prefix: "browser_" }] },
-  { name: "memory",      icon: "▤", label: "MEMORY",         color: "var(--mauve)",  wire: wireMemoryPanel, toolMap: [{ prefix: "memory_" }] },
-  { name: "files",       icon: "▥", label: "FILES",          color: "var(--muted)",  wire: wireFilesPanel, toolMap: [{ exact: ["edit", "write"] }] },
-  { name: "sandbox",     icon: "▩", label: "SANDBOX",        color: "var(--peach)",  wire: wireSandboxPanel, toolMap: [{ prefix: "sandbox_" }] },
-  { name: "skills",      icon: "✦", label: "SKILLS",         color: "var(--yellow)", wire: wireSkillsPanel, toolMap: [{ exact: ["skill", "create_skill", "list_skills", "create_agent", "list_agents"] }] },
-  { name: "templates",   icon: "⬡", label: "TEMPLATES",      wire: wireTemplatesPanel },
-  { name: "design",      icon: "❖", label: "DESIGN",         color: "var(--pink)",   wire: wireDesignPanel, toolMap: [{ prefix: "design_" }] },
-  { name: "spec",        icon: "◇", label: "SPEC",           color: "var(--peach)",  wire: wireSpecPanel, toolMap: [{ prefix: "openspec_" }] },
-  { name: "living-docs", icon: "◧", label: "LIVING DOCS",    color: "var(--pink)",   wire: wireLivingDocsPanel, toolMap: [{ prefix: "living_docs_" }] },
-  { name: "vcs",         icon: "⌁", label: "VCS",            color: "var(--green)",  wire: wireVcsPanel, toolMap: [{ prefix: "vcs_" }] },
-  { name: "connections", icon: "⊕", label: "CONNECTIONS",    wire: wireConnectionsPanel },
-  { name: "doctrine",    icon: "◈", label: "DOCTRINE",       color: "var(--lav)",    wire: wireDoctrinePanel, toolMap: [{ exact: "agents_md" }] },
-  { name: "marketplace", icon: "⚑", label: "MARKETPLACE",    wire: wireMarketplacePanel },
-  { name: "perf",         icon: "⚡", label: "PERFORMANCE",    wire: wirePerfPanel },
-];
-// Derived (kept as const so all existing PANEL_NAMES / PANEL_META call sites work unchanged).
+// Keep UI wirers separate from the pure panel metadata so state.js and graph.js can consume the
+// registry without importing this module's wiring graph.
+const PANEL_WIRERS = {
+  chat: wireChatPanel,
+  graph: wireGraphPanel,
+  brain: wireBrainPanel,
+  browser: wireBrowserPanel,
+  memory: wireMemoryPanel,
+  files: wireFilesPanel,
+  sandbox: wireSandboxPanel,
+  skills: wireSkillsPanel,
+  templates: wireTemplatesPanel,
+  design: wireDesignPanel,
+  spec: wireSpecPanel,
+  "living-docs": wireLivingDocsPanel,
+  vcs: wireVcsPanel,
+  connections: wireConnectionsPanel,
+  doctrine: wireDoctrinePanel,
+  marketplace: wireMarketplacePanel,
+  perf: wirePerfPanel,
+};
+const PANEL_REGISTRY = PANEL_DEFINITIONS.map((entry) => ({
+  ...entry,
+  wire: PANEL_WIRERS[entry.name],
+}));
 const PANEL_NAMES = PANEL_REGISTRY.map((e) => e.name);
 const PANEL_META = Object.fromEntries(PANEL_REGISTRY.map((e) => [e.name, { icon: e.icon, label: e.label }]));
 

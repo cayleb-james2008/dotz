@@ -67,7 +67,7 @@ model absent, single-threaded) — i.e. they are pre-existing environment limits
 ## NOT RUN here (honest blockers)
 
 - **Windows Tauri build** (`cargo tauri build` → signed NSIS installer) — Windows-only.
-- **`npm install && npm run fetch-model`** — fetches the `agent-browser` binary + ONNX model from
+- **`npm run install:deps && npm run fetch-model`** — fetches the `agent-browser` binary + ONNX model from
   the network; not run.
 - **CI** (`.github/workflows/ci.yml`) — runs on `windows-latest` by design.
 - The full model-backed test set (needs provider credentials).
