@@ -34,7 +34,7 @@ class BrowserStartupGate:
 
 
 def browser_socket_directory(run_token: str, roots: list[Path]) -> Path:
-    """Select an isolated short POSIX socket directory, preferring shortest usable roots.
+    """Select an isolated short POSIX socket directory, preferring the caller's temp root.
 
     Reserve room for a socket filename instead of only checking the directory itself; the
     agent-browser/Chromium Unix-domain socket path must fit within the conservative 103-byte
@@ -42,7 +42,7 @@ def browser_socket_directory(run_token: str, roots: list[Path]) -> Path:
     """
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,12}", run_token):
         raise ValueError("run_token must be 1-12 safe filename characters")
-    candidates = sorted({Path(root) for root in roots}, key=lambda root: len(os.fsencode(root)))
+    candidates = dict.fromkeys(Path(root) for root in roots)
     for root in candidates:
         directory = root / f"db-{run_token}"
         worst_case_socket = directory / ("s" * _SOCKET_FILENAME_RESERVE_BYTES)

@@ -226,7 +226,7 @@ app_env.update({
     "DOTZ_TOKEN": "",
     "AGENT_BROWSER_SESSION": SESSION,
     "AGENT_BROWSER_EXECUTABLE_PATH": str(CHROMIUM or ""),
-    "AGENT_BROWSER_ARGS": "--no-sandbox,--disable-gpu,--disable-dev-shm-usage",
+    "AGENT_BROWSER_ARGS": "--disable-gpu,--disable-dev-shm-usage",
     "AGENT_BROWSER_IDLE_TIMEOUT_MS": "15000",
     "AGENT_BROWSER_INIT_SCRIPTS": str(OUT / "capture-ui-errors.js"),
 })

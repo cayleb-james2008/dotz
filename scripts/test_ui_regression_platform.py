@@ -85,6 +85,13 @@ class UiRegressionPlatformTests(unittest.TestCase):
                 UNIX_SOCKET_PATH_LIMIT_BYTES,
             )
 
+    def test_socket_directory_prefers_caller_root_when_both_fit(self) -> None:
+        preferred = Path("/private/tmp")
+        self.assertEqual(
+            browser_socket_directory("deadbeef", [preferred, Path("/tmp")]).parent,
+            preferred,
+        )
+
     def test_socket_directory_fails_closed_when_every_root_is_too_long(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             long_root = Path(tmp) / ("x" * 100)
