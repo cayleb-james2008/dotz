@@ -3527,7 +3527,53 @@ mod containment_tests {
         );
     }
 
-    /// Helper-process entrypoint for the two tests that must run in a separate OS process
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancel_during_containment_probe_prevents_terminal_and_web_workload() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("dotz-cancel-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("private fixture");
+        let wrapper = dir.join("gated-unshare");
+        // Only delay the real probe, never replace successful containment with a no-op.
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\n: > \"$DOTZ_TEST_GATE_DIR/ready\"\nwhile ! test -f \"$DOTZ_TEST_GATE_DIR/release\"; do sleep 0.01; done\nexec /usr/bin/unshare \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let wrapper_s = wrapper.to_string_lossy().to_string();
+        let dir_s = dir.to_string_lossy().to_string();
+        let mut helper = spawn_helper(
+            "cancel-probe",
+            &[
+                ("DOTZ_UNSHARE_BIN", &wrapper_s),
+                ("DOTZ_TEST_GATE_DIR", &dir_s),
+            ],
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = helper.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Release the probe before reaping the failed helper; don't orphan the fixture.
+                std::fs::write(dir.join("release"), "").unwrap();
+                helper.kill().unwrap();
+                helper.wait().unwrap();
+                panic!("gated cancellation helper exceeded deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let result = std::fs::read_to_string(dir.join("result"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            status.success(),
+            "gated cancellation helper failed: {status}"
+        );
+        assert_eq!(result.unwrap(), "terminal:web:cancelled-without-spawn");
+    }
+
+    /// Helper-process entrypoint for the tests that must run in a separate OS process
     /// (owner crash = SIGKILL of the owning process; fail-closed = a process-local env
     /// override). Runs as a no-op pass in the parent harness.
     #[test]
@@ -3536,6 +3582,7 @@ mod containment_tests {
         match std::env::var("DOTZ_TEST_CONTAINMENT_HELPER").as_deref() {
             Ok("owner-crash") => helper_owner_crash(),
             Ok("fail-closed") => helper_fail_closed(),
+            Ok("cancel-probe") => helper_cancel_probe(),
             _ => {}
         }
     }
@@ -3556,6 +3603,67 @@ mod containment_tests {
             cmd.env(k, v);
         }
         cmd.spawn().expect("spawn helper process")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn helper_cancel_probe() {
+        let dir = std::path::PathBuf::from(std::env::var("DOTZ_TEST_GATE_DIR").unwrap());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for mode in ["terminal", "web"] {
+                let sentinel = dir.join("workload-ran");
+                let run = start_run(
+                    "bash",
+                    &format!("printf WORKLOAD_RAN > '{}'", sentinel.display()),
+                    mode,
+                    None,
+                    60_000,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                let temp_dir = std::env::temp_dir().join(format!("dotz-sandbox-{}", run.id));
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !dir.join("ready").exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "probe never reached gate"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(
+                    temp_dir.join("run.sh").exists(),
+                    "script write must precede probe"
+                );
+                assert!(
+                    test_run_pid(&run.id).is_none(),
+                    "probe must precede workload spawn"
+                );
+                assert!(kill_run_by_id(&run.id));
+                assert!(!kill_run_by_id(&run.id));
+                std::fs::write(dir.join("release"), "").unwrap();
+                while temp_dir.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "cancelled run never cleaned up"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(lookup(&run.id).unwrap().status, "killed");
+                assert!(!sentinel.exists(), "cancelled workload ran");
+                assert!(test_run_pid(&run.id).is_none());
+                assert!(runs_guard().get(&run.id).unwrap().port.is_none());
+                remove_test_run(&run.id);
+                std::fs::remove_file(dir.join("ready")).unwrap();
+                std::fs::remove_file(dir.join("release")).unwrap();
+            }
+        });
+        std::fs::write(dir.join("result"), "terminal:web:cancelled-without-spawn").unwrap();
     }
 
     /// Helper mode `owner-crash`: start a contained run with an escaped descendant, then park
