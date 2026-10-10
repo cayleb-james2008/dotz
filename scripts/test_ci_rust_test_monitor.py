@@ -111,8 +111,8 @@ class CiRustTestMonitorTests(unittest.TestCase):
         self.assertTrue(any(e["event"] == "post_exit_drain_timeout" for e in events))
         self.assertEqual(events[-1]["event"], "command_exit")
 
-    @unittest.skipUnless(os.name == "posix" and hasattr(os, "killpg"), "requires POSIX process groups")
-    def test_command_timeout_kills_owned_leader_if_group_signal_fails(self) -> None:
+    @unittest.skipUnless(hasattr(os, "killpg"), "requires POSIX process groups")
+    def test_command_timeout_kills_leader_if_process_group_kill_fails(self) -> None:
         temp_root = os.environ.get("CI_MONITOR_TEMP_ROOT")
         with tempfile.TemporaryDirectory(prefix="rust-monitor-timeout-", dir=temp_root) as temp:
             root = Path(temp)
@@ -136,33 +136,54 @@ class CiRustTestMonitorTests(unittest.TestCase):
                 stderr=subprocess.PIPE, text=True,
             )
             command_pid: int | None = None
-            events: list[dict[str, Any]] = []
             try:
-                stdout, stderr = monitor.communicate(timeout=5)
+                try:
+                    stdout, stderr = monitor.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = "", "monitor did not finish after its hard timeout"
                 events = [json.loads(line) for line in progress.read_text().splitlines()]
-                command_pid = next(int(e["pid"]) for e in events if e.get("event") == "command_start")
-                exit_event = next(e for e in events if e.get("event") == "command_exit")
-                self.assertEqual(monitor.returncode, 124, f"{stdout}\n{stderr}")
-                self.assertTrue(any(e.get("event") == "command_process_exit_timeout" for e in events))
-                self.assertEqual(exit_event.get("command_return_code"), -signal.SIGKILL)
+                command = next(event for event in events if event["event"] == "command_start")
+                command_pid = int(command["pid"])
+                exits = [event for event in events if event["event"] == "command_exit"]
+                self.assertIsNotNone(monitor.returncode, f"monitor exceeded hard timeout\n{stdout}\n{stderr}")
+                self.assertEqual(monitor.returncode, 124, stderr)
+                self.assertTrue(any(event["event"] == "command_process_exit_timeout" for event in events))
+                self.assertEqual(len(exits), 1, events)
+                self.assertEqual(exits[0].get("command_return_code"), -signal.SIGKILL)
+                self.assertIn("running 1 test", log.read_text())
                 self.assertIsNone(sentinel.poll(), "timeout cleanup must not kill an unrelated process")
             finally:
-                if monitor.poll() is None:
-                    monitor.kill()
-                    monitor.communicate()
                 if command_pid is None and progress.exists():
                     try:
-                        command_pid = next(
-                            int(e["pid"])
-                            for e in (json.loads(line) for line in progress.read_text().splitlines())
-                            if e.get("event") == "command_start"
-                        )
+                        command_pid = int(next(
+                            event["pid"] for event in (json.loads(line) for line in progress.read_text().splitlines())
+                            if event.get("event") == "command_start"
+                        ))
                     except (StopIteration, OSError, ValueError, json.JSONDecodeError):
-                        pass
-                if command_pid is not None and not any(
-                    e.get("event") == "command_exit" and e.get("command_return_code") is not None
-                    for e in events
-                ):
+                        command_pid = None
+                try:
+                    events = [json.loads(line) for line in progress.read_text().splitlines()] if progress.exists() else []
+                except (OSError, json.JSONDecodeError):
+                    events = []
+                leader_reaped = any(
+                    event.get("event") == "command_exit" and event.get("command_return_code") is not None
+                    for event in events
+                )
+                if monitor.poll() is None:
+                    try:
+                        monitor.communicate(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        if command_pid is not None and not leader_reaped:
+                            try:
+                                os.kill(command_pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        try:
+                            monitor.communicate(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            monitor.kill()
+                            monitor.communicate()
+                elif command_pid is not None and not leader_reaped:
                     try:
                         os.kill(command_pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -171,7 +192,7 @@ class CiRustTestMonitorTests(unittest.TestCase):
                 sentinel.wait(timeout=3)
 
     @unittest.skipUnless(os.name == "posix" and hasattr(os, "killpg"), "requires POSIX process groups")
-    def test_forced_abandon_retains_leader_ownership_until_exit(self) -> None:
+    def test_forced_abandon_waits_for_owned_leader_after_kill_failures(self) -> None:
         temp_root = os.environ.get("CI_MONITOR_TEMP_ROOT")
         with tempfile.TemporaryDirectory(prefix="rust-monitor-owned-leader-", dir=temp_root) as temp:
             root = Path(temp)
@@ -179,6 +200,7 @@ class CiRustTestMonitorTests(unittest.TestCase):
             telemetry = root / "telemetry.jsonl"
             progress = root / "progress.jsonl"
             release = root / "release-child"
+            injections = root / "injections.log"
             child = (
                 "import pathlib,time; print('running 1 test', flush=True); "
                 f"release=pathlib.Path({str(release)!r}); "
@@ -192,9 +214,15 @@ class CiRustTestMonitorTests(unittest.TestCase):
             ]
             wrapper = (
                 "import os,runpy,subprocess,sys\n"
-                "def fail_group(*_args):\n    raise ProcessLookupError()\n"
+                f"injections = {str(injections)!r}\n"
+                "def fail_group(*_args):\n"
+                " with open(injections, 'a', encoding='utf-8') as out: out.write('group\\n')\n"
+                " raise ProcessLookupError('injected process-group kill failure')\n"
+                "def fail_direct(self):\n"
+                " with open(injections, 'a', encoding='utf-8') as out: out.write('direct\\n')\n"
+                " return None\n"
                 "os.killpg = fail_group\n"
-                "subprocess.Popen.kill = lambda _self: None\n"
+                "subprocess.Popen.kill = fail_direct\n"
                 f"sys.argv = {monitor_args!r}\n"
                 "runpy.run_path(sys.argv[0], run_name='__main__')\n"
             )
@@ -218,40 +246,58 @@ class CiRustTestMonitorTests(unittest.TestCase):
                 events: list[dict[str, Any]] = []
                 while time.monotonic() < deadline:
                     events = read_events()
-                    start_event = next((e for e in events if e.get("event") == "command_start"), None)
+                    start_event = next((event for event in events if event.get("event") == "command_start"), None)
                     if start_event:
                         command_pid = int(start_event["pid"])
-                    if (any(e.get("event") == "command_process_exit_timeout" for e in events)
-                            and any(e.get("event") == "command_leader_reap_pending" for e in events)):
+                    if (any(event.get("event") == "command_process_exit_timeout" for event in events)
+                            and any(event.get("event") == "command_leader_reap_pending" for event in events)):
                         break
                     if monitor.poll() is not None:
                         break
                     time.sleep(0.02)
                 self.assertIsNotNone(command_pid, f"missing command_start event: {events}")
                 assert command_pid is not None
-                self.assertTrue(any(e.get("event") == "command_process_exit_timeout" for e in events))
-                self.assertTrue(any(e.get("event") == "command_leader_reap_pending" for e in events))
-                time.sleep(0.3)
+                self.assertTrue(
+                    any(event.get("event") == "command_process_exit_timeout" for event in events),
+                    f"monitor did not reach forced abandonment: {events}",
+                )
+                self.assertTrue(injections.exists(), "kill failures were not injected")
+                injected = injections.read_text().splitlines()
+                self.assertIn("group", injected)
+                self.assertIn("direct", injected)
+
+                # The old one-shot wait path exited after its wait timeout even though
+                # this deliberately gated leader remained live. Hold the gate longer
+                # than that wait to exercise the race deterministically.
+                time.sleep(1.15)
                 events = read_events()
-                self.assertFalse(any(e.get("event") == "command_exit" for e in events), events)
+                self.assertFalse(any(event.get("event") == "command_exit" for event in events), events)
                 self.assertIsNone(monitor.poll(), "monitor relinquished its live owned leader")
-                os.kill(command_pid, 0)
-                self.assertIsNone(sentinel.poll(), "cleanup must not signal an unrelated process")
+                try:
+                    os.kill(command_pid, 0)
+                except ProcessLookupError:
+                    self.fail("owned leader exited before the test released its gate")
+                self.assertTrue(any(event.get("event") == "command_leader_reap_pending" for event in events))
+                self.assertIsNone(sentinel.poll(), "cleanup must not widen to an unrelated process")
 
                 release.touch()
                 stdout, stderr = monitor.communicate(timeout=5)
                 events = read_events()
-                exits = [e for e in events if e.get("event") == "command_exit"]
-                self.assertEqual(monitor.returncode, 124, f"{stdout}\n{stderr}")
+                exits = [event for event in events if event.get("event") == "command_exit"]
+                self.assertEqual(monitor.returncode, 124, f"{stdout}\\n{stderr}")
+                self.assertIn("command_process_exit_timeout", stdout)
+                self.assertIn("command_leader_reap_pending", stdout)
                 self.assertEqual(len(exits), 1, events)
                 self.assertEqual(exits[0].get("command_return_code"), 0, events)
                 self.assertEqual(events[-1].get("event"), "command_exit")
-                self.assertIsNone(sentinel.poll(), "cleanup must not signal an unrelated process")
+                self.assertIn("running 1 test", log.read_text())
+                self.assertIsNone(sentinel.poll(), "monitor cleanup killed an unrelated sentinel")
             finally:
                 release.touch(exist_ok=True)
                 if command_pid is None:
                     command_pid = next((
-                        int(e["pid"]) for e in read_events() if e.get("event") == "command_start"
+                        int(event["pid"]) for event in read_events()
+                        if event.get("event") == "command_start"
                     ), None)
                 if monitor.poll() is None:
                     try:
@@ -267,6 +313,14 @@ class CiRustTestMonitorTests(unittest.TestCase):
                         except subprocess.TimeoutExpired:
                             monitor.kill()
                             monitor.communicate()
+                elif command_pid is not None and not any(
+                    event.get("event") == "command_exit" and event.get("command_return_code") is not None
+                    for event in read_events()
+                ):
+                    try:
+                        os.kill(command_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                 sentinel.terminate()
                 sentinel.wait(timeout=3)
 

@@ -92,5 +92,5 @@ jobs:
 # .icns via `iconutil -c icns icon.iconset/` on a macOS host before the first `cargo tauri build`
 # that targets `dmg`. Tauri warns on a malformed .icns but does not fail the build; the macOS
 # build is not exercised on this host (see tauri.conf.json `targets: [nsis, dmg, appimage, deb]`).
-# The seatbelt (macOS sandbox-exec) and bwrap (Linux bubblewrap) argv in dotz-core/src/sandbox.rs
-# are also deferred — see the `# ponytail:` TODOs in MacSandbox/LinuxSandbox::prepare_command.
+# Only the macOS seatbelt (`sandbox-exec`) argv remains deferred. Linux PID namespaces provide
+# process cleanup, not filesystem or network isolation; see the boundary notes in README.md.

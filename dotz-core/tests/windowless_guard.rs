@@ -35,6 +35,7 @@ const EXEMPT_ATTRS: [&str; 4] = [
     "#[cfg(not(windows))]",
     "#[cfg(unix)]",
     "#[cfg(target_os = \"macos\")]",
+    "#[cfg(target_os = \"linux\")]",
 ];
 
 /// A marker that proves the spawn site suppresses the console window on Windows.
