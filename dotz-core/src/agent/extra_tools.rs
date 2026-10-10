@@ -345,15 +345,16 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
     };
     #[cfg(not(windows))]
     let mut child = {
-        use std::os::unix::process::CommandExt;
-        let mut sc = std::process::Command::new("sh");
-        sc.arg("-c")
-            .arg(&command)
-            .current_dir(&cwd)
+        let mut sc = match crate::sandbox::owned_shell_command(&command) {
+            Ok(command) => command,
+            Err(e) => {
+                return json!({"error": format!("gate containment unavailable: {e}"), "ok": false, "passed": 0, "failed": 0});
+            }
+        };
+        sc.current_dir(&cwd)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        match tokio::process::Command::from(sc).spawn() {
+            .stderr(Stdio::piped());
+        match sc.spawn() {
             Ok(c) => c,
             Err(e) => {
                 return json!({
@@ -2350,6 +2351,12 @@ mod tests {
         let command = if cfg!(windows) {
             // ~3s of wall-clock time; the 1s timeout fires first.
             "ping -n 4 127.0.0.1".to_string()
+        } else if cfg!(target_os = "linux") {
+            // Preserve a host-visible PID even though the shell now runs in a PID namespace.
+            format!(
+                "(read pid rest < /proc/self/stat; echo $pid > {}; exec sleep 30) & wait",
+                pidfile.to_string_lossy()
+            )
         } else {
             format!("sleep 30 & echo $! > {} ; wait", pidfile.to_string_lossy())
         };

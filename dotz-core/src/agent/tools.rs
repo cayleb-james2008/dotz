@@ -324,15 +324,8 @@ impl Tool for BashTool {
             }
             #[cfg(not(windows))]
             {
-                // Build a std Command so we can place the child in its own process group
-                // (tokio's Command doesn't expose process_group). The group lets a timeout
-                // tree-kill the shell AND every descendant (cargo/npm/sleep …) with
-                // the shared process-group kill helper. Without this, `start_kill` only terminates the shell
-                // and leaves the real workload running as an orphan that keeps consuming CPU.
-                use std::os::unix::process::CommandExt;
-                let mut sc = std::process::Command::new("sh");
-                sc.arg("-c").arg(&cmd).process_group(0);
-                tokio::process::Command::from(sc)
+                crate::sandbox::owned_shell_command(&cmd)
+                    .map_err(|e| format!("exec containment unavailable: {e}"))?
             }
         };
         c.current_dir(&cwd);
@@ -1203,6 +1196,13 @@ mod tests {
 
         let command = if cfg!(windows) {
             "ping -n 3 127.0.0.1".to_string()
+        } else if cfg!(target_os = "linux") {
+            // /proc is the host view but $! is namespace-relative. A builtin read in the
+            // background shell captures its host PID; exec preserves that identity.
+            format!(
+                "(read pid rest < /proc/self/stat; echo $pid > {}; exec sleep 30) & wait",
+                pidfile.to_string_lossy()
+            )
         } else {
             // Spawn `sleep 30` as a background child of the shell, write its PID to
             // the pidfile, then `wait` so the shell stays alive until the timeout.

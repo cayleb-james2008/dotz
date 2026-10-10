@@ -634,6 +634,30 @@ pub(crate) fn wrap_sandbox_argv(argv: Vec<String>) -> Result<Vec<String>, String
     }
 }
 
+/// Shell tools need the same per-command PID lifetime as sandbox runs: when their root exits,
+/// the kernel must remove background output-pipe holders before the command is discarded.
+/// Keep the existing host /proc view for system-inspection commands; this is process lifetime
+/// containment, not filesystem/network isolation. Non-Linux behavior remains unchanged.
+#[cfg(not(windows))]
+pub(crate) fn owned_shell_command(script: &str) -> Result<tokio::process::Command, String> {
+    let argv = wrap_sandbox_argv(vec!["sh".into(), "-c".into(), script.into()])?;
+    #[cfg(target_os = "linux")]
+    let argv = {
+        let mut argv = argv;
+        let index = UNSHARE_WRAPPER_FLAGS
+            .iter()
+            .position(|arg| *arg == "--mount-proc")
+            .unwrap()
+            + 1;
+        argv.remove(index);
+        argv
+    };
+    let mut command = tokio::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    backend().prepare_command(&mut command);
+    Ok(command)
+}
+
 // PR_SET_PDEATHSIG / SIGKILL constants and the two libc entry points used by the Linux
 // parent-death arm above. Declared locally (instead of a `libc` dependency) against the C
 // runtime Rust already links; both calls are async-signal-safe, which pre_exec requires.
