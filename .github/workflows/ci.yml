@@ -44,6 +44,25 @@ jobs:
         with:
           node-version: '22'
       - run: npm run install:deps && npm run fetch-model
+      # Ubuntu's AppArmor userns restriction can deny unshare on an otherwise
+      # namespace-capable runner. Provision only that executable's permission;
+      # never disable AppArmor/sysctls, run tests as root, skip assertions, or
+      # let the product fall back to an uncontained command.
+      - name: Verify Linux namespace prerequisite
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          diag_dir="${RUNNER_TEMP}/dotz-core-ci"
+          mkdir -p "$diag_dir"
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone > "$diag_dir/userns-before.txt" 2>&1 || true
+          probe=(unshare --user --map-root-user --pid --fork --mount-proc --kill-child=KILL -- sh -c 'test "$$" -eq 1')
+          if ! "${probe[@]}" > "$diag_dir/userns-before-probe.log" 2>&1; then
+            test "$(command -v unshare)" = /usr/bin/unshare
+            sudo apparmor_parser -r .github/ci/dotz-ci-unshare
+            touch "$diag_dir/userns-profile-loaded"
+          fi
+          "${probe[@]}" > "$diag_dir/userns-after-probe.log" 2>&1
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone > "$diag_dir/userns-after.txt" 2>&1 || true
+          cmp "$diag_dir/userns-before.txt" "$diag_dir/userns-after.txt"
       # Prior Ubuntu runs 37259587470 and 37249846971 lost runner communication in cargo test;
       # their log endpoints returned 404 and no artifacts were available. That does not establish
       # whether compilation, a test, a child process, or runner resources caused the failure.
@@ -78,6 +97,12 @@ jobs:
           path: ${{ runner.temp }}/dotz-core-ci/
           if-no-files-found: warn
           retention-days: 14
+      - name: Remove CI-only namespace profile
+        if: ${{ always() && runner.os == 'Linux' }}
+        run: |
+          if test -f "${RUNNER_TEMP}/dotz-core-ci/userns-profile-loaded"; then
+            sudo apparmor_parser -R .github/ci/dotz-ci-unshare
+          fi
       # Cold-start perf bench (Windows-only): measures Embedder::load() and records the number.
       # The bench is non-gating by design (see dotz-core/benches/cold_start.rs doc header): it
       # skips when the bundled ONNX model is absent, and it does not fail on a regression — a

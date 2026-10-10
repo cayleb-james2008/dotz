@@ -1,0 +1,7 @@
+# CI runner prerequisite only: allow util-linux unshare to create the namespace
+# required by the fail-closed Linux sandbox. Do not disable host-wide AppArmor
+# or change namespace sysctls. This profile is removed at the end of the CI job.
+abi <abi/4.0>,
+profile dotz-ci-unshare /usr/bin/unshare flags=(unconfined) {
+  userns,
+}
