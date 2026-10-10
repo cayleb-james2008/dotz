@@ -452,7 +452,7 @@ def main() -> int:
                 proc.stdout.close()
                 stream_eof = True
                 forced_abandon = True
-            return_code = proc.poll()
+            return_code = peek_return_code(proc)
             if (return_code is not None and stream_eof) or forced_abandon:
                 break
         if timeout_reason is not None and not kill_sent:

@@ -99,6 +99,8 @@ class CiRustTestMonitorTests(unittest.TestCase):
             ], capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
             self.assertNotIn("leader reaped before group signal", result.stderr)
+            events = [json.loads(line) for line in (root / "progress.jsonl").read_text().splitlines()]
+            self.assertFalse(any(e["event"] == "reaped_owner_signal_refused" for e in events), events)
 
     def test_finished_cargo_with_inherited_child_pipe_is_bounded_and_failed(self) -> None:
         child = (
