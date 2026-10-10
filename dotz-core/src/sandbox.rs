@@ -337,19 +337,17 @@ impl SandboxBackend for LinuxSandbox {
 /// catches its normal descendants; it does not claim to catch a descendant that calls `setsid`.
 #[cfg(target_os = "macos")]
 fn posix_kill_tree(pid: u32) -> Result<(), &'static str> {
-    let group = std::process::Command::new("kill")
-        .args(["-9", &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    if matches!(group, Ok(s) if s.success()) {
+    let p = i32::try_from(pid).map_err(|_| "process ID out of range")?;
+    if p <= 1 {
+        return Err("reserved process ID");
+    }
+    // SAFETY: only the spawned process group's non-reserved ID is targeted. Do not use
+    // kill(1): negative operand parsing differs between implementations.
+    if unsafe { kill(-p, SIGKILL_AS_C_INT) } == 0 {
         return Ok(());
     }
-    let _ = std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    // SAFETY: positive p targets only the owned child.
+    let _ = unsafe { kill(p, SIGKILL_AS_C_INT) };
     Err("process-group kill failed; only a root fallback was attempted")
 }
 
@@ -643,7 +641,7 @@ pub(crate) fn wrap_sandbox_argv(argv: Vec<String>) -> Result<Vec<String>, String
 const PR_SET_PDEATHSIG: std::os::raw::c_int = 1;
 #[cfg(target_os = "linux")]
 const SIGKILL_AS_C_ULONG: std::os::raw::c_ulong = 9;
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 const SIGKILL_AS_C_INT: std::os::raw::c_int = 9;
 
 #[cfg(target_os = "linux")]
@@ -652,7 +650,7 @@ unsafe extern "C" {
     fn getppid() -> std::os::raw::c_int;
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
 }
@@ -928,7 +926,7 @@ async fn execute_run(
     let killed_before_spawn = runs_guard()
         .get(&id)
         .map(|e| e.killed_by_us && e.process.is_none())
-        .unwrap_or(false);
+        .unwrap_or(true);
     if killed_before_spawn {
         return;
     }
@@ -1003,7 +1001,26 @@ async fn execute_run(
     // process group on posix (so `kill_tree` can signal the whole group). See `SandboxBackend`.
     backend().prepare_command(&mut command);
 
-    let mut child = match command.spawn() {
+    // Cancellation and spawn are linearized under the same lock. A cancellation accepted
+    // during script I/O or the containment probe must prevent execution, not just kill later.
+    let spawned = {
+        let mut store = runs_guard();
+        match store.get_mut(&id) {
+            Some(entry) if !entry.killed_by_us => Some(command.spawn().map(|child| {
+                let process = OwnedProcess::pin(child.id());
+                if let Ok(process) = &process {
+                    entry.process = Some(process.clone());
+                }
+                (child, process)
+            })),
+            _ => None,
+        }
+    };
+    let Some(spawned) = spawned else {
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        return;
+    };
+    let (mut child, pinned) = match spawned {
         Ok(c) => c,
         Err(e) => {
             finish(&id, "error", None, &format!("[spawn error] {e}\n"));
@@ -1012,8 +1029,8 @@ async fn execute_run(
         }
     };
 
-    // Pin the spawned identity before any await can reap the root or let its PID be reused.
-    let process = match OwnedProcess::pin(child.id()) {
+    // The identity was pinned before releasing the spawn lock and before any child wait.
+    let process = match pinned {
         Ok(process) => process,
         Err(reason) => {
             let _ = child.start_kill();
@@ -1028,16 +1045,10 @@ async fn execute_run(
             return;
         }
     };
-    let killed_before_spawn = {
-        let mut guard = runs_guard();
-        match guard.get_mut(&id) {
-            Some(e) => {
-                e.process = Some(process.clone());
-                e.killed_by_us
-            }
-            None => false,
-        }
-    };
+    let killed_before_spawn = runs_guard()
+        .get(&id)
+        .map(|e| e.killed_by_us)
+        .unwrap_or(true);
     // A kill/supersede that raced the spawn could not signal before the process was pinned.
     if killed_before_spawn {
         let _ = kill_pid(Some(process.clone()));
@@ -1319,7 +1330,8 @@ fn kill_pid(process: Option<OwnedProcess>) -> Result<(), &'static str> {
     result
 }
 
-/// Kill a running sandbox run by id, returning true if a live child was signalled. Shared by the
+/// Accept cancellation of a running or queued sandbox run by id. True means the request was
+/// accepted, not that process teardown has finished. Shared by the
 /// REST kill endpoint and the WebSocket kill message so both paths behave identically.
 ///
 /// The run is marked `killed` (and `endedAt` set) immediately so the UI reflects the operator
@@ -1330,23 +1342,18 @@ pub fn kill_run_by_id(id: &str) -> bool {
     let process = {
         let mut store = runs_guard();
         match store.get_mut(id) {
-            Some(e) if e.process.is_some() && e.run.status == "running" => {
+            Some(e) if e.run.status == "running" => {
                 e.killed_by_us = true;
                 e.run.status = "killed".to_string();
                 e.run.ended_at = Some(crate::util::now_ms());
                 e.run.output.push_str("\n[killed]\n");
                 e.process.take()
             }
-            _ => None,
+            _ => return false,
         }
     };
-    match process {
-        Some(process) => {
-            let _ = kill_pid(Some(process));
-            true
-        }
-        None => false,
-    }
+    let _ = kill_pid(process);
+    true
 }
 
 /// Kill every still-running `mode:"web"` run for the same project (`None` matches `None`,
@@ -2705,6 +2712,78 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn immediate_cancel_is_sticky_before_terminal_or_web_spawn() {
+        for mode in ["terminal", "web"] {
+            let sentinel =
+                std::env::temp_dir().join(format!("dotz-cancel-{}", uuid::Uuid::new_v4()));
+            let code = if cfg!(windows) {
+                format!(
+                    "Set-Content -LiteralPath '{}' -Value WORKLOAD_RAN",
+                    sentinel.display()
+                )
+            } else {
+                format!("printf WORKLOAD_RAN > '{}'", sentinel.display())
+            };
+            let run = start_run(
+                if cfg!(windows) { "powershell" } else { "bash" },
+                &code,
+                mode,
+                None,
+                60_000,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            // No yield: execute_run has been queued but has not begun.
+            assert!(
+                kill_run_by_id(&run.id),
+                "pending cancellation must be accepted"
+            );
+            assert!(
+                !kill_run_by_id(&run.id),
+                "repeat cancellation must not signal twice"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let final_run = lookup(&run.id).unwrap();
+            assert_eq!(final_run.status, "killed");
+            assert!(!sentinel.exists(), "cancelled workload executed");
+            assert!(test_run_pid(&run.id).is_none());
+            assert!(
+                !std::env::temp_dir()
+                    .join(format!("dotz-sandbox-{}", run.id))
+                    .exists()
+            );
+            remove_test_run(&run.id);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_owned_identity_does_not_signal_unrelated_process() {
+        let mut root = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let process = OwnedProcess::pin(Some(root.id())).unwrap();
+        root.kill().unwrap();
+        root.wait().unwrap();
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let result = backend().kill_tree(&process);
+        let alive = unrelated.try_wait().unwrap().is_none();
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        assert!(
+            result.is_err(),
+            "stale owner must not claim full-tree cleanup"
+        );
+        assert!(alive, "stale cleanup signalled an unrelated process");
+    }
+
     /// When a sandbox run is manually killed mid-execution, the child's captured stdout/stderr
     /// must survive in the final run record.  Before the fix, `kill_run_by_id` set the terminal
     /// state (status="killed", output="\n[killed]\n") for immediate UI feedback, and the later
@@ -2811,7 +2890,7 @@ mod tests {
         );
 
         // Preserve the pid before kill_run_by_id clears it from the run record.
-        let tracked_pid = runs_guard().get(&id).and_then(|entry| entry.pid);
+        let tracked_pid = test_run_pid(&id);
         assert!(
             tracked_pid.is_some(),
             "live child PID must be recorded before kill"

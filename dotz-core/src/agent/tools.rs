@@ -347,6 +347,14 @@ impl Tool for BashTool {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("exec: {e}"))?;
+        let process = match crate::sandbox::OwnedProcess::pin(child.id()) {
+            Ok(process) => process,
+            Err(reason) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(format!("exec process tracking failed: {reason}"));
+            }
+        };
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();
         let mut stdout_buf = Vec::new();
@@ -385,26 +393,22 @@ impl Tool for BashTool {
                 //
                 // Windows waits for taskkill; POSIX uses the guarded shared syscall helper
                 // so no external kill parser or signal-delivery subprocess is involved.
-                #[cfg(windows)]
-                {
-                    if let Some(pid) = child.id() {
-                        let mut kc = std::process::Command::new("taskkill");
-                        kc.args(["/PID", &pid.to_string(), "/T", "/F"])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null());
-                        let _ = crate::util::no_window(&mut kc).status();
-                    }
-                }
-                #[cfg(not(windows))]
-                {
-                    if let Some(pid) = child.id() {
-                        crate::sandbox::backend().kill_tree(pid);
-                    }
-                }
+                let cleanup = tokio::task::spawn_blocking(move || {
+                    crate::sandbox::backend().kill_tree(&process)
+                })
+                .await
+                .unwrap_or(Err("cleanup worker failed"));
                 // Reap the killed child so it does not become a zombie (Unix) or
                 // leak a process handle (Windows) after the timeout path returns.
                 let _ = child.wait().await;
-                return Err(format!("[timeout] killed after {}ms", timeout.as_millis()));
+                return Err(format!(
+                    "[timeout] after {}ms{}",
+                    timeout.as_millis(),
+                    cleanup
+                        .err()
+                        .map(|e| format!("; cleanup incomplete: {e}"))
+                        .unwrap_or_default()
+                ));
             }
         };
 

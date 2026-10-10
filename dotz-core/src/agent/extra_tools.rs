@@ -366,6 +366,14 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
         }
     };
 
+    let process = match crate::sandbox::OwnedProcess::pin(child.id()) {
+        Ok(process) => process,
+        Err(reason) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return json!({"error": format!("gate process tracking failed: {reason}"), "ok": false, "passed": 0, "failed": 0});
+        }
+    };
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
     let mut stdout = child.stdout.take();
@@ -446,27 +454,15 @@ async fn run_gate(cwd: &Path, command: Option<&str>) -> Value {
             // the entire group — shell + every descendant.
             // Windows waits for taskkill; POSIX shares the guarded syscall helper with
             // sandbox and bash cleanup, avoiding the external kill parser entirely.
-            #[cfg(windows)]
-            {
-                if let Some(pid) = child.id() {
-                    let mut kc = std::process::Command::new("taskkill");
-                    kc.args(["/PID", &pid.to_string(), "/T", "/F"])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null());
-                    let _ = crate::util::no_window(&mut kc).status();
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                if let Some(pid) = child.id() {
-                    crate::sandbox::backend().kill_tree(pid);
-                }
-            }
+            let cleanup =
+                tokio::task::spawn_blocking(move || crate::sandbox::backend().kill_tree(&process))
+                    .await
+                    .unwrap_or(Err("cleanup worker failed"));
             // Reap the killed child so it does not become a zombie (Unix) or leak handles
             // (Windows) after the timeout path returns.
             let _ = child.wait().await;
             json!({
-                "error": format!("[timeout] killed after {}ms", timeout.as_millis()),
+                "error": format!("[timeout] after {}ms{}", timeout.as_millis(), cleanup.err().map(|e| format!("; cleanup incomplete: {e}")).unwrap_or_default()),
                 "ok": false,
                 "passed": 0,
                 "failed": 0,

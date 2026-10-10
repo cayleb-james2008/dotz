@@ -30,7 +30,7 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Attributes whose following item/block is exempt from the windowing convention.
-const EXEMPT_ATTRS: [&str; 4] = [
+const EXEMPT_ATTRS: [&str; 5] = [
     "#[cfg(test)]",
     "#[cfg(not(windows))]",
     "#[cfg(unix)]",
