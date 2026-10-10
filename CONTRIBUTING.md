@@ -10,10 +10,11 @@ in-process multi-agent coding dashboard built in Rust.
    - [Rust](https://rustup.rs/) (stable, edition 2024)
    - [Node.js](https://nodejs.org/) (for the agent-browser binary + ONNX model fetch)
    - [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) (WebView2 on Windows)
+   - Python 3 and Chromium/Chrome (for the browser regression)
 3. **Set up the workspace**:
    ```bash
-   npm install
-   npm run fetch-model    # downloads the all-MiniLM-L6-v2 ONNX model
+   npm run install:deps   # installs dependencies; runs only version-pinned approved hooks
+   npm run fetch-model   # downloads the all-MiniLM-L6-v2 ONNX model
    ```
 4. **Verify the build**:
    ```bash
@@ -43,6 +44,9 @@ cargo clippy -p dotz-core --all-targets -- -D warnings
 cargo test -p dotz-core
 ```
 
+> **Browser regression:** when changing frontend initialization, onboarding, or panel wiring, run
+> `npm run test:ui`. It starts the real local backend with an isolated profile and never submits a prompt.
+>
 > **LLVM OOM note:** On memory-constrained hosts, bound parallelism:
 > `cargo test -p dotz-core -- --test-threads=2`. If a build dies with
 > `STATUS_STACK_BUFFER_OVERRUN` or exit 1455, re-run once before treating the

@@ -364,18 +364,26 @@ since the bundled systems are static HTML/CSS — a hardened default that still 
 - [Rust](https://rustup.rs/) (stable, edition 2024)
 - [Node.js](https://nodejs.org/) (for the agent-browser binary + ONNX model fetch)
 - [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) (WebView2 on Windows)
+- Python 3 and Chromium/Chrome (for `npm run test:ui`)
 
 ### Install dependencies
 
 ```bash
-npm install        # ships the agent-browser binary + the @huggingface/transformers model fetcher
-npm run fetch-model    # downloads the all-MiniLM-L6-v2 ONNX model into assets/models/ (bundled by Tauri)
+npm run install:deps     # installs dependencies and runs only approved lifecycle hooks
+npm run fetch-model      # downloads the all-MiniLM-L6-v2 ONNX model into assets/models/ (bundled by Tauri)
 ```
 
-> Linux note (verified 2026-09-18, Node v26.7.0): plain `npm install` fails building
-> `sharp` from source (`npm error sharp: Please add node-addon-api to your dependencies`).
-> `npm install --ignore-scripts` works and is enough for the model fetch. Without the
-> fetch, the `embed::*` / `memory::*` tests fail — run it before `cargo test`, as CI does.
+`package.json` carries version-pinned `allowScripts` approvals for the four dependencies that need
+install hooks (`agent-browser`, `onnxruntime-node`, `protobufjs`, and `sharp`). The wrapper enforces
+that exact list instead of relying on npm's version-dependent policy: it installs with
+`--ignore-scripts`, then runs `npm rebuild` only for approved packages that are present at the pinned
+version. A local fixture on npm 11.19.0 still ran an unapproved lifecycle hook after warning, so use
+`npm run install:deps` rather than raw `npm install` when relying on this gate.
+
+`npm run install:deps` sets `SHARP_IGNORE_GLOBAL_LIBVIPS=1` for both child phases. This prevents an
+unrelated system libvips installation from forcing Sharp's source-build path (which requires
+`node-addon-api` and `node-gyp`). Approved postinstall scripts remain enabled; network access is
+required for the `onnxruntime-node` runtime download.
 
 ### Provider configuration
 
@@ -453,7 +461,7 @@ goes live with the first `v*` release. Full topology and the release commands ar
 
 ## What works today
 
-Status as verified on this Linux host on 2026-09-18. Anything not listed here is untested.
+Status as verified on this Linux host on 2026-10-04. Anything not listed here is not re-tested in this pass.
 
 **Verified in code (file proves the claim):**
 
@@ -483,15 +491,16 @@ Status as verified on this Linux host on 2026-09-18. Anything not listed here is
 
 **Verified by running (exact commands + results):**
 
-- `cargo fmt --all -- --check` — passes (exit 0).
-- `cargo test -p dotz-core` after a two-line test-compile fix: 796 passed / 17 failed
-  with default parallelism, 803 passed / 10 failed with `-- --test-threads=1` (see
-  POLISH-NOTES.md for the per-cause breakdown; remaining failures are environment:
-  missing `minisign` CLI, filesystem walk order, process-group/pid capture).
-- `npm install --ignore-scripts && npm run fetch-model` — works (exit 0; plain
-  `npm install` fails building `sharp` from source on this host, the fetcher does not
-  need it). Without the model fetch, the `embed::*` / `memory::*` tests fail — a fresh
-  clone must run the fetch first, exactly as CI does.
+- `cargo fmt --all -- --check` — passes.
+- `cargo clippy -p dotz-core --all-targets -- --deny warnings` — passes.
+- `cargo test -p dotz-core --locked -- --test-threads=1` — 824 passed / 0 failed
+  (run with the locally cached all-MiniLM-L6-v2 assets; no live-provider tests are enabled).
+- `npm run install:deps` — an isolated npm 11.19.0 fixture verifies that the wrapper suppresses an
+  unapproved lifecycle hook, runs only `sharp@0.34.5`, and passes `SHARP_IGNORE_GLOBAL_LIBVIPS=1`
+  to that hook. A clean external ONNX Runtime artifact download was not re-run in the networkless
+  review pass; it remains a required online install step.
+- `npm run fetch-model` — downloads the all-MiniLM-L6-v2 files into `assets/models/`; keep
+  this step before local embedder tests when the model is not already cached.
 
 **Not run / needs something else:**
 

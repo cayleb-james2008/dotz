@@ -11,9 +11,12 @@
 //! are NEVER exposed. The closed action set is validated up front so a typo'd action can't no-op into a
 //! false-success observation.
 //!
-//! ponytail: no persistent daemon management beyond what browser.ts does — one spawn per command, and
-//! a best-effort `reap_stray_browsers` backstop on app shutdown (the Tauri shell calls `dispose_all`
-//! and `reap_stray_browsers` on `RunEvent::Exit` so headless Chrome instances do not outlive the app).
+//! The controller intentionally preserves agent-browser's session daemon after successful one-shot
+//! commands; `close` during `stop`/`dispose_all` is the supported session teardown path. Timeout
+//! cleanup on Linux cancels the one-shot process and live descendants still in its parent tree,
+//! including `setsid` children. It does not claim to kill an agent-browser/Chrome daemon that has
+//! daemonized/reparented, and no global image-name kill is used because it could signal unrelated
+//! user processes.
 use axum::{
     Json, Router,
     extract::Query,
@@ -349,7 +352,8 @@ fn resolve_executable() -> Result<PathBuf, String> {
 
 /// True when the resolved `agent-browser` binary is actually present on disk. Used by the
 /// first-run wizard (`GET /api/first-run/state`) so the UI can tell the operator whether the
-/// browser panel will work out of the box or whether they need to run `npm install` first.
+/// browser panel will work out of the box or whether they need to run
+/// `npm run install:deps` first.
 /// Mirrors [`resolve_executable`] exactly: `DOTZ_BROWSER_BIN` wins (must exist), then the
 /// bundled `node_modules/agent-browser/bin/<name>` path, then a PATH lookup for the bare
 /// `agent-browser[.exe]` name (so a system install is recognized).
@@ -571,8 +575,10 @@ fn split_role_name(descriptor: &str) -> (String, String) {
 }
 
 // ---- the one-shot command runner ----
-/// Spawn agent-browser ONE-SHOT with the exact security flags + AGENT_BROWSER_HEADED=false, a 35s
-/// timeout, capture stdout/stderr, kill-tree on timeout, parse stdout as JSON. `command` is the
+/// Spawn agent-browser ONE-SHOT with the exact security flags + AGENT_BROWSER_HEADED=false, a
+/// bounded timeout, capture stdout/stderr, cancel the owned process tree on timeout, and parse
+/// stdout as JSON. On Linux cleanup reaches live descendants still in the parent tree, including
+/// `setsid` children; it does not sweep daemonized/reparented browser processes. `command` is the
 /// trailing `--json <command...>` portion.
 async fn run(
     session_id: &str,
@@ -635,27 +641,51 @@ async fn run(
         .stderr(Stdio::from(err_file))
         .env("AGENT_BROWSER_HEADED", "false");
     // Cross-platform spawn flags via the shared sandbox backend: CREATE_NO_WINDOW on Windows,
-    // own process group on posix (so the tree-kill reaches the headless Chrome grandchild).
+    // own process group on POSIX. Linux cleanup also tracks live descendants that call `setsid`.
     crate::sandbox::backend().prepare_command(&mut cmd);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("agent-browser spawn failed: {e}"))?;
-    let pid = child.id();
+    let process = match crate::sandbox::OwnedProcess::pin(child.id()) {
+        Ok(process) => process,
+        Err(reason) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = std::fs::remove_file(&out_path);
+            let _ = std::fs::remove_file(&err_path);
+            return Err(format!("agent-browser process tracking failed: {reason}"));
+        }
+    };
+    let mut process_tree_guard = ProcessTreeGuard::new(process.clone());
 
     let status = match tokio::time::timeout(command_timeout(), child.wait()).await {
         Err(_) => {
             // Timed out: kill-tree (the child + its headless Chrome grandchild), reap the
             // process so it does not become a zombie (Unix) or leak handles (Windows), then
             // clean up the temp output files after the process has released them.
-            kill_pid(pid);
+            let cleanup = match kill_process(Some(process.clone())) {
+                Some(kill_task) => kill_task.await.unwrap_or(Err("cleanup worker failed")),
+                None => Err("spawned process identity unavailable"),
+            };
             let _ = child.start_kill();
             let _ = child.wait().await;
+            process_tree_guard.disarm();
             let _ = std::fs::remove_file(&out_path);
             let _ = std::fs::remove_file(&err_path);
-            return Err("agent-browser command timed out".into());
+            return Err(match cleanup {
+                Ok(()) => "agent-browser command timed out".into(),
+                Err(reason) => {
+                    format!("agent-browser command timed out; cleanup incomplete: {reason}")
+                }
+            });
         }
-        Ok(s) => s,
+        Ok(status) => {
+            if status.is_ok() {
+                process_tree_guard.disarm();
+            }
+            status
+        }
     };
     // Let any final buffered write flush, then read the captured files.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -679,24 +709,49 @@ async fn run(
     }
 }
 
-/// Kill a pid and its descendant tree — `taskkill /T /F` on win32, `kill(2) on the owned process group` on posix.
-/// Best-effort. Dispatched through the shared `sandbox::backend()` so browser + sandbox use the
-/// SAME platform kill path. This FIXES the former posix gap: the old inline `#[cfg(not(windows))]`
-/// branch sent `kill -9 <pid>` (single-pid only), so a headless Chrome grandchild that the
-/// agent-browser child spawned leaked as an orphan on timeout/stop. The backend's posix
-/// `kill_tree` signals the whole process group (`kill(2) on the owned process group`), matching sandbox.rs parity.
-///
-/// The kill is dispatched on a blocking thread (spawn_blocking) and not awaited by the caller:
-/// `CreateProcess` for taskkill.exe is a synchronous syscall that can take several hundred ms
-/// under load, and running it inline on the timeout path would stall a tokio worker thread for
-/// that whole time (and let the caller's wall-clock timeout balloon past its budget). Inside the
-/// blocking task, Windows waits for and reaps taskkill. POSIX signals the process group
-/// directly through kill(2), with no signal-delivery subprocess to reap.
-fn kill_pid(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-    tokio::task::spawn_blocking(move || {
-        crate::sandbox::backend().kill_tree(pid);
-    });
+/// Kill a pid and its owned descendants via the platform backend. The blocking backend runs off
+/// the Tokio worker. Explicit command timeouts await its completion; the guard below detaches it
+/// on future cancellation (for example, stop() timing out run()).
+fn kill_process(
+    process: Option<crate::sandbox::OwnedProcess>,
+) -> Option<tokio::task::JoinHandle<Result<(), &'static str>>> {
+    let process = process?;
+    Some(tokio::task::spawn_blocking(move || {
+        let result = crate::sandbox::backend().kill_tree(&process);
+        if let Err(reason) = result {
+            tracing::warn!(
+                pid = process.pid(),
+                reason,
+                "browser process cleanup incomplete"
+            );
+        }
+        result
+    }))
+}
+
+/// A dropped `run()` future must not orphan the spawned process tree. `Child` itself does not
+/// kill descendants on drop, so schedule owned-tree cleanup unless normal completion or the
+/// explicit timeout path disarms this guard.
+struct ProcessTreeGuard {
+    process: Option<crate::sandbox::OwnedProcess>,
+}
+
+impl ProcessTreeGuard {
+    fn new(process: crate::sandbox::OwnedProcess) -> Self {
+        Self {
+            process: Some(process),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.process = None;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        let _ = kill_process(self.process.take());
+    }
 }
 
 // ---- clamping helpers ----
@@ -1337,8 +1392,9 @@ pub async fn stop(session_id: &str) -> Result<BrowserObservation, String> {
         profile_dir: profile_dir.clone(),
         disarm: false,
     };
-    // Bound close so a hung agent-browser cannot block shutdown. The result is best-effort:
-    // `reap_stray_browsers()` kills any lingering Chrome process tree afterwards.
+    // Bound close so a hung agent-browser cannot block shutdown. On Linux, cancellation reaches
+    // the one-shot process and live descendants still in its parent tree (including setsid); it
+    // does not claim to reap a daemon that agent-browser has already daemonized/reparented.
     let _ = tokio::time::timeout(
         CLOSE_TIMEOUT,
         run(session_id, &profile_dir, &allowed_origins, &["close"]),
@@ -1400,37 +1456,14 @@ fn frame(session_id: &str, after_seq: i64) -> Option<(i64, Vec<u8>)> {
     Some((seq, data.clone()))
 }
 
-/// Dispose every browser session. Called by the Tauri shell on `RunEvent::Exit` so the app does
-/// not leave headless Chrome profiles/processes behind. Each session stop is bounded so a hung
-/// `agent-browser close` command cannot block shutdown indefinitely.
+/// Dispose every browser session. Called by the Tauri shell on `RunEvent::Exit`; each stop asks
+/// agent-browser to close its session and is bounded so a hung close cannot block shutdown. A
+/// daemon that has already daemonized/reparented and ignores close is outside the owned-child
+/// cleanup boundary and is not globally killed by image name.
 pub async fn dispose_all() {
     let ids: Vec<String> = sessions_guard().keys().cloned().collect();
     for id in ids {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stop(&id)).await;
-    }
-}
-
-/// Force-kill any lingering agent-browser process tree by image name. Best-effort backstop —
-/// `agent-browser close` does not reliably reap the headless-Chrome grandchild. Exposed publicly
-/// so the Tauri shell can call it after `dispose_all` on shutdown.
-/// Blocking (`.status()`, not `.spawn()`): only called at process exit, where waiting a few ms
-/// for taskkill/pkill is fine and reaping the subprocess avoids leaving a zombie behind.
-pub fn reap_stray_browsers() {
-    #[cfg(windows)]
-    {
-        let mut cmd = std::process::Command::new("taskkill");
-        cmd.args(["/IM", "agent-browser-win32-x64.exe", "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _ = crate::util::no_window(&mut cmd).status();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "agent-browser"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
     }
 }
 
@@ -1889,11 +1922,34 @@ mod tests {
         ));
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        // Fake agent-browser binary: sleeps long enough that only the close timeout can end it.
+        #[cfg(unix)]
+        let pidfile = dir.join("pid");
+        #[cfg(unix)]
+        let sleep_pidfile = dir.join("sleep-pid");
+        #[cfg(target_os = "linux")]
+        let unrelated_pidfile = dir.join("unrelated-pid");
+        #[cfg(unix)]
+        let _cleanup = TimeoutTestProcessCleanup {
+            pid_files: vec![
+                pidfile.clone(),
+                sleep_pidfile.clone(),
+                #[cfg(target_os = "linux")]
+                unrelated_pidfile.clone(),
+            ],
+        };
+        #[cfg(target_os = "linux")]
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unrelated control process");
+        #[cfg(target_os = "linux")]
+        std::fs::write(&unrelated_pidfile, unrelated.id().to_string()).unwrap();
+
+        // Fake agent-browser binary: a shell launches a separate sleeper to verify tree cleanup.
         #[cfg(windows)]
         let script_path = {
             let bat = dir.join("fake-browser.bat");
-            tokio::fs::write(&bat, "@echo off\nping -n 60 127.0.0.1 >nul\n")
+            tokio::fs::write(&bat, "@echo off\nping -n 30 127.0.0.1 >nul\n")
                 .await
                 .unwrap();
             bat
@@ -1901,7 +1957,7 @@ mod tests {
         #[cfg(unix)]
         let script_path = {
             let sh = dir.join("fake-browser.sh");
-            tokio::fs::write(&sh, "#!/bin/sh\nsleep 60\n")
+            tokio::fs::write(&sh, fake_browser_waiting_script(&pidfile, &sleep_pidfile))
                 .await
                 .unwrap();
             use std::os::unix::fs::PermissionsExt;
@@ -1943,7 +1999,19 @@ mod tests {
         unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "300000") };
 
         let start = std::time::Instant::now();
-        let result = stop(&sid).await;
+        let stop_sid = sid.clone();
+        let stop_task = tokio::spawn(async move { stop(&stop_sid).await });
+        #[cfg(target_os = "linux")]
+        {
+            let (root, escaped) = wait_for_linux_process_pair(&pidfile, &sleep_pidfile)
+                .await
+                .unwrap();
+            assert_ne!(
+                escaped, root,
+                "the stop-test descendant must have escaped the browser's process group and session"
+            );
+        }
+        let result = stop_task.await.expect("browser stop task should not panic");
         let elapsed = start.elapsed();
 
         match prev_bin {
@@ -1981,6 +2049,24 @@ mod tests {
             !profile_dir.exists(),
             "stop() should remove the profile dir even when close hangs"
         );
+        #[cfg(target_os = "linux")]
+        {
+            let child_stopped = wait_for_process_exit(&sleep_pidfile).await;
+            assert!(
+                child_stopped.is_ok(),
+                "stop() must terminate the fake browser's setsid-escaped descendant: {child_stopped:?}"
+            );
+            let unrelated_running = unrelated.try_wait().unwrap().is_none();
+            let _ = std::fs::remove_file(&unrelated_pidfile);
+            if unrelated_running {
+                unrelated.kill().unwrap();
+            }
+            let _ = unrelated.wait();
+            assert!(
+                unrelated_running,
+                "session stop must not signal an unrelated process"
+            );
+        }
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -2088,10 +2174,131 @@ mod tests {
     /// `DOTZ_BROWSER_BIN` env vars so concurrent browser timeout tests do not race.
     static BROWSER_TIMEOUT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// A timed-out agent-browser command must be reaped, not left as a zombie (Unix) or leaking
-    /// handles (Windows). Before the fix, `run()` killed the child but did not wait for it to
-    /// exit, so the process could outlive the timeout error. The timeout is configurable so the
-    /// test can use a very short value.
+    #[cfg(unix)]
+    struct TimeoutTestProcessCleanup {
+        pid_files: Vec<std::path::PathBuf>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for TimeoutTestProcessCleanup {
+        fn drop(&mut self) {
+            for path in &self.pid_files {
+                let Ok(contents) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                let Ok(pid) = contents.trim().parse::<u32>() else {
+                    continue;
+                };
+                let pid = pid.to_string();
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", pid.as_str()])
+                    .status();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_browser_waiting_script(
+        pid_file: &std::path::Path,
+        escaped_child_pid_file: &std::path::Path,
+    ) -> String {
+        #[cfg(target_os = "linux")]
+        let child_command = format!(
+            "setsid sh -c 'echo $$ > \"{}\"; exec sleep 30' & child=$!\necho \"$child\" > \"{}.launcher\"\nwait \"$child\"\n",
+            escaped_child_pid_file.to_string_lossy(),
+            escaped_child_pid_file.to_string_lossy(),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let child_command = format!(
+            "sleep 30 & child=$!\necho \"$child\" > \"{}\"\nwait \"$child\"\n",
+            escaped_child_pid_file.to_string_lossy(),
+        );
+        format!(
+            "#!/bin/sh\necho $$ > \"{}\"\n{}",
+            pid_file.to_string_lossy(),
+            child_command,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_exit(pid_file: &std::path::Path) -> Result<(), String> {
+        let contents = std::fs::read_to_string(pid_file)
+            .map_err(|e| format!("could not read timeout-test pid file: {e}"))?;
+        let pid = contents
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| format!("invalid timeout-test pid {contents:?}: {e}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let stat_path = format!("/proc/{pid}/stat");
+            match std::fs::read_to_string(&stat_path) {
+                Ok(stat) => {
+                    let state = stat
+                        .rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next());
+                    if matches!(state, Some("Z" | "X")) {
+                        return Ok(());
+                    }
+                }
+                Err(_) => return Ok(()),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("timed-out child process {pid} remained live"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_session_group(pid_file: &std::path::Path) -> Result<(u32, u32), String> {
+        let contents = std::fs::read_to_string(pid_file)
+            .map_err(|e| format!("could not read browser-test pid file: {e}"))?;
+        let pid = contents
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| format!("invalid browser-test pid {contents:?}: {e}"))?;
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_err(|e| format!("could not read process {pid} stat: {e}"))?;
+        let (_, fields) = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| format!("malformed process {pid} stat"))?;
+        let fields = fields.split_whitespace().collect::<Vec<_>>();
+        let group = fields
+            .get(2)
+            .ok_or_else(|| format!("missing process group for pid {pid}"))?
+            .parse::<u32>()
+            .map_err(|e| format!("invalid process group for pid {pid}: {e}"))?;
+        let session = fields
+            .get(3)
+            .ok_or_else(|| format!("missing session for pid {pid}"))?
+            .parse::<u32>()
+            .map_err(|e| format!("invalid session for pid {pid}: {e}"))?;
+        Ok((group, session))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_linux_process_pair(
+        root_file: &std::path::Path,
+        descendant_file: &std::path::Path,
+    ) -> Result<((u32, u32), (u32, u32)), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let (Ok(root), Ok(descendant)) = (
+                linux_session_group(root_file),
+                linux_session_group(descendant_file),
+            ) {
+                return Ok((root, descendant));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("browser-test processes did not become observable".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A timed-out agent-browser command must cancel its live owned descendants, including a
+    /// Linux child that calls `setsid` and escapes the command's process group. An unrelated
+    /// sleeper acts as a negative control and must remain alive after cleanup.
     #[tokio::test]
     async fn run_reaps_child_after_timeout() {
         let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
@@ -2104,9 +2311,27 @@ mod tests {
 
         #[cfg(unix)]
         let pidfile = dir.join("pid");
+        #[cfg(unix)]
+        let sleep_pidfile = dir.join("sleep-pid");
+        #[cfg(unix)]
+        let unrelated_pidfile = dir.join("unrelated-pid");
+        #[cfg(unix)]
+        let _cleanup = TimeoutTestProcessCleanup {
+            pid_files: vec![
+                pidfile.clone(),
+                sleep_pidfile.clone(),
+                unrelated_pidfile.clone(),
+            ],
+        };
+        #[cfg(target_os = "linux")]
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unrelated control process");
+        #[cfg(target_os = "linux")]
+        std::fs::write(&unrelated_pidfile, unrelated.id().to_string()).unwrap();
 
-        // Fake agent-browser binary: ignores arguments and sleeps long enough to be killed by the
-        // short test timeout. A single batch/shell script keeps the process tree simple.
+        // Fake agent-browser binary: a shell launches a separate sleeper to verify tree cleanup.
         #[cfg(windows)]
         let script_path = {
             let bat = dir.join("fake-browser.bat");
@@ -2118,15 +2343,9 @@ mod tests {
         #[cfg(unix)]
         let script_path = {
             let sh = dir.join("fake-browser.sh");
-            tokio::fs::write(
-                &sh,
-                format!(
-                    "#!/bin/sh\necho $$ > \"{}\"\nsleep 30\n",
-                    pidfile.to_string_lossy()
-                ),
-            )
-            .await
-            .unwrap();
+            tokio::fs::write(&sh, fake_browser_waiting_script(&pidfile, &sleep_pidfile))
+                .await
+                .unwrap();
             use std::os::unix::fs::PermissionsExt;
             let mut perms = tokio::fs::metadata(&sh).await.unwrap().permissions();
             perms.set_mode(0o755);
@@ -2165,7 +2384,25 @@ mod tests {
         unsafe { std::env::set_var("DOTZ_BROWSER_TIMEOUT_MS", "500") };
 
         let start = std::time::Instant::now();
-        let result = run(&sid, &profile_dir, &allowed, &["get", "url"]).await;
+        let task_sid = sid.clone();
+        let task_profile_dir = profile_dir.clone();
+        let task_allowed = allowed.clone();
+        let run_task = tokio::spawn(async move {
+            run(&task_sid, &task_profile_dir, &task_allowed, &["get", "url"]).await
+        });
+        #[cfg(target_os = "linux")]
+        {
+            let (root, escaped) = wait_for_linux_process_pair(&pidfile, &sleep_pidfile)
+                .await
+                .unwrap();
+            assert_ne!(
+                escaped, root,
+                "the timeout-test descendant must have escaped the browser's process group and session"
+            );
+        }
+        let result = run_task
+            .await
+            .expect("browser timeout task should not panic");
         let elapsed = start.elapsed();
 
         match prev_bin {
@@ -2213,6 +2450,22 @@ mod tests {
                 gone,
                 "timed-out browser child (pid {pid}) should have been killed and reaped, not still running"
             );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let child_stopped = wait_for_process_exit(&sleep_pidfile).await;
+            assert!(
+                child_stopped.is_ok(),
+                "timed-out browser command must terminate its setsid-escaped descendant: {child_stopped:?}"
+            );
+            let unrelated_running = unrelated.try_wait().unwrap().is_none();
+            let _ = std::fs::remove_file(&unrelated_pidfile);
+            assert!(
+                unrelated_running,
+                "browser cancellation must not signal an unrelated process"
+            );
+            unrelated.kill().unwrap();
+            let _ = unrelated.wait();
         }
 
         sessions_guard().remove(&sid);
@@ -2290,9 +2543,9 @@ mod tests {
     /// `binary_present` must reflect whether the resolved `agent-browser` binary is on disk.
     /// With `DOTZ_BROWSER_BIN` pointed at a temp file that exists, it returns true; pointed at a
     /// missing path, it returns false. With the env var cleared, it falls back to the bundled /
-    /// PATH lookup, which on a dev host without `npm install` returns false (and on a packaged
-    /// install with the bundled binary returns true) — so we only assert the explicit-DOTZ_BROWSER_BIN
-    /// branch here to keep the test host-independent.
+    /// PATH lookup, which on a dev host without `npm run install:deps` returns false (and on a
+    /// packaged install with the bundled binary returns true). We assert only the
+    /// explicit-DOTZ_BROWSER_BIN branch here to keep the test host-independent.
     #[test]
     fn binary_present_matches_disk_state_for_explicit_bin() {
         let _guard = BROWSER_TIMEOUT_TEST_LOCK.blocking_lock();

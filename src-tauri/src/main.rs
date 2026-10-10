@@ -331,14 +331,12 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = builder.build(tauri::generate_context!())?;
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            // Dispose all browser sessions and reap any lingering agent-browser processes so the
-            // app does not leave headless Chrome instances running after exit. Bound the cleanup
-            // so a hung `agent-browser close` command cannot block shutdown indefinitely.
-            // 2 s, not 10: graceful close is best-effort (reap_stray_browsers force-kills the
-            // image right after), and the WHOLE exit path must stay well under ~9 s of WM_CLOSE —
-            // measured 2026-07-13: three hung session closes at 3 s each pushed exit to 10.1 s,
-            // which reads as a hung app to `taskkill` verification. Budget now ≈ 2 s here +
-            // reap + 3 s drain ≈ 5.5 s worst case.
+            // Dispose browser sessions with a bounded graceful close. Successful one-shot
+            // commands preserve agent-browser's session daemon; `dispose_all` asks each session
+            // to close, and timeout cleanup cancels only the command's still-owned descendants.
+            // We deliberately avoid a global image-name kill because it can affect unrelated user
+            // processes; a daemon that daemonizes/reparents and ignores close remains outside this
+            // process-ownership boundary. Keep the exit path bounded for WM_CLOSE/taskkill checks.
             tauri::async_runtime::block_on(async {
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
@@ -346,7 +344,6 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 )
                 .await;
             });
-            dotz_core::browser::reap_stray_browsers();
             if let Some(tx) = app_handle.try_state::<tokio::sync::watch::Sender<()>>() {
                 let _ = tx.send(());
             }
