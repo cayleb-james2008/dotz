@@ -3,6 +3,7 @@
 use dotz_core::agent::tools::{ToolCtx, ToolRegistry};
 use serde_json::json;
 use std::{
+    os::fd::AsRawFd,
     process::{Child, Command},
     time::Duration,
 };
@@ -57,10 +58,16 @@ async fn bash_and_gate_teardown_root_exit_and_timeout_without_harming_control() 
             };
             let mut registry = ToolRegistry::new();
             registry.set_active(&[tool.into()]);
-            // /proc remains the host view for shell tools; the builtin read captures the
-            // actual background shell's host PID before it starts the sentinel timer.
+            let host_proc = std::fs::File::open("/proc").unwrap();
+            // SAFETY: this is our fixture descriptor. Inherit the original proc directory
+            // to capture host PIDs without changing the production namespace's proc view.
+            assert_eq!(
+                unsafe { libc::fcntl(host_proc.as_raw_fd(), libc::F_SETFD, 0) },
+                0
+            );
+            let host_stat = format!("/proc/self/fd/{}/self/stat", host_proc.as_raw_fd());
             let command = format!(
-                "(read host_pid rest < /proc/self/stat; printf '%s' \"$host_pid\" > pid; sleep 2; touch late) & while ! test -s pid; do sleep 0.01; done; echo '1 passed, 0 failed'; {}",
+                "(read host_pid rest < {host_stat}; printf '%s' \"$host_pid\" > pid; sleep 2; touch late) & while ! test -s pid; do sleep 0.01; done; echo '1 passed, 0 failed'; {}",
                 if root_exits { "exit 0" } else { "wait" }
             );
             let started = std::time::Instant::now();
@@ -99,6 +106,20 @@ async fn bash_and_gate_teardown_root_exit_and_timeout_without_harming_control() 
                 failures.push(format!("{tool} root_exits={root_exits}: alive={alive}, late={late}, unrelated_alive={unrelated_alive}, result={text:?}"));
             }
         }
+    }
+    let dir = TempDir::new();
+    let ctx = ToolCtx {
+        cwd: dir.path().to_path_buf(),
+        tx: None,
+        run_id: None,
+    };
+    let mut registry = ToolRegistry::new();
+    registry.set_active(&["bash".into()]);
+    let result = registry.run("bash", &json!({"command": "read stat_pid rest < /proc/self/stat; test \"$stat_pid\" = \"$$\" && echo CONSISTENT_PROC"}), &ctx).await;
+    if result.as_deref() != Ok("CONSISTENT_PROC\n") {
+        failures.push(format!(
+            "namespace PID and procfs view disagree: {result:?}"
+        ));
     }
     // Diagnostic failures are asserted only after finite sentinel workers have finished and
     // the unrelated control has been explicitly reaped; no leaked probe persists on RED.

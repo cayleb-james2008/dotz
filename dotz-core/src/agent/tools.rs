@@ -1193,14 +1193,23 @@ mod tests {
             std::env::temp_dir().join(format!("dotz-bash-reap-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
         let pidfile = base.join("pid");
+        #[cfg(target_os = "linux")]
+        let host_proc = crate::sandbox::inherited_host_proc_for_test();
+        #[cfg(target_os = "linux")]
+        let host_stat = {
+            use std::os::fd::AsRawFd;
+            format!("/proc/self/fd/{}/self/stat", host_proc.as_raw_fd())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let host_stat = "/proc/self/stat";
 
         let command = if cfg!(windows) {
             "ping -n 3 127.0.0.1".to_string()
         } else if cfg!(target_os = "linux") {
-            // /proc is the host view but $! is namespace-relative. A builtin read in the
-            // background shell captures its host PID; exec preserves that identity.
+            // $! is namespace-relative. Read via the inherited host-proc descriptor to
+            // capture the background shell's host PID; exec preserves that identity.
             format!(
-                "(read pid rest < /proc/self/stat; echo $pid > {}; exec sleep 30) & wait",
+                "(read pid rest < {host_stat}; echo $pid > {}; exec sleep 30) & wait",
                 pidfile.to_string_lossy()
             )
         } else {

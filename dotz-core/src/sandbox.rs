@@ -636,26 +636,27 @@ pub(crate) fn wrap_sandbox_argv(argv: Vec<String>) -> Result<Vec<String>, String
 
 /// Shell tools need the same per-command PID lifetime as sandbox runs: when their root exits,
 /// the kernel must remove background output-pipe holders before the command is discarded.
-/// Keep the existing host /proc view for system-inspection commands; this is process lifetime
-/// containment, not filesystem/network isolation. Non-Linux behavior remains unchanged.
+/// A private /proc view keeps nested lifecycle tooling consistent with its namespace PIDs.
+/// This is not filesystem/network isolation. Non-Linux behavior remains unchanged.
 #[cfg(not(windows))]
 pub(crate) fn owned_shell_command(script: &str) -> Result<tokio::process::Command, String> {
     let argv = wrap_sandbox_argv(vec!["sh".into(), "-c".into(), script.into()])?;
-    #[cfg(target_os = "linux")]
-    let argv = {
-        let mut argv = argv;
-        let index = UNSHARE_WRAPPER_FLAGS
-            .iter()
-            .position(|arg| *arg == "--mount-proc")
-            .unwrap()
-            + 1;
-        argv.remove(index);
-        argv
-    };
     let mut command = tokio::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
     backend().prepare_command(&mut command);
     Ok(command)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn inherited_host_proc_for_test() -> std::fs::File {
+    use std::os::fd::AsRawFd;
+    let proc = std::fs::File::open("/proc").unwrap();
+    // SAFETY: owned fixture descriptor; inherit only to read host PIDs across the private proc mount.
+    assert_eq!(
+        unsafe { libc::fcntl(proc.as_raw_fd(), libc::F_SETFD, 0) },
+        0
+    );
+    proc
 }
 
 // PR_SET_PDEATHSIG / SIGKILL constants and the two libc entry points used by the Linux

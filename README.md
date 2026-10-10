@@ -219,8 +219,11 @@ an origin allowlist (`dotz-core/src/browser.rs`), and the loopback API rejects d
 `Origin`/`Host` with `403` (`dotz-core/src/server/guard.rs`). The `bash` tool itself runs the
 given command in the session cwd with a wall-clock timeout — no command allowlist.
 
-**Unmerged candidate work:** the Linux sandbox path uses a per-run PID namespace and fails closed
-when it cannot create one. This is process lifecycle containment, not filesystem or network
+**Unmerged candidate work:** Linux sandbox runs, `bash`, and RSI verification gates each use a
+per-command PID namespace and fail closed when they cannot create one. Background processes and
+inherited output-pipe holders are removed when that command's root exits; use a managed `web`
+sandbox run for a persistent preview instead of shell backgrounding. This is process lifecycle
+containment, not filesystem or network
 isolation, and is not a current-main or release acceptance claim. Windows keeps `taskkill /T`;
 macOS uses process-group signaling. Neither establishes the Linux namespace guarantee. The browser
 has a persistent Chrome daemon whose lifetime spans one-shot commands. Persistent browser ownership
@@ -362,7 +365,7 @@ upstream licenses/credits when redistributing them.
 - [Rust](https://rustup.rs/) (stable, edition 2024)
 - [Node.js](https://nodejs.org/) and npm (for the agent-browser binary + ONNX model fetch)
 - [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) (WebView2 on Windows)
-- Linux candidate sandbox runs require `unshare` with working user/PID namespaces; unavailable
+- Linux candidate sandbox runs, shell tools, and RSI gates require `unshare` with working user/PID namespaces; unavailable
   containment is an error, not a reason to run the workload uncontained
 - Python 3 and Chromium/Chrome (for `npm run test:ui`)
 

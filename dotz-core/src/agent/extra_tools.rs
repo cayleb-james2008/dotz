@@ -2342,6 +2342,15 @@ mod tests {
 
         let dir = tmp_dir();
         let pidfile = dir.join("pid");
+        #[cfg(target_os = "linux")]
+        let host_proc = crate::sandbox::inherited_host_proc_for_test();
+        #[cfg(target_os = "linux")]
+        let host_stat = {
+            use std::os::fd::AsRawFd;
+            format!("/proc/self/fd/{}/self/stat", host_proc.as_raw_fd())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let host_stat = "/proc/self/stat";
 
         // `sleep 30 & echo $! > pidfile; wait` — the shell forks `sleep 30` as a background
         // child, writes the *sleep*'s PID ($!) to the pidfile, then waits. The 1s timeout fires
@@ -2354,7 +2363,7 @@ mod tests {
         } else if cfg!(target_os = "linux") {
             // Preserve a host-visible PID even though the shell now runs in a PID namespace.
             format!(
-                "(read pid rest < /proc/self/stat; echo $pid > {}; exec sleep 30) & wait",
+                "(read pid rest < {host_stat}; echo $pid > {}; exec sleep 30) & wait",
                 pidfile.to_string_lossy()
             )
         } else {
