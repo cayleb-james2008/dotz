@@ -7,21 +7,22 @@
 **An in-process coding dashboard for directing work to a team of AI coding agents.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows-first-89b4fa)](#what-works-today)
+[![Platform](https://img.shields.io/badge/platform-Windows-first-89b4fa)](#verified-implementation-and-current-limits)
 [![Built with](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri-cba6f7)](https://tauri.app)
 [![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](dotz-core/Cargo.toml)
 
-> Release availability is not runtime acceptance. On 2026-10-10, unauthenticated GET checks
-> returned HTTP 200 for the latest release and updater manifest (version `0.2.8`,
-> `windows-x86_64` only). See [What works today](#what-works-today) for the evidence limits.
-> The tag-triggered [release workflow](.github/workflows/release.yml) is configured to build
-> Windows NSIS and updater artifacts and create a draft release; it is not an acceptance gate.
+> Reviewed source is merged to `main` at [`4df6871`](https://github.com/cayleb-james2008/dotz/commit/4df6871ff45250e52b6a2276d37b5f9303743bf0); the merged tree matches tested head
+> `de040bda`. Six hosted CI jobs passed on that head: 839 Linux, 828 Windows, and 831 macOS Rust
+> tests, plus formatting, Clippy, cold-start install policy, and dependency checks. A signed
+> source-head installer, updater install/relaunch, and live provider inference still need separate
+> acceptance. The tag-triggered [release workflow](.github/workflows/release.yml) creates a draft;
+> a passing build alone does not verify those journeys.
 
 </div>
 
-I'm working on **dotz**, a Rust/Tauri coding dashboard that brings agent sessions, a workflow graph,
-persistent projects, and local memory into one interface. My current focus is making setup and
-process cleanup reproducible, with tests and clear notes about what has actually been checked.
+**dotz** is a Rust/Tauri coding dashboard for agent sessions, workflow graphs, persistent projects,
+and local memory. Its in-process runtime, managed tools, isolated browser, and cross-platform cleanup
+checks are implemented; the current release boundaries are recorded below.
 
 The backend is an [axum](https://github.com/tokio-rs/axum) server with an in-process Rust agent runtime;
 the UI is plain HTML, CSS, and JavaScript, wrapped by a [Tauri](https://tauri.app) 2 desktop shell.
@@ -55,7 +56,7 @@ separately below.
 - [Build and Test](#build-and-test)
 - [Development and Gates](#development-and-gates)
 - [Cross-device Auto-update](#cross-device-auto-update)
-- [What works today](#what-works-today)
+- [Verified implementation and current limits](#verified-implementation-and-current-limits)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -477,50 +478,50 @@ evidence that the native UI bridge, update installation, or relaunch has succeed
 
 On 2026-10-13, both public release URLs returned HTTP 200; the manifest reported `0.2.8` and
 `windows-x86_64`. The release tag points to `16f27f5878c44cf7aa13ea3719a84dce9b58b0fd`, not this
-candidate. Neither HTTP availability nor a signature field proves signature validity, Authenticode,
-or that a release was built from this unmerged candidate. See
+source head. Neither HTTP availability nor a signature field proves signature validity,
+Authenticode, or that a release was built from the merged source. See
 [src-tauri/DEPLOY.md](src-tauri/DEPLOY.md) for build and release boundaries.
 
-## What works today
+## Verified implementation and current limits
 
-I'm keeping source inspection, local receipts, hosted checks, and release acceptance separate. This
-documentation pass records the isolated PR 222 candidate at
-`85bd6d21ef7e602f9c840aeaddc4f931b34da21c` on 2026-10-13. Its exact-head hosted checks passed;
-this does not merge the source or accept the packaged runtime.
+The reviewed source at [`de040bda77420ccf6a79b6eab825db514cc78da3`](https://github.com/cayleb-james2008/dotz/commit/de040bda77420ccf6a79b6eab825db514cc78da3)
+is merged to `main` at [`4df6871ff45250e52b6a2276d37b5f9303743bf0`](https://github.com/cayleb-james2008/dotz/commit/4df6871ff45250e52b6a2276d37b5f9303743bf0); the merge readback matches the tested tree. Its six
+hosted CI jobs passed: Rust tests on Linux (839), Windows (828), and macOS (831), with formatting,
+Clippy, cold-start installation policy, and dependency checks also passing. An independent review
+passed 27 focused browser checks. See the [exact-head PR CI](https://github.com/cayleb-james2008/dotz/actions/runs/38425638979)
+and the [reviewed source commit](https://github.com/cayleb-james2008/dotz/commit/de040bda77420ccf6a79b6eab825db514cc78da3).
 
-**Source inspection:** the Rust agent runtime, local embedder, project/memory persistence paths,
-provider adapters, API guards, and updater commands are present in their respective modules.
-`package.json` exposes `install:deps`; the wrapper installs with scripts disabled and rebuilds only
-present, exact-version approved packages. Those facts explain the implementation, not its end-to-end
-success. The shared web UI does not prove that native-only controls work on every OS.
+dotz implements the Rust agent runtime, local ONNX embedder, persistent projects and memory,
+provider adapters, API guards, managed browser and tool cleanup, and updater commands. Source and
+fixture checks do not establish a signed native installer, installation of the source-head package,
+updater install/relaunch, or live provider inference.
 
 **Dated evidence and retained limits:**
 
 | Evidence | Scope / identity | Result and limit |
 |----------|------------------|------------------|
-| Candidate source tests, 2026-10-13 | Linux, `52e6d6df5f090e0f57a1033ced7c207112f37dec`; `cargo test -p dotz-core --locked -- --test-threads=2` | 826 core library tests, 4 serve tests, 2 e2e tests, 2 ORT lock tests, lifecycle and documentation tests passed. Formatting and Clippy passed. No live provider inference was configured. |
-| Candidate UI and installer policy, 2026-10-13 | Same local source candidate; isolated UI harness and install-policy scripts | 21 browser checks, 9 platform-helper checks, `test:install-wrapper`, and `test:release-install-policy` passed. The UI receipt reported no provider/prompt call and no external network request. |
-| PR 222 hosted CI, 2026-10-13 | [PR 222](https://github.com/cayleb-james2008/dotz/pull/222), run [38416589014](https://github.com/cayleb-james2008/dotz/actions/runs/38416589014), exact head `85bd6d21ef7e602f9c840aeaddc4f931b34da21c` | All six required jobs passed. Rust test totals across binaries: Linux 838, Windows 828, macOS 831; all had zero failures. Formatting and Clippy passed on each OS; Windows cold-start benchmark passed. Dependency-policy checks passed on all three OSes, including 9 platform-helper tests each. The [compact receipt](docs/evidence/pr-222-ci-38416589014.md) links job logs. This is hosted source CI, not packaged-app or release acceptance. |
+| Local source tests, 2026-10-13 (earlier candidate) | Linux, `52e6d6df5f090e0f57a1033ced7c207112f37dec`; `cargo test -p dotz-core --locked -- --test-threads=2` | 826 core library tests, 4 serve tests, 2 e2e tests, 2 ORT lock tests, lifecycle and documentation tests passed. Formatting and Clippy passed. No live provider inference was configured. |
+| Local UI and installer-policy checks, 2026-10-13 (earlier candidate) | Isolated UI harness and install-policy scripts | 21 browser checks, 9 platform-helper checks, `test:install-wrapper`, and `test:release-install-policy` passed. The UI receipt reported no provider/prompt call and no external network request. |
+| PR 222 hosted CI and merge readback, 2026-10-13 | [PR 222](https://github.com/cayleb-james2008/dotz/pull/222), run [38425638979](https://github.com/cayleb-james2008/dotz/actions/runs/38425638979), tested head `de040bda77420ccf6a79b6eab825db514cc78da3`; merged as [`4df6871ff45250e52b6a2276d37b5f9303743bf0`](https://github.com/cayleb-james2008/dotz/commit/4df6871ff45250e52b6a2276d37b5f9303743bf0) | All six core and dependency-policy jobs passed in push and PR CI. Rust tests: Linux 839, Windows 828, macOS 831, zero failures. Formatting, Clippy, cold-start installation policy, and the independent 27-test browser review passed. The merged tree exactly matches the reviewed head. This is source validation, not packaged-app or release acceptance. |
 | Independent local Rust receipt, 2026-10-08 | Linux, `d22a0567e7976427071ce5783d8f7fcc224dc1d1`; `cargo test -p dotz-core --locked -- --test-threads=1` | 824 passed / 0 failed, cached model assets; formatting and Clippy also passed. Historical local result, not this snapshot or exact-head hosted acceptance. Credential-gated tests can return without inference. |
 | Installer-policy fixture described in the integration baseline | npm 11.19.0 fixture; not a fresh online setup receipt | Wrapper suppressed an unapproved hook and passed `SHARP_IGNORE_GLOBAL_LIBVIPS=1` to approved `sharp@0.34.5`. A fixture does not verify external runtime downloads or the complete quickstart. |
 | Historical native package receipts | Extracted local Linux DEB journeys; the later digest-linked package is candidate `1bdb5df1eeb7988bb44524ce6e2cecef374695d1` | Onboarding, project/memory persistence and 384-dimensional local embeddings were recorded. An earlier first-run attempt failed; semantic-search diagnostic returned HTTP 401 and remains unverified. Distinct package receipts must not be combined into one build identity. No system-wide installation, independent rebuild, or current public-release acceptance is inferred. |
 | Public release GET checks, 2026-10-13 | [Latest release](https://github.com/cayleb-james2008/dotz/releases/latest), [updater manifest](https://github.com/cayleb-james2008/dotz/releases/latest/download/latest.json); unauthenticated | Both HTTP 200; latest redirected to `v0.2.8`, manifest version `0.2.8`, platform key `windows-x86_64`; tag SHA is `16f27f5878c44cf7aa13ea3719a84dce9b58b0fd`. No installer execution or new signature verification. |
 | Candidate audit, 2026-10-10 | [PR218](https://github.com/cayleb-james2008/dotz/pull/218) at `016a4a3c49ba58097ca0f1a809520b623fa72b7e`; [PR219](https://github.com/cayleb-james2008/dotz/pull/219) at `45366fa2701d06d467f9c5fab814a95d69d8d934` | Both open draft/unmerged at audit. PR218 pull-request run `37781781173` failed on Ubuntu; Windows/macOS and dependency-policy jobs passed. No PR219 exact-head success established. These are dated observations, not final integration gates. |
 
-**Not accepted by this documentation pass:**
+**Still requires separate release acceptance:**
 
-- Final integrated-head CI and independent review, deliberate merge/default-branch readback, and
-  fresh public-download setup/native primary journeys remain separate gates. Distinguish `push`
-  from `pull_request` evidence and record the exact SHA for each result.
-- The exact PR head has passed hosted source CI. Windows/macOS fixture tests verify close-failure
-  retention and successful retry; they do not verify native browser teardown inside the packaged
-  desktop app. Linux namespace cleanup is covered by source tests, not an installed-app journey.
+- Main branch readback matches the reviewed source, and exact-head CI plus independent review passed.
+  Fresh public-download setup and native primary journeys remain separate checks.
+- Windows/macOS fixture tests verify close-failure retention and successful retry; they do not
+  verify native browser teardown inside the packaged desktop app. Linux namespace cleanup is
+  covered by source tests, not an installed-app journey.
 - Windows native installer launch, Authenticode, release-to-candidate build identity, and actual
   update/install/relaunch need their own receipts. Tauri can build Linux/macOS bundles with their
   prerequisites; an NSIS build specifically needs a Windows build environment.
-- A Linux `cargo build -p dotz-tauri` succeeded for this candidate, but no native bundle, installer,
-  signature, or candidate-to-release artifact identity was produced. The public `v0.2.8` artifact is
-  Windows-only and was not installed in this run.
+- A Linux `cargo build -p dotz-tauri` succeeded, but no source-head native bundle, installer,
+  signature, or release-artifact identity was produced. The public `v0.2.8` artifact is Windows-only
+  and was not installed in this run.
 - Live provider inference is not established by an adapter, a readiness banner, or a gated test
   name. DirectML is not configured/verified by the inspected embedder.
 - Benchmarks and telemetry examples are not current performance or adoption measurements. The
