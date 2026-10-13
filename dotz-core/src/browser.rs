@@ -2311,9 +2311,58 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
+    #[cfg(not(target_os = "linux"))]
+    struct SuccessfulCloseFixture {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    impl SuccessfulCloseFixture {
+        // Caller holds BROWSER_TIMEOUT_TEST_LOCK for process-global environment access.
+        async fn new(directory: &Path) -> Self {
+            #[cfg(windows)]
+            let (name, script) = (
+                "close-browser.bat",
+                "@echo off\r\nping -n 2 127.0.0.1 >nul\r\necho {\"success\":true}\r\nexit /b 0\r\n",
+            );
+            #[cfg(unix)]
+            let (name, script) = (
+                "close-browser.sh",
+                "#!/bin/sh\nsleep 0.2\nprintf '%s\\n' '{\"success\":true}'\n",
+            );
+            let file = directory.join(name);
+            tokio::fs::write(&file, script).await.unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700))
+                    .await
+                    .unwrap();
+            }
+            let previous = std::env::var_os("DOTZ_BROWSER_BIN");
+            unsafe {
+                std::env::set_var("DOTZ_BROWSER_BIN", file);
+            }
+            Self { previous }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    impl Drop for SuccessfulCloseFixture {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => unsafe {
+                    std::env::set_var("DOTZ_BROWSER_BIN", previous);
+                },
+                None => unsafe {
+                    std::env::remove_var("DOTZ_BROWSER_BIN");
+                },
+            }
+        }
+    }
+
     /// `dispose_all` stops every tracked browser session and removes its disposable profile
-    /// directory, even when the external `agent-browser` binary is not present (the `stop()` path
-    /// deletes the record and temp dir regardless of whether `agent-browser close` succeeded).
+    /// directory after verified scope exit on Linux or successful close on weaker platforms.
     #[tokio::test]
     async fn dispose_all_closes_every_session_and_removes_profile_dirs() {
         // Serialize with other tests that mutate the process-global browser env / sessions store
@@ -2379,6 +2428,8 @@ mod tests {
             );
         }
 
+        #[cfg(not(target_os = "linux"))]
+        let _close = SuccessfulCloseFixture::new(&base).await;
         dispose_all().await;
 
         assert!(
@@ -2397,9 +2448,8 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
-    /// `stop()` must dispose the session and profile directory even when the `agent-browser close`
-    /// command hangs. Before the fix, stop() waited for the full `command_timeout()` which let
-    /// `dispose_all()`'s outer timeout drop the future and leave the session record behind.
+    /// Hung close is bounded. Linux verifies namespace exit before disposal; weaker platforms
+    /// retain the session/profile with an error until a later close succeeds.
     #[tokio::test]
     async fn stop_disposes_session_even_when_close_command_hangs() {
         let _guard = BROWSER_TIMEOUT_TEST_LOCK.lock().await;
@@ -2545,14 +2595,40 @@ mod tests {
             elapsed < std::time::Duration::from_secs(10),
             "stop() should not wait for the full command_timeout, elapsed: {elapsed:?}"
         );
-        assert!(
-            result.is_ok(),
-            "stop() should succeed even when close hangs: {}",
-            result.err().unwrap_or_default()
-        );
-        let obs = result.unwrap();
-        assert_eq!(obs.status, "stopped");
-        assert_eq!(obs.session_id, sid);
+        #[cfg(target_os = "linux")]
+        {
+            let obs = result.expect("Linux stop verifies scope exit even when close hangs");
+            assert_eq!(obs.status, "stopped");
+            assert_eq!(obs.session_id, sid);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(
+                result.is_err(),
+                "Unverified close must not report successful disposal"
+            );
+            {
+                let record = sessions_guard();
+                let retained = record.get(&sid).expect("Retry record must remain");
+                assert_eq!(retained.observation.status, "error");
+                assert_eq!(
+                    retained.observation.error.as_ref().unwrap().code,
+                    "BROWSER_CLEANUP_INCOMPLETE"
+                );
+                assert!(
+                    profile_dir.exists(),
+                    "Unverified browser profile must remain"
+                );
+            }
+            let _close = SuccessfulCloseFixture::new(&dir).await;
+            assert_eq!(
+                stop(&sid)
+                    .await
+                    .expect("Successful close permits cleanup retry")
+                    .status,
+                "stopped"
+            );
+        }
 
         assert!(
             sessions_guard().get(&sid).is_none(),
@@ -2624,6 +2700,9 @@ mod tests {
                 );
             }
         }
+
+        #[cfg(not(target_os = "linux"))]
+        let _close = SuccessfulCloseFixture::new(&dir).await;
 
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
         let first = {
