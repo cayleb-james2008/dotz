@@ -1735,36 +1735,52 @@ fn mark_cleanup_error(session_id: &str, message: &str) {
 /// Stop while the per-session operation mutex is held. Linux only removes the profile after the
 /// pinned namespace supervisor has exited; other platforms retain the session if close fails.
 async fn stop_locked(session_id: &str) -> Result<BrowserObservation, String> {
-    let (profile_dir, allowed_origins, already_terminated, scope_started, scope_poisoned) = {
+    struct StopSnapshot {
+        profile_dir: PathBuf,
+        allowed_origins: Vec<String>,
+        already_terminated: bool,
+        #[cfg(target_os = "linux")]
+        scope_started: bool,
+        #[cfg(target_os = "linux")]
+        scope_poisoned: bool,
+    }
+
+    let snapshot = {
         let mut store = sessions_guard();
         let record = store.get_mut(session_id).ok_or("no such browser session")?;
         record.disposed = true;
-        (
-            record.profile_dir.clone(),
-            record.observation.allowed_origins.clone(),
-            record.scope_terminated,
+        StopSnapshot {
+            profile_dir: record.profile_dir.clone(),
+            allowed_origins: record.observation.allowed_origins.clone(),
+            already_terminated: record.scope_terminated,
             #[cfg(target_os = "linux")]
-            record.scope_started,
+            scope_started: record.scope_started,
             #[cfg(target_os = "linux")]
-            record.scope_poisoned,
-        )
+            scope_poisoned: record.scope_poisoned,
+        }
     };
 
     #[cfg(target_os = "linux")]
-    let close_error = if scope_started && !already_terminated && !scope_poisoned {
-        match tokio::time::timeout(
-            CLOSE_TIMEOUT,
-            run(session_id, &profile_dir, &allowed_origins, &["close"]),
-        )
-        .await
-        {
-            Ok(Ok(_)) => None,
-            Ok(Err(error)) => Some(format!("agent-browser close failed: {error}")),
-            Err(_) => Some("agent-browser close timed out".to_string()),
-        }
-    } else {
-        None
-    };
+    let close_error =
+        if snapshot.scope_started && !snapshot.already_terminated && !snapshot.scope_poisoned {
+            match tokio::time::timeout(
+                CLOSE_TIMEOUT,
+                run(
+                    session_id,
+                    &snapshot.profile_dir,
+                    &snapshot.allowed_origins,
+                    &["close"],
+                ),
+            )
+            .await
+            {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(format!("agent-browser close failed: {error}")),
+                Err(_) => Some("agent-browser close timed out".to_string()),
+            }
+        } else {
+            None
+        };
 
     #[cfg(target_os = "linux")]
     {
@@ -1772,7 +1788,7 @@ async fn stop_locked(session_id: &str) -> Result<BrowserObservation, String> {
             .get(session_id)
             .map(|record| record.scope.clone())
             .ok_or("no such browser session")?;
-        if scope_started && !already_terminated {
+        if snapshot.scope_started && !snapshot.already_terminated {
             let mut scope = scope_arc.lock().await;
             let Some(active_scope) = scope.as_mut() else {
                 let message = "browser scope handle missing before teardown was verified";
@@ -1793,7 +1809,12 @@ async fn stop_locked(session_id: &str) -> Result<BrowserObservation, String> {
     #[cfg(not(target_os = "linux"))]
     let close_error = match tokio::time::timeout(
         CLOSE_TIMEOUT,
-        run(session_id, &profile_dir, &allowed_origins, &["close"]),
+        run(
+            session_id,
+            &snapshot.profile_dir,
+            &snapshot.allowed_origins,
+            &["close"],
+        ),
     )
     .await
     {
@@ -1808,7 +1829,7 @@ async fn stop_locked(session_id: &str) -> Result<BrowserObservation, String> {
         return Err(error.to_string());
     }
 
-    if let Err(error) = tokio::fs::remove_dir_all(&profile_dir).await
+    if let Err(error) = tokio::fs::remove_dir_all(&snapshot.profile_dir).await
         && error.kind() != std::io::ErrorKind::NotFound
     {
         let message = format!("browser profile cleanup incomplete: {error}");
