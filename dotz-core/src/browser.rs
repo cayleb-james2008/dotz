@@ -761,9 +761,18 @@ done
             encoded.extend_from_slice(arg.as_bytes());
             encoded.push(0);
         }
-        tokio::fs::write(&argv_path, encoded)
+        let mut arguments = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&argv_path)
             .await
             .map_err(|e| format!("browser command arguments: {e}"))?;
+        arguments
+            .write_all(&encoded)
+            .await
+            .map_err(|e| format!("browser command arguments: {e}"))?;
+        drop(arguments);
         self.stdin
             .write_all(format!("{request}\n").as_bytes())
             .await
@@ -1707,11 +1716,16 @@ fn action_summary(
 /// never inherits another session's cookies, storage, or state.
 async fn fresh_profile_dir(session_id: &str) -> Result<PathBuf, String> {
     let dir = std::env::temp_dir().join(format!("dotz-browser-{session_id}"));
-    match tokio::fs::create_dir(&dir).await {
+    let mut builder = tokio::fs::DirBuilder::new();
+    builder.recursive(false);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    match builder.create(&dir).await {
         Ok(()) => Ok(dir),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let _ = tokio::fs::remove_dir_all(&dir).await;
-            tokio::fs::create_dir(&dir)
+            builder
+                .create(&dir)
                 .await
                 .map_err(|e| format!("create profile dir: {e}"))?;
             Ok(dir)
@@ -2288,6 +2302,15 @@ mod tests {
             .await
             .expect("profile dir should exist");
         assert!(meta.is_dir(), "profile path should be a directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(meta.permissions().mode() & 0o077, 0);
+            // Recreate even a legacy profile whose permissions were too broad.
+            tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+        }
 
         // Simulate a stale profile from a previous crash.
         tokio::fs::write(dir.join("stale-cookie.txt"), "old")
@@ -2306,9 +2329,37 @@ mod tests {
             !dir2.join("stale-cookie.txt").exists(),
             "stale profile data must be removed"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = tokio::fs::metadata(&dir2).await.unwrap();
+            assert_eq!(meta.permissions().mode() & 0o077, 0);
+        }
 
         // Cleanup.
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn browser_scope_request_arguments_are_owner_only() {
+        let sid = format!("private-arguments-{}", uuid::Uuid::new_v4());
+        let dir = fresh_profile_dir(&sid).await.unwrap();
+        let mut scope = LinuxBrowserScope::spawn(&dir).await.unwrap();
+        // Inspect the production request file while its command is executing.
+        let observed = scope
+            .execute(&[
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"printf '{"argv_mode":"'; stat -c %a "$1"/request-*.argv | tr -d '\n'; printf '"}'"#.into(),
+                "private-request-fixture".into(),
+                dir.to_string_lossy().into_owned(),
+            ])
+            .await;
+        let stopped = scope.terminate().await;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        stopped.expect("scope cleanup must succeed");
+        assert_eq!(observed.unwrap()["argv_mode"], "600");
     }
 
     #[cfg(not(target_os = "linux"))]
