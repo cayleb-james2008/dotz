@@ -301,6 +301,7 @@ struct SessionRecord {
     /// Set when stop() begins; commands other than its own close are rejected afterward.
     disposed: bool,
     /// True only after the owned Linux namespace has exited (or no command ever started it).
+    #[cfg(target_os = "linux")]
     scope_terminated: bool,
     #[cfg(target_os = "linux")]
     scope_started: bool,
@@ -1341,6 +1342,7 @@ pub async fn start(
             frame_data: None,
             operation: operation.clone(),
             disposed: false,
+            #[cfg(target_os = "linux")]
             scope_terminated: false,
             #[cfg(target_os = "linux")]
             scope_started: false,
@@ -2343,6 +2345,7 @@ mod tests {
                     frame_data: None,
                     operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    #[cfg(target_os = "linux")]
                     scope_terminated: false,
                     #[cfg(target_os = "linux")]
                     scope_started: false,
@@ -2362,6 +2365,7 @@ mod tests {
                     frame_data: None,
                     operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    #[cfg(target_os = "linux")]
                     scope_terminated: false,
                     #[cfg(target_os = "linux")]
                     scope_started: false,
@@ -2465,6 +2469,7 @@ mod tests {
                     frame_data: None,
                     operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    #[cfg(target_os = "linux")]
                     scope_terminated: false,
                     #[cfg(target_os = "linux")]
                     scope_started: false,
@@ -2605,6 +2610,7 @@ mod tests {
                         frame_data: None,
                         operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                         disposed: false,
+                        #[cfg(target_os = "linux")]
                         scope_terminated: false,
                         #[cfg(target_os = "linux")]
                         scope_started: false,
@@ -2748,6 +2754,7 @@ mod tests {
                     frame_data: None,
                     operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    #[cfg(target_os = "linux")]
                     scope_terminated: false,
                     #[cfg(target_os = "linux")]
                     scope_started: false,
@@ -2767,6 +2774,7 @@ mod tests {
                     frame_data: None,
                     operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    #[cfg(target_os = "linux")]
                     scope_terminated: false,
                     #[cfg(target_os = "linux")]
                     scope_started: false,
@@ -3103,6 +3111,7 @@ mod tests {
                     frame_data: None,
                     operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                     disposed: false,
+                    #[cfg(target_os = "linux")]
                     scope_terminated: false,
                     #[cfg(target_os = "linux")]
                     scope_started: false,
