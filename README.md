@@ -223,12 +223,12 @@ given command in the session cwd with a wall-clock timeout — no command allowl
 per-command PID namespace and fail closed when they cannot create one. Background processes and
 inherited output-pipe holders are removed when that command's root exits; use a managed `web`
 sandbox run for a persistent preview instead of shell backgrounding. This is process lifecycle
-containment, not filesystem or network
-isolation, and is not a current-main or release acceptance claim. Windows keeps `taskkill /T`;
-macOS uses process-group signaling. Neither establishes the Linux namespace guarantee. The browser
-has a persistent Chrome daemon whose lifetime spans one-shot commands. Persistent browser ownership
-and pre-spawn cancellation repairs are under implementation/review; this documentation does not
-claim those gaps are fixed. The sandbox runs in two modes:
+containment, not filesystem or network isolation. The browser controller now records an owner per
+session, serializes session operations, and tears down its persistent Chrome scope with the session;
+the sandbox cancellation path also keeps a cancellation accepted before spawn sticky. Linux has
+namespace and pinned-process cleanup tests. Windows keeps `taskkill /T`; macOS uses process-group
+signaling. Native teardown on Windows and macOS has not been exercised by this lane. This source
+candidate is not a current-main or release acceptance claim. The sandbox runs in two modes:
 
 - **`terminal`** mode — streams stdout/stderr back into the chat panel.
 - **`web`** mode — starts a long-lived process bound to a local HTTP port; the UI renders an inline
@@ -474,18 +474,18 @@ platform artifact URLs and signatures; the updater verifies downloaded artifacts
 The apply path calls `download_and_install` and then requests a restart. That source wiring is not
 evidence that the native UI bridge, update installation, or relaunch has succeeded.
 
-On 2026-10-10 at 18:07 UTC, both public release URLs returned HTTP 200; the manifest reported
-`0.2.8` and `windows-x86_64`. The earlier 2026-09-18 HTTP 404 observation is historical, not the
-current feed state. Neither HTTP availability nor a signature field proves signature validity,
-Authenticode, or that a release was built from this unmerged candidate. See
+On 2026-10-13, both public release URLs returned HTTP 200; the manifest reported `0.2.8` and
+`windows-x86_64`. The release tag points to `16f27f5878c44cf7aa13ea3719a84dce9b58b0fd`, not this
+candidate. Neither HTTP availability nor a signature field proves signature validity, Authenticode,
+or that a release was built from this unmerged candidate. See
 [src-tauri/DEPLOY.md](src-tauri/DEPLOY.md) for build and release boundaries.
 
 ## What works today
 
-I'm keeping source inspection, historical local receipts, hosted checks, and release acceptance
-separate. This documentation pass reads the isolated integration snapshot
-`c6b465616ec3e9b9ad679542330c5a8be249ba31` on 2026-10-10; it does not rerun or accept the runtime.
-That snapshot locally reconciles main and draft candidates. Local integration is not a remote merge.
+I'm keeping source inspection, local receipts, hosted checks, and release acceptance separate. This
+documentation pass records the isolated PR 222 candidate at
+`52e6d6df5f090e0f57a1033ced7c207112f37dec` on 2026-10-13. It does not merge or publish the source,
+and does not accept the packaged runtime.
 
 **Source inspection:** the Rust agent runtime, local embedder, project/memory persistence paths,
 provider adapters, API guards, and updater commands are present in their respective modules.
@@ -497,10 +497,13 @@ success. The shared web UI does not prove that native-only controls work on ever
 
 | Evidence | Scope / identity | Result and limit |
 |----------|------------------|------------------|
+| Candidate source tests, 2026-10-13 | Linux, `52e6d6df5f090e0f57a1033ced7c207112f37dec`; `cargo test -p dotz-core --locked -- --test-threads=2` | 826 core library tests, 4 serve tests, 2 e2e tests, 2 ORT lock tests, lifecycle and documentation tests passed. Formatting and Clippy passed. No live provider inference was configured. |
+| Candidate UI and installer policy, 2026-10-13 | Same local source candidate; isolated UI harness and install-policy scripts | 21 browser checks, 9 platform-helper checks, `test:install-wrapper`, and `test:release-install-policy` passed. The UI receipt reported no provider/prompt call and no external network request. |
+| PR 222 hosted CI, prior source head | [PR 222](https://github.com/cayleb-james2008/dotz/pull/222), `14065718b113f6af1509bd4fb8a2623ce925b1f9` | Linux and dependency-policy checks passed; Windows and macOS Clippy failed on cfg-gated tuple destructuring. Candidate `52e6d6d` replaces that tuple with cfg-gated snapshot fields; hosted verification of this new commit is pending. |
 | Independent local Rust receipt, 2026-10-08 | Linux, `d22a0567e7976427071ce5783d8f7fcc224dc1d1`; `cargo test -p dotz-core --locked -- --test-threads=1` | 824 passed / 0 failed, cached model assets; formatting and Clippy also passed. Historical local result, not this snapshot or exact-head hosted acceptance. Credential-gated tests can return without inference. |
 | Installer-policy fixture described in the integration baseline | npm 11.19.0 fixture; not a fresh online setup receipt | Wrapper suppressed an unapproved hook and passed `SHARP_IGNORE_GLOBAL_LIBVIPS=1` to approved `sharp@0.34.5`. A fixture does not verify external runtime downloads or the complete quickstart. |
 | Historical native package receipts | Extracted local Linux DEB journeys; the later digest-linked package is candidate `1bdb5df1eeb7988bb44524ce6e2cecef374695d1` | Onboarding, project/memory persistence and 384-dimensional local embeddings were recorded. An earlier first-run attempt failed; semantic-search diagnostic returned HTTP 401 and remains unverified. Distinct package receipts must not be combined into one build identity. No system-wide installation, independent rebuild, or current public-release acceptance is inferred. |
-| Public release GET checks, 2026-10-10 18:07 UTC | [Latest release](https://github.com/cayleb-james2008/dotz/releases/latest), [updater manifest](https://github.com/cayleb-james2008/dotz/releases/latest/download/latest.json); unauthenticated | Both HTTP 200; latest redirected to `v0.2.8`, manifest version `0.2.8`, platform key `windows-x86_64`. No installer execution or new signature verification. |
+| Public release GET checks, 2026-10-13 | [Latest release](https://github.com/cayleb-james2008/dotz/releases/latest), [updater manifest](https://github.com/cayleb-james2008/dotz/releases/latest/download/latest.json); unauthenticated | Both HTTP 200; latest redirected to `v0.2.8`, manifest version `0.2.8`, platform key `windows-x86_64`; tag SHA is `16f27f5878c44cf7aa13ea3719a84dce9b58b0fd`. No installer execution or new signature verification. |
 | Candidate audit, 2026-10-10 | [PR218](https://github.com/cayleb-james2008/dotz/pull/218) at `016a4a3c49ba58097ca0f1a809520b623fa72b7e`; [PR219](https://github.com/cayleb-james2008/dotz/pull/219) at `45366fa2701d06d467f9c5fab814a95d69d8d934` | Both open draft/unmerged at audit. PR218 pull-request run `37781781173` failed on Ubuntu; Windows/macOS and dependency-policy jobs passed. No PR219 exact-head success established. These are dated observations, not final integration gates. |
 
 **Not accepted by this documentation pass:**
@@ -508,12 +511,14 @@ success. The shared web UI does not prove that native-only controls work on ever
 - Final integrated-head CI and independent review, deliberate merge/default-branch readback, and
   fresh public-download setup/native primary journeys remain separate gates. Distinguish `push`
   from `pull_request` evidence and record the exact SHA for each result.
-- Browser persistent-daemon teardown and pre-spawn cancellation repairs are active candidate work;
-  no new cleanup acceptance is claimed here. Windows/macOS teardown has not been exercised by this
-  lane and does not inherit the Linux namespace boundary.
+- The current source candidate is not hosted-verified at its new SHA yet. Windows/macOS process
+  cleanup remains less isolated than the Linux namespace path and was not exercised in this lane.
 - Windows native installer launch, Authenticode, release-to-candidate build identity, and actual
   update/install/relaunch need their own receipts. Tauri can build Linux/macOS bundles with their
   prerequisites; an NSIS build specifically needs a Windows build environment.
+- A Linux `cargo build -p dotz-tauri` succeeded for this candidate, but no native bundle, installer,
+  signature, or candidate-to-release artifact identity was produced. The public `v0.2.8` artifact is
+  Windows-only and was not installed in this run.
 - Live provider inference is not established by an adapter, a readiness banner, or a gated test
   name. DirectML is not configured/verified by the inspected embedder.
 - Benchmarks and telemetry examples are not current performance or adoption measurements. The
