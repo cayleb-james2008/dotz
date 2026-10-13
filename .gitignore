@@ -1,4 +1,6 @@
 node_modules/
+__pycache__/
+*.pyc
 dist/
 release/
 # local copies of shipped installers + latest.json (scripts/release.ps1, gh release download)

@@ -4,7 +4,7 @@
  * module-instance reference, so mutations propagate identically to the old single-file scope.
  */
 import { $ } from './api.js';
-import { PANEL_NAMES } from './panels.js';
+import { PANEL_NAMES } from './panel-registry.js';
 
 const LAYOUT_KEY = "dotz.layout.v1";
 const BRAIN_FLOAT_KEY = "dotz.brainFloat.v1";
@@ -24,6 +24,7 @@ const state = {
   activeProvider: "ollama",
   config: null,
   providerDefaults: {},
+  providerHealth: { providers: {}, failoverPairs: {} },
   modelCatalog: [],
   memory: [],
   skills: [],

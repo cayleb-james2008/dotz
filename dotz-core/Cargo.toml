@@ -19,6 +19,7 @@ name = "telemetry"
 path = "src/bin/telemetry.rs"
 
 [dependencies]
+libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "process", "fs", "io-util", "time"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs"] }

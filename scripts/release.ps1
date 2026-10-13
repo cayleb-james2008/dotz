@@ -7,7 +7,7 @@
 #
 # Usage (from the repo root, PowerShell 5.1+):
 #   powershell -NoProfile -File scripts\release.ps1                # build + sign + archive
-#   powershell -NoProfile -File scripts\release.ps1 -SkipNpm      # skip npm install/fetch-model
+#   powershell -NoProfile -File scripts\release.ps1 -SkipNpm      # skip npm run install:deps/fetch-model
 #   powershell -NoProfile -File scripts\release.ps1 -Publish      # ALSO gh release create (operator-gated)
 #
 # Key material: read from ~\.claude\dotz-rust\ into PROCESS env vars only — never echoed, never
@@ -53,8 +53,8 @@ $env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content $keyFile -Raw)
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ((Get-Content $pwFile | Select-Object -First 1) -replace '^PASSWORD=', '')
 try {
     if (-not $SkipNpm) {
-        npm install
-        if ($LASTEXITCODE -ne 0) { throw "npm install failed ($LASTEXITCODE)" }
+        npm run install:deps
+        if ($LASTEXITCODE -ne 0) { throw "npm run install:deps failed ($LASTEXITCODE)" }
         npm run fetch-model
         if ($LASTEXITCODE -ne 0) { throw "npm run fetch-model failed ($LASTEXITCODE)" }
     }

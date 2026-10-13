@@ -12,10 +12,6 @@ import {
 import { logBrain } from './panels/brain.js';
 import { renderRecalled } from './panels/memory.js';
 
-// state.providerHealth: { providers: { [id]: { status, consecutive_failures, failures, successes, last_error, ... } }, failoverPairs: { [id]: { primary, backup } } }
-// Mutated onto the shared state singleton at module load (mirrors the original post-literal
-// assignment in app.js — colocated with handleProviderHealthEvent which is its primary mutator).
-state.providerHealth = { providers: {}, failoverPairs: {} };
 
 function stringifyResult(r) {
   if (r == null) return "";

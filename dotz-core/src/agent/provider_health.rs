@@ -158,9 +158,12 @@ pub struct FailoverPair {
 }
 
 /// Resolve the default failover pair for a given primary provider. The backup is the *other* big
-/// free-form provider: OpenRouter ↔ Ollama Cloud. For anything else we fall back to Ollama Cloud
-/// (the cheapest always-on default) if it differs from the primary, otherwise no backup.
+/// free-form provider: OpenRouter ↔ Ollama Cloud. Local inference never leaves the device, so it
+/// has no cloud fallback. Other providers fall back to Ollama Cloud when it differs from primary.
 pub fn default_failover_for(primary_provider: &str, primary_model: &str) -> Option<FailoverPair> {
+    if primary_provider == "local" {
+        return None;
+    }
     let (backup_provider, backup_model) = match primary_provider {
         "openrouter" => ("ollama", "minimax-m3"),
         "ollama" => ("openrouter", "nex-agi/nex-n2-pro:free"),
@@ -576,10 +579,24 @@ mod tests {
     }
 
     #[test]
-    fn default_failover_returns_none_for_same_provider_backup() {
-        // A provider whose only possible backup would be itself has no failover.
-        // "local" → backup would be "ollama" (different), so it DOES have a failover.
-        assert!(default_failover_for("local", "qwen2.5-coder").is_some());
+    fn local_provider_has_no_cloud_failover() {
+        assert!(default_failover_for("local", "qwen2.5-coder").is_none());
+    }
+
+    #[tokio::test]
+    async fn degraded_local_provider_stays_local() {
+        let _guard = HEALTH_TEST_LOCK.lock().await;
+        reset().await;
+        record_failure("local", "returned 503: local model server unavailable").await;
+        record_failure("local", "returned 503: local model server unavailable").await;
+
+        assert!(is_degraded("local").await);
+        assert!(
+            resolve_effective_model("local", "qwen2.5-coder")
+                .await
+                .is_none()
+        );
+        reset().await;
     }
 
     #[test]

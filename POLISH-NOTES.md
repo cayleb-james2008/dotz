@@ -54,11 +54,17 @@
   at `dotz-core/src/sandbox.rs:2232` and `:2499` (log: `cargo-test.log`).
   AFTER the fix, model absent: EXIT=101, 786 passed / 27 failed (log: `cargo-test2.log`).
   The failures were dominated by the missing ONNX model (`assets/models/` gitignored).
-- `npm install --ignore-scripts` → EXIT=0 (51 packages; plain `npm install` fails on
-  `sharp@0.34.5` node-gyp build: `npm error sharp: Please add node-addon-api to your
-  dependencies`, Node v26.7.0 — log: `fetch-model.log`). `--ignore-scripts` skips the
-  native build; the model fetcher does not need it. Then `npm run fetch-model` → EXIT=0,
-  `Xenova/all-MiniLM-L6-v2 bundled (dim 384)` (log: `fetch-model2.log`).
+- Historical check (2026-09-18): plain `npm install` fell back to a `sharp@0.34.5`
+  source build and requested `node-addon-api`. `npm install --ignore-scripts` exited 0,
+  but skipped lifecycle scripts and is not a supported setup path.
+- Initial repair verified 2026-10-04: the wrapper set Sharp's packaged libvips and the clean install ran
+  the four currently pinned hooks; this is historical evidence from before the independent policy
+  correction. The npm 11.19.0 probe showed a warning did not prevent an unapproved lifecycle script.
+- Independent corrective patch: base `npm install --ignore-scripts`, then `npm rebuild` only for the
+  exact version-pinned approved packages present in `node_modules`; `SHARP_IGNORE_GLOBAL_LIBVIPS=1`
+  is passed to both phases. `npm run test:install-wrapper` reproduces approved Sharp hook success,
+  environment forwarding, and unapproved hook suppression. A fresh ONNX runtime download was not
+  repeated with network disabled.
 - AFTER the fix, model present: EXIT=101, 796 passed / 17 failed (log: `cargo-test3.log`).
   All `embed::*` / `memory::*` model tests pass with the model.
 - Single-threaded rerun `cargo test -p dotz-core --lib -- --test-threads=1` → EXIT=101,
