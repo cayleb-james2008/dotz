@@ -40,7 +40,9 @@ const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(75);
 /// Timeout for `agent-browser close`. Linux then tears down the persistent namespace even when
 /// close fails; weaker platforms retain the retry record.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(target_os = "linux")]
 const SCOPE_START_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
 const SCOPE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configurable wall-clock timeout for each agent-browser command. A hung command (e.g. a
@@ -1738,6 +1740,7 @@ async fn stop_locked(session_id: &str) -> Result<BrowserObservation, String> {
     struct StopSnapshot {
         profile_dir: PathBuf,
         allowed_origins: Vec<String>,
+        #[cfg(target_os = "linux")]
         already_terminated: bool,
         #[cfg(target_os = "linux")]
         scope_started: bool,
@@ -1752,6 +1755,7 @@ async fn stop_locked(session_id: &str) -> Result<BrowserObservation, String> {
         StopSnapshot {
             profile_dir: record.profile_dir.clone(),
             allowed_origins: record.observation.allowed_origins.clone(),
+            #[cfg(target_os = "linux")]
             already_terminated: record.scope_terminated,
             #[cfg(target_os = "linux")]
             scope_started: record.scope_started,
@@ -1837,7 +1841,7 @@ async fn stop_locked(session_id: &str) -> Result<BrowserObservation, String> {
         return Err(message);
     }
 
-    let mut stopped = {
+    let stopped = {
         let mut store = sessions_guard();
         let record = store.get_mut(session_id).ok_or("no such browser session")?;
         record.observation.status = "stopped".into();
@@ -1848,6 +1852,8 @@ async fn stop_locked(session_id: &str) -> Result<BrowserObservation, String> {
         record.frame_data = None;
         record.observation.clone()
     };
+    #[cfg(target_os = "linux")]
+    let mut stopped = stopped;
     #[cfg(target_os = "linux")]
     if let Some(error) = close_error {
         stopped.error = Some(ObsError {
